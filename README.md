@@ -96,6 +96,15 @@ npm start          # backend only; serve packages/web/dist with any static host
 Secrets live in `.env` and `data/` (the encrypted keystore + a Flashbots
 reputation key). Both are git-ignored. **Never commit them.**
 
+Strategy settings are edited from the dashboard and saved to `data/config.json`
+(also git-ignored, since it holds your live strategy). With no such file the bot
+starts from safe defaults — dry-run on, offense/defense off. To seed a starting
+point, copy the template:
+
+```bash
+cp data/config.example.json data/config.json
+```
+
 ---
 
 ## Safety model

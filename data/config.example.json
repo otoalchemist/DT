@@ -1,15 +1,15 @@
 {
   "enabled": false,
-  "dryRun": false,
+  "dryRun": true,
   "auditSafetyBufferSeconds": 10800,
   "proactivePay": false,
   "prepayEpochs": 1,
   "jitEnabled": false,
   "jitTargetEpoch": null,
   "jitTokenIds": [],
-  "offenseEnabled": true,
-  "autoAudit": true,
-  "autoKill": true,
+  "offenseEnabled": false,
+  "autoAudit": false,
+  "autoKill": false,
   "endgameOnlyWithin": null,
   "offenseTargetTokenIds": [
     "75",
@@ -68,12 +68,12 @@
     "6749",
     "6953"
   ],
-  "maxBaseFeeGwei": 100,
-  "priorityFeeGwei": 21.1,
+  "maxBaseFeeGwei": 30,
+  "priorityFeeGwei": 2,
   "minBalanceEth": 0.01,
   "offenseBoundaryScheduling": false,
   "racePublicMempool": false,
-  "dynamicTipEnabled": true,
-  "dynamicTipMaxGwei": 100,
+  "dynamicTipEnabled": false,
+  "dynamicTipMaxGwei": 50,
   "maxPaymentEth": 0
 }
