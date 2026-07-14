@@ -1,0 +1,309 @@
+import { useEffect, useState } from "react";
+import type { StrategyConfig } from "@dat-bot/shared";
+import { api } from "./api.js";
+
+const MODE_TIPS: Record<"public" | "mainnet", string> = {
+  public:
+    "Fastest path — transaction goes directly to the public mempool and every block builder sees it immediately. " +
+    "Recommended for this game since you're racing a clock, not a MEV searcher. " +
+    "Anyone can see the tx before it lands, but frontrunning tax payments isn't a meaningful risk here.",
+  mainnet:
+    "Sends your transaction privately to the Flashbots relay as a bundle. " +
+    "Nobody sees it until it lands in a block, so it can't be frontrun. " +
+    "Adds ~100–200 ms relay round-trip overhead and submits to the next two blocks for inclusion odds. " +
+    "Only useful if you have a specific reason to hide the transaction.",
+};
+
+function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" }) {
+  const [key, setKey] = useState("");
+  const [mode, setMode] = useState<"mainnet" | "public">(initialMode);
+  const [busyKey, setBusyKey] = useState(false);
+  const [busyMode, setBusyMode] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const saveKey = async () => {
+    if (!key.trim()) return;
+    setBusyKey(true);
+    setMsg(null);
+    try {
+      await api.saveAlchemyKey(key.trim());
+      setMsg("Saved — RPC clients updated.");
+      setKey("");
+    } catch (e) {
+      setMsg(`Error: ${(e as Error).message}`);
+    } finally {
+      setBusyKey(false);
+    }
+  };
+
+  const switchMode = async (next: "mainnet" | "public") => {
+    setMode(next);
+    setBusyMode(true);
+    setMsg(null);
+    try {
+      await api.saveMode(next);
+      setMsg(`Mode switched to ${next}.`);
+    } catch (e) {
+      setMsg(`Error: ${(e as Error).message}`);
+      setMode(mode); // revert on failure
+    } finally {
+      setBusyMode(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>RPC / ALCHEMY</div>
+
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Submission mode</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          {(["public", "mainnet"] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => switchMode(m)}
+              disabled={busyMode || mode === m}
+              style={{
+                padding: "4px 14px",
+                borderRadius: 6,
+                border: mode === m ? "2px solid var(--accent, #6c7)" : "1px solid #555",
+                fontWeight: mode === m ? 700 : 400,
+                opacity: busyMode ? 0.6 : 1,
+                cursor: mode === m ? "default" : "pointer",
+              }}
+            >
+              {m}
+            </button>
+          ))}
+        </div>
+        <p style={{ fontSize: 12, color: "#aaa", margin: 0, lineHeight: 1.5 }}>
+          {MODE_TIPS[mode]}
+        </p>
+      </div>
+
+      <label className="field">
+        Update Alchemy API key
+        <input
+          type="password"
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          placeholder="paste new key to replace"
+        />
+      </label>
+      {msg && <p className={msg.startsWith("Error") ? "err" : "hint"}>{msg}</p>}
+      <button onClick={saveKey} disabled={busyKey || key.trim().length < 10} style={{ marginBottom: 8 }}>
+        {busyKey ? "Saving…" : "Update key"}
+      </button>
+    </>
+  );
+}
+
+// Strategy configuration form. Persists via POST /api/config.
+export function Config({ initial }: { initial: StrategyConfig }) {
+  const [cfg, setCfg] = useState<StrategyConfig>(initial);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("public");
+
+  useEffect(() => setCfg(initial), [initial]);
+
+  useEffect(() => {
+    api.getSettings().then((s) => setCurrentMode(s.mode)).catch(() => {});
+  }, []);
+
+  const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
+    setCfg((c) => ({ ...c, [k]: v }));
+    setSaved(false);
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setSaveErr(null);
+    try {
+      await api.setConfig(cfg);
+      setSaved(true);
+    } catch (e) {
+      setSaveErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const num = (k: keyof StrategyConfig) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    set(k, Number(e.target.value) as never);
+  const chk = (k: keyof StrategyConfig) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    set(k, e.target.checked as never);
+
+  return (
+    <div className="panel">
+      <h2>Strategy</h2>
+
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          padding: "10px 14px",
+          borderRadius: 8,
+          border: `2px solid ${cfg.dryRun ? "var(--purple)" : "var(--red)"}`,
+          background: cfg.dryRun ? "rgba(183,139,255,0.08)" : "rgba(255,92,92,0.08)",
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        <input type="checkbox" checked={cfg.dryRun} onChange={chk("dryRun")} style={{ width: "auto" }} />
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 13, color: cfg.dryRun ? "var(--purple)" : "var(--red)" }}>
+            {cfg.dryRun ? "DRY-RUN MODE — simulates only, no transactions sent" : "⚠ LIVE FIRE — real transactions will be submitted"}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+            {cfg.dryRun ? "Uncheck this when you're ready to go live." : "Check this to simulate without spending gas."}
+          </div>
+        </div>
+      </label>
+
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>DEFENSE</div>
+      <label className="check">
+        <input type="checkbox" checked={cfg.enabled} onChange={chk("enabled")} />
+        Enable defense (auto-pay taxes to keep your citizens alive)
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.proactivePay} onChange={chk("proactivePay")} disabled={!cfg.enabled} />
+        Proactively pay when delinquent (avoid being auditable)
+      </label>
+      <label className="field">
+        Clear audits with this much time to spare (hours)
+        <input
+          type="number" min={0} step={0.5}
+          value={cfg.auditSafetyBufferSeconds / 3600}
+          onChange={(e) => set("auditSafetyBufferSeconds", Math.round(Number(e.target.value) * 3600))}
+        />
+      </label>
+      <label className="field">
+        Epochs to prepay per payment (1–7, locks current rate)
+        <input type="number" min={1} max={7} value={cfg.prepayEpochs} onChange={num("prepayEpochs")} />
+      </label>
+
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
+      <label className="check">
+        <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />
+        Enable offense
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.autoAudit} onChange={chk("autoAudit")} disabled={!cfg.offenseEnabled} />
+        Auto-audit delinquent rivals ({(0.00069).toString()} ETH each)
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.autoKill} onChange={chk("autoKill")} disabled={!cfg.offenseEnabled} />
+        Auto-kill expired-audit tokens (free, gas only)
+      </label>
+      <label className="field">
+        Only run offense when supply is within N of 69 winners (blank = always)
+        <input
+          type="number" min={0}
+          value={cfg.endgameOnlyWithin ?? ""}
+          onChange={(e) => set("endgameOnlyWithin", e.target.value === "" ? null : Number(e.target.value))}
+        />
+      </label>
+      <label className="field">
+        Rival token IDs to target (one per line or comma-separated — blank = all delinquent rivals)
+        <textarea
+          rows={5}
+          style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, resize: "vertical" }}
+          value={cfg.offenseTargetTokenIds.join("\n")}
+          onChange={(e) => {
+            const ids = e.target.value.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+            set("offenseTargetTokenIds", ids);
+          }}
+          disabled={!cfg.offenseEnabled}
+          placeholder={"42\n137\n501"}
+        />
+        <span className="muted" style={{ fontSize: 11 }}>
+          {cfg.offenseTargetTokenIds.length} token{cfg.offenseTargetTokenIds.length !== 1 ? "s" : ""}
+        </span>
+      </label>
+
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>
+      <label className="field">
+        Max base fee (gwei)
+        <input type="number" min={0} value={cfg.maxBaseFeeGwei} onChange={num("maxBaseFeeGwei")} />
+      </label>
+      <label className="field">
+        Priority fee / bundle tip (gwei)
+        <input type="number" min={0} step={0.1} value={cfg.priorityFeeGwei} onChange={num("priorityFeeGwei")} />
+      </label>
+      <label className="field">
+        Min wallet balance floor (ETH)
+        <input type="number" min={0} step={0.01} value={cfg.minBalanceEth} onChange={num("minBalanceEth")} />
+      </label>
+      <label className="field">
+        Max single payment (ETH) — 0 disables
+        <input type="number" min={0} step={0.01} value={cfg.maxPaymentEth} onChange={num("maxPaymentEth")} />
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 0", lineHeight: 1.5 }}>
+        Hard cap on any one transaction's value. A payment above this is skipped, not sent — a backstop
+        against a bad estimate or a badly-delinquent token draining the wallet in one shot.
+      </p>
+
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>LATENCY (offense)</div>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.offenseBoundaryScheduling}
+          onChange={chk("offenseBoundaryScheduling")}
+          disabled={!cfg.offenseEnabled}
+        />
+        Pre-schedule offense at deadlines
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+        Fires a tick just before each audit-expiry / epoch boundary so kills and audits compete in the
+        first eligible block instead of the block after (~12s sooner).
+      </p>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.racePublicMempool}
+          onChange={chk("racePublicMempool")}
+          disabled={!cfg.offenseEnabled}
+        />
+        Race public mempool (mainnet mode)
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+        Also broadcasts time-critical offense txs to the public mempool alongside the Flashbots bundle,
+        so any builder can include them next block. Trades bundle privacy for speed. No effect in public mode.
+      </p>
+      <label className="check">
+        <input type="checkbox" checked={cfg.dynamicTipEnabled} onChange={chk("dynamicTipEnabled")} />
+        Dynamic priority tip
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 6px 24px", lineHeight: 1.5 }}>
+        Scales the tip up as the latest block fills past 50%, up to the max below. When off, the static
+        priority fee is always used.
+      </p>
+      <label className="field" style={{ marginLeft: 24 }}>
+        Max dynamic tip (gwei)
+        <input
+          type="number"
+          min={0}
+          step={1}
+          value={cfg.dynamicTipMaxGwei}
+          onChange={num("dynamicTipMaxGwei")}
+          disabled={!cfg.dynamicTipEnabled}
+        />
+      </label>
+
+      <button className="primary" onClick={save} disabled={busy}>
+        {busy ? "Saving…" : saved ? "Saved ✓" : "Save strategy"}
+      </button>
+      {saveErr && <p className="err" style={{ marginTop: 6 }}>{saveErr}</p>}
+
+      <AlchemyKeySection initialMode={currentMode} />
+    </div>
+  );
+}

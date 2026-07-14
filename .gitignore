@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+
+# Local editor / agent config
+.claude/
+
+# Secrets & local state — NEVER commit
+.env
+.env.*
+!.env.example
+data/settings.json
+data/activity.json
+data/flashbots-signer.key
+data/*.keystore.json
+keystore/

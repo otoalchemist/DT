@@ -1,0 +1,259 @@
+import fs from "node:fs";
+import path from "node:path";
+import { keccak256, toHex, type Address, type Hex } from "viem";
+import {
+  privateKeyToAccount,
+  generatePrivateKey,
+  type PrivateKeyAccount,
+} from "viem/accounts";
+import { mainnet } from "viem/chains";
+import { publicClient } from "./chain.js";
+import { appConfig } from "./config.js";
+import { runtime } from "./runtime.js";
+import { nonceManager } from "./nonce.js";
+import { dynamicTipGwei } from "./logic.js";
+import { logger } from "./logger.js";
+
+export interface TxIntent {
+  to: Address;
+  data: Hex;
+  value: bigint;
+  /** Optional gas override; estimated if omitted. */
+  gas?: bigint;
+}
+
+export interface SubmitResult {
+  ok: boolean;
+  simulated: boolean;
+  txHash?: Hex;
+  bundleHash?: string;
+  targetBlock?: bigint;
+  nonce: number;
+  valueWei: bigint;
+  gasWei: bigint;
+  error?: string;
+}
+
+// --- Flashbots reputation signer (identity only; holds no funds) ---
+
+function reputationSigner(): PrivateKeyAccount {
+  const p = path.join(appConfig.dataDir, "flashbots-signer.key");
+  let pk: Hex;
+  if (fs.existsSync(p)) {
+    pk = fs.readFileSync(p, "utf8").trim() as Hex;
+  } else {
+    pk = generatePrivateKey();
+    fs.mkdirSync(appConfig.dataDir, { recursive: true });
+    fs.writeFileSync(p, pk, { mode: 0o600 });
+    logger.info("Generated a new Flashbots reputation key.");
+  }
+  return privateKeyToAccount(pk);
+}
+// Lazily initialized so switching mode from public→mainnet at runtime works.
+let _signer: PrivateKeyAccount | null = null;
+function getSigner(): PrivateKeyAccount {
+  if (!_signer) _signer = reputationSigner();
+  return _signer;
+}
+
+async function flashbotsRpc(method: string, params: unknown[], signal?: AbortSignal): Promise<any> {
+  const signer = getSigner();
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
+  const signature = `${signer.address}:${await signer.signMessage({
+    message: keccak256(toHex(body)),
+  })}`;
+  const res = await fetch(appConfig.flashbotsRelayUrl, {
+    method: "POST",
+    signal,
+    headers: {
+      "content-type": "application/json",
+      "X-Flashbots-Signature": signature,
+    },
+    body,
+  });
+  const json = (await res.json()) as { error?: { message: string }; result?: any };
+  if (json.error) throw new Error(`Flashbots ${method}: ${json.error.message}`);
+  return json.result;
+}
+
+// --- fee + gas ---
+
+async function computeFees(): Promise<{
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  baseFee: bigint;
+}> {
+  const s = runtime.strategy;
+  const block = await publicClient.getBlock({ blockTag: "latest" });
+  const baseFee = block.baseFeePerGas ?? 0n;
+
+  // Priority tip: static by default, or scaled up by block fullness when the
+  // dynamic-tip edge is enabled (helps win inclusion in contested blocks).
+  let tipGwei = s.priorityFeeGwei;
+  if (s.dynamicTipEnabled) {
+    tipGwei = dynamicTipGwei(s.priorityFeeGwei, s.dynamicTipMaxGwei, block.gasUsed, block.gasLimit);
+  }
+  const priority = BigInt(Math.round(tipGwei * 1e9));
+  const maxFeePerGas = baseFee * 2n + priority;
+  return { maxFeePerGas, maxPriorityFeePerGas: priority, baseFee };
+}
+
+async function estimateGas(account: Address, intent: TxIntent): Promise<bigint> {
+  if (intent.gas) return intent.gas;
+  const est = await publicClient.estimateGas({
+    account,
+    to: intent.to,
+    data: intent.data,
+    value: intent.value,
+  });
+  return (est * 12n) / 10n; // +20% buffer
+}
+
+async function signTx(
+  account: PrivateKeyAccount,
+  intent: TxIntent,
+  nonce: number,
+  gas: bigint,
+  maxFeePerGas: bigint,
+  maxPriorityFeePerGas: bigint,
+): Promise<Hex> {
+  return account.signTransaction({
+    to: intent.to,
+    data: intent.data,
+    value: intent.value,
+    gas,
+    nonce,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    chainId: mainnet.id,
+    type: "eip1559",
+  });
+}
+
+/**
+ * Build, (optionally simulate), and submit a single tx.
+ * - dryRun: builds + simulates, never sends.
+ * - mainnet: submits as a Flashbots bundle (block+1, block+2) after eth_callBundle sim.
+ * - local: broadcasts the raw tx to the node (anvil).
+ */
+const RELAY_TIMEOUT_MS = 10_000;
+
+async function flashbotsRpcWithTimeout(method: string, params: unknown[]): Promise<any> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), RELAY_TIMEOUT_MS);
+  try {
+    return await flashbotsRpc(method, params, abort.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function submitTx(
+  intent: TxIntent,
+  opts: { dryRun: boolean; race?: boolean },
+): Promise<SubmitResult> {
+  const account = runtime.account;
+  if (!account) throw new Error("Wallet locked");
+
+  const { maxFeePerGas, maxPriorityFeePerGas } = await computeFees();
+  const gas = await estimateGas(account.address, intent);
+  const gasWei = gas * maxFeePerGas;
+  const targetBlock = (await publicClient.getBlockNumber()) + 1n;
+
+  // Nonce is only reserved after simulation passes to avoid burning nonces on reverts.
+  const base: SubmitResult = {
+    ok: false,
+    simulated: false,
+    nonce: nonceManager.peek(), // placeholder; updated if we reserve
+    valueWei: intent.value,
+    gasWei,
+  };
+
+  // --- Simulation ---
+  if (appConfig.mode === "mainnet") {
+    // Flashbots bundle simulation needs a signed tx — use peeked nonce (not consumed yet).
+    const simSigned = await signTx(account, intent, nonceManager.peek(), gas, maxFeePerGas, maxPriorityFeePerGas);
+    try {
+      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [
+        { txs: [simSigned], blockNumber: toHex(targetBlock), stateBlockNumber: "latest" },
+      ]);
+      const results = sim?.results ?? [];
+      const failed = results.find((r: any) => r.error || r.revert);
+      if (failed) {
+        return { ...base, simulated: true, error: `sim revert: ${failed.error ?? failed.revert}`, targetBlock };
+      }
+      base.simulated = true;
+    } catch (err) {
+      return { ...base, error: `simulation failed: ${(err as Error).message}`, targetBlock };
+    }
+  } else if (appConfig.mode === "public") {
+    // Plain eth_call — no nonce needed, no relay round-trip.
+    try {
+      await publicClient.call({
+        account: account.address,
+        to: intent.to,
+        data: intent.data,
+        value: intent.value,
+        gas,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      });
+      base.simulated = true;
+    } catch (err) {
+      return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
+    }
+  }
+
+  if (opts.dryRun) {
+    return { ...base, ok: true, targetBlock };
+  }
+
+  // Simulation passed — now officially consume the nonce and sign for real.
+  const nonce = nonceManager.reserve();
+  base.nonce = nonce;
+  const signed = await signTx(account, intent, nonce, gas, maxFeePerGas, maxPriorityFeePerGas);
+
+  // --- Submission ---
+  if (appConfig.mode === "local" || appConfig.mode === "public") {
+    const txHash = await publicClient.sendRawTransaction({ serializedTransaction: signed });
+    return { ...base, ok: true, txHash, targetBlock };
+  }
+
+  // mainnet (Flashbots): send bundle to the relay for the next two blocks.
+  const bundleHashes: string[] = [];
+  for (const blk of [targetBlock, targetBlock + 1n]) {
+    try {
+      const r = await flashbotsRpcWithTimeout("eth_sendBundle", [
+        { txs: [signed], blockNumber: toHex(blk) },
+      ]);
+      if (r?.bundleHash) bundleHashes.push(r.bundleHash);
+    } catch (err) {
+      logger.warn(`sendBundle block ${blk} failed:`, (err as Error).message);
+    }
+  }
+
+  // Race mode: also broadcast to the public mempool so ANY builder can include
+  // us in the very next block, not only a Flashbots-winning one. Trades bundle
+  // privacy (the tx is now public and front-runnable) for lower inclusion
+  // latency — worth it for time-critical offense where the target action is
+  // already public knowledge on-chain. The tx is identical (same nonce/sig), so
+  // whichever path lands first wins and the other is dropped as a duplicate.
+  let txHash: Hex | undefined;
+  if (opts.race) {
+    try {
+      txHash = await publicClient.sendRawTransaction({ serializedTransaction: signed });
+    } catch (err) {
+      // A "nonce too low"/"already known" here means a bundle already landed — not fatal.
+      logger.warn("race public broadcast failed:", (err as Error).message);
+    }
+  }
+
+  return {
+    ...base,
+    ok: bundleHashes.length > 0 || txHash !== undefined,
+    bundleHash: bundleHashes[0],
+    txHash,
+    targetBlock,
+    error: bundleHashes.length === 0 && txHash === undefined ? "no bundle accepted" : undefined,
+  };
+}

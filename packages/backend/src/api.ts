@@ -1,0 +1,291 @@
+import Fastify, { type FastifyInstance } from "fastify";
+import websocket from "@fastify/websocket";
+import { z } from "zod";
+import { generatePrivateKey } from "viem/accounts";
+import { isHex } from "viem";
+import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
+import { reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
+import { runtime } from "./runtime.js";
+import { activity } from "./activity.js";
+import { logger } from "./logger.js";
+import {
+  encryptPrivateKey,
+  decryptPrivateKey,
+  saveKeystore,
+  loadKeystore,
+  keystoreExists,
+} from "./keystore.js";
+import { getGameSnapshot } from "./contract.js";
+import { startEngine, stopEngine, scheduleJitBoundary, resetJitState } from "./strategy.js";
+import { readOwnedStatuses, readTargets } from "./service.js";
+import { runPostMortem } from "./postmortem.js";
+
+const strategyPatch = z
+  .object({
+    enabled: z.boolean(),
+    dryRun: z.boolean(),
+    auditSafetyBufferSeconds: z.number().int().min(0),
+    proactivePay: z.boolean(),
+    prepayEpochs: z.number().int().min(1).max(7),
+    jitEnabled: z.boolean(),
+    jitTargetEpoch: z.number().int().min(1).nullable(),
+    jitTokenIds: z.array(z.string()),
+    offenseEnabled: z.boolean(),
+    autoAudit: z.boolean(),
+    autoKill: z.boolean(),
+    endgameOnlyWithin: z.number().int().min(0).nullable(),
+    offenseTargetTokenIds: z.array(z.string()),
+    maxBaseFeeGwei: z.number().positive(),
+    priorityFeeGwei: z.number().min(0),
+    minBalanceEth: z.number().min(0),
+    offenseBoundaryScheduling: z.boolean(),
+    racePublicMempool: z.boolean(),
+    dynamicTipEnabled: z.boolean(),
+    dynamicTipMaxGwei: z.number().positive(),
+    maxPaymentEth: z.number().min(0),
+  })
+  .partial();
+
+export async function buildServer(): Promise<FastifyInstance> {
+  const app = Fastify({ logger: false });
+  await app.register(websocket);
+
+  // --- status & config ---
+  app.get("/api/status", async () => runtime.status());
+  app.get("/api/config", async () => runtime.strategy);
+
+  app.post("/api/config", async (req, reply) => {
+    const parsed = strategyPatch.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const prev = runtime.strategy;
+    const next = runtime.saveStrategy(parsed.data);
+    const wasActive = prev.enabled || prev.offenseEnabled;
+    const nowActive = next.enabled || next.offenseEnabled;
+    // Only auto-start when a flag just turned on; don't restart a manually paused engine.
+    if (nowActive && !wasActive && runtime.unlocked && !runtime.running) startEngine();
+    if (!nowActive && runtime.running) stopEngine();
+    return next;
+  });
+
+  // --- keystore lifecycle ---
+  app.get("/api/keystore", async () => {
+    const file = loadKeystore(appConfig.dataDir);
+    return { exists: keystoreExists(appConfig.dataDir), address: file?.address ?? null };
+  });
+
+  app.post("/api/keystore", async (req, reply) => {
+    const schema = z.object({
+      mode: z.enum(["import", "generate"]),
+      privateKey: z.string().optional(),
+      passphrase: z.string().min(8),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const { mode, passphrase } = parsed.data;
+
+    let pk = parsed.data.privateKey as `0x${string}` | undefined;
+    if (mode === "generate") pk = generatePrivateKey();
+    if (!pk || !isHex(pk) || pk.length !== 66) {
+      return reply.code(400).send({ error: "Invalid private key (expected 0x + 64 hex chars)" });
+    }
+    const account = accountFromPrivateKey(pk);
+    const file = encryptPrivateKey(pk, passphrase, account.address);
+    saveKeystore(appConfig.dataDir, file);
+    logger.info(`Keystore created for ${account.address}`);
+    return { address: account.address };
+  });
+
+  app.post("/api/unlock", async (req, reply) => {
+    const schema = z.object({ passphrase: z.string() });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const file = loadKeystore(appConfig.dataDir);
+    if (!file) return reply.code(400).send({ error: "No keystore found" });
+    try {
+      const pk = decryptPrivateKey(file, parsed.data.passphrase);
+      const account = accountFromPrivateKey(pk);
+      runtime.account = account;
+      runtime.walletClient = makeWalletClient(account);
+      runtime.chainId = await getChainId();
+      runtime.emitStatus();
+      logger.info(`Wallet unlocked: ${account.address}`);
+      // Populate chain state immediately so the UI can show epoch/countdown even
+      // when the engine is paused.
+      getGameSnapshot().then((snap) => {
+        runtime.currentEpoch = snap.currentEpoch;
+        runtime.startTime = snap.startTime;
+        runtime.gameState = snap.state;
+        runtime.citizenSupply = snap.citizenSupply;
+        runtime.citizensAddress = snap.citizensAddress;
+        runtime.emitStatus();
+      }).catch(() => {});
+      // Engine stays paused on unlock — user must press Start manually.
+      return runtime.status();
+    } catch {
+      return reply.code(401).send({ error: "Incorrect passphrase" });
+    }
+  });
+
+  app.post("/api/lock", async () => {
+    stopEngine();
+    runtime.lock();
+    return { ok: true };
+  });
+
+  // --- engine control ---
+  app.post("/api/start", async (_req, reply) => {
+    if (!runtime.unlocked) return reply.code(400).send({ error: "Unlock the wallet first" });
+    startEngine();
+    return runtime.status();
+  });
+
+  app.post("/api/stop", async () => {
+    stopEngine();
+    return runtime.status();
+  });
+
+  // --- just-in-time single-epoch payment ---
+  app.post("/api/jit", async (req, reply) => {
+    const schema = z.object({
+      enable: z.boolean(),
+      targetEpoch: z.number().int().min(1).optional(),
+      tokenIds: z.array(z.string()).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const { enable, targetEpoch, tokenIds } = parsed.data;
+
+    if (!enable) {
+      runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
+      scheduleJitBoundary();
+      return runtime.status();
+    }
+
+    if (!runtime.unlocked) return reply.code(400).send({ error: "Unlock the wallet first" });
+    // Default target = the upcoming epoch.
+    const current = runtime.currentEpoch !== null ? Number(runtime.currentEpoch) : null;
+    const target = targetEpoch ?? (current !== null ? current + 1 : null);
+    if (target === null) {
+      return reply.code(400).send({ error: "Unknown current epoch — start the bot once so it can read chain state" });
+    }
+    runtime.saveStrategy({
+      jitEnabled: true,
+      jitTargetEpoch: target,
+      jitTokenIds: tokenIds ?? [],
+      enabled: true,
+    });
+    resetJitState(); // clear any prior submission bookkeeping for this epoch
+    if (!runtime.running) startEngine();
+    scheduleJitBoundary();
+    return runtime.status();
+  });
+
+  // --- Alchemy / RPC settings ---
+  app.get("/api/settings", async () => {
+    const s = loadSettings();
+    return {
+      alchemyKeySet: !!s.alchemyApiKey || !!process.env.ALCHEMY_API_KEY,
+      mode: appConfig.mode,
+    };
+  });
+
+  app.post("/api/settings", async (req, reply) => {
+    const schema = z.object({
+      alchemyApiKey: z.string().min(1).optional(),
+      mode: z.enum(["mainnet", "public"]).optional(),
+    }).refine((d) => d.alchemyApiKey !== undefined || d.mode !== undefined, {
+      message: "Provide at least one of: alchemyApiKey, mode",
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const { alchemyApiKey, mode } = parsed.data;
+
+    const existing = loadSettings();
+
+    if (alchemyApiKey) {
+      saveSettings({ ...existing, alchemyApiKey, ...(mode ? { mode } : {}) });
+      process.env.ALCHEMY_API_KEY = alchemyApiKey;
+      const urls = deriveUrlsFromKey(alchemyApiKey);
+      appConfig.httpUrl = urls.httpUrl;
+      appConfig.wsUrl = urls.wsUrl;
+      appConfig.nftUrl = urls.nftUrl;
+      reinitClients(urls.httpUrl, urls.wsUrl);
+      logger.info("Alchemy API key saved and RPC clients reinitialized.");
+    }
+
+    if (mode) {
+      saveSettings({ ...existing, ...(alchemyApiKey ? { alchemyApiKey } : {}), mode });
+      appConfig.mode = mode;
+      logger.info(`Submission mode switched to: ${mode}`);
+    }
+
+    return { ok: true, mode: appConfig.mode };
+  });
+
+  // --- reads for the dashboard ---
+  app.get("/api/tokens", async (_req, reply) => {
+    if (!runtime.unlocked) return reply.code(400).send({ error: "locked" });
+    try {
+      return await readOwnedStatuses();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  app.get("/api/targets", async (_req, reply) => {
+    try {
+      return await readTargets();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  app.get("/api/activity", async (req) => {
+    const limit = Number((req.query as { limit?: string }).limit ?? 200);
+    return activity.recent(limit);
+  });
+
+  // --- race post-mortem: compare our tx(s) vs rival tx(s) on-chain ---
+  app.post("/api/postmortem", async (req, reply) => {
+    const hash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "invalid tx hash");
+    const schema = z.object({
+      ours: z.array(hash).min(1).max(20),
+      rivals: z.array(hash).max(20).default([]),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    if (!appConfig.httpUrl) {
+      return reply.code(400).send({ error: "No RPC configured — set the Alchemy key first." });
+    }
+    try {
+      const result = await runPostMortem(
+        parsed.data.ours as `0x${string}`[],
+        parsed.data.rivals as `0x${string}`[],
+      );
+      return result;
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  // --- websocket: push status + activity ---
+  app.get("/ws", { websocket: true }, (socket) => {
+    const send = (type: string, data: unknown) => {
+      try {
+        socket.send(JSON.stringify({ type, data }));
+      } catch {
+        /* ignore */
+      }
+    };
+    send("status", runtime.status());
+    send("activity-batch", activity.recent(100));
+    const offStatus = runtime.onStatus((s) => send("status", s));
+    const offActivity = activity.subscribe((e) => send("activity", e));
+    socket.on("close", () => {
+      offStatus();
+      offActivity();
+    });
+  });
+
+  return app;
+}
