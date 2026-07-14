@@ -1,6 +1,6 @@
 {
-  "enabled": true,
-  "dryRun": true,
+  "enabled": false,
+  "dryRun": false,
   "auditSafetyBufferSeconds": 10800,
   "proactivePay": false,
   "prepayEpochs": 1,
@@ -68,12 +68,12 @@
     "6749",
     "6953"
   ],
-  "maxBaseFeeGwei": 50,
+  "maxBaseFeeGwei": 100,
   "priorityFeeGwei": 21.1,
   "minBalanceEth": 0.01,
   "offenseBoundaryScheduling": false,
   "racePublicMempool": false,
-  "dynamicTipEnabled": false,
-  "dynamicTipMaxGwei": 50,
+  "dynamicTipEnabled": true,
+  "dynamicTipMaxGwei": 100,
   "maxPaymentEth": 0
 }
