@@ -3,6 +3,7 @@ import type { StrategyConfig } from "@dat-bot/shared";
 import {
   isAuditable,
   isKillable,
+  isEligibleAuditor,
   classifyRisk,
   wouldBreachFloor,
   dynamicTipGwei,
@@ -18,6 +19,17 @@ describe("delinquency / audit math", () => {
     expect(isAuditable(9n, 10n)).toBe(false); // 1 behind (grace)
     expect(isAuditable(8n, 10n)).toBe(true); // 2 behind
     expect(isAuditable(3n, 10n)).toBe(true);
+  });
+
+  it("eligible auditor: needs audit capacity and must not be auditable itself", () => {
+    // currentEpoch = 10, normal token (auditLimit 1).
+    expect(isEligibleAuditor(10n, 10n, 0n, 1n)).toBe(true); // current, unused
+    expect(isEligibleAuditor(9n, 10n, 0n, 1n)).toBe(true); // 1 behind (grace) still audits
+    expect(isEligibleAuditor(8n, 10n, 0n, 1n)).toBe(false); // 2 behind -> itself auditable
+    expect(isEligibleAuditor(10n, 10n, 1n, 1n)).toBe(false); // capacity used up this epoch
+    // auditor-role token (limit 3): can audit until it hits the limit.
+    expect(isEligibleAuditor(10n, 10n, 2n, 3n)).toBe(true);
+    expect(isEligibleAuditor(10n, 10n, 3n, 3n)).toBe(false);
   });
 
   it("is killable only after the audit deadline passes", () => {

@@ -23,7 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -509,17 +509,34 @@ async function jitPass(
   }
 }
 
-async function findEligibleAuditor(ownedIds: bigint[], currentEpoch: bigint): Promise<bigint | undefined> {
-  if (ownedIds.length === 0) return undefined;
+/**
+ * Build the pool of owned tokens usable as audit "from" tokens this tick — each
+ * not itself auditable and still under its per-epoch audit limit. Reading
+ * auditsUsedInEpoch on-chain means a token already used earlier this epoch (even
+ * in a prior tick) is excluded, so we never reuse one and hit AuditLimitReached.
+ * Each entry can back exactly one audit (a normal token audits once/epoch).
+ */
+async function findEligibleAuditors(ownedIds: bigint[], currentEpoch: bigint): Promise<bigint[]> {
+  if (ownedIds.length === 0) return [];
   const results = await publicClient.multicall({
     allowFailure: true,
-    contracts: ownedIds.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
+    contracts: ownedIds.flatMap((id) => [
+      { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditsUsedInEpoch" as const, args: [id, currentEpoch] as const },
+      { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
+    ]),
   });
+  const eligible: bigint[] = [];
   for (let i = 0; i < ownedIds.length; i++) {
-    const r = results[i];
-    if (r?.status === "success" && (r.result as bigint) >= currentEpoch) return ownedIds[i];
+    const lep = results[i * 3];
+    const used = results[i * 3 + 1];
+    const limit = results[i * 3 + 2];
+    if (lep?.status !== "success" || used?.status !== "success" || limit?.status !== "success") continue;
+    if (isEligibleAuditor(lep.result as bigint, currentEpoch, used.result as bigint, limit.result as bigint)) {
+      eligible.push(ownedIds[i]!);
+    }
   }
-  return undefined;
+  return eligible;
 }
 
 async function offensePass(
@@ -541,9 +558,13 @@ async function offensePass(
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
 
-  // Find an owned token that is current (lastEpochPaid >= currentEpoch) to use as the auditor.
-  // Auditing from a delinquent token reverts on-chain.
-  const auditFrom = await findEligibleAuditor(ownedIds, currentEpoch);
+  // Pool of owned tokens we can audit FROM this tick (each backs one audit,
+  // since a token audits at most `auditLimit` times per epoch). We hand them out
+  // one per target so multiple rivals can be audited in a single epoch instead
+  // of reusing one token and reverting on the second with AuditLimitReached.
+  const auditors = await findEligibleAuditors(ownedIds, currentEpoch);
+  let auditorIdx = 0;
+  let noAuditorSkips = 0;
 
   // Track the soonest not-yet-expired audit deadline so the boundary scheduler
   // can pre-empt the exact moment a kill becomes valid. Reset each sweep.
@@ -571,15 +592,26 @@ async function offensePass(
       continue;
     }
 
-    if (s.autoAudit && t.auditable && auditFrom !== undefined) {
+    if (s.autoAudit && t.auditable) {
+      if (auditorIdx >= auditors.length) { noAuditorSkips++; continue; } // out of usable auditor tokens
       const guard = await canSpend(AUDIT_COST_WEI, true);
       if (!guard.ok) continue;
-      await act(
+      const auditFrom = auditors[auditorIdx]!;
+      const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },
         "audit",
         { tokenId: auditFrom.toString(), targetTokenId: t.tokenId, message: `Audit delinquent #${t.tokenId} from #${auditFrom}`, race: true },
       );
+      if (res?.ok) auditorIdx++; // consume this auditor only if the audit actually went out
     }
+  }
+
+  if (noAuditorSkips > 0) {
+    activity.add({
+      kind: "info",
+      status: "info",
+      message: `Audited ${auditorIdx} rival(s) this sweep; ${noAuditorSkips} more auditable but no eligible auditor token left (each audits up to its per-epoch limit).`,
+    });
   }
 
   // Publish the nearest kill deadline and (re)arm the pre-emptive boundary tick.

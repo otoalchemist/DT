@@ -44,6 +44,23 @@ export function isKillable(auditDueTimestamp: bigint, nowSec: bigint): boolean {
   return auditDueTimestamp !== 0n && nowSec > auditDueTimestamp;
 }
 
+/**
+ * Whether an owned token can be used as an audit "from" token right now. The
+ * contract requires the from-token to not itself be delinquent/auditable and to
+ * still have audit capacity this epoch. On-chain evidence: a token one epoch
+ * behind can still audit (so it need not be strictly current — up to 1 behind is
+ * fine), and each token may audit `auditLimit` times per epoch (1 for a normal
+ * token, higher for auditor-role tokens).
+ */
+export function isEligibleAuditor(
+  lastEpochPaid: bigint,
+  currentEpoch: bigint,
+  auditsUsedThisEpoch: bigint,
+  auditLimit: bigint,
+): boolean {
+  return !isAuditable(lastEpochPaid, currentEpoch) && auditsUsedThisEpoch < auditLimit;
+}
+
 export interface RiskResult {
   risk: TokenRisk;
   secondsUntilKillable: number | null;
