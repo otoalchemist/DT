@@ -80,6 +80,13 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
               />
             </label>
           )}
+          <div className="warnbox">
+            <b>This wallet must hold your Citizen tokens.</b> The bot can only pay
+            taxes for and defend Citizens owned by the wallet it unlocks.
+            {mode === "import"
+              ? " Import the private key of the wallet that actually holds your Citizens."
+              : " A freshly generated burner owns no Citizens — you'd have to transfer your Citizens into its address first. To protect Citizens you already hold, choose “Import existing private key” instead."}
+          </div>
         </>
       )}
 

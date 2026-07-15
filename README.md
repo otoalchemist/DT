@@ -66,7 +66,11 @@ Open the dashboard at **`http://localhost:5173`** and:
 
 1. **Create a hot wallet** — generate a fresh burner or import a private key. It's
    encrypted at rest with a passphrase you choose. **Use a dedicated burner funded
-   only with what you're willing to spend.**
+   only with what you're willing to spend.** **This wallet must hold the Citizen
+   tokens you want defended** — the bot only pays taxes for and defends Citizens
+   owned by the wallet it unlocks. A freshly generated burner owns none until you
+   transfer Citizens into it, so to protect Citizens you already hold, import that
+   wallet's key.
 2. **Unlock** it with your passphrase.
 3. Configure your **strategy** (defense buffers, offense toggles, spend caps).
 4. Leave **Dry-run ON** first to watch what the bot *would* do — toggle it from the **DRY-RUN / LIVE FIRE** badge in the top bar (going live asks for confirmation). Turn it off to go live.
