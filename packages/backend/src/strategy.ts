@@ -10,7 +10,6 @@ import {
   getOwnedTokenStatus,
   getTargetStatus,
   filterLiveTokenIds,
-  estimateTaxes,
   encodePayTaxes,
   encodeAudit,
   encodeKill,
@@ -395,7 +394,7 @@ async function defensePass(
         );
         continue;
       }
-      const value = await estimateTaxes(tokenId, s.prepayEpochs);
+      const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (same epochs)
       const guard = await canSpend(value, false);
       if (!guard.ok) {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer pay #${st.tokenId}: ${guard.reason}` });
@@ -435,7 +434,7 @@ async function proactivePayPass(
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
 
-    const value = await estimateTaxes(tokenId, s.prepayEpochs);
+    const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (same epochs)
     if (value === 0n) continue;
     const guard = await canSpend(value, false);
     if (!guard.ok) {
@@ -484,7 +483,7 @@ async function jitPass(
       jitSubmitted.add(key); // already current for this epoch
       continue;
     }
-    const value = await estimateTaxes(tokenId, 1);
+    const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (1 epoch)
     if (value === 0n) {
       jitSubmitted.add(key);
       continue;
@@ -629,7 +628,12 @@ async function tick(fireProactivePay = false): Promise<void> {
   committedThisTickWei = 0n; // fresh spend budget for this tick
   const address = runtime.account.address;
   try {
-    await refreshSnapshot(address);
+    // Snapshot + nonce sync are independent RPC reads — run them together so the
+    // boundary tick shaves a round-trip before it can submit anything.
+    await Promise.all([
+      refreshSnapshot(address),
+      nonceManager.sync(address, appConfig.mode),
+    ]);
 
     if (runtime.gameState !== 1) {
       // Not LIVE — nothing to do.
@@ -637,8 +641,6 @@ async function tick(fireProactivePay = false): Promise<void> {
     }
     const nowSec = BigInt(Math.floor(Date.now() / 1000));
     const currentEpoch = runtime.currentEpoch ?? 0n;
-
-    await nonceManager.sync(address, appConfig.mode);
 
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
 
