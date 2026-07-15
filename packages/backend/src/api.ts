@@ -84,10 +84,19 @@ export async function buildServer(): Promise<FastifyInstance> {
       mode: z.enum(["import", "generate"]),
       privateKey: z.string().optional(),
       passphrase: z.string().min(8),
+      overwrite: z.boolean().optional(),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
     const { mode, passphrase } = parsed.data;
+
+    // Never silently clobber an existing keystore — that permanently discards the
+    // old wallet's key (and access to any funds it holds). Require an explicit opt-in.
+    if (keystoreExists(appConfig.dataDir) && !parsed.data.overwrite) {
+      return reply.code(409).send({
+        error: "A wallet keystore already exists. Overwriting permanently discards the old key — resend with overwrite:true to confirm.",
+      });
+    }
 
     let pk = parsed.data.privateKey as `0x${string}` | undefined;
     if (mode === "generate") pk = generatePrivateKey();
