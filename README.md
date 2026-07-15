@@ -4,8 +4,9 @@ A self-hosted automation bot for the on-chain game **[Death & Taxes](https://eth
 
 - **Defense (primary):** never let one of your Citizen tokens get killed. If a token is audited, the bot clears the audit — by spending a **bribe** (free) or **paying taxes** — before the 24-hour deadline. It can also pay proactively so your tokens are never even auditable, and prepay up to 7 epochs to lock the current (lower) tax rate.
 - **Just-in-time epoch payment (one-shot):** arm the bot for a single upcoming epoch and it pays exactly one epoch for each of your citizens *the moment that epoch begins on-chain* — before they can be audited — then auto-disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per citizen the instant epoch 133 starts. The exact amount is read on-chain at pay time, so it's always correct even for multiple citizens.
-- **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. This is a game strategy, not a profit engine — see below.
+- **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. It audits **multiple rivals per epoch** — one per eligible citizen you hold (each token may audit once per epoch) — instead of just one. This is a game strategy, not a profit engine — see below.
 - **Reliable inclusion:** choose your submission path — **`public`** (broadcast straight to the mempool; fastest, the default) or **`mainnet`** (private, front-run-resistant **Flashbots bundles**). Optional latency edges let offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
+- **Live activity log:** every action is timestamped with its status; submitted transactions link to Etherscan and auto-update from **submitted → included / reverted** once the receipt lands.
 - **Race post-mortem:** after the fact, paste your tx hash and a rival's to see whether you lost on **timing** (later block) or **fee** (same block, out-priced) — in the dashboard or from the CLI.
 
 You run it on your own machine with your own key. It ships with a local web dashboard.
@@ -68,7 +69,7 @@ Open the dashboard at **`http://localhost:5173`** and:
    only with what you're willing to spend.**
 2. **Unlock** it with your passphrase.
 3. Configure your **strategy** (defense buffers, offense toggles, spend caps).
-4. Leave **Dry-run ON** first to watch what the bot *would* do. Turn it off to go live.
+4. Leave **Dry-run ON** first to watch what the bot *would* do — toggle it from the **DRY-RUN / LIVE FIRE** badge in the top bar (going live asks for confirmation). Turn it off to go live.
 5. Click **Start bot**.
 
 Fund the wallet with a little ETH for taxes/audits/gas. Keep the dashboard's
@@ -110,19 +111,27 @@ cp data/config.example.json data/config.json
 ## Safety model
 
 - **You are the sole custodian.** The key never leaves your machine and is only
-  decrypted in memory after you enter your passphrase.
+  decrypted in memory after you enter your passphrase. An existing keystore is
+  never silently overwritten — re-creating a wallet requires an explicit confirm,
+  so you can't accidentally discard the old key.
 - **Guardrails:** min-balance floor, max base-fee, an optional **max single-payment
   cap** (skips any tax payment above a set ETH value — a backstop against a bad
   estimate or a badly-delinquent token draining the wallet in one shot; `0` = off),
   a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
+  The min-balance floor is enforced **cumulatively** — several payments in one
+  cycle can't sneak the wallet below it.
 - **Separate offense gas (audit/kill):** by default one set of gas settings
   (max base-fee, priority tip, dynamic tip) applies to everything. Turn on
   **Separate gas for audit / kill** to bid gas independently for offense — it's a
   race against rivals, whereas tax payments aren't — without overpaying on
   routine payments. Off by default, so behavior is unchanged until you opt in.
-- **Simulate-before-send:** every mainnet bundle is checked with `eth_callBundle`
-  first, so reverting transactions aren't paid for.
-- Bind the API to `127.0.0.1` (default). Do not expose it to the internet.
+  Payment gas is edited under **Just-in-time epoch payment → Payment gas**.
+- **Simulate-before-send:** every transaction is checked first (`eth_call` in
+  public/local mode, `eth_callBundle` for Flashbots bundles), so reverting
+  transactions aren't paid for and nonces aren't burned on them.
+- **Local-only by default.** The API binds to `127.0.0.1`; when bound to loopback
+  it also rejects requests with an unexpected `Host` header, blocking DNS-rebinding
+  from a malicious web page. Do not expose it to the internet.
 
 ---
 
@@ -133,14 +142,18 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
 
 - **Pre-schedule offense at deadlines** — fires an extra tick just before each
   offense deadline (the nearest audit expiry, or the next epoch boundary) so kills
-  and audits compete in the **first eligible block** instead of the block after.
+  and audits compete in the **first eligible block** instead of the block after. A
+  boundary tick is never dropped just because a routine tick is mid-flight — it
+  retries as soon as the engine is free, so the race isn't lost to bad luck.
 - **Race the public mempool** (`mainnet` mode only) — also broadcasts a
   time-critical offense tx to the public mempool alongside the Flashbots bundle, so
   *any* builder can include it next block. The tx is identical (same nonce), so only
   one can ever land. Trades bundle privacy for lower inclusion latency.
 - **Dynamic priority tip** — scales the tip up as the latest block fills past 50%,
   up to a configurable ceiling, to stay competitive in contested blocks. When off,
-  the static priority fee is always used.
+  the static priority fee is always used. It applies to **tax payments** too (set
+  under *Just-in-time epoch payment → Payment gas*) — useful when a boundary-timed
+  payment has to out-order a rival's batch-audit in the first block of an epoch.
 
 ## Race post-mortem
 
