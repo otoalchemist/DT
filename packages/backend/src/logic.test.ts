@@ -8,6 +8,7 @@ import {
   dynamicTipGwei,
   resolveGas,
   effectiveTipGwei,
+  canAffordSpend,
 } from "./logic.js";
 
 describe("delinquency / audit math", () => {
@@ -51,6 +52,28 @@ describe("spend guardrails", () => {
   it("floor: blocks spend that would drop below the balance floor", () => {
     expect(wouldBreachFloor(100n, 95n, 10n)).toBe(true); // 5 left < 10
     expect(wouldBreachFloor(100n, 80n, 10n)).toBe(false); // 20 left >= 10
+  });
+
+  describe("canAffordSpend (cumulative floor within a tick)", () => {
+    it("allows a single spend that keeps the balance at/above the floor", () => {
+      // 100 balance, floor 10; spend value 80 + gas 10 -> 10 left == floor.
+      expect(canAffordSpend(100n, 0n, 80n, 10n, 10n)).toBe(true);
+      // one wei more of value drops below the floor.
+      expect(canAffordSpend(100n, 0n, 81n, 10n, 10n)).toBe(false);
+    });
+
+    it("blocks a later spend once earlier same-tick spend has eaten the headroom", () => {
+      // Balance 100, floor 10. First payment (value 50 + gas 5 = 55) already
+      // committed this tick. A second value-40 + gas-5 payment would leave
+      // 100 - 55 - 45 = 0 < floor 10 -> must be blocked, even though on its own
+      // (against the untouched 100 balance) it looks affordable.
+      expect(canAffordSpend(100n, 0n, 40n, 5n, 10n)).toBe(true); // in isolation: fine
+      expect(canAffordSpend(100n, 55n, 40n, 5n, 10n)).toBe(false); // cumulative: blocked
+    });
+
+    it("still allows a second spend when there is enough headroom for both", () => {
+      expect(canAffordSpend(100n, 30n, 40n, 5n, 10n)).toBe(true); // 100-30-45 = 25 >= 10
+    });
   });
 });
 

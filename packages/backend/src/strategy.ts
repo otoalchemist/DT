@@ -23,7 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas } from "./logic.js";
+import { resolveGas, canAffordSpend } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -35,6 +35,10 @@ let offenseBoundaryTimer: NodeJS.Timeout | null = null;
 let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
+// Total wei committed to spend so far in the current tick (value + gas of each
+// submitted tx). Reset at the top of every tick; consulted by canSpend so the
+// min-balance floor holds across all spends in a tick, not just each in isolation.
+let committedThisTickWei = 0n;
 
 // A precisely-timed boundary tick (JIT / defense / offense) must not be silently
 // dropped just because a routine block/poll tick happens to be running when its
@@ -264,11 +268,15 @@ async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boole
   }
 
   const gasWei = GAS_GUESS * (baseFee * 2n + BigInt(Math.round(gas.priorityFeeGwei * 1e9)));
-  const total = valueWei + gasWei;
 
   const bal = runtime.balanceWei ?? 0n;
   const floor = parseEther(String(s.minBalanceEth));
-  if (bal - total < floor) return { ok: false, reason: "would breach min-balance floor" };
+  // Account for spend already committed earlier in this tick — the on-chain
+  // balance is read once per tick and doesn't yet reflect those payments, so
+  // without this several payments in one tick could cumulatively breach the floor.
+  if (!canAffordSpend(bal, committedThisTickWei, valueWei, gasWei, floor)) {
+    return { ok: false, reason: "would breach min-balance floor" };
+  }
 
   return { ok: true };
 }
@@ -326,6 +334,9 @@ async function act(
       return result;
     }
     if (!dryRun) runtime.recordSpend(result.valueWei + result.gasWei);
+    // Count it against this tick's budget so later canSpend checks in the same
+    // tick see the reduced headroom (applies in dry-run too, to simulate faithfully).
+    committedThisTickWei += result.valueWei + result.gasWei;
     const entry = activity.add({
       kind,
       status: dryRun ? "dry-run" : "submitted",
@@ -576,6 +587,7 @@ async function tick(fireProactivePay = false): Promise<void> {
   if (ticking) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   ticking = true;
+  committedThisTickWei = 0n; // fresh spend budget for this tick
   const address = runtime.account.address;
   try {
     await refreshSnapshot(address);

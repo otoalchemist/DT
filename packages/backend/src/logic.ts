@@ -78,6 +78,24 @@ export function wouldBreachFloor(
 }
 
 /**
+ * Whether a spend of `value` (plus `gasWei` gas) is affordable without dropping
+ * the wallet below `floorWei`. `committedWei` is spend already decided but not
+ * yet reflected in `balanceWei` — e.g. earlier payments made in the same engine
+ * tick, which the on-chain balance (read once at tick start) doesn't show yet.
+ * Subtracting it makes the floor guard hold across *all* spends in a tick, not
+ * just each one in isolation.
+ */
+export function canAffordSpend(
+  balanceWei: bigint,
+  committedWei: bigint,
+  value: bigint,
+  gasWei: bigint,
+  floorWei: bigint,
+): boolean {
+  return (balanceWei - committedWei) - (value + gasWei) >= floorWei;
+}
+
+/**
  * Scale the priority-fee tip by how full the latest block is. Blocks target 50%
  * fullness under EIP-1559; above that, inclusion is contested and a higher tip
  * helps. Returns `baseTipGwei` at/below 50% fill, ramping linearly to
