@@ -1,6 +1,7 @@
 import type { Address } from "viem";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { makeIdCache } from "./id-cache.js";
 
 // Ownership indexing via the Alchemy NFT API against the Citizen collection.
 // Falls back to config overrides (useful for local/anvil testing).
@@ -30,15 +31,19 @@ export function ownershipIndexingAvailable(): boolean {
   );
 }
 
-/** Enumerate tokenIds of the Citizen collection owned by `owner`. */
-export async function fetchOwnedTokenIds(
-  citizens: Address,
-  owner: Address,
-): Promise<bigint[]> {
-  if (appConfig.ownedTokensOverride.length > 0) {
-    return appConfig.ownedTokensOverride;
-  }
-  if (!appConfig.nftUrl) return []; // unconfigured: degrade quietly, engine idles
+// Ownership changes rarely; the candidate set (mints/kills) even more rarely.
+// Cache both so the Alchemy NFT API stays off the hot path of the boundary tick —
+// the cached list is served instantly and refreshed in the background once stale.
+const OWNED_TTL_MS = 30_000;
+const CANDIDATES_TTL_MS = 5 * 60_000;
+const ownedCache = makeIdCache<bigint[]>({
+  onError: (e) => logger.warn("Owned-token refresh failed:", (e as Error).message),
+});
+const candidateCache = makeIdCache<bigint[]>({
+  onError: (e) => logger.warn("Candidate enumeration failed:", (e as Error).message),
+});
+
+async function fetchOwnedFromApi(citizens: Address, owner: Address): Promise<bigint[]> {
   const ids: bigint[] = [];
   let pageKey: string | undefined;
   do {
@@ -53,27 +58,43 @@ export async function fetchOwnedTokenIds(
   return ids.slice(0, appConfig.maxCandidates);
 }
 
-/** Enumerate up to `maxCandidates` tokenIds in the Citizen collection. */
+async function fetchCandidatesFromApi(citizens: Address): Promise<bigint[]> {
+  const ids: bigint[] = [];
+  let pageKey: string | undefined;
+  do {
+    const q =
+      `/getNFTsForContract?contractAddress=${citizens}` +
+      `&withMetadata=false&limit=100` +
+      (pageKey ? `&pageKey=${encodeURIComponent(pageKey)}` : "");
+    const data = await alchemyGet<{ nfts: AlchemyNft[]; pageKey?: string }>(q);
+    for (const nft of data.nfts) ids.push(BigInt(nft.tokenId));
+    pageKey = data.pageKey;
+  } while (pageKey && ids.length < appConfig.maxCandidates);
+  return ids.slice(0, appConfig.maxCandidates);
+}
+
+/** Enumerate tokenIds of the Citizen collection owned by `owner` (cached). */
+export async function fetchOwnedTokenIds(
+  citizens: Address,
+  owner: Address,
+): Promise<bigint[]> {
+  if (appConfig.ownedTokensOverride.length > 0) {
+    return appConfig.ownedTokensOverride;
+  }
+  if (!appConfig.nftUrl) return []; // unconfigured: degrade quietly, engine idles
+  const key = `${owner.toLowerCase()}:${citizens.toLowerCase()}`;
+  return ownedCache(key, OWNED_TTL_MS, () => fetchOwnedFromApi(citizens, owner));
+}
+
+/** Enumerate up to `maxCandidates` tokenIds in the Citizen collection (cached). */
 export async function fetchCandidateTokenIds(
   citizens: Address,
 ): Promise<bigint[]> {
   if (appConfig.targetTokensOverride.length > 0) {
     return appConfig.targetTokensOverride;
   }
-  const ids: bigint[] = [];
-  let pageKey: string | undefined;
-  try {
-    do {
-      const q =
-        `/getNFTsForContract?contractAddress=${citizens}` +
-        `&withMetadata=false&limit=100` +
-        (pageKey ? `&pageKey=${encodeURIComponent(pageKey)}` : "");
-      const data = await alchemyGet<{ nfts: AlchemyNft[]; pageKey?: string }>(q);
-      for (const nft of data.nfts) ids.push(BigInt(nft.tokenId));
-      pageKey = data.pageKey;
-    } while (pageKey && ids.length < appConfig.maxCandidates);
-  } catch (err) {
-    logger.warn("Candidate enumeration failed:", (err as Error).message);
-  }
-  return ids.slice(0, appConfig.maxCandidates);
+  // Preserve the old "never throw" contract: a cold-miss error degrades to [].
+  return candidateCache(citizens.toLowerCase(), CANDIDATES_TTL_MS, () =>
+    fetchCandidatesFromApi(citizens),
+  ).catch(() => []);
 }
