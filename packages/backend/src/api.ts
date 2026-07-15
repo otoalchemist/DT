@@ -16,7 +16,7 @@ import {
   keystoreExists,
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
-import { startEngine, stopEngine, scheduleJitBoundary, resetJitState } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -64,6 +64,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     // Only auto-start when a flag just turned on; don't restart a manually paused engine.
     if (nowActive && !wasActive && runtime.unlocked && !runtime.running) startEngine();
     if (!nowActive && runtime.running) stopEngine();
+    scheduleDefenseBoundary();
     return next;
   });
 

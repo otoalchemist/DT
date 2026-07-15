@@ -9,6 +9,22 @@ import { ownershipIndexingAvailable } from "./index-tokens.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
+// Curated rival token IDs ship in git (data/rival-targets.json, unlike the
+// gitignored data/config.json) so a fresh clone has offense targets without
+// needing to `cp data/config.example.json data/config.json` first.
+function loadDefaultRivalTargets(): string[] {
+  try {
+    const p = path.join(appConfig.dataDir, "rival-targets.json");
+    if (fs.existsSync(p)) {
+      const ids = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (Array.isArray(ids)) return ids.map(String);
+    }
+  } catch (err) {
+    logger.warn("Could not load default rival targets:", (err as Error).message);
+  }
+  return [];
+}
+
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
   dryRun: true,
@@ -22,7 +38,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   autoAudit: false,
   autoKill: false,
   endgameOnlyWithin: null,
-  offenseTargetTokenIds: [],
+  offenseTargetTokenIds: loadDefaultRivalTargets(),
   maxBaseFeeGwei: 30,
   priorityFeeGwei: 2,
   minBalanceEth: 0.01,

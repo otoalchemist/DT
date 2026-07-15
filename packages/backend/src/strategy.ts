@@ -31,6 +31,7 @@ const GAS_GUESS = 200_000n; // for pre-flight spend-cap checks only
 let timer: NodeJS.Timeout | null = null;
 let boundaryTimer: NodeJS.Timeout | null = null;
 let offenseBoundaryTimer: NodeJS.Timeout | null = null;
+let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
 
@@ -80,10 +81,12 @@ export function stopEngine(): void {
   if (timer) clearInterval(timer);
   if (boundaryTimer) clearTimeout(boundaryTimer);
   if (offenseBoundaryTimer) clearTimeout(offenseBoundaryTimer);
+  if (defenseBoundaryTimer) clearTimeout(defenseBoundaryTimer);
   if (unwatchBlocks) unwatchBlocks();
   timer = null;
   boundaryTimer = null;
   offenseBoundaryTimer = null;
+  defenseBoundaryTimer = null;
   unwatchBlocks = null;
   runtime.running = false;
   runtime.emitStatus();
@@ -158,6 +161,38 @@ export function scheduleOffenseBoundary(): void {
   offenseBoundaryTimer = setTimeout(() => void tick(), delayMs);
 }
 
+// Lead time before the next epoch boundary at which we fire the proactive-pay
+// tick, so the tx is built and broadcast right as the new epoch begins instead
+// of waiting for the next lazy poll/block tick to notice.
+const DEFENSE_LEAD_MS = 1_500;
+
+/**
+ * Arm a precise tick at the next epoch boundary to run proactive-pay. Proactive
+ * pay never fires from a regular tick — only from this boundary-timed one — so
+ * an already-delinquent citizen is left alone until the *next* epoch rolls,
+ * then paid as fast as possible rather than instantly on detection.
+ */
+export function scheduleDefenseBoundary(): void {
+  if (defenseBoundaryTimer) {
+    clearTimeout(defenseBoundaryTimer);
+    defenseBoundaryTimer = null;
+  }
+  const s = runtime.strategy;
+  if (!runtime.running || !s.enabled || !s.proactivePay) return;
+  if (runtime.startTime === null || runtime.currentEpoch === null) return;
+
+  // Epoch boundary that starts epoch (current+1) is startTime + current*DURATION.
+  const nextEpochBoundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const deltaMs = Number(nextEpochBoundary - nowSec) * 1000 - DEFENSE_LEAD_MS;
+  if (deltaMs <= 0) {
+    void tick(true);
+    return;
+  }
+  const delayMs = Math.min(deltaMs, 2_000_000_000);
+  defenseBoundaryTimer = setTimeout(() => void tick(true), delayMs);
+}
+
 async function refreshSnapshot(address: Address): Promise<void> {
   const [snap, balance, block] = await Promise.all([
     getGameSnapshot(),
@@ -173,6 +208,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
   runtime.lastBlock = block;
   runtime.emitStatus();
   scheduleJitBoundary();
+  scheduleDefenseBoundary();
 }
 
 /** Pre-flight guardrail: can we afford this spend without breaching caps/floors? */
@@ -287,22 +323,38 @@ async function defensePass(
       );
       continue;
     }
+  }
+}
 
-    // 2) Proactively pay if delinquent (auditable) but not yet audited.
-    if (s.proactivePay && !underAudit && st.risk === "delinquent") {
-      const value = await estimateTaxes(tokenId, s.prepayEpochs);
-      if (value === 0n) continue;
-      const guard = await canSpend(value);
-      if (!guard.ok) {
-        activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
-        continue;
-      }
-      await act(
-        { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, s.prepayEpochs), value },
-        "pay-taxes",
-        { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${s.prepayEpochs} epoch) = ${formatEther(value)} ETH` },
-      );
+/**
+ * Pay delinquent-but-not-yet-audited citizens. Only invoked from the
+ * boundary-timed tick armed by `scheduleDefenseBoundary` (see DEFENSE_LEAD_MS),
+ * never from a regular poll/block tick — so a citizen that's already delinquent
+ * is left alone until the next epoch boundary, then paid immediately.
+ */
+async function proactivePayPass(
+  ownedIds: bigint[],
+  currentEpoch: bigint,
+  nowSec: bigint,
+): Promise<void> {
+  const s = runtime.strategy;
+  for (const tokenId of ownedIds) {
+    const st = await getOwnedTokenStatus(tokenId, currentEpoch, nowSec, s.prepayEpochs);
+    const underAudit = st.auditDueTimestamp !== "0";
+    if (underAudit || st.risk !== "delinquent") continue;
+
+    const value = await estimateTaxes(tokenId, s.prepayEpochs);
+    if (value === 0n) continue;
+    const guard = await canSpend(value);
+    if (!guard.ok) {
+      activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
+      continue;
     }
+    await act(
+      { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, s.prepayEpochs), value },
+      "pay-taxes",
+      { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${s.prepayEpochs} epoch) = ${formatEther(value)} ETH` },
+    );
   }
 }
 
@@ -442,7 +494,10 @@ async function offensePass(
   scheduleOffenseBoundary();
 }
 
-async function tick(): Promise<void> {
+// `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary
+// at the next epoch boundary — every other tick (block watch, poll, JIT/offense
+// boundary ticks) leaves already-delinquent citizens alone.
+async function tick(fireProactivePay = false): Promise<void> {
   if (ticking) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   ticking = true;
@@ -463,6 +518,9 @@ async function tick(): Promise<void> {
 
     if (runtime.strategy.enabled) {
       await defensePass(ownedIds, currentEpoch, nowSec);
+      if (fireProactivePay && runtime.strategy.proactivePay) {
+        await proactivePayPass(ownedIds, currentEpoch, nowSec);
+      }
       await jitPass(ownedIds, currentEpoch, nowSec);
     }
     await offensePass(ownedIds, currentEpoch, nowSec);
