@@ -124,6 +124,23 @@ export function Dashboard({
     }
   };
 
+  const [dryToggling, setDryToggling] = useState(false);
+  const toggleDryRun = async () => {
+    const next = !dryRun;
+    // Guard the risky direction only: going live submits real transactions.
+    if (!next && !confirm("Switch to LIVE FIRE? Real transactions will be submitted with real ETH.")) return;
+    setDryToggling(true);
+    setToggleErr(null);
+    try {
+      const cfg = await api.setConfig({ dryRun: next });
+      setConfig(cfg);
+    } catch (e) {
+      setToggleErr((e as Error).message);
+    } finally {
+      setDryToggling(false);
+    }
+  };
+
   return (
     <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
 
@@ -136,7 +153,17 @@ export function Dashboard({
             <small>{connected ? "● live" : "○ reconnecting…"} · {shortAddr(status?.address)}</small>
           </div>
           <div className="row wrap">
-            <span className={`badge ${dryRun ? "dry" : "danger"}`}>{dryRun ? "DRY-RUN" : "LIVE FIRE"}</span>
+            <span
+              className={`badge ${dryRun ? "dry" : "danger"}`}
+              role="button"
+              tabIndex={0}
+              onClick={dryToggling ? undefined : toggleDryRun}
+              onKeyDown={(e) => { if (!dryToggling && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); void toggleDryRun(); } }}
+              title={dryRun ? "Dry-run: simulating only. Click to go LIVE FIRE." : "LIVE FIRE: real transactions. Click to return to dry-run."}
+              style={{ cursor: dryToggling ? "wait" : "pointer", userSelect: "none", opacity: dryToggling ? 0.6 : 1 }}
+            >
+              {dryRun ? "DRY-RUN" : "⚠ LIVE FIRE"}
+            </span>
             <span className={`badge ${running ? "on" : "off"}`}>{running ? "RUNNING" : "PAUSED"}</span>
             <button className={running ? "danger" : "primary"} onClick={toggleRun} disabled={toggling}>
               {toggling ? "…" : running ? "Pause bot" : "Start bot"}

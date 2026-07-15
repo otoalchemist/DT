@@ -139,32 +139,10 @@ export function Config({ initial }: { initial: StrategyConfig }) {
   return (
     <div className="panel">
       <h2>Strategy</h2>
+      <p className="muted" style={{ fontSize: 11, margin: "0 0 4px 0" }}>
+        Dry-run / live-fire is toggled from the badge in the top bar.
+      </p>
 
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          padding: "10px 14px",
-          borderRadius: 8,
-          border: `2px solid ${cfg.dryRun ? "var(--purple)" : "var(--red)"}`,
-          background: cfg.dryRun ? "rgba(183,139,255,0.08)" : "rgba(255,92,92,0.08)",
-          cursor: "pointer",
-          userSelect: "none",
-        }}
-      >
-        <input type="checkbox" checked={cfg.dryRun} onChange={chk("dryRun")} style={{ width: "auto" }} />
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 13, color: cfg.dryRun ? "var(--purple)" : "var(--red)" }}>
-            {cfg.dryRun ? "DRY-RUN MODE — simulates only, no transactions sent" : "⚠ LIVE FIRE — real transactions will be submitted"}
-          </div>
-          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
-            {cfg.dryRun ? "Uncheck this when you're ready to go live." : "Check this to simulate without spending gas."}
-          </div>
-        </div>
-      </label>
-
-      <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
       <label className="check">
         <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />
