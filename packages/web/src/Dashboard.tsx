@@ -160,7 +160,16 @@ export function Dashboard({
               onClick={dryToggling ? undefined : toggleDryRun}
               onKeyDown={(e) => { if (!dryToggling && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); void toggleDryRun(); } }}
               title={dryRun ? "Dry-run: simulating only. Click to go LIVE FIRE." : "LIVE FIRE: real transactions. Click to return to dry-run."}
-              style={{ cursor: dryToggling ? "wait" : "pointer", userSelect: "none", opacity: dryToggling ? 0.6 : 1 }}
+              style={{
+                cursor: dryToggling ? "wait" : "pointer",
+                userSelect: "none",
+                opacity: dryToggling ? 0.6 : 1,
+                fontSize: 15,
+                fontWeight: 700,
+                letterSpacing: "0.04em",
+                padding: "8px 18px",
+                borderWidth: 2,
+              }}
             >
               {dryRun ? "DRY-RUN" : "⚠ LIVE FIRE"}
             </span>
