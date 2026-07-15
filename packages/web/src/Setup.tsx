@@ -71,12 +71,12 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
           </label>
           {mode === "import" && (
             <label className="field">
-              Private key (0x…)
+              Private key (64 hex chars — 0x prefix optional)
               <input
                 type="password"
                 value={privateKey}
                 onChange={(e) => setPrivateKey(e.target.value)}
-                placeholder="0x…"
+                placeholder="0x… or bare hex"
               />
             </label>
           )}

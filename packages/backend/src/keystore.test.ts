@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
-import { encryptPrivateKey, decryptPrivateKey } from "./keystore.js";
+import { encryptPrivateKey, decryptPrivateKey, normalizePrivateKey } from "./keystore.js";
 
 describe("keystore encryption", () => {
   it("round-trips a private key with the correct passphrase", () => {
@@ -29,5 +29,37 @@ describe("keystore encryption", () => {
     expect(a.kdfParams.salt).not.toBe(b.kdfParams.salt);
     expect(a.iv).not.toBe(b.iv);
     expect(a.ciphertext).not.toBe(b.ciphertext);
+  });
+});
+
+describe("normalizePrivateKey", () => {
+  const bare = "a".repeat(64);
+
+  it("accepts a bare 64-hex key and adds the 0x prefix", () => {
+    expect(normalizePrivateKey(bare)).toBe(`0x${bare}`);
+  });
+
+  it("accepts an already-0x-prefixed key unchanged", () => {
+    expect(normalizePrivateKey(`0x${bare}`)).toBe(`0x${bare}`);
+  });
+
+  it("trims whitespace, lowercases, and tolerates a 0X prefix", () => {
+    expect(normalizePrivateKey(`  0X${"A".repeat(64)}\n`)).toBe(`0x${bare}`);
+  });
+
+  it("produces the same account whether or not the 0x prefix is supplied", () => {
+    const pk = generatePrivateKey(); // 0x + 64 hex
+    const withoutPrefix = pk.slice(2);
+    expect(normalizePrivateKey(withoutPrefix)).toBe(pk.toLowerCase());
+    expect(privateKeyToAccount(normalizePrivateKey(withoutPrefix)!).address).toBe(
+      privateKeyToAccount(pk).address,
+    );
+  });
+
+  it("rejects wrong length or non-hex input", () => {
+    expect(normalizePrivateKey("0x1234")).toBeNull(); // too short
+    expect(normalizePrivateKey("z".repeat(64))).toBeNull(); // not hex
+    expect(normalizePrivateKey(`0x${bare}ff`)).toBeNull(); // too long
+    expect(normalizePrivateKey("")).toBeNull();
   });
 });

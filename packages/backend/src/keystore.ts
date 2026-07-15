@@ -34,6 +34,17 @@ function deriveKey(passphrase: string, salt: Buffer): Buffer {
   });
 }
 
+/**
+ * Normalize an imported private key. Accepts 64 hex chars **with or without** a
+ * `0x` prefix (and surrounding whitespace), returning a `0x`-prefixed lowercase
+ * key — or `null` if it isn't a valid 32-byte hex key.
+ */
+export function normalizePrivateKey(raw: string): `0x${string}` | null {
+  const hex = raw.trim().replace(/^0x/i, "");
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+  return `0x${hex.toLowerCase()}` as `0x${string}`;
+}
+
 /** Encrypts a 0x-prefixed private key with a passphrase. */
 export function encryptPrivateKey(
   privateKey: string,

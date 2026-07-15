@@ -2,7 +2,6 @@ import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
-import { isHex } from "viem";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
 import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
 import { runtime } from "./runtime.js";
@@ -14,6 +13,7 @@ import {
   saveKeystore,
   loadKeystore,
   keystoreExists,
+  normalizePrivateKey,
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
 import { startEngine, stopEngine, scheduleJitBoundary, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
@@ -121,10 +121,16 @@ export async function buildServer(): Promise<FastifyInstance> {
       });
     }
 
-    let pk = parsed.data.privateKey as `0x${string}` | undefined;
-    if (mode === "generate") pk = generatePrivateKey();
-    if (!pk || !isHex(pk) || pk.length !== 66) {
-      return reply.code(400).send({ error: "Invalid private key (expected 0x + 64 hex chars)" });
+    let pk: `0x${string}`;
+    if (mode === "generate") {
+      pk = generatePrivateKey();
+    } else {
+      // Accept a 64-hex key with or without the 0x prefix (and stray whitespace).
+      const normalized = parsed.data.privateKey ? normalizePrivateKey(parsed.data.privateKey) : null;
+      if (!normalized) {
+        return reply.code(400).send({ error: "Invalid private key (expected 64 hex characters, with or without a 0x prefix)" });
+      }
+      pk = normalized;
     }
     const account = accountFromPrivateKey(pk);
     const file = encryptPrivateKey(pk, passphrase, account.address);
