@@ -381,6 +381,13 @@ async function defensePass(
     // 1) Under audit and within safety buffer -> clear it.
     if (underAudit && (st.secondsUntilKillable ?? 0) <= s.auditSafetyBufferSeconds) {
       if (bribes > 0n) {
+        // Bribe is free (value 0) but still costs gas — apply the same guardrail
+        // as the pay-to-clear path below so the base-fee cap holds consistently.
+        const guard = await canSpend(0n, false);
+        if (!guard.ok) {
+          activity.add({ kind: "use-bribe", status: "skipped", tokenId: st.tokenId, message: `Defer bribe clear #${st.tokenId}: ${guard.reason}` });
+          continue;
+        }
         await act(
           { to: appConfig.gameAddress, data: encodeUseBribe(tokenId), value: 0n },
           "use-bribe",

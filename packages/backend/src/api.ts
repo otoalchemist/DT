@@ -51,9 +51,32 @@ const strategyPatch = z
   })
   .partial();
 
+/** Extract the hostname from a Host header, dropping the port (handles [::1]). */
+function hostnameOf(hostHeader: string): string {
+  const h = hostHeader.trim();
+  if (h.startsWith("[")) return h.slice(1, h.indexOf("]")).toLowerCase(); // [IPv6]:port
+  const i = h.lastIndexOf(":");
+  return (i >= 0 ? h.slice(0, i) : h).toLowerCase();
+}
+
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(websocket);
+
+  // DNS-rebinding guard: when bound to loopback (the default, documented secure
+  // setup), only accept requests whose Host header is a loopback name. This stops
+  // a malicious web page from rebinding a domain to 127.0.0.1 and driving the
+  // wallet API. If the operator deliberately bound to a non-loopback interface,
+  // they've opted into exposure, so we don't second-guess their Host header.
+  const boundToLoopback = ["127.0.0.1", "::1", "localhost"].includes(appConfig.host);
+  if (boundToLoopback) {
+    const allowedHosts = new Set(["127.0.0.1", "localhost", "::1"]);
+    app.addHook("onRequest", async (req, reply) => {
+      if (!allowedHosts.has(hostnameOf(req.headers.host ?? ""))) {
+        return reply.code(403).send({ error: "Forbidden: unexpected Host header" });
+      }
+    });
+  }
 
   // --- status & config ---
   app.get("/api/status", async () => runtime.status());
