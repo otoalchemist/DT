@@ -119,7 +119,7 @@ export function JitPanel({
 
       <div className="row wrap" style={{ gap: 24, marginBottom: 12 }}>
         <div className="stat"><span className="label">Target epoch</span><span className="value">{targetEpoch ?? "—"}</span></div>
-        <div className="stat"><span className="label">Begins in</span><span className="value">{countdown(secondsToTarget)}</span></div>
+        <div className="stat"><span className="label">Begins in</span><span className="value">{countdown(secondsToTarget, true)}</span></div>
         <div className="stat"><span className="label">Selected</span><span className="value">{nSelected} / {tokens.length}</span></div>
         <div className="stat"><span className="label">Est. per token</span><span className="value">{weiToEth(perTokenWei, 5)} ETH</span></div>
         <div className="stat"><span className="label">Est. total</span><span className="value">{weiToEth(totalWei, 5)} ETH</span></div>

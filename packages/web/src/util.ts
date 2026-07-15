@@ -9,14 +9,23 @@ export function shortAddr(a: string | null | undefined): string {
   return `${a.slice(0, 6)}…${a.slice(-4)}`;
 }
 
-export function countdown(seconds: number | null): string {
+export function countdown(seconds: number | null, withSeconds = false): string {
   if (seconds == null) return "—";
   const neg = seconds < 0;
   let s = Math.abs(seconds);
   const h = Math.floor(s / 3600);
   s -= h * 3600;
   const m = Math.floor(s / 60);
-  const label = h > 0 ? `${h}h ${m}m` : `${m}m`;
+  s -= m * 60;
+  const label = withSeconds
+    ? h > 0
+      ? `${h}h ${m}m ${s}s`
+      : m > 0
+        ? `${m}m ${s}s`
+        : `${s}s`
+    : h > 0
+      ? `${h}h ${m}m`
+      : `${m}m`;
   return neg ? `expired ${label} ago` : label;
 }
 
