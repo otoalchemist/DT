@@ -4,7 +4,7 @@ import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { isHex } from "viem";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
-import { reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
+import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
 import { runtime } from "./runtime.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
@@ -123,6 +123,12 @@ export async function buildServer(): Promise<FastifyInstance> {
         runtime.gameState = snap.state;
         runtime.citizenSupply = snap.citizenSupply;
         runtime.citizensAddress = snap.citizensAddress;
+        runtime.emitStatus();
+      }).catch(() => {});
+      // Fetch the wallet balance up front too — otherwise it stays blank until
+      // the engine is started (balance is otherwise only read inside tick()).
+      publicClient.getBalance({ address: account.address }).then((bal) => {
+        runtime.balanceWei = bal;
         runtime.emitStatus();
       }).catch(() => {});
       // Engine stays paused on unlock — user must press Start manually.
