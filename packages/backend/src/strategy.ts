@@ -48,6 +48,15 @@ export function resetJitState(): void {
   jitSubmittedTarget = null;
 }
 
+// Proactive-pay bookkeeping: tokenIds already submitted for the current epoch.
+// DEFENSE_LEAD_MS's pre-boundary fire converges through a short second re-arm
+// (deltaMs shrinks from ~1.5s to a few hundred ms before finally hitting the
+// immediate-fire branch), which would otherwise call proactivePayPass twice in
+// quick succession — before the first tx has a chance to confirm and clear the
+// "delinquent" classification — and double-submit the same payment.
+let proactivePaySubmittedEpoch: bigint | null = null;
+let proactivePaySubmitted = new Set<string>();
+
 export function startEngine(): void {
   if (timer || unwatchBlocks) return;
   runtime.running = true;
@@ -338,7 +347,14 @@ async function proactivePayPass(
   nowSec: bigint,
 ): Promise<void> {
   const s = runtime.strategy;
+  if (proactivePaySubmittedEpoch !== currentEpoch) {
+    proactivePaySubmittedEpoch = currentEpoch;
+    proactivePaySubmitted = new Set();
+  }
   for (const tokenId of ownedIds) {
+    const key = tokenId.toString();
+    if (proactivePaySubmitted.has(key)) continue;
+
     const st = await getOwnedTokenStatus(tokenId, currentEpoch, nowSec, s.prepayEpochs);
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
@@ -350,6 +366,7 @@ async function proactivePayPass(
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
       continue;
     }
+    proactivePaySubmitted.add(key); // mark before awaiting so a rapid re-fire can't double-submit
     await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, s.prepayEpochs), value },
       "pay-taxes",
