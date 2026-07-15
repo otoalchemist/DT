@@ -183,55 +183,6 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       </label>
 
       <div className="spacer" />
-      <details>
-        <summary style={{ cursor: "pointer", userSelect: "none", marginBottom: 6 }}>
-          <span className="muted" style={{ fontSize: 11 }}>DEFENSE</span>
-          <span className="muted" style={{ fontSize: 11 }}>
-            {" "}· {cfg.enabled ? "on" : "off"} — rarely used, click to expand
-          </span>
-        </summary>
-        <label className="check">
-          <input type="checkbox" checked={cfg.enabled} onChange={chk("enabled")} />
-          Enable defense (auto-pay taxes to keep your citizens alive)
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={cfg.proactivePay} onChange={chk("proactivePay")} disabled={!cfg.enabled} />
-          Proactively pay when delinquent (avoid being auditable)
-        </label>
-        <label className="field">
-          Clear audits with this much time to spare (hours)
-          <input
-            type="number" min={0} step={0.5}
-            value={cfg.auditSafetyBufferSeconds / 3600}
-            onChange={(e) => set("auditSafetyBufferSeconds", Math.round(Number(e.target.value) * 3600))}
-          />
-        </label>
-        <label className="field">
-          Epochs to prepay per payment (1–7, locks current rate)
-          <input type="number" min={1} max={7} value={cfg.prepayEpochs} onChange={num("prepayEpochs")} />
-        </label>
-      </details>
-
-      <div className="spacer" />
-      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 0", lineHeight: 1.5 }}>
-        Payment gas (base fee cap, priority tip, dynamic tip) now lives under <b>Just-in-time epoch
-        payment → Payment gas</b>, next to the arm button.
-      </p>
-      <label className="field">
-        Min wallet balance floor (ETH)
-        <input type="number" min={0} step={0.01} value={cfg.minBalanceEth} onChange={num("minBalanceEth")} />
-      </label>
-      <label className="field">
-        Max single payment (ETH) — 0 disables
-        <input type="number" min={0} step={0.01} value={cfg.maxPaymentEth} onChange={num("maxPaymentEth")} />
-      </label>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 0", lineHeight: 1.5 }}>
-        Hard cap on any one transaction's value. A payment above this is skipped, not sent — a backstop
-        against a bad estimate or a badly-delinquent token draining the wallet in one shot.
-      </p>
-
-      <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE GAS (audit / kill)</div>
       <label className="check">
         <input
@@ -314,6 +265,55 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
         Also broadcasts time-critical offense txs to the public mempool alongside the Flashbots bundle,
         so any builder can include them next block. Trades bundle privacy for speed. No effect in public mode.
+      </p>
+
+      <div className="spacer" />
+      <details>
+        <summary style={{ cursor: "pointer", userSelect: "none", marginBottom: 6 }}>
+          <span className="muted" style={{ fontSize: 11 }}>DEFENSE</span>
+          <span className="muted" style={{ fontSize: 11 }}>
+            {" "}· {cfg.enabled ? "on" : "off"} — rarely used, click to expand
+          </span>
+        </summary>
+        <label className="check">
+          <input type="checkbox" checked={cfg.enabled} onChange={chk("enabled")} />
+          Enable defense (auto-pay taxes to keep your citizens alive)
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={cfg.proactivePay} onChange={chk("proactivePay")} disabled={!cfg.enabled} />
+          Proactively pay when delinquent (avoid being auditable)
+        </label>
+        <label className="field">
+          Clear audits with this much time to spare (hours)
+          <input
+            type="number" min={0} step={0.5}
+            value={cfg.auditSafetyBufferSeconds / 3600}
+            onChange={(e) => set("auditSafetyBufferSeconds", Math.round(Number(e.target.value) * 3600))}
+          />
+        </label>
+        <label className="field">
+          Epochs to prepay per payment (1–7, locks current rate)
+          <input type="number" min={1} max={7} value={cfg.prepayEpochs} onChange={num("prepayEpochs")} />
+        </label>
+      </details>
+
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 0", lineHeight: 1.5 }}>
+        Payment gas (base fee cap, priority tip, dynamic tip) now lives under <b>Just-in-time epoch
+        payment → Payment gas</b>, next to the arm button.
+      </p>
+      <label className="field">
+        Min wallet balance floor (ETH)
+        <input type="number" min={0} step={0.01} value={cfg.minBalanceEth} onChange={num("minBalanceEth")} />
+      </label>
+      <label className="field">
+        Max single payment (ETH) — 0 disables
+        <input type="number" min={0} step={0.01} value={cfg.maxPaymentEth} onChange={num("maxPaymentEth")} />
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 0", lineHeight: 1.5 }}>
+        Hard cap on any one transaction's value. A payment above this is skipped, not sent — a backstop
+        against a bad estimate or a badly-delinquent token draining the wallet in one shot.
       </p>
 
       <button className="primary" onClick={save} disabled={busy}>
