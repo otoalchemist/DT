@@ -33,7 +33,16 @@ export function useSocket(): LiveState {
         if (msg.type === "status") setStatus(msg.data);
         else if (msg.type === "activity-batch") setActivity(msg.data);
         else if (msg.type === "activity")
-          setActivity((prev) => [...prev, msg.data].slice(-300));
+          setActivity((prev) => {
+            // Upsert by id: a receipt-tracking update re-emits the same entry id.
+            const idx = prev.findIndex((e) => e.id === msg.data.id);
+            if (idx >= 0) {
+              const next = prev.slice();
+              next[idx] = msg.data;
+              return next;
+            }
+            return [...prev, msg.data].slice(-300);
+          });
       };
     };
     connect();

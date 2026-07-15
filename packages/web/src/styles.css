@@ -80,9 +80,11 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
 
 .log { max-height: 340px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-.log-row { display: grid; grid-template-columns: 64px 90px 1fr; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 12px; }
+.log-row { display: grid; grid-template-columns: 72px 90px 1fr; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 12px; }
 .log-row:hover { background: var(--panel-2); }
-.log-row .time { color: var(--muted); }
+.log-row .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.log-row a { color: var(--accent); text-decoration: none; white-space: nowrap; }
+.log-row a:hover { text-decoration: underline; }
 
 .pill { font-size: 10px; padding: 1px 6px; border-radius: 4px; text-align: center; font-weight: 600; }
 .pill.submitted { background: rgba(91,157,255,0.2); color: var(--accent); }

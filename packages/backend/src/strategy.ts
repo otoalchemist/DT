@@ -36,6 +36,23 @@ let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
 
+// A precisely-timed boundary tick (JIT / defense / offense) must not be silently
+// dropped just because a routine block/poll tick happens to be running when its
+// timer fires — that would push the payment/kill to the next ordinary tick and
+// lose the boundary race. If a tick is in flight, retry shortly until it clears.
+// Used ONLY for the setTimeout-driven boundary firings; the synchronous
+// immediate-fire branches inside the schedulers keep dropping when nested in a
+// tick, which is what avoids a re-entrant rerun loop.
+const BOUNDARY_RETRY_MS = 250;
+function fireBoundaryTick(fireProactivePay: boolean): void {
+  if (!runtime.running) return;
+  if (ticking) {
+    setTimeout(() => fireBoundaryTick(fireProactivePay), BOUNDARY_RETRY_MS);
+    return;
+  }
+  void tick(fireProactivePay);
+}
+
 // Soonest future audit-expiry (kill deadline) seen in the last offense sweep, in
 // unix seconds. Null when no rival token is currently under a pending audit.
 let nextKillDeadlineSec: bigint | null = null;
@@ -122,7 +139,7 @@ export function scheduleJitBoundary(): void {
     return;
   }
   const delayMs = Math.min(deltaSec * 1000 + 500, 2_000_000_000);
-  boundaryTimer = setTimeout(() => void tick(), delayMs);
+  boundaryTimer = setTimeout(() => fireBoundaryTick(false), delayMs);
 }
 
 // Lead time before an offense deadline at which we fire the pre-emptive tick, so
@@ -168,7 +185,7 @@ export function scheduleOffenseBoundary(): void {
     return;
   }
   const delayMs = Math.min(deltaMs, 2_000_000_000);
-  offenseBoundaryTimer = setTimeout(() => void tick(), delayMs);
+  offenseBoundaryTimer = setTimeout(() => fireBoundaryTick(false), delayMs);
 }
 
 // Lead time before the next epoch boundary at which we fire the proactive-pay
@@ -200,7 +217,7 @@ export function scheduleDefenseBoundary(): void {
     return;
   }
   const delayMs = Math.min(deltaMs, 2_000_000_000);
-  defenseBoundaryTimer = setTimeout(() => void tick(true), delayMs);
+  defenseBoundaryTimer = setTimeout(() => fireBoundaryTick(true), delayMs);
 }
 
 async function refreshSnapshot(address: Address): Promise<void> {
@@ -256,6 +273,34 @@ async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boole
   return { ok: true };
 }
 
+// How long to wait for a submitted tx's receipt before giving up. A tx that
+// never lands (dropped, replaced, or a bundle that lost) times out and is left
+// as "submitted" rather than being force-marked one way or the other.
+const RECEIPT_TIMEOUT_MS = 3 * 60_000;
+
+/**
+ * Poll for a submitted tx's receipt and flip its activity entry from "submitted"
+ * to "included" (mined OK) or "reverted" (mined but failed). Fire-and-forget:
+ * never awaited by the tick loop, and swallows errors/timeouts so a stuck poll
+ * can't wedge the engine.
+ */
+async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<void> {
+  try {
+    const receipt = await publicClient.waitForTransactionReceipt({
+      hash: txHash,
+      timeout: RECEIPT_TIMEOUT_MS,
+    });
+    const block = receipt.blockNumber?.toString();
+    activity.update(entryId, {
+      status: receipt.status === "success" ? "included" : "reverted",
+      targetBlock: block,
+    });
+  } catch (err) {
+    // Timed out or RPC error — leave the entry as "submitted".
+    logger.warn(`receipt tracking for ${txHash.slice(0, 10)}… failed: ${(err as Error).message}`);
+  }
+}
+
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
@@ -281,7 +326,7 @@ async function act(
       return result;
     }
     if (!dryRun) runtime.recordSpend(result.valueWei + result.gasWei);
-    activity.add({
+    const entry = activity.add({
       kind,
       status: dryRun ? "dry-run" : "submitted",
       tokenId: ctx.tokenId,
@@ -294,6 +339,10 @@ async function act(
       message: dryRun ? `[dry-run] ${ctx.message}` : ctx.message,
     });
     runtime.emitStatus();
+    // Watch for the receipt so the entry flips submitted -> included/reverted.
+    // Only public-mempool submissions expose a tx hash; pure Flashbots bundles
+    // (bundleHash only) stay "submitted" since there's nothing to poll.
+    if (!dryRun && result.txHash) void trackReceipt(entry.id, result.txHash);
     return result;
   } catch (err) {
     activity.add({

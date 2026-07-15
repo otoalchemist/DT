@@ -104,6 +104,9 @@ export function Dashboard({
 
   const running = status?.running ?? false;
   const dryRun = status?.dryRun ?? true;
+  // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
+  // aren't there, so fall back to plain text in that case.
+  const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
 
   const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
@@ -239,13 +242,30 @@ export function Dashboard({
             <h2>Activity</h2>
             <div className="log">
               {activity.length === 0 && <p className="muted">No activity yet.</p>}
-              {[...activity].reverse().map((e) => (
+              {[...activity].reverse().map((e) => {
+                const when = new Date(e.ts);
+                return (
                 <div className="log-row" key={e.id}>
-                  <span className="time">{timeAgo(e.ts)} ago</span>
+                  <span className="time" title={`${when.toLocaleString()} · ${timeAgo(e.ts)} ago`}>
+                    {when.toLocaleTimeString(undefined, { hour12: false })}
+                  </span>
                   <span className={`pill ${e.status}`}>{e.status}</span>
-                  <span>{e.message}</span>
+                  <span>
+                    {e.message}
+                    {e.txHash && (explorerBase
+                      ? <> · <a href={`${explorerBase}/tx/${e.txHash}`} target="_blank" rel="noreferrer">tx ↗</a></>
+                      : <> · <span className="mono">{e.txHash.slice(0, 10)}…</span></>)}
+                    {!e.txHash && e.bundleHash && (
+                      <> · <span className="muted">bundle {e.bundleHash.slice(0, 8)}…</span>
+                        {e.targetBlock && explorerBase && (
+                          <> · <a href={`${explorerBase}/block/${e.targetBlock}`} target="_blank" rel="noreferrer">blk {e.targetBlock} ↗</a></>
+                        )}
+                      </>
+                    )}
+                  </span>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>

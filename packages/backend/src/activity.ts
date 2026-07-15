@@ -65,6 +65,24 @@ class ActivityLog {
     return full;
   }
 
+  /** Patch an existing entry (e.g. flip a submitted tx to included/reverted once
+   *  its receipt lands) and re-emit it so subscribers upsert by id. */
+  update(id: string, patch: Partial<Omit<ActivityEntry, "id" | "ts">>): ActivityEntry | null {
+    const entry = this.entries.find((e) => e.id === id);
+    if (!entry) return null;
+    Object.assign(entry, patch);
+    this.dirty = true;
+    for (const l of this.listeners) {
+      try {
+        l(entry);
+      } catch {
+        /* ignore listener errors */
+      }
+    }
+    logger.info(`activity update ${entry.kind}/${entry.status}: ${entry.message}`);
+    return entry;
+  }
+
   recent(limit = 200): ActivityEntry[] {
     return this.entries.slice(-limit);
   }
