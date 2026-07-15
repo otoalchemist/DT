@@ -638,7 +638,7 @@ async function tick(fireProactivePay = false): Promise<void> {
     const nowSec = BigInt(Math.floor(Date.now() / 1000));
     const currentEpoch = runtime.currentEpoch ?? 0n;
 
-    await nonceManager.sync(address);
+    await nonceManager.sync(address, appConfig.mode);
 
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
 
