@@ -23,6 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
+import { resolveGas } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -220,12 +221,15 @@ async function refreshSnapshot(address: Address): Promise<void> {
   scheduleDefenseBoundary();
 }
 
-/** Pre-flight guardrail: can we afford this spend without breaching caps/floors? */
-async function canSpend(valueWei: bigint): Promise<{ ok: boolean; reason?: string }> {
+/** Pre-flight guardrail: can we afford this spend without breaching caps/floors?
+ *  `offense` selects the audit/kill gas profile so the base-fee cap and gas
+ *  estimate match what `submitTx` will actually bid. */
+async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boolean; reason?: string }> {
   const s = runtime.strategy;
+  const gas = resolveGas(s, offense);
   const block = await publicClient.getBlock({ blockTag: "latest" });
   const baseFee = block.baseFeePerGas ?? 0n;
-  const maxBase = BigInt(Math.round(s.maxBaseFeeGwei * 1e9));
+  const maxBase = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
   if (baseFee > maxBase) {
     return { ok: false, reason: `base fee ${formatEther(baseFee * 1_000_000_000n)} gwei over cap` };
   }
@@ -242,7 +246,7 @@ async function canSpend(valueWei: bigint): Promise<{ ok: boolean; reason?: strin
     }
   }
 
-  const gasWei = GAS_GUESS * (baseFee * 2n + BigInt(Math.round(s.priorityFeeGwei * 1e9)));
+  const gasWei = GAS_GUESS * (baseFee * 2n + BigInt(Math.round(gas.priorityFeeGwei * 1e9)));
   const total = valueWei + gasWei;
 
   const bal = runtime.balanceWei ?? 0n;
@@ -258,8 +262,13 @@ async function act(
   ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean },
 ): Promise<SubmitResult | null> {
   const dryRun = runtime.strategy.dryRun;
+  const offense = kind === "audit" || kind === "kill";
   try {
-    const result = await submitTx(intent, { dryRun, race: ctx.race && runtime.strategy.racePublicMempool });
+    const result = await submitTx(intent, {
+      dryRun,
+      race: ctx.race && runtime.strategy.racePublicMempool,
+      offense,
+    });
     if (!result.ok) {
       activity.add({
         kind,
@@ -320,7 +329,7 @@ async function defensePass(
         continue;
       }
       const value = await estimateTaxes(tokenId, s.prepayEpochs);
-      const guard = await canSpend(value);
+      const guard = await canSpend(value, false);
       if (!guard.ok) {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer pay #${st.tokenId}: ${guard.reason}` });
         continue;
@@ -361,7 +370,7 @@ async function proactivePayPass(
 
     const value = await estimateTaxes(tokenId, s.prepayEpochs);
     if (value === 0n) continue;
-    const guard = await canSpend(value);
+    const guard = await canSpend(value, false);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
       continue;
@@ -413,7 +422,7 @@ async function jitPass(
       jitSubmitted.add(key);
       continue;
     }
-    const guard = await canSpend(value);
+    const guard = await canSpend(value, false);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer JIT pay #${key}: ${guard.reason}` });
       continue; // retry next tick — do not mark submitted
@@ -485,7 +494,7 @@ async function offensePass(
     }
 
     if (s.autoKill && t.killable) {
-      const guard = await canSpend(0n);
+      const guard = await canSpend(0n, true);
       if (!guard.ok) continue;
       await act(
         { to: appConfig.gameAddress, data: encodeKill(tokenId), value: 0n },
@@ -496,7 +505,7 @@ async function offensePass(
     }
 
     if (s.autoAudit && t.auditable && auditFrom !== undefined) {
-      const guard = await canSpend(AUDIT_COST_WEI);
+      const guard = await canSpend(AUDIT_COST_WEI, true);
       if (!guard.ok) continue;
       await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },

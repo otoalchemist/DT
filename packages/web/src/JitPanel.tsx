@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { BotStatus, OwnedTokenStatus } from "@dat-bot/shared";
+import type { BotStatus, OwnedTokenStatus, StrategyConfig } from "@dat-bot/shared";
 import { EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { countdown, weiToEth } from "./util.js";
@@ -7,9 +7,13 @@ import { countdown, weiToEth } from "./util.js";
 export function JitPanel({
   status,
   tokens,
+  config,
+  onConfigChange,
 }: {
   status: BotStatus | null;
   tokens: OwnedTokenStatus[];
+  config: StrategyConfig | null;
+  onConfigChange: (c: StrategyConfig) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -73,6 +77,35 @@ export function JitPanel({
       await api.jit({ enable: false });
     } finally {
       setBusy(false);
+    }
+  };
+
+  // --- Payment gas (used by every tax payment, incl. the boundary-timed JIT pay) ---
+  const [gasBusy, setGasBusy] = useState(false);
+  const [gasSaved, setGasSaved] = useState(false);
+  const [gasErr, setGasErr] = useState<string | null>(null);
+  const gasField = (k: keyof StrategyConfig, v: number | boolean) => {
+    if (!config) return;
+    onConfigChange({ ...config, [k]: v });
+    setGasSaved(false);
+  };
+  const saveGas = async () => {
+    if (!config) return;
+    setGasBusy(true);
+    setGasErr(null);
+    try {
+      const next = await api.setConfig({
+        maxBaseFeeGwei: config.maxBaseFeeGwei,
+        priorityFeeGwei: config.priorityFeeGwei,
+        dynamicTipEnabled: config.dynamicTipEnabled,
+        dynamicTipMaxGwei: config.dynamicTipMaxGwei,
+      });
+      onConfigChange(next);
+      setGasSaved(true);
+    } catch (e) {
+      setGasErr((e as Error).message);
+    } finally {
+      setGasBusy(false);
     }
   };
 
@@ -146,6 +179,56 @@ export function JitPanel({
         >
           {busy ? "Arming…" : `Arm payment for epoch ${targetEpoch ?? "…"}`}
         </button>
+      )}
+
+      {config && (
+        <div style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PAYMENT GAS</div>
+          <p className="muted" style={{ fontSize: 11, margin: "0 0 10px 0", lineHeight: 1.5 }}>
+            Applied to every tax payment, including the boundary-timed pay above. Raise the priority tip
+            (or enable the dynamic tip) so your payment out-orders a batch-audit tx landing in the same
+            first-of-epoch block.
+          </p>
+          <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
+            <label className="field" style={{ flex: "1 1 120px" }}>
+              Priority fee / tip (gwei)
+              <input
+                type="number" min={0} step={0.1}
+                value={config.priorityFeeGwei}
+                onChange={(e) => gasField("priorityFeeGwei", Number(e.target.value))}
+              />
+            </label>
+            <label className="field" style={{ flex: "1 1 120px" }}>
+              Max base fee (gwei)
+              <input
+                type="number" min={0}
+                value={config.maxBaseFeeGwei}
+                onChange={(e) => gasField("maxBaseFeeGwei", Number(e.target.value))}
+              />
+            </label>
+          </div>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={config.dynamicTipEnabled}
+              onChange={(e) => gasField("dynamicTipEnabled", e.target.checked)}
+            />
+            Dynamic priority tip (scale up as the block fills)
+          </label>
+          <label className="field" style={{ marginLeft: 24 }}>
+            Max dynamic tip (gwei)
+            <input
+              type="number" min={0} step={1}
+              value={config.dynamicTipMaxGwei}
+              onChange={(e) => gasField("dynamicTipMaxGwei", Number(e.target.value))}
+              disabled={!config.dynamicTipEnabled}
+            />
+          </label>
+          <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>
+            {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment gas"}
+          </button>
+          {gasErr && <p className="err" style={{ marginTop: 6 }}>{gasErr}</p>}
+        </div>
       )}
 
       {tokens.length === 0 && (

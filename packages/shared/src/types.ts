@@ -104,12 +104,30 @@ export interface StrategyConfig {
   offenseTargetTokenIds: string[];
 
   // --- Guardrails ---
-  /** Max base fee (gwei) the bot will transact at. */
+  /** Max base fee (gwei) the bot will transact at. Applies to tax payments
+   *  (defense) and, unless `separateOffenseGas` is on, to audit/kill too. */
   maxBaseFeeGwei: number;
-  /** Priority fee (gwei) to include on bundles. */
+  /** Priority fee (gwei) to include on bundles. Applies to tax payments
+   *  (defense) and, unless `separateOffenseGas` is on, to audit/kill too. */
   priorityFeeGwei: number;
   /** Never spend below this wallet balance (ether). */
   minBalanceEth: number;
+
+  // --- Offense gas override (audit / kill) ---
+  /** When true, audit/kill use the `offense*` gas fields below instead of the
+   *  shared `maxBaseFeeGwei`/`priorityFeeGwei`/`dynamicTip*` settings. Lets you
+   *  bid more aggressively to win offense races without overpaying on the
+   *  (non-competitive) tax payments. When false, audit/kill inherit the base
+   *  settings — identical to the pre-split behavior. */
+  separateOffenseGas: boolean;
+  /** Max base fee (gwei) for audit/kill. Used only when separateOffenseGas. */
+  offenseMaxBaseFeeGwei: number;
+  /** Priority fee (gwei) for audit/kill. Used only when separateOffenseGas. */
+  offensePriorityFeeGwei: number;
+  /** Dynamic-tip toggle for audit/kill. Used only when separateOffenseGas. */
+  offenseDynamicTipEnabled: boolean;
+  /** Dynamic-tip ceiling (gwei) for audit/kill. Used only when separateOffenseGas. */
+  offenseDynamicTipMaxGwei: number;
 
   // --- Latency (mainnet mode only) ---
   /** Fire an extra tick just before each offense deadline (nearest audit

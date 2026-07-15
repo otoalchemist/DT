@@ -1,6 +1,38 @@
-import type { TokenRisk } from "@dat-bot/shared";
+import type { StrategyConfig, TokenRisk } from "@dat-bot/shared";
 
 // Pure game/strategy logic — no I/O, so it can be unit-tested directly.
+
+/** The gas knobs that apply to a single transaction. */
+export interface GasSettings {
+  maxBaseFeeGwei: number;
+  priorityFeeGwei: number;
+  dynamicTipEnabled: boolean;
+  dynamicTipMaxGwei: number;
+}
+
+/**
+ * Resolve the gas settings for a transaction. Audit/kill (`offense`) use the
+ * dedicated `offense*` fields when `separateOffenseGas` is on; everything else —
+ * and offense when the split is off — uses the shared base settings. Keeping
+ * this in one pure function guarantees the guardrail check (`canSpend`) and the
+ * fee builder (`computeFees`) always agree on which numbers apply.
+ */
+export function resolveGas(s: StrategyConfig, offense: boolean): GasSettings {
+  if (offense && s.separateOffenseGas) {
+    return {
+      maxBaseFeeGwei: s.offenseMaxBaseFeeGwei,
+      priorityFeeGwei: s.offensePriorityFeeGwei,
+      dynamicTipEnabled: s.offenseDynamicTipEnabled,
+      dynamicTipMaxGwei: s.offenseDynamicTipMaxGwei,
+    };
+  }
+  return {
+    maxBaseFeeGwei: s.maxBaseFeeGwei,
+    priorityFeeGwei: s.priorityFeeGwei,
+    dynamicTipEnabled: s.dynamicTipEnabled,
+    dynamicTipMaxGwei: s.dynamicTipMaxGwei,
+  };
+}
 
 /** A token is auditable once it is >= 2 epochs behind (matches contract `_audit`). */
 export function isAuditable(lastEpochPaid: bigint, currentEpoch: bigint): boolean {
@@ -65,4 +97,17 @@ export function dynamicTipGwei(
   const t = (fill - 0.5) / 0.5; // 0 at half-full, 1 at full
   const scaled = baseTipGwei + (ceil - baseTipGwei) * Math.min(t, 1);
   return Math.min(scaled, ceil);
+}
+
+/**
+ * The priority tip (gwei) to actually bid for a transaction given its resolved
+ * gas profile and the latest block's fullness. Returns the static
+ * `priorityFeeGwei` unless the profile's dynamic tip is enabled, in which case it
+ * scales with block fullness up to the profile's ceiling. Applies to whichever
+ * profile `resolveGas` selected — tax payments included — so it's the single
+ * source of truth `computeFees` uses for every action.
+ */
+export function effectiveTipGwei(gas: GasSettings, gasUsed: bigint, gasLimit: bigint): number {
+  if (!gas.dynamicTipEnabled) return gas.priorityFeeGwei;
+  return dynamicTipGwei(gas.priorityFeeGwei, gas.dynamicTipMaxGwei, gasUsed, gasLimit);
 }

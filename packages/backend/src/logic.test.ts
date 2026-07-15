@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
+import type { StrategyConfig } from "@dat-bot/shared";
 import {
   isAuditable,
   isKillable,
   classifyRisk,
   wouldBreachFloor,
   dynamicTipGwei,
+  resolveGas,
+  effectiveTipGwei,
 } from "./logic.js";
 
 describe("delinquency / audit math", () => {
@@ -77,5 +80,92 @@ describe("dynamic priority tip", () => {
 
   it("never returns below base even if max is misconfigured below base", () => {
     expect(dynamicTipGwei(10, 5, full, full)).toBe(10);
+  });
+});
+
+describe("resolveGas (per-category gas split)", () => {
+  // resolveGas only reads the 9 gas fields; cast a minimal fixture so this stays
+  // a pure unit test (importing runtime would pull in env-parsing config).
+  const base = {
+    maxBaseFeeGwei: 30,
+    priorityFeeGwei: 2,
+    dynamicTipEnabled: false,
+    dynamicTipMaxGwei: 50,
+    offenseMaxBaseFeeGwei: 80,
+    offensePriorityFeeGwei: 25,
+    offenseDynamicTipEnabled: true,
+    offenseDynamicTipMaxGwei: 120,
+  } as StrategyConfig;
+
+  it("uses base settings for payments regardless of the split flag", () => {
+    for (const separateOffenseGas of [false, true]) {
+      expect(resolveGas({ ...base, separateOffenseGas }, false)).toEqual({
+        maxBaseFeeGwei: 30,
+        priorityFeeGwei: 2,
+        dynamicTipEnabled: false,
+        dynamicTipMaxGwei: 50,
+      });
+    }
+  });
+
+  it("offense inherits base settings when the split is off", () => {
+    expect(resolveGas({ ...base, separateOffenseGas: false }, true)).toEqual({
+      maxBaseFeeGwei: 30,
+      priorityFeeGwei: 2,
+      dynamicTipEnabled: false,
+      dynamicTipMaxGwei: 50,
+    });
+  });
+
+  it("offense uses its own settings when the split is on", () => {
+    expect(resolveGas({ ...base, separateOffenseGas: true }, true)).toEqual({
+      maxBaseFeeGwei: 80,
+      priorityFeeGwei: 25,
+      dynamicTipEnabled: true,
+      dynamicTipMaxGwei: 120,
+    });
+  });
+});
+
+describe("effectiveTipGwei (what computeFees actually bids)", () => {
+  const full = 30_000_000n;
+  const threeQuarters = 22_500_000n; // 75% fill -> halfway from base to max
+
+  it("returns the static priority fee when dynamic tip is off", () => {
+    const gas = { maxBaseFeeGwei: 30, priorityFeeGwei: 15.1, dynamicTipEnabled: false, dynamicTipMaxGwei: 50 };
+    expect(effectiveTipGwei(gas, full, full)).toBe(15.1);
+    expect(effectiveTipGwei(gas, 0n, full)).toBe(15.1);
+  });
+
+  it("scales the tip by block fullness when dynamic tip is on", () => {
+    const gas = { maxBaseFeeGwei: 30, priorityFeeGwei: 2, dynamicTipEnabled: true, dynamicTipMaxGwei: 50 };
+    expect(effectiveTipGwei(gas, 10_000_000n, full)).toBe(2); // 33% -> base
+    expect(effectiveTipGwei(gas, threeQuarters, full)).toBeCloseTo(26, 5); // 75% -> (2+50)/2
+    expect(effectiveTipGwei(gas, full, full)).toBeCloseTo(50, 5); // full -> ceiling
+  });
+
+  it("applies dynamic tip to the TAX-PAYMENT profile (offense=false) end to end", () => {
+    // A payments config with dynamic tip on — exactly the real-world case where a
+    // payTaxes tx bid a scaled-up tip. resolveGas(false) picks the base profile,
+    // and effectiveTipGwei scales it, proving the payment path is covered.
+    const strategy = {
+      maxBaseFeeGwei: 100,
+      priorityFeeGwei: 15.1,
+      dynamicTipEnabled: true,
+      dynamicTipMaxGwei: 50,
+      separateOffenseGas: true, // even with the split on, payments use the base profile
+      offenseMaxBaseFeeGwei: 100,
+      offensePriorityFeeGwei: 2,
+      offenseDynamicTipEnabled: false,
+      offenseDynamicTipMaxGwei: 50,
+    } as StrategyConfig;
+
+    const payGas = resolveGas(strategy, false);
+    // 75% full: 15.1 + (50 - 15.1) * 0.5 = 32.55 gwei — scaled above the static 15.1.
+    expect(effectiveTipGwei(payGas, threeQuarters, full)).toBeCloseTo(32.55, 5);
+
+    // Offense here has dynamic tip off, so it stays flat at its static tip.
+    const offGas = resolveGas(strategy, true);
+    expect(effectiveTipGwei(offGas, threeQuarters, full)).toBe(2);
   });
 });

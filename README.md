@@ -115,6 +115,11 @@ cp data/config.example.json data/config.json
   cap** (skips any tax payment above a set ETH value — a backstop against a bad
   estimate or a badly-delinquent token draining the wallet in one shot; `0` = off),
   a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
+- **Separate offense gas (audit/kill):** by default one set of gas settings
+  (max base-fee, priority tip, dynamic tip) applies to everything. Turn on
+  **Separate gas for audit / kill** to bid gas independently for offense — it's a
+  race against rivals, whereas tax payments aren't — without overpaying on
+  routine payments. Off by default, so behavior is unchanged until you opt in.
 - **Simulate-before-send:** every mainnet bundle is checked with `eth_callBundle`
   first, so reverting transactions aren't paid for.
 - Bind the API to `127.0.0.1` (default). Do not expose it to the internet.

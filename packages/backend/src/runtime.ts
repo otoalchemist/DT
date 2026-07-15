@@ -42,6 +42,14 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   maxBaseFeeGwei: 30,
   priorityFeeGwei: 2,
   minBalanceEth: 0.01,
+  // Offense gas defaults mirror the base settings; they only take effect once
+  // separateOffenseGas is turned on, so a fresh/upgraded config behaves exactly
+  // as before until the user opts in.
+  separateOffenseGas: false,
+  offenseMaxBaseFeeGwei: 30,
+  offensePriorityFeeGwei: 2,
+  offenseDynamicTipEnabled: false,
+  offenseDynamicTipMaxGwei: 50,
   offenseBoundaryScheduling: false,
   racePublicMempool: false,
   dynamicTipEnabled: false,

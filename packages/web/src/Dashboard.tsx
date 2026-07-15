@@ -158,7 +158,7 @@ export function Dashboard({
         </div>
 
         <div className="spacer" />
-        <JitPanel status={status} tokens={tokens} />
+        <JitPanel status={status} tokens={tokens} config={config} onConfigChange={setConfig} />
 
         <div className="spacer" />
         <div className="panel">

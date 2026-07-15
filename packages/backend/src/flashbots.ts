@@ -11,7 +11,7 @@ import { publicClient } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { nonceManager } from "./nonce.js";
-import { dynamicTipGwei } from "./logic.js";
+import { effectiveTipGwei, resolveGas } from "./logic.js";
 import { logger } from "./logger.js";
 
 export interface TxIntent {
@@ -78,21 +78,18 @@ async function flashbotsRpc(method: string, params: unknown[], signal?: AbortSig
 
 // --- fee + gas ---
 
-async function computeFees(): Promise<{
+async function computeFees(offense: boolean): Promise<{
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
   baseFee: bigint;
 }> {
-  const s = runtime.strategy;
+  const gas = resolveGas(runtime.strategy, offense);
   const block = await publicClient.getBlock({ blockTag: "latest" });
   const baseFee = block.baseFeePerGas ?? 0n;
 
   // Priority tip: static by default, or scaled up by block fullness when the
   // dynamic-tip edge is enabled (helps win inclusion in contested blocks).
-  let tipGwei = s.priorityFeeGwei;
-  if (s.dynamicTipEnabled) {
-    tipGwei = dynamicTipGwei(s.priorityFeeGwei, s.dynamicTipMaxGwei, block.gasUsed, block.gasLimit);
-  }
+  const tipGwei = effectiveTipGwei(gas, block.gasUsed, block.gasLimit);
   const priority = BigInt(Math.round(tipGwei * 1e9));
   const maxFeePerGas = baseFee * 2n + priority;
   return { maxFeePerGas, maxPriorityFeePerGas: priority, baseFee };
@@ -150,12 +147,12 @@ async function flashbotsRpcWithTimeout(method: string, params: unknown[]): Promi
 
 export async function submitTx(
   intent: TxIntent,
-  opts: { dryRun: boolean; race?: boolean },
+  opts: { dryRun: boolean; race?: boolean; offense?: boolean },
 ): Promise<SubmitResult> {
   const account = runtime.account;
   if (!account) throw new Error("Wallet locked");
 
-  const { maxFeePerGas, maxPriorityFeePerGas } = await computeFees();
+  const { maxFeePerGas, maxPriorityFeePerGas } = await computeFees(opts.offense ?? false);
   const gas = await estimateGas(account.address, intent);
   const gasWei = gas * maxFeePerGas;
   const targetBlock = (await publicClient.getBlockNumber()) + 1n;
