@@ -110,6 +110,15 @@ export interface StrategyConfig {
   endgameOnlyWithin: number | null;
   /** Specific rival token IDs to target. Empty array = target any delinquent rival. */
   offenseTargetTokenIds: string[];
+  /** ADVANCED: pre-submit audits ~preBoundaryLeadMs before the epoch boundary so
+   *  they land in the FIRST block of the epoch (auditing rivals the instant they
+   *  become delinquent, like a batch-auditor) instead of the block after.
+   *  Unsimulated; a mis-timed audit reverts (gas only — the fee is refunded). */
+  preBoundaryAudit: boolean;
+  /** ADVANCED: pre-submit kills ~preBoundaryLeadMs before a target's audit-expiry
+   *  so the kill lands in the first eligible block. Unsimulated; a too-early kill
+   *  reverts (gas only). */
+  preBoundaryKill: boolean;
 
   // --- Guardrails ---
   /** Max base fee (gwei) the bot will transact at. Applies to tax payments

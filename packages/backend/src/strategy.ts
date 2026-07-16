@@ -9,6 +9,7 @@ import {
   getGameSnapshot,
   getOwnedTokenStatus,
   getTargetStatus,
+  batchGetTargetStatuses,
   filterLiveTokenIds,
   encodePayTaxes,
   encodeAudit,
@@ -22,7 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, preBoundaryTaxWei } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -33,6 +34,8 @@ let boundaryTimer: NodeJS.Timeout | null = null;
 let offenseBoundaryTimer: NodeJS.Timeout | null = null;
 let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryTimer: NodeJS.Timeout | null = null;
+let preBoundaryAuditTimer: NodeJS.Timeout | null = null;
+let preBoundaryKillTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
 // Total wei committed to spend so far in the current tick (value + gas of each
@@ -114,12 +117,16 @@ export function stopEngine(): void {
   if (offenseBoundaryTimer) clearTimeout(offenseBoundaryTimer);
   if (defenseBoundaryTimer) clearTimeout(defenseBoundaryTimer);
   if (preBoundaryTimer) clearTimeout(preBoundaryTimer);
+  if (preBoundaryAuditTimer) clearTimeout(preBoundaryAuditTimer);
+  if (preBoundaryKillTimer) clearTimeout(preBoundaryKillTimer);
   if (unwatchBlocks) unwatchBlocks();
   timer = null;
   boundaryTimer = null;
   offenseBoundaryTimer = null;
   defenseBoundaryTimer = null;
   preBoundaryTimer = null;
+  preBoundaryAuditTimer = null;
+  preBoundaryKillTimer = null;
   unwatchBlocks = null;
   runtime.running = false;
   runtime.emitStatus();
@@ -230,6 +237,163 @@ async function firePreBoundaryPay(): Promise<void> {
   }
 }
 
+// Generous fixed gas for an unsimulated offense pre-submit (real audits used
+// ~113–130k on-chain; we can't eth_estimateGas an action that isn't valid yet).
+const PRE_BOUNDARY_OFFENSE_GAS = 250_000n;
+
+/** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
+ *  auditable at `targetEpoch` (so still current now) and with full capacity
+ *  (the new epoch has 0 audits used). One audit per token. */
+async function findPreBoundaryAuditors(ownedIds: bigint[], targetEpoch: bigint): Promise<bigint[]> {
+  if (ownedIds.length === 0) return [];
+  const results = await publicClient.multicall({
+    allowFailure: true,
+    contracts: ownedIds.flatMap((id) => [
+      { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
+    ]),
+  });
+  const eligible: bigint[] = [];
+  for (let i = 0; i < ownedIds.length; i++) {
+    const lep = results[i * 2];
+    const limit = results[i * 2 + 1];
+    if (lep?.status !== "success" || limit?.status !== "success") continue;
+    // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet.
+    if (isEligibleAuditor(lep.result as bigint, targetEpoch, 0n, limit.result as bigint)) {
+      eligible.push(ownedIds[i]!);
+    }
+  }
+  return eligible;
+}
+
+/** Arm a pre-submit of audits ~preBoundaryLeadMs before the next epoch boundary. */
+export function schedulePreBoundaryAudit(): void {
+  if (preBoundaryAuditTimer) {
+    clearTimeout(preBoundaryAuditTimer);
+    preBoundaryAuditTimer = null;
+  }
+  const s = runtime.strategy;
+  if (!runtime.running || !s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
+  if (runtime.startTime === null || runtime.currentEpoch === null) return;
+  const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
+  if (deltaMs <= 0) return; // too late; normal offense picks it up after the roll
+  preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
+}
+
+/** Pre-submit audits (skip-sim) for rivals that will be auditable in the FIRST
+ *  block of the upcoming epoch, so we compete with a batch-auditor rather than
+ *  landing a block later. Best-effort; normal offensePass remains the fallback. */
+async function firePreBoundaryAudit(): Promise<void> {
+  const s = runtime.strategy;
+  if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
+  if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (ticking) { setTimeout(() => void firePreBoundaryAudit(), 150); return; }
+  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
+  ticking = true;
+  committedThisTickWei = 0n;
+  const address = runtime.account.address;
+  const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  try {
+    await nonceManager.sync(address, appConfig.mode);
+    const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+    const auditors = await findPreBoundaryAuditors(ownedIds, targetEpoch);
+    if (auditors.length === 0) return;
+
+    const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
+    const live = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+    const owned = new Set(ownedIds.map((x) => x.toString()));
+    const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+    // Auditable AT the target epoch, not already under audit.
+    const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
+    let idx = 0;
+    for (const t of statuses) {
+      if (idx >= auditors.length) break;
+      if (owned.has(t.tokenId)) continue;
+      if (pinned && !pinned.has(t.tokenId)) continue;
+      if (t.auditDueTimestamp !== "0") continue; // already under audit
+      if (!isAuditable(BigInt(t.lastEpochPaid), targetEpoch)) continue; // won't be auditable at the boundary
+      const guard = await canSpend(AUDIT_COST_WEI, true);
+      if (!guard.ok) continue;
+      const from = auditors[idx]!;
+      const res = await act(
+        { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
+        "audit",
+        { tokenId: from.toString(), targetTokenId: t.tokenId, message: `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch} (unsimulated, boundary race)`, race: true, skipSim: true },
+      );
+      if (res?.ok) idx++;
+    }
+  } catch (err) {
+    logger.error("pre-boundary audit error:", (err as Error).message);
+    activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
+  } finally {
+    nonceManager.reset();
+    ticking = false;
+  }
+}
+
+/** Arm a pre-submit of kills ~preBoundaryLeadMs before the soonest audit-expiry. */
+export function schedulePreBoundaryKill(): void {
+  if (preBoundaryKillTimer) {
+    clearTimeout(preBoundaryKillTimer);
+    preBoundaryKillTimer = null;
+  }
+  const s = runtime.strategy;
+  if (!runtime.running || !s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
+  if (nextKillDeadlineSec === null) return;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const deltaMs = Number(nextKillDeadlineSec - nowSec) * 1000 - s.preBoundaryLeadMs;
+  if (deltaMs <= 0) return; // too late; normal offense kills it right after expiry
+  preBoundaryKillTimer = setTimeout(() => void firePreBoundaryKill(), Math.min(deltaMs, 2_000_000_000));
+}
+
+/** Pre-submit kills (skip-sim) for targets whose audit is about to expire, so the
+ *  kill lands in the first eligible block instead of the one after. */
+async function firePreBoundaryKill(): Promise<void> {
+  const s = runtime.strategy;
+  if (!s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
+  if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
+  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
+  ticking = true;
+  committedThisTickWei = 0n;
+  const address = runtime.account.address;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  // Pre-submit kills for audits expiring within our lead + one slot of headroom.
+  const windowSec = BigInt(Math.ceil(s.preBoundaryLeadMs / 1000) + 12);
+  try {
+    await nonceManager.sync(address, appConfig.mode);
+    const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+    const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
+    const live = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+    const owned = new Set(ownedIds.map((x) => x.toString()));
+    const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+    const statuses = await batchGetTargetStatuses(live, runtime.currentEpoch ?? 0n, nowSec);
+    for (const t of statuses) {
+      if (owned.has(t.tokenId)) continue;
+      if (pinned && !pinned.has(t.tokenId)) continue;
+      const due = BigInt(t.auditDueTimestamp);
+      if (due === 0n || t.killable) continue; // not under audit, or already killable (normal path handles it)
+      if (due <= nowSec || due - nowSec > windowSec) continue; // not imminent
+      const guard = await canSpend(0n, true);
+      if (!guard.ok) continue;
+      await act(
+        { to: appConfig.gameAddress, data: encodeKill(BigInt(t.tokenId)), value: 0n, gas: PRE_BOUNDARY_OFFENSE_GAS },
+        "kill",
+        { targetTokenId: t.tokenId, message: `Pre-boundary kill #${t.tokenId} (audit expiring, unsimulated race)`, race: true, skipSim: true },
+      );
+    }
+  } catch (err) {
+    logger.error("pre-boundary kill error:", (err as Error).message);
+    activity.add({ kind: "error", status: "skipped", message: `Pre-boundary kill error: ${(err as Error).message}` });
+  } finally {
+    nonceManager.reset();
+    ticking = false;
+  }
+}
+
 // Lead time before an offense deadline at which we fire the pre-emptive tick, so
 // the tx is built and submitted in time to compete in the first eligible block.
 const OFFENSE_LEAD_MS = 1_500;
@@ -324,6 +488,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
   runtime.emitStatus();
   scheduleJitBoundary();
   schedulePreBoundaryPay();
+  schedulePreBoundaryAudit();
   scheduleDefenseBoundary();
 }
 
@@ -703,6 +868,7 @@ async function offensePass(
   // Publish the nearest kill deadline and (re)arm the pre-emptive boundary tick.
   nextKillDeadlineSec = soonestKillDeadline;
   scheduleOffenseBoundary();
+  schedulePreBoundaryKill();
 }
 
 // `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary

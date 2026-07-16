@@ -16,7 +16,7 @@ import {
   normalizePrivateKey,
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
-import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -37,6 +37,8 @@ const strategyPatch = z
     autoKill: z.boolean(),
     endgameOnlyWithin: z.number().int().min(0).nullable(),
     offenseTargetTokenIds: z.array(z.string()),
+    preBoundaryAudit: z.boolean(),
+    preBoundaryKill: z.boolean(),
     maxBaseFeeGwei: z.number().positive(),
     priorityFeeGwei: z.number().min(0),
     minBalanceEth: z.number().min(0),
@@ -96,6 +98,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (!nowActive && runtime.running) stopEngine();
     scheduleDefenseBoundary();
     schedulePreBoundaryPay();
+    schedulePreBoundaryAudit();
     return next;
   });
 

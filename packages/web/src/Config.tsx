@@ -156,6 +156,19 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         <input type="checkbox" checked={cfg.autoKill} onChange={chk("autoKill")} disabled={!cfg.offenseEnabled} />
         Auto-kill expired-audit tokens (free, gas only)
       </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.preBoundaryAudit} onChange={chk("preBoundaryAudit")} disabled={!cfg.offenseEnabled || !cfg.autoAudit} />
+        ⚠ Race audits into the boundary block (advanced)
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.preBoundaryKill} onChange={chk("preBoundaryKill")} disabled={!cfg.offenseEnabled || !cfg.autoKill} />
+        ⚠ Race kills into the first block after expiry (advanced)
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+        Pre-submit audits/kills (unsimulated) ~{cfg.preBoundaryLeadMs}ms before the deadline so they land
+        in the first eligible block ahead of rivals, instead of the block after. A mis-timed tx reverts and
+        wastes gas (audit fees are refunded on revert). Lead is shared with the JIT boundary race.
+      </p>
       <label className="field">
         Only run offense when supply is within N of 69 winners (blank = always)
         <input

@@ -167,6 +167,13 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   simulate-before-send is skipped — a mis-timed tx reverts and wastes gas (no fund
   loss), and the normal post-boundary JIT pay still runs as a fallback. Off by
   default; enable it under *Just-in-time epoch payment → Payment gas*.
+- **Race audits/kills into the first block** (advanced, opt-in) — the offense
+  equivalents. *Race audits* pre-submits audits just before the epoch boundary so
+  they land the instant rivals become delinquent (like a batch-auditor); *race
+  kills* pre-submits a `kill` just before a target's audit-expiry so it lands in
+  the first eligible block. Both skip simulation (a mis-timed tx reverts, gas only —
+  audit fees are refunded), reuse the shared pre-submit lead, and fall back to the
+  normal post-deadline offense. Off by default; enable under *Offense*.
 
 ## Race post-mortem
 

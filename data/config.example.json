@@ -70,6 +70,8 @@
     "6749",
     "6953"
   ],
+  "preBoundaryAudit": false,
+  "preBoundaryKill": false,
   "maxBaseFeeGwei": 30,
   "priorityFeeGwei": 2,
   "minBalanceEth": 0.01,

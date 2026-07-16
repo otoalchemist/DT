@@ -41,6 +41,8 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   autoKill: false,
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadDefaultRivalTargets(),
+  preBoundaryAudit: false,
+  preBoundaryKill: false,
   maxBaseFeeGwei: 30,
   priorityFeeGwei: 2,
   minBalanceEth: 0.01,
