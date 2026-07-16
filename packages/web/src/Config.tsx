@@ -168,6 +168,7 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         Pre-submit audits/kills (unsimulated) ~{cfg.preBoundaryLeadMs}ms before the deadline so they land
         in the first eligible block ahead of rivals, instead of the block after. A mis-timed tx reverts and
         wastes gas (audit fees are refunded on revert). Lead is shared with the JIT boundary race.
+        <b> Public mode only</b> — the Flashbots relay rejects the unsimulated tx in mainnet mode.
       </p>
       <label className="field">
         Only run offense when supply is within N of 69 winners (blank = always)

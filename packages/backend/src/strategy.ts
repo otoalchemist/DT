@@ -43,6 +43,24 @@ let ticking = false;
 // min-balance floor holds across all spends in a tick, not just each in isolation.
 let committedThisTickWei = 0n;
 
+// The pre-boundary (skip-sim) races only work in public mode: in mainnet mode the
+// Flashbots relay simulates the bundle server-side and drops it because the tx
+// reverts against current state. Disable those schedulers in mainnet mode and say
+// why (once), rather than silently burning effort that can never land.
+let warnedPreBoundaryMainnet = false;
+function preBoundaryUnavailable(): boolean {
+  if (appConfig.mode !== "mainnet") return false;
+  if (!warnedPreBoundaryMainnet) {
+    warnedPreBoundaryMainnet = true;
+    activity.add({
+      kind: "info",
+      status: "info",
+      message: "Pre-boundary races (pay/audit/kill) are disabled in mainnet mode — the Flashbots relay rejects the unsimulated tx. Switch to public mode to use them.",
+    });
+  }
+  return true;
+}
+
 // A precisely-timed boundary tick (JIT / defense / offense) must not be silently
 // dropped just because a routine block/poll tick happens to be running when its
 // timer fires — that would push the payment/kill to the next ordinary tick and
@@ -170,6 +188,7 @@ export function schedulePreBoundaryPay(): void {
   if (!runtime.running || !s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null || runtime.startTime === null) {
     return;
   }
+  if (preBoundaryUnavailable()) return;
   const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
@@ -193,6 +212,7 @@ async function firePreBoundaryPay(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (runtime.gameState !== 1) return; // only act while the game is LIVE
   if (ticking) { setTimeout(() => void firePreBoundaryPay(), 150); return; } // don't overlap nonce use
   ticking = true;
   committedThisTickWei = 0n;
@@ -275,6 +295,7 @@ export function schedulePreBoundaryAudit(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
+  if (preBoundaryUnavailable()) return;
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
@@ -289,6 +310,7 @@ async function firePreBoundaryAudit(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (runtime.gameState !== 1) return; // only act while the game is LIVE
   if (ticking) { setTimeout(() => void firePreBoundaryAudit(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
@@ -343,6 +365,7 @@ export function schedulePreBoundaryKill(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
   if (nextKillDeadlineSec === null) return;
+  if (preBoundaryUnavailable()) return;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(nextKillDeadlineSec - nowSec) * 1000 - s.preBoundaryLeadMs;
   if (deltaMs <= 0) return; // too late; normal offense kills it right after expiry
@@ -355,6 +378,7 @@ async function firePreBoundaryKill(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (runtime.gameState !== 1) return; // only act while the game is LIVE
   if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
