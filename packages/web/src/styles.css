@@ -85,6 +85,9 @@ th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: upp
 .log-row .time { color: var(--muted); font-variant-numeric: tabular-nums; }
 .log-row a { color: var(--accent); text-decoration: none; white-space: nowrap; }
 .log-row a:hover { text-decoration: underline; }
+/* Let long messages wrap (and break unbroken strings like hashes) instead of
+   overflowing the column. min-width:0 lets the grid cell shrink below content. */
+.log-row > span:last-child { min-width: 0; overflow-wrap: anywhere; }
 
 .pill { font-size: 10px; padding: 1px 6px; border-radius: 4px; text-align: center; font-weight: 600; }
 .pill.submitted { background: rgba(91,157,255,0.2); color: var(--accent); }
