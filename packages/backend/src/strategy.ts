@@ -1,5 +1,5 @@
 import { parseEther, formatEther, type Address } from "viem";
-import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS } from "@dat-bot/shared";
+import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
 import { publicClient, wsClient } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
@@ -22,7 +22,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, preBoundaryTaxWei } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -32,6 +32,7 @@ let timer: NodeJS.Timeout | null = null;
 let boundaryTimer: NodeJS.Timeout | null = null;
 let offenseBoundaryTimer: NodeJS.Timeout | null = null;
 let defenseBoundaryTimer: NodeJS.Timeout | null = null;
+let preBoundaryTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
 // Total wei committed to spend so far in the current tick (value + gas of each
@@ -112,11 +113,13 @@ export function stopEngine(): void {
   if (boundaryTimer) clearTimeout(boundaryTimer);
   if (offenseBoundaryTimer) clearTimeout(offenseBoundaryTimer);
   if (defenseBoundaryTimer) clearTimeout(defenseBoundaryTimer);
+  if (preBoundaryTimer) clearTimeout(preBoundaryTimer);
   if (unwatchBlocks) unwatchBlocks();
   timer = null;
   boundaryTimer = null;
   offenseBoundaryTimer = null;
   defenseBoundaryTimer = null;
+  preBoundaryTimer = null;
   unwatchBlocks = null;
   runtime.running = false;
   runtime.emitStatus();
@@ -143,6 +146,88 @@ export function scheduleJitBoundary(): void {
   }
   const delayMs = Math.min(deltaSec * 1000 + 500, 2_000_000_000);
   boundaryTimer = setTimeout(() => fireBoundaryTick(false), delayMs);
+}
+
+/**
+ * ADVANCED (opt-in): arm a pre-submit ~preBoundaryLeadMs BEFORE the armed epoch
+ * boundary, so the JIT payment lands in the FIRST block of the epoch (ahead of a
+ * batch-auditor) rather than the block after. Requires an off-chain value for the
+ * upcoming epoch and skips simulate-before-send, so a mis-timed tx can revert.
+ */
+export function schedulePreBoundaryPay(): void {
+  if (preBoundaryTimer) {
+    clearTimeout(preBoundaryTimer);
+    preBoundaryTimer = null;
+  }
+  const s = runtime.strategy;
+  if (!runtime.running || !s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null || runtime.startTime === null) {
+    return;
+  }
+  const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
+  if (deltaMs <= 0) return; // too late to pre-submit; the +500ms JIT tick covers it
+  preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(), Math.min(deltaMs, 2_000_000_000));
+}
+
+// Fixed gas for a pre-boundary payTaxes — we can't eth_estimateGas it (the value
+// is invalid against current state), so pass a generous fixed limit.
+const PRE_BOUNDARY_GAS = 120_000n;
+
+/**
+ * Fire the opt-in pre-boundary JIT payment: for each armed token still behind on
+ * the target epoch, submit payTaxes with a value computed off-chain for that
+ * epoch, skipping simulation, aiming to land in the boundary block. Best-effort —
+ * it does NOT mark jitSubmitted, so the ordinary +500ms JIT tick (with real
+ * simulation + on-chain value) remains the authoritative fallback if a pre-submit
+ * reverts or loses the race.
+ */
+async function firePreBoundaryPay(): Promise<void> {
+  const s = runtime.strategy;
+  if (!s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null) return;
+  if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  if (ticking) { setTimeout(() => void firePreBoundaryPay(), 150); return; } // don't overlap nonce use
+  ticking = true;
+  committedThisTickWei = 0n;
+  const address = runtime.account.address;
+  const targetEpoch = BigInt(s.jitTargetEpoch);
+  try {
+    await nonceManager.sync(address, appConfig.mode);
+    const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+    const selected = s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds;
+    if (selected.length === 0) return;
+
+    // One multicall for lastEpochPaid across the selected tokens.
+    const results = await publicClient.multicall({
+      allowFailure: true,
+      contracts: selected.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
+    });
+    for (let i = 0; i < selected.length; i++) {
+      const r = results[i];
+      if (r?.status !== "success") continue;
+      const lastEpochPaid = r.result as bigint;
+      if (lastEpochPaid >= targetEpoch) continue; // already current for the target
+      const value = preBoundaryTaxWei(lastEpochPaid, targetEpoch, 1, BASE_TAX_RATE_WEI);
+      if (value === 0n) continue;
+      const key = selected[i]!.toString();
+      const guard = await canSpend(value, false); // enforces max-base-fee, floor, max-payment caps
+      if (!guard.ok) {
+        activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
+        continue;
+      }
+      await act(
+        { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
+        "pay-taxes",
+        { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (unsimulated, boundary race)`, race: true, skipSim: true },
+      );
+    }
+  } catch (err) {
+    logger.error("pre-boundary pay error:", (err as Error).message);
+    activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
+  } finally {
+    nonceManager.reset();
+    ticking = false;
+  }
 }
 
 // Lead time before an offense deadline at which we fire the pre-emptive tick, so
@@ -238,6 +323,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
   runtime.lastBlock = block;
   runtime.emitStatus();
   scheduleJitBoundary();
+  schedulePreBoundaryPay();
   scheduleDefenseBoundary();
 }
 
@@ -311,7 +397,7 @@ async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<voi
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; skipSim?: boolean },
 ): Promise<SubmitResult | null> {
   const dryRun = runtime.strategy.dryRun;
   const offense = kind === "audit" || kind === "kill";
@@ -320,6 +406,7 @@ async function act(
       dryRun,
       race: ctx.race && runtime.strategy.racePublicMempool,
       offense,
+      skipSim: ctx.skipSim,
     });
     if (!result.ok) {
       activity.add({

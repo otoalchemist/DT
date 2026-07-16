@@ -16,7 +16,7 @@ import {
   normalizePrivateKey,
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
-import { startEngine, stopEngine, scheduleJitBoundary, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -30,6 +30,8 @@ const strategyPatch = z
     jitEnabled: z.boolean(),
     jitTargetEpoch: z.number().int().min(1).nullable(),
     jitTokenIds: z.array(z.string()),
+    preBoundaryPay: z.boolean(),
+    preBoundaryLeadMs: z.number().int().min(250).max(8000),
     offenseEnabled: z.boolean(),
     autoAudit: z.boolean(),
     autoKill: z.boolean(),
@@ -93,6 +95,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (nowActive && !wasActive && runtime.unlocked && !runtime.running) startEngine();
     if (!nowActive && runtime.running) stopEngine();
     scheduleDefenseBoundary();
+    schedulePreBoundaryPay();
     return next;
   });
 
@@ -208,6 +211,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (!enable) {
       runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
       scheduleJitBoundary();
+      schedulePreBoundaryPay();
       return runtime.status();
     }
 
@@ -227,6 +231,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     resetJitState(); // clear any prior submission bookkeeping for this epoch
     if (!runtime.running) startEngine();
     scheduleJitBoundary();
+    schedulePreBoundaryPay();
     return runtime.status();
   });
 

@@ -85,6 +85,27 @@ export function classifyRisk(
 }
 
 
+/**
+ * Wei to send for a **pre-boundary** payTaxes that will execute in `targetEpoch`
+ * (the first block of the new epoch), computed off-chain because our reads only
+ * see the current epoch. Mirrors the on-chain estimate reverse-engineered from
+ * live data: `(epochsBehindAtTarget + numEpochs - 1) * targetEpoch * baseTaxRateWei`,
+ * where `epochsBehindAtTarget = targetEpoch - lastEpochPaid`. Returns 0 if the
+ * token is already current for the target (nothing to pre-pay). If this value is
+ * wrong when the tx lands, payTaxes reverts (wasted gas, no fund loss).
+ */
+export function preBoundaryTaxWei(
+  lastEpochPaid: bigint,
+  targetEpoch: bigint,
+  numEpochs: number,
+  baseTaxRateWei: bigint,
+): bigint {
+  const behind = targetEpoch - lastEpochPaid;
+  if (behind <= 0n) return 0n;
+  const units = behind + BigInt(numEpochs) - 1n;
+  return units * targetEpoch * baseTaxRateWei;
+}
+
 /** Would spending `total` drop the balance below the floor? */
 export function wouldBreachFloor(
   balance: bigint,

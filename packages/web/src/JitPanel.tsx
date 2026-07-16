@@ -99,6 +99,8 @@ export function JitPanel({
         priorityFeeGwei: config.priorityFeeGwei,
         dynamicTipEnabled: config.dynamicTipEnabled,
         dynamicTipMaxGwei: config.dynamicTipMaxGwei,
+        preBoundaryPay: config.preBoundaryPay,
+        preBoundaryLeadMs: config.preBoundaryLeadMs,
       });
       onConfigChange(next);
       setGasSaved(true);
@@ -224,6 +226,32 @@ export function JitPanel({
               disabled={!config.dynamicTipEnabled}
             />
           </label>
+          <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={config.preBoundaryPay}
+                onChange={(e) => gasField("preBoundaryPay", e.target.checked)}
+              />
+              ⚠ Race into the boundary block (advanced)
+            </label>
+            <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+              Pre-submits the armed JIT payment just before the epoch boundary so it can land in the
+              <b> first block of the epoch</b>, ahead of a batch-auditor — matching the fastest rivals.
+              The amount is computed off-chain for the next epoch and <b>simulate-before-send is skipped</b>,
+              so a mis-timed tx can revert and waste gas (no funds lost). Pair with a high tip above. The
+              normal boundary-timed pay still runs as a fallback.
+            </p>
+            <label className="field" style={{ marginLeft: 24 }}>
+              Pre-submit lead (ms before boundary, 250–8000)
+              <input
+                type="number" min={250} max={8000} step={250}
+                value={config.preBoundaryLeadMs}
+                onChange={(e) => gasField("preBoundaryLeadMs", Number(e.target.value))}
+                disabled={!config.preBoundaryPay}
+              />
+            </label>
+          </div>
           <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>
             {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment gas"}
           </button>

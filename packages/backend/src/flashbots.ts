@@ -147,7 +147,7 @@ async function flashbotsRpcWithTimeout(method: string, params: unknown[]): Promi
 
 export async function submitTx(
   intent: TxIntent,
-  opts: { dryRun: boolean; race?: boolean; offense?: boolean },
+  opts: { dryRun: boolean; race?: boolean; offense?: boolean; skipSim?: boolean },
 ): Promise<SubmitResult> {
   const account = runtime.account;
   if (!account) throw new Error("Wallet locked");
@@ -167,7 +167,13 @@ export async function submitTx(
   };
 
   // --- Simulation ---
-  if (appConfig.mode === "mainnet") {
+  // skipSim: pre-boundary payTaxes carries a value computed for the *next* epoch,
+  // which reverts when simulated against current state — so the caller opts to
+  // skip the check and accept on-chain revert risk (payTaxes reverts on a wrong
+  // value = wasted gas, no fund loss).
+  if (opts.skipSim) {
+    // fall through to submission with no simulation
+  } else if (appConfig.mode === "mainnet") {
     // Flashbots bundle simulation needs a signed tx — use peeked nonce (not consumed yet).
     const simSigned = await signTx(account, intent, nonceManager.peek(), gas, maxFeePerGas, maxPriorityFeePerGas);
     try {

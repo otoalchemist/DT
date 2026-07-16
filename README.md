@@ -158,6 +158,15 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   the static priority fee is always used. It applies to **tax payments** too (set
   under *Just-in-time epoch payment → Payment gas*) — useful when a boundary-timed
   payment has to out-order a rival's batch-audit in the first block of an epoch.
+- **Race into the boundary block** (advanced, opt-in, `payTaxes` only) — the
+  ordinary JIT pay fires *just after* the boundary, so it lands one block late. This
+  mode instead *pre-submits* the armed JIT payment shortly **before** the boundary
+  with a value computed off-chain for the upcoming epoch, so it can land in the
+  **first block of the epoch** ahead of a batch-auditor (matching the fastest
+  rivals). Because that value can't be simulated against current state,
+  simulate-before-send is skipped — a mis-timed tx reverts and wastes gas (no fund
+  loss), and the normal post-boundary JIT pay still runs as a fallback. Off by
+  default; enable it under *Just-in-time epoch payment → Payment gas*.
 
 ## Race post-mortem
 

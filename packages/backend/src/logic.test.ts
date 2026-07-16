@@ -10,6 +10,7 @@ import {
   resolveGas,
   effectiveTipGwei,
   canAffordSpend,
+  preBoundaryTaxWei,
 } from "./logic.js";
 
 describe("delinquency / audit math", () => {
@@ -64,6 +65,29 @@ describe("spend guardrails", () => {
   it("floor: blocks spend that would drop below the balance floor", () => {
     expect(wouldBreachFloor(100n, 95n, 10n)).toBe(true); // 5 left < 10
     expect(wouldBreachFloor(100n, 80n, 10n)).toBe(false); // 20 left >= 10
+  });
+
+  describe("preBoundaryTaxWei (off-chain value for a boundary-block payTaxes)", () => {
+    const BASE = 690_000_000_000_000n; // 0.00069 ETH
+
+    it("matches the real fast tx: 1-behind at target epoch 136 -> 1 x 136 x base", () => {
+      // fast #1 paid payTaxes(272,1) with 0.09384 ETH landing in epoch 136.
+      expect(preBoundaryTaxWei(135n, 136n, 1, BASE)).toBe(136n * BASE); // 0.09384 ETH
+    });
+
+    it("charges an extra epoch when the token is 2 behind at the target", () => {
+      // matches on-chain estimateTaxesToPay(#230,1) = 2 x 136 x base.
+      expect(preBoundaryTaxWei(134n, 136n, 1, BASE)).toBe(2n * 136n * BASE);
+    });
+
+    it("scales with numEpochs", () => {
+      expect(preBoundaryTaxWei(135n, 136n, 2, BASE)).toBe(2n * 136n * BASE); // (1 + 2 - 1) x 136
+    });
+
+    it("returns 0 when already current for the target epoch", () => {
+      expect(preBoundaryTaxWei(136n, 136n, 1, BASE)).toBe(0n);
+      expect(preBoundaryTaxWei(137n, 136n, 1, BASE)).toBe(0n);
+    });
   });
 
   describe("canAffordSpend (cumulative floor within a tick)", () => {
