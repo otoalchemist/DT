@@ -35,7 +35,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   jitTargetEpoch: null,
   jitTokenIds: [],
   preBoundaryPay: false,
-  preBoundaryLeadMs: 2500,
+  preBoundaryLeadMs: 3000,
   offenseEnabled: false,
   autoAudit: false,
   autoKill: false,
