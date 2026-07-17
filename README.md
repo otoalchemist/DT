@@ -107,6 +107,22 @@ tracked files — no `node_modules`, no `.env`, and none of your local
 matching `package.json` `version` fields — `npm run package` refuses to run if they
 disagree) and commit before packaging.
 
+**Tag it so GitHub serves a versioned download.** GitHub's green *Code → Download
+ZIP* button always gives `DT-<branch>.zip` (a branch has no version). To get a
+version in the filename, push a tag:
+
+```bash
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
+```
+
+GitHub then serves the tagged source archive as **`DT-0.2.0.zip`** (leading `v`
+stripped) from the repo's **Tags**/**Releases** page and at
+`https://github.com/<owner>/DT/archive/refs/tags/v0.2.0.zip`. For a published
+**Release** with the nicer `death-and-taxes-bot-v<VERSION>.zip` name, draft a
+release on that tag and upload the `npm run package` artifact as an asset (via the
+web UI or `gh release create`).
+
 ---
 
 ## Configuration (`.env`)
