@@ -583,7 +583,13 @@ async function act(
   try {
     const result = await submitTx(intent, {
       dryRun,
-      race: ctx.race && runtime.strategy.racePublicMempool,
+      // In mainnet mode a bundle only lands if a builder we sent it to wins the
+      // slot — so PAYMENTS always mirror to the public mempool as a fallback: one
+      // that never lands can cost a citizen, and a tax payment isn't meaningfully
+      // front-runnable (rivals already see the delinquency on-chain).
+      // OFFENSE stays opt-in (racePublicMempool): a visible pending audit lets the
+      // target escape by paying first, so privacy is worth something there.
+      race: offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
       offense,
       simTimestamp: ctx.simTimestamp,
     });

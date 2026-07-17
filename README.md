@@ -132,8 +132,14 @@ cp data/config.example.json data/config.json
   routine payments. Off by default, so behavior is unchanged until you opt in.
   Payment gas is edited under **Just-in-time epoch payment → Payment gas**.
 - **Simulate-before-send:** every transaction is checked first (`eth_call` in
-  public/local mode, `eth_callBundle` for Flashbots bundles), so reverting
-  transactions aren't paid for and nonces aren't burned on them.
+  public/local mode, `eth_callBundle` for bundles), so reverting transactions aren't
+  paid for and nonces aren't burned on them.
+- **Payments always land, even in `mainnet` mode.** A bundle is only included if a
+  builder you sent it to wins the slot, so a bundle-only payment can silently fail
+  to land — which can cost a citizen. Tax payments are therefore **always** mirrored
+  to the public mempool alongside the bundle (identical tx, so only one can land).
+  There's nothing to protect by hiding a tax payment: rivals already see the
+  delinquency on-chain.
 - **Local-only by default.** The API binds to `127.0.0.1`; when bound to loopback
   it also rejects requests with an unexpected `Host` header, blocking DNS-rebinding
   from a malicious web page. Do not expose it to the internet.
@@ -151,9 +157,12 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   boundary tick is never dropped just because a routine tick is mid-flight — it
   retries as soon as the engine is free, so the race isn't lost to bad luck.
 - **Race the public mempool** (`mainnet` mode only) — also broadcasts a
-  time-critical offense tx to the public mempool alongside the Flashbots bundle, so
-  *any* builder can include it next block. The tx is identical (same nonce), so only
-  one can ever land. Trades bundle privacy for lower inclusion latency.
+  time-critical **offense** tx to the public mempool alongside the bundle, so *any*
+  builder can include it next block. The tx is identical (same nonce), so only one
+  can ever land. Trades bundle privacy for lower inclusion latency. It's opt-in for
+  offense because a *visible pending audit* lets the target escape by paying first.
+  **Payments don't need this toggle** — in `mainnet` mode they always mirror to the
+  mempool (see below), and both paths fire concurrently so neither waits on the other.
 - **Dynamic priority tip** — scales the tip up as the latest block fills past 50%,
   up to a configurable ceiling, to stay competitive in contested blocks. When off,
   the static priority fee is always used. It applies to **tax payments** too (set

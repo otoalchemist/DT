@@ -308,7 +308,21 @@ export async function submitTx(
       return { url, bundleHash: r?.bundleHash as string | undefined };
     }),
   );
-  for (const s of await Promise.allSettled(attempts)) {
+
+  // Public-mempool copy (identical tx: same nonce/sig, so only one can ever land
+  // and the loser is dropped as a duplicate). Fire it CONCURRENTLY with the
+  // bundles — awaiting relay round-trips first would delay the broadcast by
+  // 100-200ms+ per builder, which is exactly the margin a boundary race runs on.
+  const broadcast: Promise<Hex | undefined> = opts.race
+    ? publicClient.sendRawTransaction({ serializedTransaction: signed }).catch((err) => {
+        // "nonce too low"/"already known" just means a bundle landed first — not fatal.
+        logger.warn("public broadcast failed:", (err as Error).message);
+        return undefined;
+      })
+    : Promise.resolve(undefined);
+
+  const [txHash, settled] = await Promise.all([broadcast, Promise.allSettled(attempts)]);
+  for (const s of settled) {
     if (s.status === "fulfilled") {
       acceptedBy.add(hostOf(s.value.url));
       if (s.value.bundleHash) bundleHashes.push(s.value.bundleHash);
@@ -318,22 +332,6 @@ export async function submitTx(
   }
   if (acceptedBy.size > 0) {
     logger.info(`bundle accepted by ${acceptedBy.size}/${appConfig.builderUrls.length} builders: ${[...acceptedBy].join(", ")}`);
-  }
-
-  // Race mode: also broadcast to the public mempool so ANY builder can include
-  // us in the very next block, not only a Flashbots-winning one. Trades bundle
-  // privacy (the tx is now public and front-runnable) for lower inclusion
-  // latency — worth it for time-critical offense where the target action is
-  // already public knowledge on-chain. The tx is identical (same nonce/sig), so
-  // whichever path lands first wins and the other is dropped as a duplicate.
-  let txHash: Hex | undefined;
-  if (opts.race) {
-    try {
-      txHash = await publicClient.sendRawTransaction({ serializedTransaction: signed });
-    } catch (err) {
-      // A "nonce too low"/"already known" here means a bundle already landed — not fatal.
-      logger.warn("race public broadcast failed:", (err as Error).message);
-    }
   }
 
   return {
