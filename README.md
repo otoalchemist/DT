@@ -94,7 +94,8 @@ npm start          # backend only; serve packages/web/dist with any static host
 | --- | --- |
 | `ALCHEMY_API_KEY` | Derives the mainnet HTTPS/WSS RPC and NFT API endpoints. |
 | `RPC_HTTP_URL` / `RPC_WS_URL` / `ALCHEMY_NFT_URL` | Explicit overrides (any RPC). |
-| `MODE` | `public` (broadcast to the mempool — **default**, fastest), `mainnet` (Flashbots bundles, private/front-run-resistant), or `local` (anvil fork). Also switchable at runtime from the dashboard. |
+| `MODE` | `public` (broadcast to the mempool — **default**, fastest), `mainnet` (private builder bundles, front-run-resistant), or `local` (anvil fork). Also switchable at runtime from the dashboard. |
+| `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that wins a slot can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to Flashbots + beaverbuild + Titan + rsync; verify endpoints against each builder's docs and add others (e.g. BuilderNet). |
 | `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
 

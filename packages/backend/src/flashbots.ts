@@ -56,13 +56,21 @@ function getSigner(): PrivateKeyAccount {
   return _signer;
 }
 
-async function flashbotsRpc(method: string, params: unknown[], signal?: AbortSignal): Promise<any> {
+/** POST a bundle RPC to one builder/relay. `url` defaults to the Flashbots relay
+ *  (the only endpoint that implements eth_callBundle for simulation). */
+async function flashbotsRpc(
+  method: string,
+  params: unknown[],
+  signal?: AbortSignal,
+  url: string = appConfig.flashbotsRelayUrl,
+): Promise<any> {
   const signer = getSigner();
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
+  // Flashbots requires this reputation signature; other builders accept or ignore it.
   const signature = `${signer.address}:${await signer.signMessage({
     message: keccak256(toHex(body)),
   })}`;
-  const res = await fetch(appConfig.flashbotsRelayUrl, {
+  const res = await fetch(url, {
     method: "POST",
     signal,
     headers: {
@@ -72,8 +80,12 @@ async function flashbotsRpc(method: string, params: unknown[], signal?: AbortSig
     body,
   });
   const json = (await res.json()) as { error?: { message: string }; result?: any };
-  if (json.error) throw new Error(`Flashbots ${method}: ${json.error.message}`);
+  if (json.error) throw new Error(`${method} @${hostOf(url)}: ${json.error.message}`);
   return json.result;
+}
+
+function hostOf(url: string): string {
+  try { return new URL(url).host; } catch { return url; }
 }
 
 // --- fee + gas ---
@@ -135,11 +147,11 @@ async function signTx(
  */
 const RELAY_TIMEOUT_MS = 10_000;
 
-async function flashbotsRpcWithTimeout(method: string, params: unknown[]): Promise<any> {
+async function flashbotsRpcWithTimeout(method: string, params: unknown[], url?: string): Promise<any> {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), RELAY_TIMEOUT_MS);
   try {
-    return await flashbotsRpc(method, params, abort.signal);
+    return await flashbotsRpc(method, params, abort.signal, url);
   } finally {
     clearTimeout(timer);
   }
@@ -280,17 +292,32 @@ export async function submitTx(
     return { ...base, ok: true, txHash, targetBlock };
   }
 
-  // mainnet (Flashbots): send bundle to the relay for the next two blocks.
+  // mainnet: fan the bundle out to EVERY configured builder for the next two
+  // blocks. Only the builder that wins a slot can include us, so submitting to one
+  // relay means only winning when that relay's builder wins. All attempts run in
+  // parallel; unreachable builders are tolerated — we succeed if ANY accepts.
   const bundleHashes: string[] = [];
-  for (const blk of [targetBlock, targetBlock + 1n]) {
-    try {
-      const r = await flashbotsRpcWithTimeout("eth_sendBundle", [
-        { txs: [signed], blockNumber: toHex(blk) },
-      ]);
-      if (r?.bundleHash) bundleHashes.push(r.bundleHash);
-    } catch (err) {
-      logger.warn(`sendBundle block ${blk} failed:`, (err as Error).message);
+  const acceptedBy = new Set<string>();
+  const attempts = appConfig.builderUrls.flatMap((url) =>
+    [targetBlock, targetBlock + 1n].map(async (blk) => {
+      const r = await flashbotsRpcWithTimeout(
+        "eth_sendBundle",
+        [{ txs: [signed], blockNumber: toHex(blk) }],
+        url,
+      );
+      return { url, bundleHash: r?.bundleHash as string | undefined };
+    }),
+  );
+  for (const s of await Promise.allSettled(attempts)) {
+    if (s.status === "fulfilled") {
+      acceptedBy.add(hostOf(s.value.url));
+      if (s.value.bundleHash) bundleHashes.push(s.value.bundleHash);
+    } else {
+      logger.warn("sendBundle failed:", (s.reason as Error).message);
     }
+  }
+  if (acceptedBy.size > 0) {
+    logger.info(`bundle accepted by ${acceptedBy.size}/${appConfig.builderUrls.length} builders: ${[...acceptedBy].join(", ")}`);
   }
 
   // Race mode: also broadcast to the public mempool so ANY builder can include

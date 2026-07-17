@@ -49,7 +49,12 @@ const schema = z.object({
   RPC_WS_URL: z.string().url().optional(),
   ALCHEMY_NFT_URL: z.string().url().optional(),
   GAME_ADDRESS: z.string().default(GAME_CONTRACT_ADDRESS),
+  /** Used for bundle SIMULATION (eth_callBundle is Flashbots-specific). */
   FLASHBOTS_RELAY_URL: z.string().url().default("https://relay.flashbots.net"),
+  /** Comma-separated builder endpoints for bundle SUBMISSION (eth_sendBundle).
+   *  Only the builder that wins a slot can include your bundle, so submitting to
+   *  many raises the odds. Defaults to DEFAULT_BUILDER_URLS below. */
+  BUILDER_URLS: z.string().optional(),
   PORT: z.coerce.number().default(8787),
   HOST: z.string().default("127.0.0.1"),
   DATA_DIR: z.string().default(path.resolve(__dirname, "../../../data")),
@@ -74,6 +79,17 @@ export function deriveUrlsFromKey(key: string) {
   };
 }
 
+// Well-known builders that accept `eth_sendBundle`. A bundle can only be included
+// by the builder that wins the slot, so we fan out. Endpoints do change — override
+// with BUILDER_URLS if one moves or you want to add others (e.g. BuilderNet).
+// Unreachable entries are tolerated: submission succeeds if ANY builder accepts.
+const DEFAULT_BUILDER_URLS = [
+  "https://relay.flashbots.net",
+  "https://rpc.beaverbuild.org",
+  "https://rpc.titanbuilder.xyz",
+  "https://rsync-builder.xyz",
+];
+
 function derive() {
   const raw = schema.parse(process.env);
   const key = raw.ALCHEMY_API_KEY;
@@ -89,6 +105,9 @@ function derive() {
     nftUrl,
     gameAddress: raw.GAME_ADDRESS as `0x${string}`,
     flashbotsRelayUrl: raw.FLASHBOTS_RELAY_URL,
+    builderUrls: raw.BUILDER_URLS
+      ? raw.BUILDER_URLS.split(",").map((s) => s.trim()).filter(Boolean)
+      : [...new Set([raw.FLASHBOTS_RELAY_URL, ...DEFAULT_BUILDER_URLS])],
     port: raw.PORT,
     host: raw.HOST,
     dataDir: raw.DATA_DIR,
