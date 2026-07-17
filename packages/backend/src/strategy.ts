@@ -284,9 +284,21 @@ async function firePreBoundaryPay(): Promise<void> {
       if (r?.status !== "success") continue;
       const lastEpochPaid = r.result as bigint;
       if (lastEpochPaid >= targetEpoch) continue; // already current for the target
+      const key = selected[i]!.toString();
+      // JIT pays a single epoch. If the token is more than one epoch behind the
+      // target, a prior JIT didn't land; don't pre-pay a multi-day catch-up. Leave
+      // it for manual handling (the post-boundary jitPass logs it once and stops).
+      if (lastEpochPaid < targetEpoch - 1n) {
+        activity.add({
+          kind: "pay-taxes",
+          status: "skipped",
+          tokenId: key,
+          message: `Pre-boundary JIT skip #${key}: ${targetEpoch - lastEpochPaid} epochs behind target — needs manual catch-up, not auto-paid.`,
+        });
+        continue;
+      }
       const value = preBoundaryTaxWei(lastEpochPaid, targetEpoch, 1, BASE_TAX_RATE_WEI);
       if (value === 0n) continue;
-      const key = selected[i]!.toString();
       const guard = await canSpend(value, false); // enforces max-base-fee, floor, max-payment caps
       if (!guard.ok) {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
@@ -838,6 +850,22 @@ async function jitPass(
 
     if (BigInt(st.lastEpochPaid) >= currentEpoch) {
       jitSubmitted.add(key); // already current for this epoch
+      continue;
+    }
+    // JIT is a SINGLE-epoch payment. If the token is 2+ epochs behind, a prior JIT
+    // payment didn't land and paying to become current now would cost a multi-day
+    // catch-up (estimateTaxesToPay charges every missed epoch). Don't auto-pay that:
+    // leave the token — which is/where it becomes auditable — for the user to clear
+    // manually before the audit deadline, so a lost race never balloons the spend.
+    const behind = currentEpoch - BigInt(st.lastEpochPaid);
+    if (behind >= 2n) {
+      activity.add({
+        kind: "pay-taxes",
+        status: "skipped",
+        tokenId: key,
+        message: `JIT skip #${key}: ${behind} epochs behind — a prior JIT didn't land. Not auto-paying the ${behind}-epoch catch-up; pay manually before the audit deadline.`,
+      });
+      jitSubmitted.add(key); // stop auto-retrying — hand off to the user
       continue;
     }
     const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (1 epoch)
