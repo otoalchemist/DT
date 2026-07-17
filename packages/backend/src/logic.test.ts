@@ -67,21 +67,32 @@ describe("spend guardrails", () => {
     expect(wouldBreachFloor(100n, 80n, 10n)).toBe(false); // 20 left >= 10
   });
 
-  describe("preBoundaryTaxWei (off-chain value for a boundary-block payTaxes)", () => {
+  describe("preBoundaryTaxWei (JIT pays one upcoming epoch's amount)", () => {
     const BASE = 690_000_000_000_000n; // 0.00069 ETH
 
-    it("matches the real fast tx: 1-behind at target epoch 136 -> 1 x 136 x base", () => {
+    it("matches the real fast tx: target epoch 136 -> 1 x 136 x base", () => {
       // fast #1 paid payTaxes(272,1) with 0.09384 ETH landing in epoch 136.
       expect(preBoundaryTaxWei(135n, 136n, 1, BASE)).toBe(136n * BASE); // 0.09384 ETH
     });
 
-    it("charges an extra epoch when the token is 2 behind at the target", () => {
-      // matches on-chain estimateTaxesToPay(#230,1) = 2 x 136 x base.
-      expect(preBoundaryTaxWei(134n, 136n, 1, BASE)).toBe(2n * 136n * BASE);
+    it("pays only the target epoch's amount even when 2 epochs behind", () => {
+      // Regression: #2036 (lastEpochPaid 135) at target epoch 137 must send
+      // 1 x 137 x base = 0.09453 — the amount every successful payer used in the
+      // boundary block. The old catch-up value (2 x 137 = 0.18906) reverted with
+      // IncorrectPayment.
+      expect(preBoundaryTaxWei(135n, 137n, 1, BASE)).toBe(137n * BASE); // 0.09453 ETH
+      expect(preBoundaryTaxWei(135n, 137n, 1, BASE)).not.toBe(2n * 137n * BASE);
+    });
+
+    it("is the same amount regardless of how far behind the token is", () => {
+      const oneBehind = preBoundaryTaxWei(137n, 138n, 1, BASE); // 1 behind at 138
+      const twoBehind = preBoundaryTaxWei(136n, 138n, 1, BASE); // 2 behind at 138
+      expect(oneBehind).toBe(138n * BASE); // 0.09522 ETH
+      expect(twoBehind).toBe(oneBehind);
     });
 
     it("scales with numEpochs", () => {
-      expect(preBoundaryTaxWei(135n, 136n, 2, BASE)).toBe(2n * 136n * BASE); // (1 + 2 - 1) x 136
+      expect(preBoundaryTaxWei(135n, 136n, 2, BASE)).toBe(2n * 136n * BASE);
     });
 
     it("returns 0 when already current for the target epoch", () => {

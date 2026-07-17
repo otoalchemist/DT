@@ -86,13 +86,20 @@ export function classifyRisk(
 
 
 /**
- * Wei to send for a **pre-boundary** payTaxes that will execute in `targetEpoch`
- * (the first block of the new epoch), computed off-chain because our reads only
- * see the current epoch. Mirrors the on-chain estimate reverse-engineered from
- * live data: `(epochsBehindAtTarget + numEpochs - 1) * targetEpoch * baseTaxRateWei`,
- * where `epochsBehindAtTarget = targetEpoch - lastEpochPaid`. Returns 0 if the
- * token is already current for the target (nothing to pre-pay). If this value is
- * wrong when the tx lands, payTaxes reverts (wasted gas, no fund loss).
+ * Wei to send for a **pre-boundary / just-in-time** payTaxes that will execute in
+ * `targetEpoch` (the first block of the new epoch), computed off-chain because our
+ * reads only see the current epoch.
+ *
+ * JIT pays exactly **one upcoming epoch's amount** — `numEpochs * targetEpoch *
+ * baseTaxRateWei` — regardless of how many epochs the token is behind. This
+ * matches the game's JIT semantics (arm for epoch N -> pay `N * 0.00069`) and the
+ * observed boundary-block behaviour: every payTaxes that succeeded in the epoch-137
+ * boundary block sent exactly `1 * 137 * base` (0.09453 ETH), while a catch-up
+ * amount (`2 * 137`) was rejected with `IncorrectPayment`.
+ *
+ * Returns 0 if the token is already current for the target (nothing to pre-pay).
+ * If the value is wrong when the tx lands, payTaxes reverts — wasted gas, no fund
+ * loss (the contract refunds on revert).
  */
 export function preBoundaryTaxWei(
   lastEpochPaid: bigint,
@@ -100,10 +107,8 @@ export function preBoundaryTaxWei(
   numEpochs: number,
   baseTaxRateWei: bigint,
 ): bigint {
-  const behind = targetEpoch - lastEpochPaid;
-  if (behind <= 0n) return 0n;
-  const units = behind + BigInt(numEpochs) - 1n;
-  return units * targetEpoch * baseTaxRateWei;
+  if (lastEpochPaid >= targetEpoch) return 0n; // already current for the target epoch
+  return BigInt(numEpochs) * targetEpoch * baseTaxRateWei;
 }
 
 /** Would spending `total` drop the balance below the floor? */
