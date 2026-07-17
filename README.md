@@ -188,6 +188,14 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   block position is driven by **builder orderflow**, not tip — a defender who
   pre-pays will beat your audit regardless of gas, so this is lower-value than the
   payment race.
+- **Salted rival sweep order** — every bot sees the same candidate list in the
+  same order (same indexer, same on-chain enumeration), so without this every
+  instance would sweep the same tokens first, piling onto identical targets while
+  starving whichever ones are late in the list once the auditor-token pool runs
+  out. Each engine start picks a random salt and uses it to reorder the sweep
+  (offense, pre-boundary audit, pre-boundary kill) for that run — stable for the
+  run's lifetime, but different across restarts and across users. Always on, not
+  configurable.
 
 ## Race post-mortem
 

@@ -11,6 +11,7 @@ import {
   effectiveTipGwei,
   canAffordSpend,
   preBoundaryTaxWei,
+  orderBySalt,
 } from "./logic.js";
 
 describe("delinquency / audit math", () => {
@@ -121,6 +122,38 @@ describe("spend guardrails", () => {
     it("still allows a second spend when there is enough headroom for both", () => {
       expect(canAffordSpend(100n, 30n, 40n, 5n, 10n)).toBe(true); // 100-30-45 = 25 >= 10
     });
+  });
+});
+
+describe("orderBySalt (per-engine rival sweep shuffle)", () => {
+  const items = ["206", "257", "272", "382", "388", "401", "553", "711", "794", "831"];
+
+  it("is a pure permutation — same elements, just reordered", () => {
+    const result = orderBySalt(items, (x) => x, 12345);
+    expect([...result].sort()).toEqual([...items].sort());
+    expect(result).toHaveLength(items.length);
+  });
+
+  it("is deterministic for a given salt", () => {
+    const a = orderBySalt(items, (x) => x, 42);
+    const b = orderBySalt(items, (x) => x, 42);
+    expect(a).toEqual(b);
+  });
+
+  it("produces a different order for different salts", () => {
+    const a = orderBySalt(items, (x) => x, 1);
+    const b = orderBySalt(items, (x) => x, 2);
+    expect(a).not.toEqual(b);
+  });
+
+  it("does not mutate the input array", () => {
+    const copy = [...items];
+    orderBySalt(items, (x) => x, 7);
+    expect(items).toEqual(copy);
+  });
+
+  it("handles an empty list", () => {
+    expect(orderBySalt([], (x: string) => x, 99)).toEqual([]);
   });
 });
 

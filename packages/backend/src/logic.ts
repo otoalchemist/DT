@@ -111,6 +111,33 @@ export function preBoundaryTaxWei(
   return BigInt(numEpochs) * targetEpoch * baseTaxRateWei;
 }
 
+/**
+ * Deterministically order items by a salted hash of their key.
+ *
+ * Every bot enumerates rival candidates in the same order (the NFT API returns a
+ * stable list), so without this every user sweeps the same tokens first — piling
+ * onto identical targets and colliding on the same races, while tokens late in the
+ * list are never reached when the auditor pool runs out. Salting per engine start
+ * gives each run a stable but distinct order, spreading coverage across users.
+ *
+ * Stable for a given salt (so a run doesn't reshuffle mid-flight) and a pure
+ * permutation — same elements, just reordered.
+ */
+export function orderBySalt<T>(items: T[], keyOf: (item: T) => string, salt: number): T[] {
+  const hash = (key: string): number => {
+    let h = salt >>> 0;
+    for (let i = 0; i < key.length; i++) {
+      h = Math.imul(h ^ key.charCodeAt(i), 0x01000193) >>> 0; // FNV-1a style
+    }
+    return h >>> 0;
+  };
+  return [...items]
+    .map((item) => ({ item, h: hash(keyOf(item)) }))
+    // Tie-break on the key so equal hashes still order deterministically.
+    .sort((a, b) => a.h - b.h || keyOf(a.item).localeCompare(keyOf(b.item)))
+    .map((x) => x.item);
+}
+
 /** Would spending `total` drop the balance below the floor? */
 export function wouldBreachFloor(
   balance: bigint,

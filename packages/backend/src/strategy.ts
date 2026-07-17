@@ -23,7 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -38,6 +38,13 @@ let preBoundaryAuditTimer: NodeJS.Timeout | null = null;
 let preBoundaryKillTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
+// Randomized once per engine start (see startEngine) and used to reorder the
+// rival sweep (offensePass, firePreBoundaryAudit, firePreBoundaryKill) so every
+// bot instance doesn't audit/kill candidates in the same identical order — the
+// candidate list order itself is identical for everyone (same indexer, same
+// on-chain order), so without this every user piles onto the same first few
+// targets and starves the ones later in the list.
+let engineSalt = 0;
 // Total wei committed to spend so far in the current tick (value + gas of each
 // submitted tx). Reset at the top of every tick; consulted by canSpend so the
 // min-balance floor holds across all spends in a tick, not just each in isolation.
@@ -105,6 +112,7 @@ let proactivePaySubmitted = new Set<string>();
 
 export function startEngine(): void {
   if (timer || unwatchBlocks) return;
+  engineSalt = Math.floor(Math.random() * 0xffffffff);
   runtime.running = true;
   runtime.emitStatus();
   activity.add({ kind: "info", status: "info", message: "Engine started" });
@@ -331,7 +339,8 @@ async function firePreBoundaryAudit(): Promise<void> {
     if (auditors.length === 0) return;
 
     const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-    const live = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+    const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+    const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
     const owned = new Set(ownedIds.map((x) => x.toString()));
     const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
     // Auditable AT the target epoch, not already under audit.
@@ -396,7 +405,8 @@ async function firePreBoundaryKill(): Promise<void> {
     await nonceManager.sync(address, appConfig.mode);
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
     const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-    const live = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+    const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+    const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
     const owned = new Set(ownedIds.map((x) => x.toString()));
     const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
     const statuses = await batchGetTargetStatuses(live, runtime.currentEpoch ?? 0n, nowSec);
@@ -841,7 +851,8 @@ async function offensePass(
   }
 
   const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-  const live = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+  const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+  const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
 
