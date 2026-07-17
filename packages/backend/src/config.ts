@@ -41,8 +41,12 @@ if (savedSettings.mode && !process.env.MODE) {
 }
 
 const schema = z.object({
-  /** "mainnet" uses Flashbots; "public" broadcasts directly to mainnet mempool (faster, no frontrun protection); "local" targets an anvil fork. */
-  MODE: z.enum(["mainnet", "public", "local"]).default("public"),
+  /** "mainnet" (default) submits private bundles to the builders in BUILDER_URLS —
+   *  bundles sit in the block's top region regardless of tip, which is what wins a
+   *  boundary race; payments still mirror to the public mempool so they can't fail
+   *  to land. "public" broadcasts only to the mempool (seated after all bundles).
+   *  "local" targets an anvil fork. */
+  MODE: z.enum(["mainnet", "public", "local"]).default("mainnet"),
   /** If set, HTTP/WS/NFT endpoints are derived from it unless explicitly overridden. */
   ALCHEMY_API_KEY: z.string().optional(),
   RPC_HTTP_URL: z.string().url().optional(),

@@ -34,16 +34,19 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   jitEnabled: false,
   jitTargetEpoch: null,
   jitTokenIds: [],
-  preBoundaryPay: false,
+  preBoundaryPay: true,
   preBoundaryLeadMs: 3000,
   preBoundaryLeadMainnetMs: 5000,
+  // Offense stays OFF by default (it spends ETH and is a game strategy, not a
+  // profit engine) — but when a user turns it on, these are the settings that
+  // actually work, so they're pre-armed rather than left for them to discover.
   offenseEnabled: false,
-  autoAudit: false,
-  autoKill: false,
+  autoAudit: true,
+  autoKill: true,
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadDefaultRivalTargets(),
-  preBoundaryAudit: false,
-  preBoundaryKill: false,
+  preBoundaryAudit: true,
+  preBoundaryKill: true,
   maxBaseFeeGwei: 30,
   priorityFeeGwei: 2,
   minBalanceEth: 0.01,
@@ -56,7 +59,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseDynamicTipEnabled: false,
   offenseDynamicTipMaxGwei: 50,
   offenseBoundaryScheduling: false,
-  racePublicMempool: false,
+  racePublicMempool: true,
   dynamicTipEnabled: false,
   dynamicTipMaxGwei: 50,
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)

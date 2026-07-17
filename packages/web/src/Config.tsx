@@ -282,35 +282,10 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         so any builder can include them next block. Trades bundle privacy for speed. No effect in public mode.
       </p>
 
-      <div className="spacer" />
-      <details>
-        <summary style={{ cursor: "pointer", userSelect: "none", marginBottom: 6 }}>
-          <span className="muted" style={{ fontSize: 11 }}>DEFENSE</span>
-          <span className="muted" style={{ fontSize: 11 }}>
-            {" "}· {cfg.enabled ? "on" : "off"} — rarely used, click to expand
-          </span>
-        </summary>
-        <label className="check">
-          <input type="checkbox" checked={cfg.enabled} onChange={chk("enabled")} />
-          Enable defense (auto-pay taxes to keep your citizens alive)
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={cfg.proactivePay} onChange={chk("proactivePay")} disabled={!cfg.enabled} />
-          Proactively pay when delinquent (avoid being auditable)
-        </label>
-        <label className="field">
-          Clear audits with this much time to spare (hours)
-          <input
-            type="number" min={0} step={0.5}
-            value={cfg.auditSafetyBufferSeconds / 3600}
-            onChange={(e) => set("auditSafetyBufferSeconds", Math.round(Number(e.target.value) * 3600))}
-          />
-        </label>
-        <label className="field">
-          Epochs to prepay per payment (1–7, locks current rate)
-          <input type="number" min={1} max={7} value={cfg.prepayEpochs} onChange={num("prepayEpochs")} />
-        </label>
-      </details>
+      {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
+          JIT payment enables it automatically. The values still apply and remain
+          editable in data/config.json (enabled, proactivePay,
+          auditSafetyBufferSeconds, prepayEpochs). */}
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>
