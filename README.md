@@ -178,6 +178,16 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   wrong value is caught before spending gas; the normal post-boundary JIT pay still
   runs as a fallback. Off by default; enable it under *Just-in-time epoch payment →
   Payment gas*.
+- **Atomic multi-tx bundles (`mainnet` mode, automatic)** — every Citizen you hold
+  is owned by the same wallet, so paying/auditing several in one cycle produces
+  multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only
+  the first (nonce == chain nonce) is a self-valid bundle; the rest carry a nonce
+  gap and won't be placed top-of-block by builders. The bot instead collects a
+  cycle's txs and submits them as **one atomic bundle** (txs in nonce order), so
+  **all** of them win top-of-block together — what you need to out-order a
+  batch-auditor hitting several of your citizens at once. Each tx still mirrors to
+  the public mempool individually as a fallback. No configuration; always on in
+  `mainnet` mode.
 - **Race audits/kills into the first block** (advanced, opt-in) — the offense
   equivalents. *Race audits* pre-submits audits just before the epoch boundary so
   they land the instant rivals become delinquent (like a batch-auditor); *race

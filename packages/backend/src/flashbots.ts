@@ -32,6 +32,9 @@ export interface SubmitResult {
   valueWei: bigint;
   gasWei: bigint;
   error?: string;
+  /** mainnet only: the tx was prepared + queued into an open bundle batch rather
+   *  than sent immediately. txHash/bundleHash are filled in later by flushBundle. */
+  queued?: boolean;
 }
 
 // --- Flashbots reputation signer (identity only; holds no funds) ---
@@ -205,6 +208,116 @@ async function simulateAtTimestamp(
   }
 }
 
+// --- Bundle batching (mainnet only) ---
+// Every Citizen you hold is owned by the same wallet, so multiple payments/audits
+// in one tick share a single nonce sequence. Sent as independent single-tx
+// bundles, only the first (nonce == chain nonce) is a self-valid bundle; the rest
+// carry a nonce gap and won't be placed top-of-block by builders (bundle merging
+// across independent bundles is best-effort). Collecting a tick's txs into ONE
+// atomic multi-tx bundle keeps the nonces valid in order and wins top-of-block
+// for ALL of them together — exactly what's needed to out-order a batch-auditor
+// hitting several of your citizens at once. Only meaningful in mainnet mode;
+// public/local always send immediately.
+interface QueuedTx {
+  signed: Hex;
+  nonce: number;
+  race: boolean;
+}
+let bundleQueue: QueuedTx[] | null = null;
+
+/** Open a batching window: subsequent mainnet submitTx calls queue their signed
+ *  tx instead of sending, until flushBundle() emits them as one bundle. */
+export function beginBundle(): void {
+  bundleQueue = [];
+}
+
+export interface BundleTxResult {
+  ok: boolean;
+  txHash?: Hex;
+  bundleHash?: string;
+  error?: string;
+}
+
+/**
+ * Send everything queued since beginBundle() as a single atomic multi-tx bundle
+ * (txs in ascending-nonce order) per target block, mirroring each race-flagged tx
+ * to the public mempool as a fallback. Returns a per-nonce result map so the
+ * caller can fill in each activity entry's hashes and start receipt tracking.
+ * Always closes the batching window, even on error.
+ */
+export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
+  const queue = bundleQueue;
+  bundleQueue = null;
+  const out = new Map<number, BundleTxResult>();
+  if (!queue || queue.length === 0) return out;
+
+  // A bundle executes its txs in the given order, so nonces must ascend.
+  queue.sort((a, b) => a.nonce - b.nonce);
+  const signedList = queue.map((q) => q.signed);
+  const targetBlock = (await publicClient.getBlockNumber()) + 1n;
+
+  // One multi-tx bundle, fanned out to every builder for the next two blocks.
+  const acceptedBy = new Set<string>();
+  const bundleHashes: string[] = [];
+  const attempts = appConfig.builderUrls.flatMap((url) =>
+    [targetBlock, targetBlock + 1n].map(async (blk) => {
+      const r = await flashbotsRpcWithTimeout(
+        "eth_sendBundle",
+        [{ txs: signedList, blockNumber: toHex(blk) }],
+        url,
+        SEND_BUNDLE_TIMEOUT_MS,
+      );
+      return { url, bundleHash: r?.bundleHash as string | undefined };
+    }),
+  );
+
+  // Public-mempool mirror per race-flagged tx (identical tx: same nonce/sig, so
+  // only one copy of each can ever land). Fired concurrently with the bundle.
+  const broadcasts = queue.map((q) =>
+    q.race
+      ? publicClient
+          .sendRawTransaction({ serializedTransaction: q.signed })
+          .then((h) => ({ nonce: q.nonce, txHash: h as Hex | undefined }))
+          .catch((err) => {
+            logger.warn(`public broadcast (nonce ${q.nonce}) failed:`, (err as Error).message);
+            return { nonce: q.nonce, txHash: undefined as Hex | undefined };
+          })
+      : Promise.resolve({ nonce: q.nonce, txHash: undefined as Hex | undefined }),
+  );
+
+  const [settled, mirrors] = await Promise.all([
+    Promise.allSettled(attempts),
+    Promise.all(broadcasts),
+  ]);
+  for (const s of settled) {
+    if (s.status === "fulfilled") {
+      acceptedBy.add(hostOf(s.value.url));
+      if (s.value.bundleHash) bundleHashes.push(s.value.bundleHash);
+    } else {
+      logger.warn("sendBundle failed:", (s.reason as Error).message);
+    }
+  }
+  const bundleHash = bundleHashes[0];
+  const bundleOk = bundleHashes.length > 0;
+  if (acceptedBy.size > 0) {
+    logger.info(
+      `batched bundle (${queue.length} tx) accepted by ${acceptedBy.size}/${appConfig.builderUrls.length} builders: ${[...acceptedBy].join(", ")}`,
+    );
+  }
+
+  const txHashByNonce = new Map(mirrors.map((m) => [m.nonce, m.txHash]));
+  for (const q of queue) {
+    const txHash = txHashByNonce.get(q.nonce);
+    out.set(q.nonce, {
+      ok: bundleOk || txHash !== undefined,
+      txHash,
+      bundleHash,
+      error: !bundleOk && txHash === undefined ? "no bundle accepted" : undefined,
+    });
+  }
+  return out;
+}
+
 export async function submitTx(
   intent: TxIntent,
   opts: {
@@ -312,10 +425,19 @@ export async function submitTx(
     return { ...base, ok: true, txHash, targetBlock };
   }
 
-  // mainnet: fan the bundle out to EVERY configured builder for the next two
-  // blocks. Only the builder that wins a slot can include us, so submitting to one
-  // relay means only winning when that relay's builder wins. All attempts run in
-  // parallel; unreachable builders are tolerated — we succeed if ANY accepts.
+  // mainnet: if a batching window is open (beginBundle), queue this tx so the
+  // whole tick's txs go out as ONE atomic multi-tx bundle with valid sequential
+  // nonces (see flushBundle). Hashes are filled in by the caller after flush.
+  if (bundleQueue !== null) {
+    bundleQueue.push({ signed, nonce, race: opts.race ?? false });
+    return { ...base, ok: true, queued: true, targetBlock };
+  }
+
+  // No batch open: fan this single-tx bundle out to EVERY configured builder for
+  // the next two blocks. Only the builder that wins a slot can include us, so
+  // submitting to one relay means only winning when that relay's builder wins. All
+  // attempts run in parallel; unreachable builders are tolerated — succeed if ANY
+  // accepts.
   const bundleHashes: string[] = [];
   const acceptedBy = new Set<string>();
   const attempts = appConfig.builderUrls.flatMap((url) =>

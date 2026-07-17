@@ -22,7 +22,7 @@ import {
   fetchCandidateTokenIds,
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
-import { submitTx, type TxIntent, type SubmitResult } from "./flashbots.js";
+import { submitTx, beginBundle, flushBundle, type TxIntent, type SubmitResult } from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
@@ -49,6 +49,43 @@ let engineSalt = 0;
 // submitted tx). Reset at the top of every tick; consulted by canSpend so the
 // min-balance floor holds across all spends in a tick, not just each in isolation.
 let committedThisTickWei = 0n;
+
+// Activity entries whose tx was queued into the current bundle batch (mainnet).
+// flushBatch fills in each one's txHash/bundleHash and starts receipt tracking
+// once the whole tick's txs are sent together as one atomic bundle.
+let batchEntries: { entryId: string; nonce: number }[] = [];
+
+/** Open a bundle batch for a tick so all its txs go out as one atomic multi-tx
+ *  bundle (mainnet only; public/local send each tx immediately as before). */
+function beginBatch(): void {
+  batchEntries = [];
+  if (appConfig.mode === "mainnet") beginBundle();
+}
+
+/** Send the tick's queued txs as one bundle and reconcile each activity entry
+ *  with its resulting hashes / status. No-op in public/local mode. */
+async function flushBatch(): Promise<void> {
+  const entries = batchEntries;
+  batchEntries = [];
+  if (appConfig.mode !== "mainnet" || entries.length === 0) return;
+  let results: Awaited<ReturnType<typeof flushBundle>>;
+  try {
+    results = await flushBundle();
+  } catch (err) {
+    logger.error("bundle flush error:", (err as Error).message);
+    return;
+  }
+  for (const { entryId, nonce } of entries) {
+    const r = results.get(nonce);
+    if (!r) continue;
+    activity.update(entryId, {
+      status: r.ok ? "submitted" : "skipped",
+      txHash: r.txHash,
+      bundleHash: r.bundleHash,
+    });
+    if (r.txHash) void trackReceipt(entryId, r.txHash);
+  }
+}
 
 // NOTE: the pre-boundary races now simulate at the future boundary/expiry
 // timestamp (see submitTx's simTimestamp), so they validate correctly in BOTH
@@ -226,6 +263,7 @@ async function firePreBoundaryPay(): Promise<void> {
   if (ticking) { setTimeout(() => void firePreBoundaryPay(), 150); return; } // don't overlap nonce use
   ticking = true;
   committedThisTickWei = 0n;
+  beginBatch();
   const address = runtime.account.address;
   const targetEpoch = BigInt(s.jitTargetEpoch);
   // The instant the target epoch begins — we simulate there so the value is
@@ -265,6 +303,7 @@ async function firePreBoundaryPay(): Promise<void> {
     logger.error("pre-boundary pay error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
   } finally {
+    await flushBatch();
     nonceManager.reset();
     ticking = false;
   }
@@ -327,6 +366,7 @@ async function firePreBoundaryAudit(): Promise<void> {
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
   committedThisTickWei = 0n;
+  beginBatch();
   const address = runtime.account.address;
   const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
@@ -366,6 +406,7 @@ async function firePreBoundaryAudit(): Promise<void> {
     logger.error("pre-boundary audit error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
   } finally {
+    await flushBatch();
     nonceManager.reset();
     ticking = false;
   }
@@ -397,6 +438,7 @@ async function firePreBoundaryKill(): Promise<void> {
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
   committedThisTickWei = 0n;
+  beginBatch();
   const address = runtime.account.address;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
@@ -429,6 +471,7 @@ async function firePreBoundaryKill(): Promise<void> {
     logger.error("pre-boundary kill error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary kill error: ${(err as Error).message}` });
   } finally {
+    await flushBatch();
     nonceManager.reset();
     ticking = false;
   }
@@ -647,6 +690,12 @@ async function act(
       message: dryRun ? `[dry-run] ${ctx.message}` : ctx.message,
     });
     runtime.emitStatus();
+    // Queued into a bundle batch (mainnet): the tx isn't sent yet, so its hashes
+    // and receipt tracking are reconciled by flushBatch at end of tick.
+    if (result.queued) {
+      batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+      return result;
+    }
     // Watch for the receipt so the entry flips submitted -> included/reverted.
     // Only public-mempool submissions expose a tx hash; pure Flashbots bundles
     // (bundleHash only) stay "submitted" since there's nothing to poll.
@@ -926,6 +975,7 @@ async function tick(fireProactivePay = false): Promise<void> {
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   ticking = true;
   committedThisTickWei = 0n; // fresh spend budget for this tick
+  beginBatch();
   const address = runtime.account.address;
   try {
     // Snapshot + nonce sync are independent RPC reads — run them together so the
@@ -956,6 +1006,7 @@ async function tick(fireProactivePay = false): Promise<void> {
     logger.error("tick error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Tick error: ${(err as Error).message}` });
   } finally {
+    await flushBatch();
     nonceManager.reset();
     ticking = false;
   }
