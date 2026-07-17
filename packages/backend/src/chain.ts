@@ -3,6 +3,7 @@ import {
   createWalletClient,
   http,
   webSocket,
+  type Block,
   type PublicClient,
   type WalletClient,
   type Transport,
@@ -30,7 +31,26 @@ export let wsClient: PublicClient | null = appConfig.wsUrl
 export function reinitClients(httpUrl: string, wsUrl?: string | null): void {
   publicClient = createPublicClient({ chain: mainnet, transport: makeHttpTransport(httpUrl) });
   wsClient = wsUrl ? createPublicClient({ chain: mainnet, transport: webSocket(wsUrl) }) : null;
+  cachedBlock = null; // drop any block cached against the old client
   logger.info(`RPC clients reinitialized (${httpUrl.slice(0, 40)}…)`);
+}
+
+// Short-lived cache of the latest block. Within one engine tick the base fee is
+// read many times — once per candidate in the guardrail (canSpend) and again per
+// submitted tx (computeFees). Blocks are ~12s apart, so reusing the same block for
+// a few seconds can't skip a fee change, and it makes the guardrail and the fee
+// builder agree on one block instead of racing separate reads. TTL is well under
+// a slot so cross-tick staleness stays within one block (base fee moves ≤12.5%,
+// inside the 2× maxFee buffer).
+let cachedBlock: { at: number; block: Block } | null = null;
+const BLOCK_CACHE_MS = 3_000;
+
+export async function getLatestBlockCached(maxAgeMs = BLOCK_CACHE_MS): Promise<Block> {
+  const now = Date.now();
+  if (cachedBlock && now - cachedBlock.at <= maxAgeMs) return cachedBlock.block;
+  const block = await publicClient.getBlock({ blockTag: "latest" });
+  cachedBlock = { at: now, block };
+  return block;
 }
 
 /** Build a wallet client bound to an unlocked account for signing. */

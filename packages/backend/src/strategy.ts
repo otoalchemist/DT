@@ -1,14 +1,13 @@
 import { parseEther, formatEther, type Address } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
-import { publicClient, wsClient } from "./chain.js";
+import { publicClient, wsClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { activity } from "./activity.js";
 import { nonceManager } from "./nonce.js";
 import {
   getGameSnapshot,
-  getOwnedTokenStatus,
-  getTargetStatus,
+  batchGetOwnedStatuses,
   batchGetTargetStatuses,
   filterLiveTokenIds,
   encodePayTaxes,
@@ -581,7 +580,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
 async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boolean; reason?: string }> {
   const s = runtime.strategy;
   const gas = resolveGas(s, offense);
-  const block = await publicClient.getBlock({ blockTag: "latest" });
+  const block = await getLatestBlockCached();
   const baseFee = block.baseFeePerGas ?? 0n;
   const maxBase = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
   if (baseFee > maxBase) {
@@ -719,8 +718,9 @@ async function defensePass(
   nowSec: bigint,
 ): Promise<void> {
   const s = runtime.strategy;
-  for (const tokenId of ownedIds) {
-    const st = await getOwnedTokenStatus(tokenId, currentEpoch, nowSec, s.prepayEpochs);
+  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, s.prepayEpochs);
+  for (const st of statuses) {
+    const tokenId = BigInt(st.tokenId);
     const underAudit = st.auditDueTimestamp !== "0";
     const bribes = BigInt(st.bribeBalance);
 
@@ -773,11 +773,12 @@ async function proactivePayPass(
     proactivePaySubmittedEpoch = currentEpoch;
     proactivePaySubmitted = new Set();
   }
-  for (const tokenId of ownedIds) {
-    const key = tokenId.toString();
+  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, s.prepayEpochs);
+  for (const st of statuses) {
+    const tokenId = BigInt(st.tokenId);
+    const key = st.tokenId;
     if (proactivePaySubmitted.has(key)) continue;
 
-    const st = await getOwnedTokenStatus(tokenId, currentEpoch, nowSec, s.prepayEpochs);
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
 
@@ -821,11 +822,12 @@ async function jitPass(
   const selected = s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds;
   if (selected.length === 0) return; // nothing owned yet — stay armed
 
-  for (const tokenId of selected) {
-    const key = tokenId.toString();
+  const statuses = await batchGetOwnedStatuses(selected, currentEpoch, nowSec, 1);
+  for (const st of statuses) {
+    const tokenId = BigInt(st.tokenId);
+    const key = st.tokenId;
     if (jitSubmitted.has(key)) continue;
 
-    const st = await getOwnedTokenStatus(tokenId, currentEpoch, nowSec, 1);
     if (BigInt(st.lastEpochPaid) >= currentEpoch) {
       jitSubmitted.add(key); // already current for this epoch
       continue;
@@ -905,11 +907,26 @@ async function offensePass(
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
 
-  // Pool of owned tokens we can audit FROM this tick (each backs one audit,
-  // since a token audits at most `auditLimit` times per epoch). We hand them out
-  // one per target so multiple rivals can be audited in a single epoch instead
-  // of reusing one token and reverting on the second with AuditLimitReached.
-  const auditors = await findEligibleAuditors(ownedIds, currentEpoch);
+  // Narrow to tokens we could actually act on BEFORE reading their status, then
+  // fetch all their statuses in ONE multicall — a serial getTargetStatus per
+  // token was hundreds/thousands of sequential RPC round-trips when offense
+  // targets the whole field (viem's http batching can't coalesce awaited calls).
+  const candidates = live.filter(({ id }) => {
+    const key = id.toString();
+    if (owned.has(key)) return false; // never audit our own
+    if (pinned && !pinned.has(key)) return false; // not on the target list
+    return true;
+  });
+
+  // The auditor pool (owned tokens usable as an audit "from" this tick — each
+  // backs one audit, since a token audits at most `auditLimit` times/epoch) and
+  // the target statuses are independent reads, so fetch them concurrently. We hand
+  // auditors out one per target so multiple rivals can be audited in a single
+  // epoch instead of reusing one token and reverting with AuditLimitReached.
+  const [auditors, statuses] = await Promise.all([
+    findEligibleAuditors(ownedIds, currentEpoch),
+    batchGetTargetStatuses(candidates, currentEpoch, nowSec),
+  ]);
   let auditorIdx = 0;
   let noAuditorSkips = 0;
 
@@ -917,10 +934,8 @@ async function offensePass(
   // can pre-empt the exact moment a kill becomes valid. Reset each sweep.
   let soonestKillDeadline: bigint | null = null;
 
-  for (const { id: tokenId, owner } of live) {
-    if (owned.has(tokenId.toString())) continue;
-    if (pinned && !pinned.has(tokenId.toString())) continue; // not on the target list
-    const t = await getTargetStatus(tokenId, owner, currentEpoch, nowSec);
+  for (const t of statuses) {
+    const tokenId = BigInt(t.tokenId);
 
     // Note the nearest future kill deadline (token under audit, not yet expired).
     const due = BigInt(t.auditDueTimestamp);

@@ -178,6 +178,53 @@ export async function batchGetTargetStatuses(
   return out;
 }
 
+/**
+ * Full status for many owned tokens in ONE multicall, instead of a serial
+ * getOwnedTokenStatus per token (N RPC round-trips). Used by the defense/proactive/
+ * JIT sweeps, which each iterate every owned token every tick. Preserves input
+ * order; a token whose reads fail is omitted (its status can't be classified).
+ */
+export async function batchGetOwnedStatuses(
+  tokenIds: bigint[],
+  currentEpoch: bigint,
+  nowSec: bigint,
+  prepayEpochs = 1,
+): Promise<OwnedTokenStatus[]> {
+  if (tokenIds.length === 0) return [];
+  const PER = 5; // lastEpochPaid, auditDueTimestamp, bribeBalance, hasLifeInsurance, estimateTaxesToPay
+  const contracts = tokenIds.flatMap((tokenId) => [
+    { ...game, functionName: "lastEpochPaid" as const, args: [tokenId] as const },
+    { ...game, functionName: "auditDueTimestamp" as const, args: [tokenId] as const },
+    { ...game, functionName: "bribeBalance" as const, args: [tokenId] as const },
+    { ...game, functionName: "hasLifeInsurance" as const, args: [tokenId] as const },
+    { ...game, functionName: "estimateTaxesToPay" as const, args: [tokenId, prepayEpochs] as const },
+  ]);
+
+  const results = await publicClient.multicall({ allowFailure: true, contracts });
+
+  const out: OwnedTokenStatus[] = [];
+  for (let i = 0; i < tokenIds.length; i++) {
+    const slice = results.slice(i * PER, i * PER + PER);
+    if (slice.some((r) => !r || r.status === "failure")) continue;
+    const [lastEpochPaid, auditDue, bribeBalance, hasLifeInsurance, estimate] = slice.map(
+      (r) => r!.result,
+    ) as [bigint, bigint, bigint, boolean, bigint];
+    const { risk, secondsUntilKillable } = classifyRisk(lastEpochPaid, currentEpoch, auditDue, nowSec);
+    out.push({
+      tokenId: tokenIds[i]!.toString(),
+      lastEpochPaid: lastEpochPaid.toString(),
+      currentEpoch: currentEpoch.toString(),
+      auditDueTimestamp: auditDue.toString(),
+      secondsUntilKillable,
+      bribeBalance: bribeBalance.toString(),
+      hasLifeInsurance,
+      risk,
+      estimatedPayWei: estimate.toString(),
+    });
+  }
+  return out;
+}
+
 export async function estimateTaxes(
   tokenId: bigint,
   numEpochs: number,

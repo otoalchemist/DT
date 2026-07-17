@@ -7,7 +7,7 @@ import {
   type PrivateKeyAccount,
 } from "viem/accounts";
 import { mainnet } from "viem/chains";
-import { publicClient } from "./chain.js";
+import { publicClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { nonceManager } from "./nonce.js";
@@ -99,7 +99,7 @@ async function computeFees(offense: boolean): Promise<{
   baseFee: bigint;
 }> {
   const gas = resolveGas(runtime.strategy, offense);
-  const block = await publicClient.getBlock({ blockTag: "latest" });
+  const block = await getLatestBlockCached();
   const baseFee = block.baseFeePerGas ?? 0n;
 
   // Priority tip: static by default, or scaled up by block fullness when the

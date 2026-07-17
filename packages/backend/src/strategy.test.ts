@@ -22,6 +22,7 @@ vi.mock("./chain.js", () => ({
     getBalance: vi.fn(async () => 10_000_000_000_000_000_000n), // 10 ETH
     getBlockNumber: vi.fn(async () => 100n),
   },
+  getLatestBlockCached: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n })), // 10 gwei
   wsClient: null, // force the 12s-poll fallback path, no block-watch subscription to simulate
 }));
 
@@ -61,6 +62,8 @@ vi.mock("./flashbots.js", () => ({
     valueWei: intent.value,
     gasWei: 0n,
   })),
+  beginBundle: vi.fn(),
+  flushBundle: vi.fn(async () => new Map()),
 }));
 
 vi.mock("./contract.js", () => ({
@@ -71,18 +74,20 @@ vi.mock("./contract.js", () => ({
     citizensAddress: "0x000000000000000000000000000000000000cc",
     citizenSupply: 100n,
   })),
-  getOwnedTokenStatus: vi.fn(async (tokenId: bigint, currentEpoch: bigint) => ({
-    tokenId: tokenId.toString(),
-    lastEpochPaid: LAST_EPOCH_PAID.toString(),
-    currentEpoch: currentEpoch.toString(),
-    auditDueTimestamp: "0", // never under audit in this scenario
-    secondsUntilKillable: null,
-    bribeBalance: "0",
-    hasLifeInsurance: false,
-    risk: isAuditableStub(LAST_EPOCH_PAID, currentEpoch) ? "delinquent" : "safe",
-    estimatedPayWei: "1000000000000000",
-  })),
-  getTargetStatus: vi.fn(),
+  batchGetOwnedStatuses: vi.fn(async (tokenIds: bigint[], currentEpoch: bigint) =>
+    tokenIds.map((tokenId) => ({
+      tokenId: tokenId.toString(),
+      lastEpochPaid: LAST_EPOCH_PAID.toString(),
+      currentEpoch: currentEpoch.toString(),
+      auditDueTimestamp: "0", // never under audit in this scenario
+      secondsUntilKillable: null,
+      bribeBalance: "0",
+      hasLifeInsurance: false,
+      risk: isAuditableStub(LAST_EPOCH_PAID, currentEpoch) ? "delinquent" : "safe",
+      estimatedPayWei: "1000000000000000",
+    })),
+  ),
+  batchGetTargetStatuses: vi.fn(async () => []),
   filterLiveTokenIds: vi.fn(async () => []),
   estimateTaxes: vi.fn(async () => 1_000_000_000_000_000n),
   encodePayTaxes: vi.fn(() => "0xPAYTAXES"),
