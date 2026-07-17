@@ -3,7 +3,7 @@
 A self-hosted automation bot for the on-chain game **[Death & Taxes](https://etherscan.io/address/0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F)** by Transient Labs. It watches the game for you and acts automatically:
 
 - **Defense (primary):** never let one of your Citizen tokens get killed. If a token is audited, the bot clears the audit by **paying taxes** before the 24-hour deadline (this also makes the token current, so it can't be immediately re-audited). It can also pay proactively so your tokens are never even auditable, and prepay up to 7 epochs to lock the current (lower) tax rate. It **won't spend a held bribe** to clear an audit unless you opt in (`autoUseBribe`, off by default) — a bribe is free but consumed and leaves the token still delinquent.
-- **Just-in-time epoch payment (one-shot):** arm the bot for a single upcoming epoch and it pays exactly one epoch for each of your citizens *the moment that epoch begins on-chain* — before they can be audited — then auto-disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per citizen the instant epoch 133 starts. The exact amount is read on-chain at pay time, so it's always correct even for multiple citizens. A lost/failed JIT payment never balloons the spend — see the **auto-pay catch-up cap** below.
+- **Just-in-time epoch payment (one-shot):** arm the bot for a single upcoming epoch and it pays exactly one epoch for each of your citizens *the moment that epoch begins on-chain* — before they can be audited — then auto-disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per citizen the instant epoch 133 starts. The exact amount is read on-chain at pay time, so it's always correct even for multiple citizens. Each JIT payment is exactly one epoch (one day) and advances the citizen a single epoch, so it fires even when a citizen is momentarily 2 epochs behind at the boundary, and never balloons into a multi-day charge — see the **per-payment epoch cap** below.
 - **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. It audits **multiple rivals per epoch** — up to each eligible citizen's **`auditLimit`** (auditor-role tokens can audit several times per epoch; the bot reads each token's remaining capacity and uses all of it), instead of just one. This is a game strategy, not a profit engine — see below.
 - **Reliable inclusion:** choose your submission path — **`mainnet`** (the default: private **bundles** fanned out to several block builders; bundles sit in the block's top region *regardless of tip*, which is what wins a boundary race — and payments still mirror to the public mempool so they can't fail to land) or **`public`** (mempool only, seated after every bundle). Optional latency edges let payments/offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
 - **Live activity log:** every action is timestamped with its status; submitted transactions link to Etherscan and auto-update from **submitted → included / reverted** once the receipt lands.
@@ -162,16 +162,17 @@ cp data/config.example.json data/config.json
   a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
   The min-balance floor is enforced **cumulatively** — several payments in one
   cycle can't sneak the wallet below it.
-- **Auto-pay catch-up cap (`maxAutoPayEpochsBehind`, default `1`):** the bot will
-  never **automatically** pay a citizen that is more than this many epochs behind —
-  it caps *every* automatic path (JIT, pre-boundary race, proactive-pay, and
-  clearing an audit in defense). At the default of `1` it only auto-pays
-  single-epoch amounts, so a lost/failed payment never balloons into a multi-day
-  catch-up. **Important consequence:** a citizen that falls **2+ epochs behind is
-  left alone — including while under audit** — and logged for you to clear manually
-  before its 24h kill deadline. This is deliberate (you decide when to pay), but it
-  means the bot won't auto-rescue a deeply-behind citizen: raise the cap (e.g. a
-  large number) if you want it to auto-clear audits regardless of depth.
+- **Per-payment epoch cap (`maxAutoPayEpochs`, default `1`):** the most epochs a
+  single **automatic** payment may cover. On-chain, `payTaxes(tokenId, n)` costs
+  `n × currentEpoch × base` and advances the token `n` epochs, so this caps the ETH
+  spent per auto payment. At the default of `1`, auto-payments never spend more than
+  one day's taxes at once — a lost/failed payment never balloons into a multi-day
+  charge. **JIT and the pre-boundary race always pay exactly one epoch and are never
+  blocked by this**, so the single-epoch payment for the upcoming epoch still fires
+  even when a citizen is momentarily 2 epochs behind at the boundary (the tax-skip
+  case). The cap only limits the multi-epoch paths — proactive-pay and defense —
+  which otherwise pay `prepayEpochs`; raise it to let those auto-catch-up several
+  epochs in one payment. Edited in the **Just-in-time epoch payment** panel.
 - **Separate offense gas (audit/kill):** audit/kill bid their own gas,
   independent of payments — it's a race against rivals where a payment isn't, so
   it carries a different tip and base-fee cap. **On by default**; turn off

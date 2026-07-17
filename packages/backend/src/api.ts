@@ -28,7 +28,7 @@ const strategyPatch = z
     proactivePay: z.boolean(),
     prepayEpochs: z.number().int().min(1).max(7),
     autoUseBribe: z.boolean(),
-    maxAutoPayEpochsBehind: z.number().int().min(1),
+    maxAutoPayEpochs: z.number().int().min(1),
     jitEnabled: z.boolean(),
     jitTargetEpoch: z.number().int().min(1).nullable(),
     jitTokenIds: z.array(z.string()),

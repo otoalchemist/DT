@@ -86,14 +86,16 @@ export interface StrategyConfig {
    *  the token still delinquent). OFF by default — the bot pays taxes to clear
    *  instead, so bribes are never auto-consumed unless you opt in. */
   autoUseBribe: boolean;
-  /** Global auto-pay catch-up cap: the bot will not AUTOMATICALLY pay a citizen
-   *  that is more than this many epochs behind — larger catch-ups are left for you
-   *  to pay manually. Applies to every automatic path (JIT, pre-boundary race,
-   *  proactive-pay, defense audit-clear). Default 1 = only auto-pay single-epoch
-   *  amounts; a citizen 2+ epochs behind (e.g. already under audit) is left alone
-   *  for you to decide when to pay. Raise it to restore deeper auto-catch-up
-   *  (e.g. a large number to auto-clear audits regardless of depth). */
-  maxAutoPayEpochsBehind: number;
+  /** Global cap on how many epochs a single AUTOMATIC payment may cover. On-chain,
+   *  payTaxes(tokenId, n) costs n * currentEpoch * base and advances the token n
+   *  epochs — so this caps the ETH spent per auto payment. Applies to proactive-pay
+   *  and defense (which would otherwise pay `prepayEpochs`); JIT and the pre-boundary
+   *  race always pay exactly one epoch and are never blocked, so the single-epoch
+   *  payment for the upcoming epoch still fires even when a citizen is momentarily
+   *  2 behind. Default 1 = auto-payments never spend more than one day's taxes at
+   *  once; a lost/failed payment never balloons into a multi-day charge. Raise it to
+   *  let proactive-pay / defense auto-catch-up multiple epochs in one payment. */
+  maxAutoPayEpochs: number;
 
   // --- Just-in-time single-epoch payment (one-shot) ---
   /** When armed, pay exactly one epoch for each selected token the moment the

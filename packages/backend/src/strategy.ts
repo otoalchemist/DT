@@ -22,7 +22,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, beginBundle, flushBundle, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, exceedsAutoPayCap, orderBySalt } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -285,18 +285,10 @@ async function firePreBoundaryPay(): Promise<void> {
       const lastEpochPaid = r.result as bigint;
       if (lastEpochPaid >= targetEpoch) continue; // already current for the target
       const key = selected[i]!.toString();
-      // Global auto-pay cap (relative to the target epoch): don't pre-pay a token
-      // more than maxAutoPayEpochsBehind behind the target — a prior JIT didn't
-      // land and this would be a multi-day catch-up. Left for manual handling.
-      if (exceedsAutoPayCap(lastEpochPaid, targetEpoch, s.maxAutoPayEpochsBehind)) {
-        activity.add({
-          kind: "pay-taxes",
-          status: "skipped",
-          tokenId: key,
-          message: `Pre-boundary JIT skip #${key}: ${targetEpoch - lastEpochPaid} epochs behind target (auto-pay cap ${s.maxAutoPayEpochsBehind}) — needs manual catch-up.`,
-        });
-        continue;
-      }
+      // JIT always pays exactly one epoch — one day (targetEpoch * base) — which
+      // advances the citizen a single epoch regardless of how far behind it is. So
+      // it fires even when the citizen is momentarily 2 behind at the boundary (the
+      // tax-skip case); the auto-pay cap governs multi-epoch paths, not this one.
       const value = preBoundaryTaxWei(lastEpochPaid, targetEpoch, 1, BASE_TAX_RATE_WEI);
       if (value === 0n) continue;
       const guard = await canSpend(value, false); // enforces max-base-fee, floor, max-payment caps
@@ -735,7 +727,10 @@ async function defensePass(
   nowSec: bigint,
 ): Promise<void> {
   const s = runtime.strategy;
-  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, s.prepayEpochs);
+  // Cap how many epochs a single auto payment covers (the on-chain estimate is
+  // read for this many). Default cap 1 = pay one day to clear, as before.
+  const epochs = cappedAutoPayEpochs(s.prepayEpochs, s.maxAutoPayEpochs);
+  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, epochs);
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const underAudit = st.auditDueTimestamp !== "0";
@@ -761,25 +756,16 @@ async function defensePass(
         );
         continue;
       }
-      // Global auto-pay cap: clearing an audit means paying for every epoch the
-      // token is behind (audited tokens are always 2+ behind). If that exceeds
-      // maxAutoPayEpochsBehind (default 1), don't auto-pay the catch-up — leave the
-      // token under audit for the user to clear manually before its deadline.
-      if (exceedsAutoPayCap(BigInt(st.lastEpochPaid), currentEpoch, s.maxAutoPayEpochsBehind)) {
-        const behind = currentEpoch - BigInt(st.lastEpochPaid);
-        activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Left under audit #${st.tokenId}: ${behind} epochs behind (auto-pay cap ${s.maxAutoPayEpochsBehind}) — clear manually before the kill deadline.` });
-        continue;
-      }
-      const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (same epochs)
+      const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
       const guard = await canSpend(value, false);
       if (!guard.ok) {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer pay #${st.tokenId}: ${guard.reason}` });
         continue;
       }
       await act(
-        { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, s.prepayEpochs), value },
+        { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, epochs), value },
         "pay-taxes",
-        { tokenId: st.tokenId, message: `Pay taxes on audited #${st.tokenId} (${s.prepayEpochs} epoch) = ${formatEther(value)} ETH` },
+        { tokenId: st.tokenId, message: `Pay taxes on audited #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
       );
       continue;
     }
@@ -802,7 +788,10 @@ async function proactivePayPass(
     proactivePaySubmittedEpoch = currentEpoch;
     proactivePaySubmitted = new Set();
   }
-  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, s.prepayEpochs);
+  // Cap how many epochs a single auto payment covers (so it can't spend a large
+  // multi-day catch-up in one shot); the on-chain estimate is read for that many.
+  const epochs = cappedAutoPayEpochs(s.prepayEpochs, s.maxAutoPayEpochs);
+  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, epochs);
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const key = st.tokenId;
@@ -811,17 +800,7 @@ async function proactivePayPass(
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
 
-    // Global auto-pay cap: don't auto-catch-up a token more than
-    // maxAutoPayEpochsBehind behind (default 1). Larger catch-ups are left for
-    // the user to pay manually rather than the bot spending multiple days at once.
-    if (exceedsAutoPayCap(BigInt(st.lastEpochPaid), currentEpoch, s.maxAutoPayEpochsBehind)) {
-      const behind = currentEpoch - BigInt(st.lastEpochPaid);
-      activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Proactive-pay skip #${st.tokenId}: ${behind} epochs behind (auto-pay cap ${s.maxAutoPayEpochsBehind}) — pay manually.` });
-      proactivePaySubmitted.add(key); // stop retrying this epoch; hand off to the user
-      continue;
-    }
-
-    const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (same epochs)
+    const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
     if (value === 0n) continue;
     const guard = await canSpend(value, false);
     if (!guard.ok) {
@@ -830,9 +809,9 @@ async function proactivePayPass(
     }
     proactivePaySubmitted.add(key); // mark before awaiting so a rapid re-fire can't double-submit
     await act(
-      { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, s.prepayEpochs), value },
+      { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, epochs), value },
       "pay-taxes",
-      { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${s.prepayEpochs} epoch) = ${formatEther(value)} ETH` },
+      { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
     );
   }
 }
@@ -871,22 +850,12 @@ async function jitPass(
       jitSubmitted.add(key); // already current for this epoch
       continue;
     }
-    // Global auto-pay cap: JIT is a single-epoch payment, and the cap bars paying
-    // a token more than maxAutoPayEpochsBehind epochs behind (default 1). If a prior
-    // JIT didn't land and the token fell further behind, paying it current now would
-    // be a multi-day catch-up — leave it (auditable) for the user to clear manually.
-    const behind = currentEpoch - BigInt(st.lastEpochPaid);
-    if (exceedsAutoPayCap(BigInt(st.lastEpochPaid), currentEpoch, s.maxAutoPayEpochsBehind)) {
-      activity.add({
-        kind: "pay-taxes",
-        status: "skipped",
-        tokenId: key,
-        message: `JIT skip #${key}: ${behind} epochs behind (auto-pay cap ${s.maxAutoPayEpochsBehind}). Not auto-paying the catch-up; pay manually before the audit deadline.`,
-      });
-      jitSubmitted.add(key); // stop auto-retrying — hand off to the user
-      continue;
-    }
-    const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (1 epoch)
+    // JIT pays exactly one epoch — one day — which advances the citizen a single
+    // epoch no matter how far behind, so it always fires (even when momentarily 2
+    // behind at the boundary). It never pays a multi-day catch-up; if one 1-day
+    // payment isn't enough to make a deeply-behind citizen safe, the rest is left
+    // for the user (this pays once and marks the token handled below).
+    const value = BigInt(st.estimatedPayWei); // estimateTaxesToPay(tokenId, 1) = one day
     if (value === 0n) {
       jitSubmitted.add(key);
       continue;

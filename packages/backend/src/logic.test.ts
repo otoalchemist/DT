@@ -11,7 +11,7 @@ import {
   effectiveTipGwei,
   canAffordSpend,
   preBoundaryTaxWei,
-  exceedsAutoPayCap,
+  cappedAutoPayEpochs,
   orderBySalt,
 } from "./logic.js";
 
@@ -103,21 +103,20 @@ describe("spend guardrails", () => {
     });
   });
 
-  describe("exceedsAutoPayCap (global catch-up cap)", () => {
-    it("default cap 1: auto-pays a token exactly one epoch behind", () => {
-      expect(exceedsAutoPayCap(136n, 137n, 1)).toBe(false); // 1 behind -> ok
+  describe("cappedAutoPayEpochs (per-payment epoch cap)", () => {
+    it("default cap 1: a JIT single-epoch request stays 1 regardless of delinquency", () => {
+      expect(cappedAutoPayEpochs(1, 1)).toBe(1);
     });
-    it("default cap 1: skips a token two or more epochs behind (would be a catch-up)", () => {
-      expect(exceedsAutoPayCap(135n, 137n, 1)).toBe(true); // 2 behind -> skip
-      expect(exceedsAutoPayCap(130n, 137n, 1)).toBe(true); // 7 behind -> skip
+    it("clamps a multi-epoch prepay request down to the cap", () => {
+      expect(cappedAutoPayEpochs(7, 1)).toBe(1); // prepay 7 but cap 1 -> pay 1
+      expect(cappedAutoPayEpochs(5, 2)).toBe(2); // prepay 5, cap 2 -> pay 2
     });
-    it("never blocks a current or ahead token", () => {
-      expect(exceedsAutoPayCap(137n, 137n, 1)).toBe(false); // current
-      expect(exceedsAutoPayCap(138n, 137n, 1)).toBe(false); // prepaid ahead
+    it("does not reduce a request already within the cap", () => {
+      expect(cappedAutoPayEpochs(2, 5)).toBe(2);
     });
-    it("respects a higher cap for users who want deeper auto-catch-up", () => {
-      expect(exceedsAutoPayCap(135n, 137n, 2)).toBe(false); // 2 behind, cap 2 -> ok
-      expect(exceedsAutoPayCap(134n, 137n, 2)).toBe(true); // 3 behind, cap 2 -> skip
+    it("never returns less than 1", () => {
+      expect(cappedAutoPayEpochs(0, 1)).toBe(1);
+      expect(cappedAutoPayEpochs(1, 0)).toBe(1);
     });
   });
 

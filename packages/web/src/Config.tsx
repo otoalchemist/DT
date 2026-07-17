@@ -292,12 +292,10 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
           JIT payment enables it automatically. The values still apply and remain
           editable in data/config.json (enabled, proactivePay,
-          auditSafetyBufferSeconds, prepayEpochs, autoUseBribe,
-          maxAutoPayEpochsBehind). autoUseBribe is OFF by default (pay taxes to
-          clear audits, never auto-spend a bribe). maxAutoPayEpochsBehind defaults
-          to 1: the bot never auto-pays a citizen more than 1 epoch behind, so a
-          citizen 2+ behind (incl. under audit) is left for you to clear manually —
-          raise it to auto-clear deeper catch-ups. */}
+          auditSafetyBufferSeconds, prepayEpochs, autoUseBribe). autoUseBribe is OFF
+          by default (pay taxes to clear audits, never auto-spend a bribe). The
+          per-payment epoch cap (maxAutoPayEpochs) is edited in the Just-in-time
+          panel. */}
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>

@@ -112,22 +112,16 @@ export function preBoundaryTaxWei(
 }
 
 /**
- * Global auto-pay catch-up cap. Returns true when a token is too far behind for
- * the bot to pay automatically — paying it current (relative to `referenceEpoch`)
- * would cover more than `maxEpochsBehind` epochs of back-taxes. When true, every
- * automatic payment path (JIT, pre-boundary race, proactive-pay, defense
- * audit-clear) skips the token and leaves it for the user to pay manually, so a
- * missed/lost payment never balloons into a multi-day catch-up. `referenceEpoch`
- * is the current epoch for most paths, or the target epoch for the pre-boundary
- * race. `maxEpochsBehind` of 1 (the default) means "only auto-pay single-epoch
- * amounts"; a token 2+ behind (e.g. already auditable) is left for manual handling.
+ * How many epochs a single automatic payTaxes should actually cover: the
+ * requested count, clamped to the global `maxAutoPayEpochs` cap and to at least 1.
+ * On-chain, payTaxes(tokenId, n) costs n * currentEpoch * base regardless of how
+ * far behind the token is, so clamping n caps the ETH spent per auto payment
+ * without ever blocking the single-epoch payment JIT relies on. Used by
+ * proactive-pay and defense (which request `prepayEpochs`); JIT paths always
+ * request 1, so the cap never reduces them below a full single-epoch payment.
  */
-export function exceedsAutoPayCap(
-  lastEpochPaid: bigint,
-  referenceEpoch: bigint,
-  maxEpochsBehind: number,
-): boolean {
-  return referenceEpoch - lastEpochPaid > BigInt(maxEpochsBehind);
+export function cappedAutoPayEpochs(requestedEpochs: number, maxAutoPayEpochs: number): number {
+  return Math.max(1, Math.min(requestedEpochs, maxAutoPayEpochs));
 }
 
 /**

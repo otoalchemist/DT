@@ -130,7 +130,7 @@ describe("proactive pay only fires at the epoch boundary, never on generic tick 
       maxPaymentEth: 0,
       maxBaseFeeGwei: 100,
       priorityFeeGwei: 2,
-      maxAutoPayEpochsBehind: 99, // this test exercises boundary timing, not the catch-up cap
+      // maxAutoPayEpochs defaults to 1; proactive-pay pays the capped single epoch.
     };
   });
 

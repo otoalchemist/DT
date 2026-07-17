@@ -102,7 +102,7 @@ export function JitPanel({
         preBoundaryPay: config.preBoundaryPay,
         preBoundaryLeadMs: config.preBoundaryLeadMs,
         preBoundaryLeadMainnetMs: config.preBoundaryLeadMainnetMs,
-        maxAutoPayEpochsBehind: config.maxAutoPayEpochsBehind,
+        maxAutoPayEpochs: config.maxAutoPayEpochs,
       });
       onConfigChange(next);
       setGasSaved(true);
@@ -189,17 +189,18 @@ export function JitPanel({
         <div style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
           <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>AUTO-PAY LIMIT</div>
           <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5 }}>
-            The bot never <b>automatically</b> pays a citizen more than this many epochs behind — larger
-            catch-ups are left for you to pay manually. <b>Default 1</b>: a lost/failed payment never
-            balloons into a multi-day catch-up, and a citizen 2+ behind (incl. under audit) is left for
-            you to decide. Raise it to let the bot auto-clear deeper catch-ups / audits.
+            Most epochs a single <b>automatic</b> payment may cover — a cap on ETH spent per auto payment.
+            <b> Default 1</b>: auto-payments never spend more than one day's taxes at once, so a lost/failed
+            payment never balloons into a multi-day charge. <b>The JIT single-epoch payment always fires</b>
+            (even when a citizen is momentarily 2 behind at the boundary); this only caps the multi-epoch
+            proactive-pay / defense paths. Raise it to let those auto-catch-up several epochs in one payment.
           </p>
-          <label className="field" style={{ maxWidth: 200 }}>
-            Auto-pay only if ≤ N epochs behind
+          <label className="field" style={{ maxWidth: 220 }}>
+            Max epochs per auto payment
             <input
               type="number" min={1} step={1}
-              value={config.maxAutoPayEpochsBehind}
-              onChange={(e) => gasField("maxAutoPayEpochsBehind", Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+              value={config.maxAutoPayEpochs}
+              onChange={(e) => gasField("maxAutoPayEpochs", Math.max(1, Math.floor(Number(e.target.value) || 1)))}
             />
           </label>
 
