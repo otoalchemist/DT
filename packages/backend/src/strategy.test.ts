@@ -22,7 +22,7 @@ vi.mock("./chain.js", () => ({
     getBalance: vi.fn(async () => 10_000_000_000_000_000_000n), // 10 ETH
     getBlockNumber: vi.fn(async () => 100n),
   },
-  getLatestBlockCached: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n })), // 10 gwei
+  getLatestBlockCached: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n, number: 100n })), // 10 gwei
   wsClient: null, // force the 12s-poll fallback path, no block-watch subscription to simulate
 }));
 

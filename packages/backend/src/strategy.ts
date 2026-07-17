@@ -555,10 +555,13 @@ export function scheduleDefenseBoundary(): void {
 }
 
 async function refreshSnapshot(address: Address): Promise<void> {
-  const [snap, balance, block] = await Promise.all([
+  // Fetch the full latest block (not just its number) so it warms the shared
+  // block cache: every canSpend/computeFees later in this tick then reuses it
+  // instead of each re-reading the block for the base fee.
+  const [snap, balance, latest] = await Promise.all([
     getGameSnapshot(),
     publicClient.getBalance({ address }),
-    publicClient.getBlockNumber(),
+    getLatestBlockCached(),
   ]);
   runtime.gameState = snap.state;
   runtime.currentEpoch = snap.currentEpoch;
@@ -566,7 +569,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
   runtime.citizensAddress = snap.citizensAddress;
   runtime.startTime = snap.startTime;
   runtime.balanceWei = balance;
-  runtime.lastBlock = block;
+  runtime.lastBlock = latest.number;
   runtime.emitStatus();
   scheduleJitBoundary();
   schedulePreBoundaryPay();

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { keccak256, toHex, type Address, type Hex } from "viem";
+import { keccak256, toHex, type Address, type Block, type Hex } from "viem";
 import {
   privateKeyToAccount,
   generatePrivateKey,
@@ -93,13 +93,14 @@ function hostOf(url: string): string {
 
 // --- fee + gas ---
 
-async function computeFees(offense: boolean): Promise<{
+// Pure — takes an already-fetched block so the caller can share one read across
+// the fee calc, the gas estimate, and the target-block derivation.
+function computeFees(offense: boolean, block: Block): {
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
   baseFee: bigint;
-}> {
+} {
   const gas = resolveGas(runtime.strategy, offense);
-  const block = await getLatestBlockCached();
   const baseFee = block.baseFeePerGas ?? 0n;
 
   // Priority tip: static by default, or scaled up by block fullness when the
@@ -331,10 +332,20 @@ export async function submitTx(
   const account = runtime.account;
   if (!account) throw new Error("Wallet locked");
 
-  const { maxFeePerGas, maxPriorityFeePerGas } = await computeFees(opts.offense ?? false);
-  const gas = await estimateGas(account.address, intent);
+  // Independent pre-submission reads — run together (viem batches them, and the
+  // block is usually already cached from the pass's canSpend), instead of three
+  // serial round-trips per tx. Pre-boundary races pass explicit gas, so estimateGas
+  // is instant there and this whole block costs zero extra round-trips.
+  const [gas, latest] = await Promise.all([
+    estimateGas(account.address, intent),
+    getLatestBlockCached(),
+  ]);
+  const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(opts.offense ?? false, latest);
   const gasWei = gas * maxFeePerGas;
-  const targetBlock = (await publicClient.getBlockNumber()) + 1n;
+  // Reuse the block's own number instead of a separate getBlockNumber round-trip.
+  // Only used for sim context + reporting here; the actual bundle target block is
+  // re-derived fresh at flush time (see flushBundle).
+  const targetBlock = (latest.number ?? (await publicClient.getBlockNumber())) + 1n;
 
   // Nonce is only reserved after simulation passes to avoid burning nonces on reverts.
   const base: SubmitResult = {
