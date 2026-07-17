@@ -22,7 +22,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, beginBundle, flushBundle, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, orderBySalt } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, exceedsAutoPayCap, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -285,15 +285,15 @@ async function firePreBoundaryPay(): Promise<void> {
       const lastEpochPaid = r.result as bigint;
       if (lastEpochPaid >= targetEpoch) continue; // already current for the target
       const key = selected[i]!.toString();
-      // JIT pays a single epoch. If the token is more than one epoch behind the
-      // target, a prior JIT didn't land; don't pre-pay a multi-day catch-up. Leave
-      // it for manual handling (the post-boundary jitPass logs it once and stops).
-      if (lastEpochPaid < targetEpoch - 1n) {
+      // Global auto-pay cap (relative to the target epoch): don't pre-pay a token
+      // more than maxAutoPayEpochsBehind behind the target — a prior JIT didn't
+      // land and this would be a multi-day catch-up. Left for manual handling.
+      if (exceedsAutoPayCap(lastEpochPaid, targetEpoch, s.maxAutoPayEpochsBehind)) {
         activity.add({
           kind: "pay-taxes",
           status: "skipped",
           tokenId: key,
-          message: `Pre-boundary JIT skip #${key}: ${targetEpoch - lastEpochPaid} epochs behind target — needs manual catch-up, not auto-paid.`,
+          message: `Pre-boundary JIT skip #${key}: ${targetEpoch - lastEpochPaid} epochs behind target (auto-pay cap ${s.maxAutoPayEpochsBehind}) — needs manual catch-up.`,
         });
         continue;
       }
@@ -761,6 +761,15 @@ async function defensePass(
         );
         continue;
       }
+      // Global auto-pay cap: clearing an audit means paying for every epoch the
+      // token is behind (audited tokens are always 2+ behind). If that exceeds
+      // maxAutoPayEpochsBehind (default 1), don't auto-pay the catch-up — leave the
+      // token under audit for the user to clear manually before its deadline.
+      if (exceedsAutoPayCap(BigInt(st.lastEpochPaid), currentEpoch, s.maxAutoPayEpochsBehind)) {
+        const behind = currentEpoch - BigInt(st.lastEpochPaid);
+        activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Left under audit #${st.tokenId}: ${behind} epochs behind (auto-pay cap ${s.maxAutoPayEpochsBehind}) — clear manually before the kill deadline.` });
+        continue;
+      }
       const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (same epochs)
       const guard = await canSpend(value, false);
       if (!guard.ok) {
@@ -801,6 +810,16 @@ async function proactivePayPass(
 
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
+
+    // Global auto-pay cap: don't auto-catch-up a token more than
+    // maxAutoPayEpochsBehind behind (default 1). Larger catch-ups are left for
+    // the user to pay manually rather than the bot spending multiple days at once.
+    if (exceedsAutoPayCap(BigInt(st.lastEpochPaid), currentEpoch, s.maxAutoPayEpochsBehind)) {
+      const behind = currentEpoch - BigInt(st.lastEpochPaid);
+      activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Proactive-pay skip #${st.tokenId}: ${behind} epochs behind (auto-pay cap ${s.maxAutoPayEpochsBehind}) — pay manually.` });
+      proactivePaySubmitted.add(key); // stop retrying this epoch; hand off to the user
+      continue;
+    }
 
     const value = BigInt(st.estimatedPayWei); // already fetched by getOwnedTokenStatus (same epochs)
     if (value === 0n) continue;
@@ -852,18 +871,17 @@ async function jitPass(
       jitSubmitted.add(key); // already current for this epoch
       continue;
     }
-    // JIT is a SINGLE-epoch payment. If the token is 2+ epochs behind, a prior JIT
-    // payment didn't land and paying to become current now would cost a multi-day
-    // catch-up (estimateTaxesToPay charges every missed epoch). Don't auto-pay that:
-    // leave the token — which is/where it becomes auditable — for the user to clear
-    // manually before the audit deadline, so a lost race never balloons the spend.
+    // Global auto-pay cap: JIT is a single-epoch payment, and the cap bars paying
+    // a token more than maxAutoPayEpochsBehind epochs behind (default 1). If a prior
+    // JIT didn't land and the token fell further behind, paying it current now would
+    // be a multi-day catch-up — leave it (auditable) for the user to clear manually.
     const behind = currentEpoch - BigInt(st.lastEpochPaid);
-    if (behind >= 2n) {
+    if (exceedsAutoPayCap(BigInt(st.lastEpochPaid), currentEpoch, s.maxAutoPayEpochsBehind)) {
       activity.add({
         kind: "pay-taxes",
         status: "skipped",
         tokenId: key,
-        message: `JIT skip #${key}: ${behind} epochs behind — a prior JIT didn't land. Not auto-paying the ${behind}-epoch catch-up; pay manually before the audit deadline.`,
+        message: `JIT skip #${key}: ${behind} epochs behind (auto-pay cap ${s.maxAutoPayEpochsBehind}). Not auto-paying the catch-up; pay manually before the audit deadline.`,
       });
       jitSubmitted.add(key); // stop auto-retrying — hand off to the user
       continue;

@@ -112,6 +112,25 @@ export function preBoundaryTaxWei(
 }
 
 /**
+ * Global auto-pay catch-up cap. Returns true when a token is too far behind for
+ * the bot to pay automatically — paying it current (relative to `referenceEpoch`)
+ * would cover more than `maxEpochsBehind` epochs of back-taxes. When true, every
+ * automatic payment path (JIT, pre-boundary race, proactive-pay, defense
+ * audit-clear) skips the token and leaves it for the user to pay manually, so a
+ * missed/lost payment never balloons into a multi-day catch-up. `referenceEpoch`
+ * is the current epoch for most paths, or the target epoch for the pre-boundary
+ * race. `maxEpochsBehind` of 1 (the default) means "only auto-pay single-epoch
+ * amounts"; a token 2+ behind (e.g. already auditable) is left for manual handling.
+ */
+export function exceedsAutoPayCap(
+  lastEpochPaid: bigint,
+  referenceEpoch: bigint,
+  maxEpochsBehind: number,
+): boolean {
+  return referenceEpoch - lastEpochPaid > BigInt(maxEpochsBehind);
+}
+
+/**
  * Deterministically order items by a salted hash of their key.
  *
  * Every bot enumerates rival candidates in the same order (the NFT API returns a

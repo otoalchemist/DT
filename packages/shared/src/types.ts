@@ -86,6 +86,14 @@ export interface StrategyConfig {
    *  the token still delinquent). OFF by default — the bot pays taxes to clear
    *  instead, so bribes are never auto-consumed unless you opt in. */
   autoUseBribe: boolean;
+  /** Global auto-pay catch-up cap: the bot will not AUTOMATICALLY pay a citizen
+   *  that is more than this many epochs behind — larger catch-ups are left for you
+   *  to pay manually. Applies to every automatic path (JIT, pre-boundary race,
+   *  proactive-pay, defense audit-clear). Default 1 = only auto-pay single-epoch
+   *  amounts; a citizen 2+ epochs behind (e.g. already under audit) is left alone
+   *  for you to decide when to pay. Raise it to restore deeper auto-catch-up
+   *  (e.g. a large number to auto-clear audits regardless of depth). */
+  maxAutoPayEpochsBehind: number;
 
   // --- Just-in-time single-epoch payment (one-shot) ---
   /** When armed, pay exactly one epoch for each selected token the moment the

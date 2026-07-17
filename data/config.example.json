@@ -5,6 +5,7 @@
   "proactivePay": true,
   "prepayEpochs": 1,
   "autoUseBribe": false,
+  "maxAutoPayEpochsBehind": 1,
   "jitEnabled": false,
   "jitTargetEpoch": null,
   "jitTokenIds": [],

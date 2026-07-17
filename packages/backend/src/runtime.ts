@@ -32,6 +32,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   proactivePay: true,
   prepayEpochs: 1,
   autoUseBribe: false, // never auto-spend bribes; pay taxes to clear audits instead
+  maxAutoPayEpochsBehind: 1, // only auto-pay single-epoch amounts; 2+ behind = manual
   jitEnabled: false,
   jitTargetEpoch: null,
   jitTokenIds: [],

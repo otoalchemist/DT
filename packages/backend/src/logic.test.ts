@@ -11,6 +11,7 @@ import {
   effectiveTipGwei,
   canAffordSpend,
   preBoundaryTaxWei,
+  exceedsAutoPayCap,
   orderBySalt,
 } from "./logic.js";
 
@@ -99,6 +100,24 @@ describe("spend guardrails", () => {
     it("returns 0 when already current for the target epoch", () => {
       expect(preBoundaryTaxWei(136n, 136n, 1, BASE)).toBe(0n);
       expect(preBoundaryTaxWei(137n, 136n, 1, BASE)).toBe(0n);
+    });
+  });
+
+  describe("exceedsAutoPayCap (global catch-up cap)", () => {
+    it("default cap 1: auto-pays a token exactly one epoch behind", () => {
+      expect(exceedsAutoPayCap(136n, 137n, 1)).toBe(false); // 1 behind -> ok
+    });
+    it("default cap 1: skips a token two or more epochs behind (would be a catch-up)", () => {
+      expect(exceedsAutoPayCap(135n, 137n, 1)).toBe(true); // 2 behind -> skip
+      expect(exceedsAutoPayCap(130n, 137n, 1)).toBe(true); // 7 behind -> skip
+    });
+    it("never blocks a current or ahead token", () => {
+      expect(exceedsAutoPayCap(137n, 137n, 1)).toBe(false); // current
+      expect(exceedsAutoPayCap(138n, 137n, 1)).toBe(false); // prepaid ahead
+    });
+    it("respects a higher cap for users who want deeper auto-catch-up", () => {
+      expect(exceedsAutoPayCap(135n, 137n, 2)).toBe(false); // 2 behind, cap 2 -> ok
+      expect(exceedsAutoPayCap(134n, 137n, 2)).toBe(true); // 3 behind, cap 2 -> skip
     });
   });
 
