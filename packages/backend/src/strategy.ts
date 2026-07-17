@@ -48,6 +48,22 @@ let committedThisTickWei = 0n;
 // public mode (eth_call block overrides) and mainnet mode (eth_callBundle's
 // timestamp field) — no mode gating needed.
 
+/**
+ * How early to pre-submit a boundary race, by submission path.
+ *
+ * public/local: a tx that lands in the block BEFORE the boundary carries a
+ *   next-epoch value and overpay-reverts, so the lead is held tight (~3s).
+ * mainnet: a bundle names its target `blockNumber`, so it cannot land in the
+ *   wrong block, and a bundle that would revert is DROPPED rather than mined —
+ *   pre-submitting earlier costs nothing and gives builders more time to weigh
+ *   it. Default ~5s, kept under a 12s slot so `currentBlock + 1` still resolves
+ *   to the boundary block.
+ */
+function effectiveLeadMs(): number {
+  const s = runtime.strategy;
+  return appConfig.mode === "mainnet" ? s.preBoundaryLeadMainnetMs : s.preBoundaryLeadMs;
+}
+
 // A precisely-timed boundary tick (JIT / defense / offense) must not be silently
 // dropped just because a routine block/poll tick happens to be running when its
 // timer fires — that would push the payment/kill to the next ordinary tick and
@@ -177,7 +193,7 @@ export function schedulePreBoundaryPay(): void {
   }
   const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
+  const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
   if (deltaMs <= 0) return; // too late to pre-submit; the +500ms JIT tick covers it
   preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(), Math.min(deltaMs, 2_000_000_000));
 }
@@ -286,7 +302,7 @@ export function schedulePreBoundaryAudit(): void {
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
+  const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
   if (deltaMs <= 0) return; // too late; normal offense picks it up after the roll
   preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
 }
@@ -356,7 +372,7 @@ export function schedulePreBoundaryKill(): void {
   if (!runtime.running || !s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
   if (nextKillDeadlineSec === null) return;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(nextKillDeadlineSec - nowSec) * 1000 - s.preBoundaryLeadMs;
+  const deltaMs = Number(nextKillDeadlineSec - nowSec) * 1000 - effectiveLeadMs();
   if (deltaMs <= 0) return; // too late; normal offense kills it right after expiry
   preBoundaryKillTimer = setTimeout(() => void firePreBoundaryKill(), Math.min(deltaMs, 2_000_000_000));
 }
@@ -375,7 +391,7 @@ async function firePreBoundaryKill(): Promise<void> {
   const address = runtime.account.address;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
-  const windowSec = BigInt(Math.ceil(s.preBoundaryLeadMs / 1000) + 12);
+  const windowSec = BigInt(Math.ceil(effectiveLeadMs() / 1000) + 12);
   try {
     await nonceManager.sync(address, appConfig.mode);
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);

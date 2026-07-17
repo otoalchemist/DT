@@ -97,8 +97,16 @@ export interface StrategyConfig {
    *  for the upcoming epoch and validated by simulating AT the boundary timestamp,
    *  so a wrong value is caught before spending gas. Off by default. */
   preBoundaryPay: boolean;
-  /** How many ms before the target boundary to fire the pre-submit (250–8000). */
+  /** How many ms before the target boundary to fire the pre-submit in
+   *  public/local mode (250–8000). Held tight because a public tx that lands in
+   *  the pre-boundary block carries a next-epoch value and overpay-reverts. */
   preBoundaryLeadMs: number;
+  /** Lead used in `mainnet` (bundle) mode (250–11000). Bundles target a specific
+   *  blockNumber, so they can't land in the wrong block, and a bundle that would
+   *  revert is dropped rather than mined — so pre-submitting earlier is free, and
+   *  gives builders more time to weigh it. Keep under a 12s slot so the bundle's
+   *  target block resolves to the boundary block. */
+  preBoundaryLeadMainnetMs: number;
 
   // --- Offense (optional) ---
   offenseEnabled: boolean;

@@ -242,15 +242,31 @@ export function JitPanel({
               boundary instant</b>, so a wrong value is caught before spending gas. Pair with a high tip
               above. The normal boundary-timed pay still runs as a fallback.
             </p>
-            <label className="field" style={{ marginLeft: 24 }}>
-              Pre-submit lead (ms before boundary, 250–8000)
-              <input
-                type="number" min={250} max={8000} step={250}
-                value={config.preBoundaryLeadMs}
-                onChange={(e) => gasField("preBoundaryLeadMs", Number(e.target.value))}
-                disabled={!config.preBoundaryPay}
-              />
-            </label>
+            <div className="row wrap" style={{ gap: 12, alignItems: "flex-end", marginLeft: 24 }}>
+              <label className="field" style={{ flex: "1 1 140px" }}>
+                Lead — public mode (ms)
+                <input
+                  type="number" min={250} max={8000} step={250}
+                  value={config.preBoundaryLeadMs}
+                  onChange={(e) => gasField("preBoundaryLeadMs", Number(e.target.value))}
+                  disabled={!config.preBoundaryPay}
+                />
+              </label>
+              <label className="field" style={{ flex: "1 1 140px" }}>
+                Lead — mainnet bundles (ms)
+                <input
+                  type="number" min={250} max={11000} step={250}
+                  value={config.preBoundaryLeadMainnetMs}
+                  onChange={(e) => gasField("preBoundaryLeadMainnetMs", Number(e.target.value))}
+                  disabled={!config.preBoundaryPay}
+                />
+              </label>
+            </div>
+            <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+              The bot uses whichever matches your submission mode. Bundles name their target block, so
+              they can't land early and are dropped (not mined) if they'd revert — pre-submitting earlier
+              is free and gives builders more time, hence the larger mainnet default. Keep it under 12s.
+            </p>
           </div>
           <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>
             {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment gas"}
