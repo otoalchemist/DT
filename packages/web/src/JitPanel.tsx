@@ -238,10 +238,9 @@ export function JitPanel({
             <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
               Pre-submits the armed JIT payment just before the epoch boundary so it can land in the
               <b> first block of the epoch</b>, ahead of a batch-auditor — matching the fastest rivals.
-              The amount is computed off-chain for the next epoch and <b>simulate-before-send is skipped</b>,
-              so a mis-timed tx can revert and waste gas (no funds lost). Pair with a high tip above. The
-              normal boundary-timed pay still runs as a fallback. <b>Public mode only</b> — the Flashbots
-              relay rejects the unsimulated tx in mainnet mode.
+              The amount is computed off-chain for the next epoch and <b>validated by simulating at the
+              boundary instant</b>, so a wrong value is caught before spending gas. Pair with a high tip
+              above. The normal boundary-timed pay still runs as a fallback.
             </p>
             <label className="field" style={{ marginLeft: 24 }}>
               Pre-submit lead (ms before boundary, 250–8000)

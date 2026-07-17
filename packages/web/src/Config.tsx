@@ -165,10 +165,11 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         ⚠ Race kills into the first block after expiry (advanced)
       </label>
       <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-        Pre-submit audits/kills (unsimulated) ~{cfg.preBoundaryLeadMs}ms before the deadline so they land
-        in the first eligible block ahead of rivals, instead of the block after. A mis-timed tx reverts and
-        wastes gas (audit fees are refunded on revert). Lead is shared with the JIT boundary race.
-        <b> Public mode only</b> — the Flashbots relay rejects the unsimulated tx in mainnet mode.
+        Pre-submit audits/kills ~{cfg.preBoundaryLeadMs}ms before the deadline so they land in the first
+        eligible block ahead of rivals, instead of the block after. Each is validated by simulating at the
+        boundary/expiry instant, so an invalid one is skipped before spending gas. Lead is shared with the
+        JIT boundary race. Note: at the boundary, block position is decided by builder orderflow more than
+        tip — a defender who pre-pays can still beat your audit.
       </p>
       <label className="field">
         Only run offense when supply is within N of 69 winners (blank = always)

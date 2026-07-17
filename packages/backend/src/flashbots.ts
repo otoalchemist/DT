@@ -145,9 +145,53 @@ async function flashbotsRpcWithTimeout(method: string, params: unknown[]): Promi
   }
 }
 
+/**
+ * Simulate an intent whose validity depends on a FUTURE block timestamp (the
+ * pre-boundary races: the epoch hasn't rolled / the audit hasn't expired yet, so a
+ * normal sim against "now" would wrongly revert). We re-run the call at `atTime`
+ * via eth_call block overrides, which reproduces the exact context the tx will
+ * execute in. Returns null when the sim passed, a revert message when the contract
+ * rejected it, or throws if the RPC can't do block overrides (caller decides).
+ */
+async function simulateAtTimestamp(
+  from: Address,
+  intent: TxIntent,
+  gas: bigint,
+  atTime: bigint,
+): Promise<string | null> {
+  try {
+    await (publicClient as unknown as {
+      request: (a: { method: string; params: unknown[] }) => Promise<unknown>;
+    }).request({
+      method: "eth_call",
+      params: [
+        { from, to: intent.to, data: intent.data, value: toHex(intent.value), gas: toHex(gas) },
+        "latest",
+        {}, // no state overrides — the wallet's real balance applies
+        { time: toHex(atTime) }, // block overrides: run at the boundary/expiry instant
+      ],
+    });
+    return null; // simulated clean
+  } catch (err) {
+    const e = err as { message?: string; data?: unknown; code?: number };
+    const msg = e.message ?? String(err);
+    // A contract revert => the action is genuinely invalid: report it.
+    if (e.data !== undefined || /revert|execution reverted/i.test(msg)) return msg;
+    // Anything else (RPC lacks block-override support, transport error) => rethrow
+    // so the caller can decide whether to proceed unsimulated.
+    throw err;
+  }
+}
+
 export async function submitTx(
   intent: TxIntent,
-  opts: { dryRun: boolean; race?: boolean; offense?: boolean; skipSim?: boolean },
+  opts: {
+    dryRun: boolean;
+    race?: boolean;
+    offense?: boolean;
+    /** Simulate at this future unix-second timestamp (pre-boundary races). */
+    simTimestamp?: bigint;
+  },
 ): Promise<SubmitResult> {
   const account = runtime.account;
   if (!account) throw new Error("Wallet locked");
@@ -167,19 +211,19 @@ export async function submitTx(
   };
 
   // --- Simulation ---
-  // skipSim: pre-boundary payTaxes carries a value computed for the *next* epoch,
-  // which reverts when simulated against current state — so the caller opts to
-  // skip the check and accept on-chain revert risk (payTaxes reverts on a wrong
-  // value = wasted gas, no fund loss).
-  if (opts.skipSim) {
-    // fall through to submission with no simulation
-  } else if (appConfig.mode === "mainnet") {
+  if (appConfig.mode === "mainnet") {
     // Flashbots bundle simulation needs a signed tx — use peeked nonce (not consumed yet).
     const simSigned = await signTx(account, intent, nonceManager.peek(), gas, maxFeePerGas, maxPriorityFeePerGas);
     try {
-      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [
-        { txs: [simSigned], blockNumber: toHex(targetBlock), stateBlockNumber: "latest" },
-      ]);
+      const bundle: Record<string, unknown> = {
+        txs: [simSigned],
+        blockNumber: toHex(targetBlock),
+        stateBlockNumber: "latest",
+      };
+      // Pre-boundary races: simulate at the future instant, otherwise the relay
+      // evaluates it against the current epoch and wrongly reports a revert.
+      if (opts.simTimestamp !== undefined) bundle.timestamp = Number(opts.simTimestamp);
+      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [bundle]);
       const results = sim?.results ?? [];
       const failed = results.find((r: any) => r.error || r.revert);
       if (failed) {
@@ -190,20 +234,34 @@ export async function submitTx(
       return { ...base, error: `simulation failed: ${(err as Error).message}`, targetBlock };
     }
   } else if (appConfig.mode === "public") {
-    // Plain eth_call — no nonce needed, no relay round-trip.
-    try {
-      await publicClient.call({
-        account: account.address,
-        to: intent.to,
-        data: intent.data,
-        value: intent.value,
-        gas,
-        maxFeePerGas,
-        maxPriorityFeePerGas,
-      });
-      base.simulated = true;
-    } catch (err) {
-      return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
+    if (opts.simTimestamp !== undefined) {
+      // Pre-boundary race: simulate at the future timestamp so the epoch/expiry
+      // has rolled — this is what catches a wrong pre-computed value BEFORE we
+      // spend gas. If the RPC can't do block overrides, fall back to sending
+      // unsimulated rather than dropping the race.
+      try {
+        const revert = await simulateAtTimestamp(account.address, intent, gas, opts.simTimestamp);
+        if (revert) return { ...base, simulated: true, error: `sim revert @${opts.simTimestamp}: ${revert}`, targetBlock };
+        base.simulated = true;
+      } catch (err) {
+        logger.warn(`timestamp-override sim unavailable (${(err as Error).message}); sending unsimulated`);
+      }
+    } else {
+      // Plain eth_call — no nonce needed, no relay round-trip.
+      try {
+        await publicClient.call({
+          account: account.address,
+          to: intent.to,
+          data: intent.data,
+          value: intent.value,
+          gas,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
+        });
+        base.simulated = true;
+      } catch (err) {
+        return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
+      }
     }
   }
 

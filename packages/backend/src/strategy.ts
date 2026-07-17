@@ -43,23 +43,10 @@ let ticking = false;
 // min-balance floor holds across all spends in a tick, not just each in isolation.
 let committedThisTickWei = 0n;
 
-// The pre-boundary (skip-sim) races only work in public mode: in mainnet mode the
-// Flashbots relay simulates the bundle server-side and drops it because the tx
-// reverts against current state. Disable those schedulers in mainnet mode and say
-// why (once), rather than silently burning effort that can never land.
-let warnedPreBoundaryMainnet = false;
-function preBoundaryUnavailable(): boolean {
-  if (appConfig.mode !== "mainnet") return false;
-  if (!warnedPreBoundaryMainnet) {
-    warnedPreBoundaryMainnet = true;
-    activity.add({
-      kind: "info",
-      status: "info",
-      message: "Pre-boundary races (pay/audit/kill) are disabled in mainnet mode — the Flashbots relay rejects the unsimulated tx. Switch to public mode to use them.",
-    });
-  }
-  return true;
-}
+// NOTE: the pre-boundary races now simulate at the future boundary/expiry
+// timestamp (see submitTx's simTimestamp), so they validate correctly in BOTH
+// public mode (eth_call block overrides) and mainnet mode (eth_callBundle's
+// timestamp field) — no mode gating needed.
 
 // A precisely-timed boundary tick (JIT / defense / offense) must not be silently
 // dropped just because a routine block/poll tick happens to be running when its
@@ -177,7 +164,7 @@ export function scheduleJitBoundary(): void {
  * ADVANCED (opt-in): arm a pre-submit ~preBoundaryLeadMs BEFORE the armed epoch
  * boundary, so the JIT payment lands in the FIRST block of the epoch (ahead of a
  * batch-auditor) rather than the block after. Requires an off-chain value for the
- * upcoming epoch and skips simulate-before-send, so a mis-timed tx can revert.
+ * upcoming epoch, validated by simulating AT the boundary timestamp before send.
  */
 export function schedulePreBoundaryPay(): void {
   if (preBoundaryTimer) {
@@ -188,7 +175,6 @@ export function schedulePreBoundaryPay(): void {
   if (!runtime.running || !s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null || runtime.startTime === null) {
     return;
   }
-  if (preBoundaryUnavailable()) return;
   const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
@@ -218,6 +204,9 @@ async function firePreBoundaryPay(): Promise<void> {
   committedThisTickWei = 0n;
   const address = runtime.account.address;
   const targetEpoch = BigInt(s.jitTargetEpoch);
+  // The instant the target epoch begins — we simulate there so the value is
+  // validated against the epoch the tx will actually execute in.
+  const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
   try {
     await nonceManager.sync(address, appConfig.mode);
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
@@ -245,7 +234,7 @@ async function firePreBoundaryPay(): Promise<void> {
       await act(
         { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
         "pay-taxes",
-        { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (unsimulated, boundary race)`, race: true, skipSim: true },
+        { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`, race: true, simTimestamp: boundaryTs },
       );
     }
   } catch (err) {
@@ -295,7 +284,6 @@ export function schedulePreBoundaryAudit(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
-  if (preBoundaryUnavailable()) return;
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - s.preBoundaryLeadMs;
@@ -318,6 +306,8 @@ async function firePreBoundaryAudit(): Promise<void> {
   const address = runtime.account.address;
   const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  // Simulate at the boundary instant, where the target actually becomes auditable.
+  const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
     await nonceManager.sync(address, appConfig.mode);
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
@@ -343,7 +333,7 @@ async function firePreBoundaryAudit(): Promise<void> {
       const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
         "audit",
-        { tokenId: from.toString(), targetTokenId: t.tokenId, message: `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch} (unsimulated, boundary race)`, race: true, skipSim: true },
+        { tokenId: from.toString(), targetTokenId: t.tokenId, message: `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch} (boundary race)`, race: true, simTimestamp: boundaryTs },
       );
       if (res?.ok) idx++;
     }
@@ -365,7 +355,6 @@ export function schedulePreBoundaryKill(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.preBoundaryKill || !s.offenseEnabled || !s.autoKill) return;
   if (nextKillDeadlineSec === null) return;
-  if (preBoundaryUnavailable()) return;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(nextKillDeadlineSec - nowSec) * 1000 - s.preBoundaryLeadMs;
   if (deltaMs <= 0) return; // too late; normal offense kills it right after expiry
@@ -406,7 +395,8 @@ async function firePreBoundaryKill(): Promise<void> {
       await act(
         { to: appConfig.gameAddress, data: encodeKill(BigInt(t.tokenId)), value: 0n, gas: PRE_BOUNDARY_OFFENSE_GAS },
         "kill",
-        { targetTokenId: t.tokenId, message: `Pre-boundary kill #${t.tokenId} (audit expiring, unsimulated race)`, race: true, skipSim: true },
+        // Simulate one second past the audit-expiry, where kill() first becomes valid.
+        { targetTokenId: t.tokenId, message: `Pre-boundary kill #${t.tokenId} (audit expiring, deadline race)`, race: true, simTimestamp: due + 1n },
       );
     }
   } catch (err) {
@@ -586,7 +576,7 @@ async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<voi
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; skipSim?: boolean },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint },
 ): Promise<SubmitResult | null> {
   const dryRun = runtime.strategy.dryRun;
   const offense = kind === "audit" || kind === "kill";
@@ -595,7 +585,7 @@ async function act(
       dryRun,
       race: ctx.race && runtime.strategy.racePublicMempool,
       offense,
-      skipSim: ctx.skipSim,
+      simTimestamp: ctx.simTimestamp,
     });
     if (!result.ok) {
       activity.add({

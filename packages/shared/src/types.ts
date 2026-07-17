@@ -94,8 +94,8 @@ export interface StrategyConfig {
   /** ADVANCED: pre-submit the JIT payment ~preBoundaryLeadMs *before* the target
    *  epoch boundary so it lands in the FIRST block of the epoch (ahead of a
    *  batch-auditor), instead of the block after. The value is computed off-chain
-   *  for the upcoming epoch and simulate-before-send is skipped, so a mis-timed
-   *  tx can revert and waste gas (no fund loss). Off by default. */
+   *  for the upcoming epoch and validated by simulating AT the boundary timestamp,
+   *  so a wrong value is caught before spending gas. Off by default. */
   preBoundaryPay: boolean;
   /** How many ms before the target boundary to fire the pre-submit (250–8000). */
   preBoundaryLeadMs: number;
