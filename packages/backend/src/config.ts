@@ -79,15 +79,19 @@ export function deriveUrlsFromKey(key: string) {
   };
 }
 
-// Well-known builders that accept `eth_sendBundle`. A bundle can only be included
-// by the builder that wins the slot, so we fan out. Endpoints do change — override
-// with BUILDER_URLS if one moves or you want to add others (e.g. BuilderNet).
+// Well-known builders that accept `eth_sendBundle` with an X-Flashbots-Signature
+// header. A bundle can only be included by the builder that WINS the slot, so we
+// fan out to all of them. Endpoints do change — override with BUILDER_URLS.
 // Unreachable entries are tolerated: submission succeeds if ANY builder accepts.
+// NOTE: rpc.buildernet.org rate-limits to ~3 req/IP/s; we send 2 per builder per
+// tx (one per target block), so a burst of many tokens at once may get throttled.
+// (rsync-builder.xyz was dropped — verified unreachable as of 2026-07; add it back
+// via BUILDER_URLS if it returns.)
 const DEFAULT_BUILDER_URLS = [
   "https://relay.flashbots.net",
+  "https://rpc.buildernet.org", // BuilderNet — built the boundary blocks we lost
   "https://rpc.beaverbuild.org",
   "https://rpc.titanbuilder.xyz",
-  "https://rsync-builder.xyz",
 ];
 
 function derive() {

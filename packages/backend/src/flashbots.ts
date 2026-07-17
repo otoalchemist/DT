@@ -146,10 +146,20 @@ async function signTx(
  * - local: broadcasts the raw tx to the node (anvil).
  */
 const RELAY_TIMEOUT_MS = 10_000;
+// Bundle submission is time-critical and fans out to several builders: a slow or
+// dead endpoint must not hold up the caller (submitTx awaits all attempts, so a
+// 10s hang would stall every later token in a boundary race). Healthy builders
+// ack in <1s, and one that can't answer before the block is built is useless to us.
+const SEND_BUNDLE_TIMEOUT_MS = 3_000;
 
-async function flashbotsRpcWithTimeout(method: string, params: unknown[], url?: string): Promise<any> {
+async function flashbotsRpcWithTimeout(
+  method: string,
+  params: unknown[],
+  url?: string,
+  timeoutMs: number = RELAY_TIMEOUT_MS,
+): Promise<any> {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), RELAY_TIMEOUT_MS);
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
   try {
     return await flashbotsRpc(method, params, abort.signal, url);
   } finally {
@@ -304,6 +314,7 @@ export async function submitTx(
         "eth_sendBundle",
         [{ txs: [signed], blockNumber: toHex(blk) }],
         url,
+        SEND_BUNDLE_TIMEOUT_MS,
       );
       return { url, bundleHash: r?.bundleHash as string | undefined };
     }),
