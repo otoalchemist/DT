@@ -233,19 +233,26 @@ export async function submitTx(
   };
 
   // --- Simulation ---
-  if (appConfig.mode === "mainnet") {
+  if (opts.simTimestamp !== undefined) {
+    // Future-timestamp race (pre-boundary pay/audit/kill): validate at the instant
+    // the tx will actually execute. Always uses eth_call block overrides against
+    // OUR OWN RPC — verified working, and deliberately not the relay's
+    // eth_callBundle `timestamp`, so the race doesn't depend on relay behaviour we
+    // can't test. Works identically in public and mainnet mode.
+    try {
+      const revert = await simulateAtTimestamp(account.address, intent, gas, opts.simTimestamp);
+      if (revert) return { ...base, simulated: true, error: `sim revert @${opts.simTimestamp}: ${revert}`, targetBlock };
+      base.simulated = true;
+    } catch (err) {
+      logger.warn(`timestamp-override sim unavailable (${(err as Error).message}); sending unsimulated`);
+    }
+  } else if (appConfig.mode === "mainnet") {
     // Flashbots bundle simulation needs a signed tx — use peeked nonce (not consumed yet).
     const simSigned = await signTx(account, intent, nonceManager.peek(), gas, maxFeePerGas, maxPriorityFeePerGas);
     try {
-      const bundle: Record<string, unknown> = {
-        txs: [simSigned],
-        blockNumber: toHex(targetBlock),
-        stateBlockNumber: "latest",
-      };
-      // Pre-boundary races: simulate at the future instant, otherwise the relay
-      // evaluates it against the current epoch and wrongly reports a revert.
-      if (opts.simTimestamp !== undefined) bundle.timestamp = Number(opts.simTimestamp);
-      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [bundle]);
+      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [
+        { txs: [simSigned], blockNumber: toHex(targetBlock), stateBlockNumber: "latest" },
+      ]);
       const results = sim?.results ?? [];
       const failed = results.find((r: any) => r.error || r.revert);
       if (failed) {
@@ -253,23 +260,10 @@ export async function submitTx(
       }
       base.simulated = true;
     } catch (err) {
-      return { ...base, error: `simulation failed: ${(err as Error).message}`, targetBlock };
-    }
-  } else if (appConfig.mode === "public") {
-    if (opts.simTimestamp !== undefined) {
-      // Pre-boundary race: simulate at the future timestamp so the epoch/expiry
-      // has rolled — this is what catches a wrong pre-computed value BEFORE we
-      // spend gas. If the RPC can't do block overrides, fall back to sending
-      // unsimulated rather than dropping the race.
-      try {
-        const revert = await simulateAtTimestamp(account.address, intent, gas, opts.simTimestamp);
-        if (revert) return { ...base, simulated: true, error: `sim revert @${opts.simTimestamp}: ${revert}`, targetBlock };
-        base.simulated = true;
-      } catch (err) {
-        logger.warn(`timestamp-override sim unavailable (${(err as Error).message}); sending unsimulated`);
-      }
-    } else {
-      // Plain eth_call — no nonce needed, no relay round-trip.
+      // The relay being slow/down must NOT block a payment — that can cost a
+      // citizen, and mainnet is the default mode. Fall back to a plain eth_call
+      // against our own RPC instead of skipping the tx entirely.
+      logger.warn(`relay sim unavailable (${(err as Error).message}); falling back to eth_call`);
       try {
         await publicClient.call({
           account: account.address,
@@ -281,9 +275,25 @@ export async function submitTx(
           maxPriorityFeePerGas,
         });
         base.simulated = true;
-      } catch (err) {
-        return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
+      } catch (e2) {
+        return { ...base, simulated: true, error: `sim revert: ${(e2 as Error).message}`, targetBlock };
       }
+    }
+  } else if (appConfig.mode === "public") {
+    // Plain eth_call — no nonce needed, no relay round-trip.
+    try {
+      await publicClient.call({
+        account: account.address,
+        to: intent.to,
+        data: intent.data,
+        value: intent.value,
+        gas,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      });
+      base.simulated = true;
+    } catch (err) {
+      return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
     }
   }
 
