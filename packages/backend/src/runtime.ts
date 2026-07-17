@@ -47,21 +47,25 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseTargetTokenIds: loadDefaultRivalTargets(),
   preBoundaryAudit: true,
   preBoundaryKill: true,
-  maxBaseFeeGwei: 30,
-  priorityFeeGwei: 2,
+  // Payment gas — tuned to win the boundary bundle race: a ~15 gwei tip clears
+  // the observed batch-audit bundles (~3 gwei) with margin, dynamic tip scales it
+  // up in contested boundary blocks, and the base-fee cap is generous (boundary
+  // blocks run near-empty at <1 gwei, but the cap protects against a fee spike).
+  maxBaseFeeGwei: 69.1,
+  priorityFeeGwei: 15.1,
   minBalanceEth: 0.01,
-  // Offense gas defaults mirror the base settings; they only take effect once
-  // separateOffenseGas is turned on, so a fresh/upgraded config behaves exactly
-  // as before until the user opts in.
-  separateOffenseGas: false,
-  offenseMaxBaseFeeGwei: 30,
-  offensePriorityFeeGwei: 2,
-  offenseDynamicTipEnabled: false,
-  offenseDynamicTipMaxGwei: 50,
+  // Offense (audit/kill) bids its own gas, independent of payments — it's a race
+  // against rivals where a payment isn't, so it carries a higher static tip and a
+  // tighter base-fee cap.
+  separateOffenseGas: true,
+  offenseMaxBaseFeeGwei: 25.1,
+  offensePriorityFeeGwei: 10.1,
+  offenseDynamicTipEnabled: true,
+  offenseDynamicTipMaxGwei: 20.1,
   offenseBoundaryScheduling: false,
   racePublicMempool: true,
-  dynamicTipEnabled: false,
-  dynamicTipMaxGwei: 50,
+  dynamicTipEnabled: true,
+  dynamicTipMaxGwei: 50.1,
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 

@@ -146,12 +146,15 @@ cp data/config.example.json data/config.json
   a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
   The min-balance floor is enforced **cumulatively** — several payments in one
   cycle can't sneak the wallet below it.
-- **Separate offense gas (audit/kill):** by default one set of gas settings
-  (max base-fee, priority tip, dynamic tip) applies to everything. Turn on
-  **Separate gas for audit / kill** to bid gas independently for offense — it's a
-  race against rivals, whereas tax payments aren't — without overpaying on
-  routine payments. Off by default, so behavior is unchanged until you opt in.
-  Payment gas is edited under **Just-in-time epoch payment → Payment gas**.
+- **Separate offense gas (audit/kill):** audit/kill bid their own gas,
+  independent of payments — it's a race against rivals where a payment isn't, so
+  it carries a different tip and base-fee cap. **On by default**; turn off
+  **Separate gas for audit / kill** to make one set of gas settings apply to
+  everything. The shipped payment defaults are tuned to win the boundary bundle
+  race (a ~15 gwei tip clears the observed batch-audit bundles at ~3 gwei, with
+  dynamic tip scaling it up in contested blocks); offense carries its own tip and
+  a tighter base-fee cap. Payment gas is edited under **Just-in-time epoch
+  payment → Payment gas**; offense gas under **Offense**.
 - **Simulate-before-send:** every transaction is checked first (`eth_call` in
   public/local mode, `eth_callBundle` for bundles), so reverting transactions aren't
   paid for and nonces aren't burned on them.
