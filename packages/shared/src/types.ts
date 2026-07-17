@@ -219,6 +219,8 @@ export interface PostMortemResult {
 }
 
 export interface BotStatus {
+  /** The bot's release version (see VERSION in constants). */
+  version: string;
   running: boolean;
   unlocked: boolean;
   dryRun: boolean;

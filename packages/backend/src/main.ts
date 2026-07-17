@@ -1,3 +1,4 @@
+import { VERSION } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { runtime } from "./runtime.js";
@@ -5,7 +6,7 @@ import { buildServer } from "./api.js";
 import { getChainId } from "./chain.js";
 
 async function main(): Promise<void> {
-  logger.info(`DeathAndTaxes bot starting in ${appConfig.mode} mode`);
+  logger.info(`DeathAndTaxes bot v${VERSION} starting in ${appConfig.mode} mode`);
   logger.info(`Game contract: ${appConfig.gameAddress}`);
 
   runtime.chainId = await getChainId();

@@ -86,6 +86,27 @@ npm run build
 npm start          # backend only; serve packages/web/dist with any static host
 ```
 
+### Versioning & releases
+
+The bot has a single version string (`VERSION` in
+`packages/shared/src/constants.ts`). It's shown **in the dashboard header** (next to
+the title) and **logged at startup**, so you can always confirm which build you're
+running — and the dashboard flags a warning if the running backend's version
+doesn't match the dashboard's (e.g. a half-updated copy).
+
+To cut a release zip:
+
+```bash
+npm run package    # writes release/death-and-taxes-bot-v<VERSION>.zip
+```
+
+The zip is named after the version, so recipients can tell an old build from a new
+one at a glance. It's built with `git archive`, so it contains only committed,
+tracked files — no `node_modules`, no `.env`, and none of your local
+`data/settings.json` or keystore. When you ship a new build, bump `VERSION` (and the
+matching `package.json` `version` fields — `npm run package` refuses to run if they
+disagree) and commit before packaging.
+
 ---
 
 ## Configuration (`.env`)

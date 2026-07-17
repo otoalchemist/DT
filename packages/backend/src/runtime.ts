@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { WalletClient } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
-import type { BotStatus, StrategyConfig } from "@dat-bot/shared";
+import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
@@ -140,6 +140,7 @@ class Runtime {
 
   status(): BotStatus {
     return {
+      version: VERSION,
       running: this.running,
       unlocked: this.unlocked,
       dryRun: this.strategy.dryRun,

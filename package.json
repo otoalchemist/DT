@@ -1,6 +1,6 @@
 {
   "name": "death-and-taxes-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Self-hosted automation bot for the DeathAndTaxes on-chain game (defense + game-strategy, Flashbots inclusion).",
   "license": "MIT",
@@ -16,7 +16,8 @@
     "dev": "npm run build:shared && concurrently -n backend,web -c blue,magenta \"npm:dev:backend\" \"npm:dev:web\"",
     "build": "npm run build:shared && npm run build -w @dat-bot/backend && npm run build -w @dat-bot/web",
     "start": "npm run build:shared && node packages/backend/dist/main.js",
-    "test": "npm run test -w @dat-bot/backend"
+    "test": "npm run test -w @dat-bot/backend",
+    "package": "node scripts/package.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

@@ -27,6 +27,8 @@ code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 .brand { font-size: 20px; font-weight: 700; }
 .brand small { color: var(--muted); font-weight: 400; font-size: 12px; display: block; }
+.brand .version { font-size: 12px; font-weight: 600; color: var(--muted); vertical-align: middle; }
+.brand .version-warn { color: var(--danger, #e5484d); font-weight: 600; }
 
 .grid { display: grid; gap: 16px; }
 .cols-2 { grid-template-columns: 1fr 1fr; }

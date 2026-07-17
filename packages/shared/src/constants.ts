@@ -1,3 +1,11 @@
+// The bot's release version. SINGLE SOURCE OF TRUTH — the backend logs it at
+// startup and returns it in /api/status, the dashboard shows it in the header,
+// and `npm run package` names the release zip after it
+// (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
+// tell at a glance whether they're running the current build. Keep the
+// package.json `version` fields in sync (npm run package verifies they match).
+export const VERSION = "0.2.0" as const;
+
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
 // values at startup (see contract.ts) and treats these only as documented defaults.

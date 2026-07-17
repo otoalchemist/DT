@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback } from "react";
-import type {
-  BotStatus,
-  StrategyConfig,
-  ActivityEntry,
-  OwnedTokenStatus,
-  TargetTokenStatus,
+import {
+  VERSION,
+  type BotStatus,
+  type StrategyConfig,
+  type ActivityEntry,
+  type OwnedTokenStatus,
+  type TargetTokenStatus,
 } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { Config } from "./Config.js";
@@ -152,8 +153,15 @@ export function Dashboard({
 
         <div className="topbar">
           <div className="brand">
-            Death &amp; Taxes Bot
-            <small>{connected ? "● live" : "○ reconnecting…"} · {shortAddr(status?.address)}</small>
+            Death &amp; Taxes Bot <span className="version">v{VERSION}</span>
+            <small>
+              {connected ? "● live" : "○ reconnecting…"} · {shortAddr(status?.address)}
+              {status?.version && status.version !== VERSION && (
+                <span className="version-warn" title="The running backend is a different version than this dashboard — re-run the current build.">
+                  {" "}· ⚠ backend v{status.version}
+                </span>
+              )}
+            </small>
           </div>
           <div className="row wrap">
             <span
