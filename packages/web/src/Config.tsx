@@ -21,6 +21,11 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
   const [busyMode, setBusyMode] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
+  // useState's initial value is only read on mount, so when the parent loads the
+  // real mode from the backend (GET /api/settings) after this component has already
+  // mounted, reflect it here — otherwise the buttons stay stuck on the seed value.
+  useEffect(() => setMode(initialMode), [initialMode]);
+
   const saveKey = async () => {
     if (!key.trim()) return;
     setBusyKey(true);
@@ -105,7 +110,9 @@ export function Config({ initial }: { initial: StrategyConfig }) {
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
-  const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("public");
+  // Seed with the actual shipped default (mainnet) so the panel doesn't briefly
+  // misreport before GET /api/settings resolves; corrected on load if it differs.
+  const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("mainnet");
 
   useEffect(() => setCfg(initial), [initial]);
 
