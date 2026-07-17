@@ -31,6 +31,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   auditSafetyBufferSeconds: 3 * 60 * 60, // clear audits with >=3h to spare
   proactivePay: true,
   prepayEpochs: 1,
+  autoUseBribe: false, // never auto-spend bribes; pay taxes to clear audits instead
   jitEnabled: false,
   jitTargetEpoch: null,
   jitTokenIds: [],

@@ -292,7 +292,9 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
           JIT payment enables it automatically. The values still apply and remain
           editable in data/config.json (enabled, proactivePay,
-          auditSafetyBufferSeconds, prepayEpochs). */}
+          auditSafetyBufferSeconds, prepayEpochs, autoUseBribe). autoUseBribe is
+          OFF by default: the bot pays taxes to clear audits and never spends a
+          held bribe unless you set it true. */}
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>

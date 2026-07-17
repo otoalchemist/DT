@@ -4,6 +4,7 @@
   "auditSafetyBufferSeconds": 10800,
   "proactivePay": true,
   "prepayEpochs": 1,
+  "autoUseBribe": false,
   "jitEnabled": false,
   "jitTargetEpoch": null,
   "jitTokenIds": [],

@@ -329,10 +329,12 @@ async function findPreBoundaryAuditors(ownedIds: bigint[], targetEpoch: bigint):
     const lep = results[i * 2];
     const limit = results[i * 2 + 1];
     if (lep?.status !== "success" || limit?.status !== "success") continue;
-    // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet.
-    if (isEligibleAuditor(lep.result as bigint, targetEpoch, 0n, limit.result as bigint)) {
-      eligible.push(ownedIds[i]!);
-    }
+    const limitV = limit.result as bigint;
+    // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet,
+    // so remaining capacity == auditLimit. Add one pool entry per available audit
+    // so auditor-role tokens (limit > 1) can hit multiple rivals at the boundary.
+    if (!isEligibleAuditor(lep.result as bigint, targetEpoch, 0n, limitV)) continue;
+    for (let k = 0n; k < limitV; k++) eligible.push(ownedIds[i]!);
   }
   return eligible;
 }
@@ -729,7 +731,10 @@ async function defensePass(
 
     // 1) Under audit and within safety buffer -> clear it.
     if (underAudit && (st.secondsUntilKillable ?? 0) <= s.auditSafetyBufferSeconds) {
-      if (bribes > 0n) {
+      // Only spend a bribe if the user opted in — a bribe clears the audit for free
+      // but is consumed and leaves the token delinquent (re-auditable), so by
+      // default we pay taxes to clear instead and never auto-consume bribes.
+      if (s.autoUseBribe && bribes > 0n) {
         // Bribe is free (value 0) but still costs gas — apply the same guardrail
         // as the pay-to-clear path below so the base-fee cap holds consistently.
         const guard = await canSpend(0n, false);
@@ -863,9 +868,12 @@ async function jitPass(
 /**
  * Build the pool of owned tokens usable as audit "from" tokens this tick — each
  * not itself auditable and still under its per-epoch audit limit. Reading
- * auditsUsedInEpoch on-chain means a token already used earlier this epoch (even
- * in a prior tick) is excluded, so we never reuse one and hit AuditLimitReached.
- * Each entry can back exactly one audit (a normal token audits once/epoch).
+ * auditsUsedInEpoch on-chain means audits already spent earlier this epoch (even
+ * in a prior tick) are excluded, so we never exceed a token's limit and hit
+ * AuditLimitReached. A token may audit up to `auditLimit` DISTINCT targets per
+ * epoch (auditor-role citizens have limit > 1), so it is added to the pool once
+ * per *remaining* audit — `auditLimit - auditsUsedInEpoch` times — and each entry
+ * backs one audit of a different rival.
  */
 async function findEligibleAuditors(ownedIds: bigint[], currentEpoch: bigint): Promise<bigint[]> {
   if (ownedIds.length === 0) return [];
@@ -883,9 +891,12 @@ async function findEligibleAuditors(ownedIds: bigint[], currentEpoch: bigint): P
     const used = results[i * 3 + 1];
     const limit = results[i * 3 + 2];
     if (lep?.status !== "success" || used?.status !== "success" || limit?.status !== "success") continue;
-    if (isEligibleAuditor(lep.result as bigint, currentEpoch, used.result as bigint, limit.result as bigint)) {
-      eligible.push(ownedIds[i]!);
-    }
+    const lepV = lep.result as bigint;
+    const usedV = used.result as bigint;
+    const limitV = limit.result as bigint;
+    if (!isEligibleAuditor(lepV, currentEpoch, usedV, limitV)) continue;
+    // Remaining capacity this epoch (>= 1 given isEligibleAuditor); one pool entry each.
+    for (let k = usedV; k < limitV; k++) eligible.push(ownedIds[i]!);
   }
   return eligible;
 }

@@ -82,6 +82,10 @@ export interface StrategyConfig {
   proactivePay: boolean;
   /** Epochs to prepay per payTaxes call (1-7) to lock the current rate. */
   prepayEpochs: number;
+  /** Spend a held bribe to clear an audit (free, but consumes the bribe and leaves
+   *  the token still delinquent). OFF by default — the bot pays taxes to clear
+   *  instead, so bribes are never auto-consumed unless you opt in. */
+  autoUseBribe: boolean;
 
   // --- Just-in-time single-epoch payment (one-shot) ---
   /** When armed, pay exactly one epoch for each selected token the moment the

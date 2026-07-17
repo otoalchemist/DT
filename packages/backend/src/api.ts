@@ -27,6 +27,7 @@ const strategyPatch = z
     auditSafetyBufferSeconds: z.number().int().min(0),
     proactivePay: z.boolean(),
     prepayEpochs: z.number().int().min(1).max(7),
+    autoUseBribe: z.boolean(),
     jitEnabled: z.boolean(),
     jitTargetEpoch: z.number().int().min(1).nullable(),
     jitTokenIds: z.array(z.string()),
