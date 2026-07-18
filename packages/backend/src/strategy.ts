@@ -279,6 +279,7 @@ async function firePreBoundaryPay(): Promise<void> {
       allowFailure: true,
       contracts: selected.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
     });
+    let queuedPayment = false;
     for (let i = 0; i < selected.length; i++) {
       const r = results[i];
       if (r?.status !== "success") continue;
@@ -296,12 +297,25 @@ async function firePreBoundaryPay(): Promise<void> {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
         continue;
       }
-      await act(
+      const res = await act(
         { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
         "pay-taxes",
         { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`, race: true, simTimestamp: boundaryTs },
       );
+      if (res?.ok) queuedPayment = true;
     }
+
+    // Ride any due pre-boundary audits in the SAME atomic bundle, queued AFTER the
+    // payments (higher nonces) and marked allowed-to-revert. They can never drop a
+    // payment (revertingTxHashes) and — when a payment IS present — aren't mirrored
+    // to the mempool, so the wallet's mempool sequence stays a clean single run of
+    // payments and the payment still wins top-of-block. This is the fix for the
+    // two-separate-bundles nonce contention that pushed a payment+audit down into
+    // the mempool region. If no payment was queued (all citizens current), the
+    // audits fall back to standalone behaviour (mirrored) — nothing to protect. At
+    // fire time the JIT target epoch is the imminent boundary, so it matches the
+    // audit target (currentEpoch+1) and boundary instant.
+    await queuePreBoundaryAudits(address, targetEpoch, BigInt(Math.floor(Date.now() / 1000)), boundaryTs, { revertible: queuedPayment });
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
@@ -352,6 +366,18 @@ export function schedulePreBoundaryAudit(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
+  // If a pre-boundary PAYMENT is armed for this same upcoming boundary, it carries
+  // the audits inside its atomic bundle (behind the payment, revertible). Don't
+  // also fire a standalone audit — that would double-submit and reintroduce the
+  // two-bundle nonce contention that demotes the payment.
+  if (
+    s.preBoundaryPay &&
+    s.jitEnabled &&
+    s.jitTargetEpoch !== null &&
+    BigInt(s.jitTargetEpoch) === runtime.currentEpoch + 1n
+  ) {
+    return;
+  }
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
@@ -359,16 +385,73 @@ export function schedulePreBoundaryAudit(): void {
   preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
 }
 
-/** Pre-submit audits (skip-sim) for rivals that will be auditable in the FIRST
- *  block of the upcoming epoch, so we compete with a batch-auditor rather than
- *  landing a block later. Best-effort; normal offensePass remains the fallback. */
+/**
+ * Queue pre-boundary audits into the CURRENTLY OPEN batch — targets that will be
+ * auditable in the first block of `targetEpoch`, simulated at `boundaryTs`. The
+ * caller must have opened the batch (beginBatch) and synced the nonce. When
+ * `revertible`, each audit is marked allowed-to-revert and is NOT mirrored to the
+ * mempool — so it can ride behind a mandatory payment in one atomic bundle without
+ * ever dropping the payment, and without adding a second mempool nonce that would
+ * push the payment out of the top-of-block region.
+ */
+async function queuePreBoundaryAudits(
+  address: Address,
+  targetEpoch: bigint,
+  nowSec: bigint,
+  boundaryTs: bigint,
+  opts: { revertible: boolean },
+): Promise<void> {
+  const s = runtime.strategy;
+  if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
+  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
+  const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+  const auditors = await findPreBoundaryAuditors(ownedIds, targetEpoch);
+  if (auditors.length === 0) return;
+
+  const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
+  const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
+  const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
+  const owned = new Set(ownedIds.map((x) => x.toString()));
+  const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+  // Auditable AT the target epoch, not already under audit.
+  const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
+  let idx = 0;
+  for (const t of statuses) {
+    if (idx >= auditors.length) break;
+    if (owned.has(t.tokenId)) continue;
+    if (pinned && !pinned.has(t.tokenId)) continue;
+    if (t.auditDueTimestamp !== "0") continue; // already under audit
+    if (!isAuditable(BigInt(t.lastEpochPaid), targetEpoch)) continue; // won't be auditable at the boundary
+    const guard = await canSpend(AUDIT_COST_WEI, true);
+    if (!guard.ok) continue;
+    const from = auditors[idx]!;
+    const res = await act(
+      { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
+      "audit",
+      {
+        tokenId: from.toString(),
+        targetTokenId: t.tokenId,
+        message: `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch}${opts.revertible ? " (rides payment bundle)" : " (boundary race)"}`,
+        race: true,
+        simTimestamp: boundaryTs,
+        revertible: opts.revertible,
+      },
+    );
+    if (res?.ok) idx++;
+  }
+}
+
+/** Pre-submit audits for rivals that will be auditable in the FIRST block of the
+ *  upcoming epoch, so we compete with a batch-auditor rather than landing a block
+ *  later. Standalone (no payment this boundary): its own bundle, mirrored per
+ *  racePublicMempool. When a payment IS armed for this boundary, firePreBoundaryPay
+ *  carries the audits instead (see schedulePreBoundaryAudit). */
 async function firePreBoundaryAudit(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
   if (ticking) { setTimeout(() => void firePreBoundaryAudit(), 150); return; }
-  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
   committedThisTickWei = 0n;
   beginBatch();
@@ -379,34 +462,7 @@ async function firePreBoundaryAudit(): Promise<void> {
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
     await nonceManager.sync(address, appConfig.mode);
-    const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
-    const auditors = await findPreBoundaryAuditors(ownedIds, targetEpoch);
-    if (auditors.length === 0) return;
-
-    const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-    const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
-    const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
-    const owned = new Set(ownedIds.map((x) => x.toString()));
-    const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
-    // Auditable AT the target epoch, not already under audit.
-    const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
-    let idx = 0;
-    for (const t of statuses) {
-      if (idx >= auditors.length) break;
-      if (owned.has(t.tokenId)) continue;
-      if (pinned && !pinned.has(t.tokenId)) continue;
-      if (t.auditDueTimestamp !== "0") continue; // already under audit
-      if (!isAuditable(BigInt(t.lastEpochPaid), targetEpoch)) continue; // won't be auditable at the boundary
-      const guard = await canSpend(AUDIT_COST_WEI, true);
-      if (!guard.ok) continue;
-      const from = auditors[idx]!;
-      const res = await act(
-        { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
-        "audit",
-        { tokenId: from.toString(), targetTokenId: t.tokenId, message: `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch} (boundary race)`, race: true, simTimestamp: boundaryTs },
-      );
-      if (res?.ok) idx++;
-    }
+    await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: false });
   } catch (err) {
     logger.error("pre-boundary audit error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
@@ -653,7 +709,7 @@ async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<voi
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean },
 ): Promise<SubmitResult | null> {
   const dryRun = runtime.strategy.dryRun;
   const offense = kind === "audit" || kind === "kill";
@@ -666,9 +722,13 @@ async function act(
       // front-runnable (rivals already see the delinquency on-chain).
       // OFFENSE stays opt-in (racePublicMempool): a visible pending audit lets the
       // target escape by paying first, so privacy is worth something there.
-      race: offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
+      // A `revertible` tx (an audit riding behind a payment in one bundle) never
+      // mirrors — the whole point is to keep the shared-nonce mempool sequence
+      // clean so the payment still wins top-of-block.
+      race: ctx.revertible ? false : offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
       offense,
       simTimestamp: ctx.simTimestamp,
+      revertible: ctx.revertible,
     });
     if (!result.ok) {
       activity.add({
