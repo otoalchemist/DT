@@ -223,10 +223,6 @@ interface QueuedTx {
   signed: Hex;
   nonce: number;
   race: boolean;
-  /** Allowed to revert without invalidating the bundle (eth_sendBundle
-   *  revertingTxHashes). Used for the optional audit riding behind a mandatory
-   *  payment, so a reverting audit can never drop the payment from the bundle. */
-  revertible: boolean;
 }
 let bundleQueue: QueuedTx[] | null = null;
 
@@ -256,13 +252,9 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   const out = new Map<number, BundleTxResult>();
   if (!queue || queue.length === 0) return out;
 
-  // A bundle executes its txs in the given order, so nonces must ascend. Mandatory
-  // txs (payments) come first at lower nonces; revertible txs (audits) follow.
+  // A bundle executes its txs in the given order, so nonces must ascend.
   queue.sort((a, b) => a.nonce - b.nonce);
   const signedList = queue.map((q) => q.signed);
-  // Txs allowed to revert without invalidating the bundle — so a reverting audit
-  // never drops the payment. A tx's hash is the keccak of its signed serialization.
-  const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
   const targetBlock = (await publicClient.getBlockNumber()) + 1n;
 
   // One multi-tx bundle, fanned out to every builder for the next two blocks.
@@ -270,9 +262,12 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   const bundleHashes: string[] = [];
   const attempts = appConfig.builderUrls.flatMap((url) =>
     [targetBlock, targetBlock + 1n].map(async (blk) => {
-      const params: Record<string, unknown> = { txs: signedList, blockNumber: toHex(blk) };
-      if (revertingTxHashes.length > 0) params.revertingTxHashes = revertingTxHashes;
-      const r = await flashbotsRpcWithTimeout("eth_sendBundle", [params], url, SEND_BUNDLE_TIMEOUT_MS);
+      const r = await flashbotsRpcWithTimeout(
+        "eth_sendBundle",
+        [{ txs: signedList, blockNumber: toHex(blk) }],
+        url,
+        SEND_BUNDLE_TIMEOUT_MS,
+      );
       return { url, bundleHash: r?.bundleHash as string | undefined };
     }),
   );
@@ -332,9 +327,6 @@ export async function submitTx(
     offense?: boolean;
     /** Simulate at this future unix-second timestamp (pre-boundary races). */
     simTimestamp?: bigint;
-    /** Queue this tx as allowed-to-revert in the bundle (never mirrored to the
-     *  mempool). Used for an audit riding behind a mandatory payment. */
-    revertible?: boolean;
   },
 ): Promise<SubmitResult> {
   const account = runtime.account;
@@ -448,7 +440,7 @@ export async function submitTx(
   // whole tick's txs go out as ONE atomic multi-tx bundle with valid sequential
   // nonces (see flushBundle). Hashes are filled in by the caller after flush.
   if (bundleQueue !== null) {
-    bundleQueue.push({ signed, nonce, race: opts.race ?? false, revertible: opts.revertible ?? false });
+    bundleQueue.push({ signed, nonce, race: opts.race ?? false });
     return { ...base, ok: true, queued: true, targetBlock };
   }
 

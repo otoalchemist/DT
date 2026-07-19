@@ -248,19 +248,7 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   post-deadline offense. Off by default; enable under *Offense*. Note: boundary
   block position is driven by **builder orderflow**, not tip — a defender who
   pre-pays will beat your audit regardless of gas, so this is lower-value than the
-  payment race. **When a payment race is armed for the same boundary, the audits
-  ride inside the payment's bundle** (see next) rather than as their own.
-- **Payment + audit in one atomic bundle (`mainnet`, automatic)** — payment and
-  audit from the same wallet share a nonce sequence, so sending them as two
-  separate bundles fails: the audit bundle is nonce-gapped and dropped, and the
-  extra pending nonce pushes the *payment* out of the top-of-block region into the
-  mempool. When both are due at the same boundary the bot instead puts the
-  **payment(s) first, then the audit(s)** in **one atomic bundle**, with the audits
-  marked **allowed-to-revert** (`revertingTxHashes`) and **not** mirrored to the
-  mempool. So the payment always wins top-of-block exactly as it does alone, a
-  reverting audit (target defended in the meantime) can never drop the payment, and
-  the audit only rides along for free. Payment placement is unchanged when no audit
-  is due. Always on in `mainnet` mode.
+  payment race.
 - **Salted rival sweep order** — every bot sees the same candidate list in the
   same order (same indexer, same on-chain enumeration), so without this every
   instance would sweep the same tokens first, piling onto identical targets while
