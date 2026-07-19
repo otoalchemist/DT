@@ -19,11 +19,32 @@ function fail(msg) {
   process.exit(1);
 }
 
-// --- Read the canonical version from the shared constants ---
-const constantsPath = path.join(root, "packages", "shared", "src", "constants.ts");
-const constantsSrc = fs.readFileSync(constantsPath, "utf8");
+// git archive reads HEAD, so reject a dirty tree before deriving any metadata.
+// This prevents a working-tree version from naming an archive of older code.
+const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim();
+if (dirty) {
+  fail(
+    "Refusing to package a dirty working tree because the archive is built from HEAD:\n" +
+      dirty
+        .split("\n")
+        .map((line) => `  ${line}`)
+        .join("\n") +
+      "\nCommit or stash the changes, then re-run.",
+  );
+}
+
+function readHead(relativePath) {
+  return execFileSync("git", ["show", `HEAD:${relativePath}`], {
+    cwd: root,
+    encoding: "utf8",
+  });
+}
+
+// --- Read the canonical version from the exact commit being archived. ---
+const constantsRelativePath = "packages/shared/src/constants.ts";
+const constantsSrc = readHead(constantsRelativePath);
 const m = constantsSrc.match(/export const VERSION\s*=\s*"([^"]+)"/);
-if (!m) fail(`Could not find VERSION in ${constantsPath}`);
+if (!m) fail(`Could not find VERSION in HEAD:${constantsRelativePath}`);
 const version = m[1];
 
 // --- Sanity-check that package.json versions agree, so the metadata doesn't
@@ -36,29 +57,20 @@ const pkgFiles = [
 ];
 const mismatches = [];
 for (const rel of pkgFiles) {
-  const p = path.join(root, rel);
-  if (!fs.existsSync(p)) continue;
-  const v = JSON.parse(fs.readFileSync(p, "utf8")).version;
+  const v = JSON.parse(readHead(rel)).version;
   if (v !== version) mismatches.push(`  ${rel}: ${v} (expected ${version})`);
+}
+const lockfile = JSON.parse(readHead("package-lock.json"));
+for (const rel of pkgFiles) {
+  const key = rel === "package.json" ? "" : rel.replace(/\/package\.json$/, "");
+  const v = lockfile.packages?.[key]?.version;
+  if (v !== version) mismatches.push(`  package-lock.json packages[${JSON.stringify(key)}]: ${String(v)} (expected ${version})`);
 }
 if (mismatches.length > 0) {
   fail(
     `package.json version(s) don't match VERSION="${version}" in constants.ts:\n` +
       mismatches.join("\n") +
       `\nBump them to ${version} (or fix VERSION) and re-run.`,
-  );
-}
-
-// --- Warn if the working tree is dirty: git archive packages the last commit,
-//     so uncommitted edits won't be in the zip. ---
-const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim();
-if (dirty) {
-  console.warn(
-    "⚠ Working tree has uncommitted changes — the zip reflects the last commit, not these edits:\n" +
-      dirty
-        .split("\n")
-        .map((l) => `    ${l}`)
-        .join("\n"),
   );
 }
 

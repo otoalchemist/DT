@@ -2,10 +2,10 @@
 
 A self-hosted automation bot for the on-chain game **[Death & Taxes](https://etherscan.io/address/0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F)** by Transient Labs. It watches the game for you and acts automatically:
 
-- **Defense (primary):** never let one of your Citizen tokens get killed. If a token is audited, the bot clears the audit by **paying taxes** before the 24-hour deadline (this also makes the token current, so it can't be immediately re-audited). It can also pay proactively so your tokens are never even auditable, and prepay up to 7 epochs to lock the current (lower) tax rate. It **won't spend a held bribe** to clear an audit unless you opt in (`autoUseBribe`, off by default) — a bribe is free but consumed and leaves the token still delinquent.
-- **Just-in-time epoch payment (one-shot):** arm the bot for a single upcoming epoch and it pays exactly one epoch for each of your citizens *the moment that epoch begins on-chain* — before they can be audited — then auto-disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per citizen the instant epoch 133 starts. The exact amount is read on-chain at pay time, so it's always correct even for multiple citizens. Each JIT payment is exactly one epoch (one day) and advances the citizen a single epoch, so it fires even when a citizen is momentarily 2 epochs behind at the boundary, and never balloons into a multi-day charge — see the **per-payment epoch cap** below.
+- **Defense (primary):** reduce the chance that one of your Citizen tokens is killed. By default, the bot reacts as soon as it observes a fresh 24-hour audit and tries to clear it by **paying taxes**. It also pays proactively at each boundary where a token would otherwise become auditable, and can prepay up to 7 epochs to lock the current (lower) tax rate. It **won't spend a held bribe** to clear an audit unless you opt in (`autoUseBribe`, off by default) — a bribe is free but consumed and leaves the token still delinquent.
+- **Just-in-time epoch payment (one-shot):** arm the bot for one explicit future epoch and an explicit set of Citizens. It pays exactly one epoch for only those Citizens as that epoch begins on-chain, then records the campaign as complete and disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per selected citizen. JIT is independent of recurring Defense: arming one Citizen never enables payments for the rest of the wallet.
 - **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. It audits **multiple rivals per epoch** — up to each eligible citizen's **`auditLimit`** (auditor-role tokens can audit several times per epoch; the bot reads each token's remaining capacity and uses all of it), instead of just one. This is a game strategy, not a profit engine — see below.
-- **Reliable inclusion:** choose your submission path — **`mainnet`** (the default: private **bundles** fanned out to several block builders; bundles sit in the block's top region *regardless of tip*, which is what wins a boundary race — and payments still mirror to the public mempool so they can't fail to land) or **`public`** (mempool only, seated after every bundle). Optional latency edges let payments/offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
+- **Reliable submission paths:** choose **`mainnet`** (the default: private **bundles** fanned out to several block builders, with tax payments also mirrored to the public mempool as an independent fallback) or **`public`** (mempool only). [Builders decide inclusion and ordering](https://docs.flashbots.net/flashbots-auction/advanced/bundle-pricing) from profitability and available orderflow; neither route guarantees inclusion or block position. Latency edges let payments/offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
 - **Live activity log:** every action is timestamped with its status; submitted transactions link to Etherscan and auto-update from **submitted → included / reverted** once the receipt lands.
 - **Race post-mortem:** after the fact, paste your tx hash and a rival's to see whether you lost on **timing** (later block) or **fee** (same block, out-priced) — in the dashboard or from the CLI.
 
@@ -45,15 +45,17 @@ packages/
 ```
 
 The backend holds an **encrypted hot-wallet key** (scrypt + AES-256-GCM) and signs
-transactions locally with [viem](https://viem.sh). Ownership is indexed via the
-**Alchemy NFT API**; chain state via your Alchemy RPC (WSS + HTTPS).
+transactions locally with [viem](https://viem.sh). The normal mainnet setup uses
+Alchemy for RPC and NFT indexing; explicit RPC/index endpoints and local
+`OWNED_TOKENS` overrides are also supported.
 
 ---
 
 ## Setup
 
-**Requirements:** Node.js ≥ 20, and an [Alchemy](https://alchemy.com) API key
-(free tier is fine) for the Ethereum mainnet RPC + NFT API.
+**Requirements:** a supported Node.js release (20.19+, 22.12+, or 24+) and a
+configured RPC plus Citizen ownership enumeration. An [Alchemy](https://alchemy.com)
+API key (free tier is fine) supplies both for the normal mainnet setup.
 
 ```bash
 git clone <this-repo> && cd death-and-taxes-bot
@@ -83,8 +85,12 @@ Fund the wallet with a little ETH for taxes/audits/gas. Keep the dashboard's
 
 ```bash
 npm run build
-npm start          # backend only; serve packages/web/dist with any static host
+npm start          # backend only
 ```
+
+Serve `packages/web/dist` behind the same production host as the API, with
+`/api` and `/ws` reverse-proxied to the backend. A bare static host is not enough
+because the dashboard deliberately uses same-origin API and WebSocket paths.
 
 ### Versioning & releases
 
@@ -107,18 +113,21 @@ tracked files — no `node_modules`, no `.env`, and none of your local
 matching `package.json` `version` fields — `npm run package` refuses to run if they
 disagree) and commit before packaging.
 
+Upgrading an existing installation? Read the [0.3.0 migration guide](docs/migration-0.3.0.md)
+before starting the new version.
+
 **Tag it so GitHub serves a versioned download.** GitHub's green *Code → Download
 ZIP* button always gives `DT-<branch>.zip` (a branch has no version). To get a
 version in the filename, push a tag:
 
 ```bash
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "v0.3.0"
+git push origin v0.3.0
 ```
 
-GitHub then serves the tagged source archive as **`DT-0.2.0.zip`** (leading `v`
+GitHub then serves the tagged source archive as **`DT-0.3.0.zip`** (leading `v`
 stripped) from the repo's **Tags**/**Releases** page and at
-`https://github.com/<owner>/DT/archive/refs/tags/v0.2.0.zip`. For a published
+`https://github.com/<owner>/DT/archive/refs/tags/v0.3.0.zip`. For a published
 **Release** with the nicer `death-and-taxes-bot-v<VERSION>.zip` name, draft a
 release on that tag and upload the `npm run package` artifact as an asset (via the
 web UI or `gh release create`).
@@ -129,23 +138,29 @@ web UI or `gh release create`).
 
 | Var | Purpose |
 | --- | --- |
-| `ALCHEMY_API_KEY` | Derives the mainnet HTTPS/WSS RPC and NFT API endpoints. |
-| `RPC_HTTP_URL` / `RPC_WS_URL` / `ALCHEMY_NFT_URL` | Explicit overrides (any RPC). |
-| `MODE` | `mainnet` (**default** — private bundles to `BUILDER_URLS`; payments also mirror to the mempool so they still land), `public` (mempool only), or `local` (anvil fork). Also switchable at runtime from the dashboard. |
-| `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to Flashbots, **BuilderNet**, beaverbuild and Titan (all verified live). Endpoints do change — verify against each builder's docs. |
+| `ALCHEMY_API_KEY` | Derives the mainnet HTTPS/WSS RPC and NFT API endpoints. If set in the environment, it is environment-owned: edit it and restart rather than replacing it in the dashboard. |
+| `RPC_HTTP_URL` / `RPC_WS_URL` / `ALCHEMY_NFT_URL` | Explicit overrides. They remain authoritative if a dashboard-saved Alchemy key changes; an explicit HTTP URL does not inherit a mainnet WebSocket. |
+| `MODE` | `mainnet` (**default** — private bundles to `BUILDER_URLS`; payments also mirror to the mempool for broader inclusion coverage), `public` (mempool only), or `local` (Anvil/non-mainnet direct broadcast). When absent from the environment it is switchable and persisted from the dashboard; an explicit environment value is read-only until restart. Local mode refuses chain ID 1. |
+| `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to [Flashbots](https://docs.flashbots.net/flashbots-auction/advanced/rpc-endpoint), [BuilderNet](https://buildernet.org/docs/send-orderflow), [beaverbuild](https://beaverbuild.org/docs.html), and [Titan](https://docs.titanbuilder.xyz/api/eth_sendbundle) (provider-documented for `eth_sendBundle` as of July 2026). Endpoints do change — verify against each builder's current docs. |
 | `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). |
+| `BACKEND_URL` | Development dashboard proxy target. Defaults to `http://127.0.0.1:<PORT>`; set it explicitly when the backend is on another host. |
+| `API_ALLOWED_HOSTS` | Comma-separated trusted Host/Origin names required for every non-loopback/LAN bind (for example `192.168.1.20,bot.internal.example`). Unlisted names fail closed. |
+| `DATA_DIR` | Per-instance durable state directory (strategy, settings, campaign, journal, activity, and keystore). Put custom directories outside the checkout. |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
+| `MAX_CANDIDATES` | Offense-only cap on rival enumeration (default 500). Owned Citizens are always fully paginated and then verified with `ownerOf`. |
 
-Secrets live in `.env` and `data/` (the encrypted keystore + a Flashbots
-reputation key). Both are git-ignored. **Never commit them.**
+Secrets live in `.env` and the default `data/` directory (the encrypted keystore
+and a Flashbots reputation key). Both are git-ignored. A custom `DATA_DIR` is not
+automatically ignored, so keep it outside the repository. **Never commit it.**
 
-Strategy settings are edited from the dashboard and saved to `data/config.json`
-(also git-ignored, since it holds your live strategy). With no such file the bot
-starts from safe defaults — dry-run on, offense/defense off. To seed a starting
-point, copy the template:
+Strategy settings are edited from the dashboard and saved to `<DATA_DIR>/config.json`.
+With no such file the bot starts from safe defaults — dry-run on, offense/defense
+off. To seed a custom state directory outside the checkout, copy the template:
 
 ```bash
-cp data/config.example.json data/config.json
+export DATA_DIR=/absolute/path/to/death-and-taxes-data
+mkdir -p "$DATA_DIR"
+cp data/config.example.json "$DATA_DIR/config.json"
 ```
 
 ---
@@ -161,7 +176,13 @@ cp data/config.example.json data/config.json
   estimate or a badly-delinquent token draining the wallet in one shot; `0` = off),
   a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
   The min-balance floor is enforced **cumulatively** — several payments in one
-  cycle can't sneak the wallet below it.
+  cycle can't sneak the wallet below it. The floor includes unresolved value and
+  worst-case gas from prior ticks and restarts, deduplicated by nonce. Same-nonce
+  fee bumps stop at explicit payment/offense replacement-tip ceilings instead of
+  escalating without bound.
+- **Audit response window (`auditSafetyBufferSeconds`, default `86400`):** an audit
+  has a 24-hour deadline, so the default makes a newly observed audit eligible for
+  immediate clearing. Lower values wait until the deadline is within that buffer.
 - **Per-payment epoch cap (`maxAutoPayEpochs`, default `1`):** the most epochs a
   single **automatic** payment may cover. On-chain, `payTaxes(tokenId, n)` costs
   `n × currentEpoch × base` and advances the token `n` epochs, so this caps the ETH
@@ -183,24 +204,44 @@ cp data/config.example.json data/config.json
   a tighter base-fee cap. Payment gas is edited under **Just-in-time epoch
   payment → Payment gas**; offense gas under **Offense**.
 - **Simulate-before-send:** every transaction is checked first (`eth_call` in
-  public/local mode, `eth_callBundle` for bundles), so reverting transactions aren't
-  paid for and nonces aren't burned on them.
-- **Payments always land, even in `mainnet` mode.** A bundle is only included if a
+  public/local mode, `eth_callBundle` for bundles). Future-timestamp work and
+  offense fail closed when the required semantic simulation is unavailable or
+  reverts. This catches deterministic failures before submission, but state can
+  still change between simulation and inclusion, so it is a guardrail rather than
+  a guarantee.
+- **Payments get a public fallback in `mainnet` mode.** A bundle is only included if a
   builder you sent it to wins the slot, so a bundle-only payment can silently fail
   to land — which can cost a citizen. Tax payments are therefore **always** mirrored
   to the public mempool alongside the bundle (identical tx, so only one can land).
+  This improves inclusion coverage but does not guarantee that either path lands.
   There's nothing to protect by hiding a tax payment: rivals already see the
   delinquency on-chain.
-- **Local-only by default.** The API binds to `127.0.0.1`; when bound to loopback
-  it also rejects requests with an unexpected `Host` header, blocking DNS-rebinding
-  from a malicious web page. Do not expose it to the internet.
+- **Connection watchdog:** WebSocket block events trigger low-latency ticks, and a
+  12-second poll runs alongside them so a silent provider subscription cannot stop
+  the engine indefinitely.
+- **One active wallet per instance.** To automate multiple wallets, use separate
+  processes with separate data directories, ports, and keystores.
+- **Keep the host clock synchronized.** Boundary timers use Unix time. Private
+  bundles carry an on-chain timestamp floor and normal ticks recover from a miss,
+  but meaningful system-clock skew can still make a first-block attempt late.
+- **Crash-safe transaction journal:** prepared and delivered flights are written
+  atomically per wallet with their signed transaction, nonce, hash, obligation,
+  replacement lineage, and delivery targets. Startup reconciles that journal before
+  allocating a fresh nonce or replaying an authorized signed transaction. Recovery
+  rechecks the current balance against all live maximum exposure plus the current
+  min-balance floor. Public or ambiguous transactions never become reusable merely
+  because a wall-clock timeout elapsed; a corrupt journal fails closed.
+- **Local-only by default.** The API binds to `127.0.0.1` and validates both HTTP
+  `Host` and browser `Origin` headers, blocking DNS-rebinding from a malicious web
+  page. LAN/wildcard binds require an explicit `API_ALLOWED_HOSTS` allowlist and
+  apply the same checks. Do not expose the API to the internet.
 
 ---
 
 ## Latency edges
 
 Rivals often win by landing in an *earlier block*, not by paying more. These
-optional, off-by-default edges close that gap (configure them in the dashboard):
+configurable edges close that gap (configure them in the dashboard):
 
 - **Pre-schedule offense at deadlines** — fires an extra tick just before each
   offense deadline (the nearest audit expiry, or the next epoch boundary) so kills
@@ -212,6 +253,9 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   builder can include it next block. The tx is identical (same nonce), so only one
   can ever land. Trades bundle privacy for lower inclusion latency. It's opt-in for
   offense because a *visible pending audit* lets the target escape by paying first.
+  When defense or JIT is active, safety takes priority and offense is mirrored even
+  if this toggle is off, preventing a private-only offense nonce from blocking an
+  emergency tax payment.
   **Payments don't need this toggle** — in `mainnet` mode they always mirror to the
   mempool (see below), and both paths fire concurrently so neither waits on the other.
 - **Dynamic priority tip** — scales the tip up as the latest block fills past 50%,
@@ -219,26 +263,31 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   the static priority fee is always used. It applies to **tax payments** too (set
   under *Just-in-time epoch payment → Payment gas*) — useful when a boundary-timed
   payment has to out-order a rival's batch-audit in the first block of an epoch.
-- **Race into the boundary block** (advanced, opt-in, `payTaxes` only) — the
-  ordinary JIT pay fires *just after* the boundary, so it lands one block late. This
-  mode instead *pre-submits* the armed JIT payment shortly **before** the boundary
-  with a value computed off-chain for the upcoming epoch, so it can land in the
-  **first block of the epoch** ahead of a batch-auditor (matching the fastest
-  rivals). The value is validated by **simulating at the boundary timestamp**
-  (`eth_call` block overrides, or `eth_callBundle`'s `timestamp` on mainnet), so a
-  wrong value is caught before spending gas; the normal post-boundary JIT pay still
-  runs as a fallback. Off by default; enable it under *Just-in-time epoch payment →
-  Payment gas*.
-- **Atomic multi-tx bundles (`mainnet` mode, automatic)** — every Citizen you hold
+- **Race tax payments into the boundary block** (`preBoundaryPay`, enabled in the
+  shipped defaults) — this is not limited to one-shot JIT. The scheduler re-arms
+  for every upcoming boundary and pre-submits one epoch for each owned token that
+  would otherwise cross from its grace period into auditable delinquency; it also
+  includes any armed JIT tokens due at that boundary. The upcoming-epoch value is
+  validated by **simulating at the boundary timestamp** (`eth_call` block overrides,
+  plus whole-bundle simulation on mainnet). If the pre-submit is missed or fails,
+  regular block/poll ticks detect the delinquency and retry from fresh on-chain data
+  immediately instead of waiting for another boundary. During a running engine
+  session, the payment paths share per-token pending/submission tracking so stale
+  chain reads do not stack another payment and definite failures can be retried.
+  Future-valid public transactions are built early but held until the boundary;
+  mainnet bundles carry the same timestamp as their minimum inclusion time.
+- **Nonce-ordered payment campaigns (`mainnet` mode, automatic)** — every Citizen you hold
   is owned by the same wallet, so paying/auditing several in one cycle produces
   multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only
-  the first (nonce == chain nonce) is a self-valid bundle; the rest carry a nonce
-  gap and won't be placed top-of-block by builders. The bot instead collects a
-  cycle's txs and submits them as **one atomic bundle** (txs in nonce order), so
-  **all** of them win top-of-block together — what you need to out-order a
-  batch-auditor hitting several of your citizens at once. Each tx still mirrors to
-  the public mempool individually as a fallback. No configuration; always on in
-  `mainnet` mode.
+  the first (nonce == chain nonce) is independently executable; the rest carry a
+  nonce gap and cannot execute without the preceding nonce. The bot instead
+  collects a cycle's txs and submits them as **one atomic bundle** (txs in nonce order). This
+  gives builders a valid ordered sequence and avoids nonce gaps, but it does not
+  guarantee inclusion or a particular position in the block. All required payments
+  are signed before the boundary wait; the public fallback dispatches the prepared
+  sequence without serializing one wait per Citizen. Bundles are validated against
+  the builder limits (100 transactions, 300,000 encoded bytes, and aggregate gas).
+  Optional audit/kill work is never attached to a survival payment bundle.
 - **Race audits/kills into the first block** (advanced, opt-in) — the offense
   equivalents. *Race audits* pre-submits audits just before the epoch boundary so
   they land the instant rivals become delinquent (like a batch-auditor); *race
@@ -246,9 +295,9 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   the first eligible block. Both are validated by simulating at the boundary/expiry
   instant, reuse the shared pre-submit lead, and fall back to the normal
   post-deadline offense. Off by default; enable under *Offense*. Note: boundary
-  block position is driven by **builder orderflow**, not tip — a defender who
-  pre-pays will beat your audit regardless of gas, so this is lower-value than the
-  payment race.
+  block position depends on builder profitability, fees, and competing orderflow;
+  a defender who pre-pays may still beat your audit, so this is lower-value than
+  the payment race.
 - **Salted rival sweep order** — every bot sees the same candidate list in the
   same order (same indexer, same on-chain enumeration), so without this every
   instance would sweep the same tokens first, piling onto identical targets while
@@ -277,8 +326,10 @@ verdict and a summary. Needs an RPC (`ALCHEMY_API_KEY` or `RPC_HTTP_URL`).
 ## Verification
 
 ```bash
-npm test                    # unit tests: keystore round-trip, epoch/delinquency
-                            # math, audit-expiry classification, spend guardrails
+npm test                    # backend unit/model tests + dashboard component tests
+npm run test:integration    # Foundry build + disposable local Anvil boundary test
+npm run build               # shared/backend/web production builds
+npm run check:diff          # committed-range whitespace check (CI supplies its base)
 ```
 
 **Live read check** (no key, no spend) — confirms the read layer against mainnet:
@@ -287,25 +338,17 @@ npm test                    # unit tests: keystore round-trip, epoch/delinquency
 RPC_HTTP_URL=<your-rpc> npx tsx packages/backend/src/probe.ts
 ```
 
-**Mainnet-fork end-to-end** (exercises real `payTaxes` / `audit` / `kill` signing
-and broadcast) — requires [Foundry](https://book.getfoundry.sh/):
+**Mainnet-fork owner QA** — follow the exact [PR #1 owner-QA guide](docs/qa/pr-1-reliability.md).
+It transfers forked Citizens to Anvil's disposable wallet before testing, because
+`OWNED_TOKENS` is only an index override and cannot bypass the bot's on-chain
+`ownerOf` authorization. The gate remains in dry-run mode and never uses a real
+wallet key. A separate offense experiment must explicitly enable offense and put
+its chosen fork-only target into the required delinquent/audited state; merely
+warping a fresh fork cannot exercise `audit` or `kill`.
 
-```bash
-# 1. Fork mainnet locally
-anvil --fork-url <your-mainnet-rpc>
-
-# 2. Point the bot at the fork; hardcode a token you'll test against
-#    (impersonate/fund it with cast). No NFT API needed in local mode.
-MODE=local RPC_HTTP_URL=http://127.0.0.1:8545 \
-  OWNED_TOKENS=<tokenId> TARGET_TOKENS=<delinquentTokenId> \
-  npm run dev
-
-# 3. In the dashboard, turn Dry-run OFF and Start. Use `cast rpc evm_increaseTime`
-#    to warp past an audit deadline and watch the kill path fire.
-```
-
-In `local` and `public` modes the submitter broadcasts the signed tx directly
-(anvil has no Flashbots relay); on `mainnet` it submits via the relay.
+In `local` and `public` modes the submitter broadcasts the signed transaction
+directly. On `mainnet`, it fans private bundles out to configured builders and
+also gives tax payments a same-nonce public fallback for independent coverage.
 
 ---
 

@@ -1,22 +1,27 @@
 @echo off
 cd /d "%~dp0"
 
-:: Install dependencies on first run (or after a clean clone)
-if not exist "node_modules" (
-    echo Installing dependencies, this may take a minute...
-    call npm install
-    if errorlevel 1 (
-        echo.
-        echo ERROR: npm install failed. Make sure Node.js 20+ is installed.
-        echo Download it from https://nodejs.org
-        pause
-        exit /b 1
-    )
+node -e "const [major,minor]=process.versions.node.split('.').map(Number);process.exit((major===20&&minor>=19)||(major===22&&minor>=12)||major>=24?0:1)" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Supported Node.js versions are 20.19+, 22.12+, or 24+.
+    echo Download it from https://nodejs.org
+    pause
+    exit /b 1
 )
 
-:: Free ports used by a previous run
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5173 " ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8787 " ^| findstr "LISTENING"') do taskkill /PID %%a /F >nul 2>&1
+:: npm install is incremental on repeat runs and reconciles upgraded manifests.
+echo Checking dependencies...
+call npm install
+if errorlevel 1 (
+    echo.
+    echo ERROR: npm install failed. Use Node.js 20.19+, 22.12+, or 24+.
+    echo Download it from https://nodejs.org
+    pause
+    exit /b 1
+)
+
+:: Vite uses strict port binding and both servers report a clear error if their
+:: configured port is already in use. Never terminate unrelated processes here.
 
 start "Death & Taxes Bot" cmd /k "npm run dev"
 timeout /t 6 /nobreak >nul
