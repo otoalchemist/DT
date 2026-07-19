@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fc from "fast-check";
+import { join } from "node:path";
 import { parseEther, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -312,7 +313,7 @@ describe("Flashbots reputation identity durability", () => {
     expect(result.ok).toBe(true);
     expect(h.writeFileAtomicDurableSync).toHaveBeenCalledTimes(1);
     const [keyPath, privateKey, mode] = h.writeFileAtomicDurableSync.mock.calls[0]!;
-    expect(keyPath).toBe("/tmp/flashbots-auth-test/flashbots-signer.key");
+    expect(keyPath).toBe(join(h.appConfig.dataDir, "flashbots-signer.key"));
     expect(privateKey).toMatch(/^0x[0-9a-f]{64}$/);
     expect(mode).toBe(0o600);
     expect(h.runtime.setJournalHealth).toHaveBeenCalledWith(
