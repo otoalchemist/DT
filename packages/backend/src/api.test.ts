@@ -1,0 +1,910 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+
+const h = vi.hoisted(() => {
+  class RevisionConflictError extends Error {
+    constructor(public currentRevision: number) {
+      super(`Revision conflict; current revision is ${currentRevision}`);
+    }
+  }
+  const strategy = { defenseEnabled: false, offenseEnabled: false, dryRun: true };
+  const campaign = {
+    revision: 0,
+    state: "cancelled",
+    targetEpoch: null,
+    tokenIds: [] as string[],
+    autoStopOnCompletion: false,
+  };
+  const runtime = {
+    strategy,
+    strategyRevision: 0,
+    jitCampaign: campaign,
+    unlocked: true,
+    running: false,
+    account: null as { address: `0x${string}` } | null,
+    walletClient: null as unknown,
+    chainId: null as number | null,
+    currentEpoch: 9n as bigint | null,
+    startTime: 0n as bigint | null,
+    gameState: 1 as number | null,
+    citizenSupply: 100n as bigint | null,
+    citizensAddress: "0x00000000000000000000000000000000000000cc" as `0x${string}` | null,
+    balanceWei: null as bigint | null,
+    strategySnapshot: vi.fn(() => ({ revision: runtime.strategyRevision, config: runtime.strategy })),
+    saveStrategy: vi.fn((patch: Record<string, unknown>, expected: number) => {
+      if (expected !== runtime.strategyRevision) throw new RevisionConflictError(runtime.strategyRevision);
+      runtime.strategy = { ...runtime.strategy, ...patch } as typeof strategy;
+      runtime.strategyRevision += 1;
+      return { revision: runtime.strategyRevision, config: runtime.strategy };
+    }),
+    saveJitCampaign: vi.fn((patch: Record<string, unknown>, expected: number) => {
+      if (expected !== runtime.jitCampaign.revision) throw new RevisionConflictError(runtime.jitCampaign.revision);
+      runtime.jitCampaign = {
+        ...runtime.jitCampaign,
+        ...patch,
+        revision: runtime.jitCampaign.revision + 1,
+      } as typeof campaign;
+      return runtime.jitCampaign;
+    }),
+    emitStatus: vi.fn(),
+    status: vi.fn(() => ({
+      running: runtime.running,
+      jitRevision: runtime.jitCampaign.revision,
+      jitEnabled: runtime.jitCampaign.state === "armed",
+      jitTargetEpoch: runtime.jitCampaign.targetEpoch,
+      jitTokenIds: runtime.jitCampaign.tokenIds,
+    })),
+    lock: vi.fn(() => { runtime.unlocked = false; runtime.account = null; }),
+    onStatus: vi.fn(() => () => {}),
+  };
+  const appConfig = {
+    host: "127.0.0.1",
+    allowedHosts: [] as string[],
+    mode: "mainnet" as "mainnet" | "public" | "local",
+    dataDir: "/tmp/dat-api-test",
+    httpUrl: "https://old.test",
+    wsUrl: "wss://old.test" as string | undefined,
+    nftUrl: "https://old-nft.test" as string | undefined,
+    ownedTokensOverride: [] as bigint[],
+    endpointOverrides: { http: false, ws: false, nft: false },
+    modeConfiguredByEnvironment: false,
+    keyConfiguredByEnvironment: false,
+    gameAddress: "0x0000000000000000000000000000000000000001" as const,
+  };
+  return {
+    RevisionConflictError,
+    runtime,
+    strategy,
+    campaign,
+    appConfig,
+    startEngine: vi.fn(() => { runtime.running = true; }),
+    stopEngine: vi.fn(() => { runtime.running = false; }),
+    waitForEngineIdle: vi.fn(async () => {}),
+    scheduleJitBoundary: vi.fn(),
+    schedulePreBoundaryPay: vi.fn(),
+    schedulePreBoundaryAudit: vi.fn(),
+    resetJitState: vi.fn(),
+    preflightSubmissionRecovery: vi.fn(async () => {}),
+    recoverAuthorizedSubmissions: vi.fn(async () => {}),
+    saveSettings: vi.fn(),
+    validateRpc: vi.fn(async () => {}),
+    reinitClients: vi.fn(),
+    loadKeystore: vi.fn((): Record<string, unknown> | null => null),
+    keystoreExists: vi.fn(() => false),
+    saveKeystore: vi.fn(),
+    decryptPrivateKey: vi.fn(() => `0x${"11".repeat(32)}` as `0x${string}`),
+    accountFromPrivateKey: vi.fn(() => ({ address: "0x2222222222222222222222222222222222222222" as const })),
+    getChainId: vi.fn(async () => 1),
+    readOwnedStatuses: vi.fn(async () => [{ tokenId: "7" }, { tokenId: "8" }]),
+    filterOwnedTokenIds: vi.fn(async (
+      _citizens: unknown,
+      tokenIds: bigint[],
+    ): Promise<bigint[]> => tokenIds.filter((tokenId) => tokenId === 7n || tokenId === 8n)),
+  };
+});
+
+vi.mock("./config.js", () => ({
+  appConfig: h.appConfig,
+  loadSettings: vi.fn(() => ({})),
+  saveSettings: h.saveSettings,
+  deriveUrlsFromKey: vi.fn(() => ({ httpUrl: "https://new.test", wsUrl: "wss://new.test", nftUrl: "https://new-nft.test" })),
+  validateMainnetRpcCandidate: h.validateRpc,
+}));
+vi.mock("./runtime.js", () => ({
+  runtime: h.runtime,
+  RevisionConflictError: h.RevisionConflictError,
+  strategyPatchSchema: z.record(z.unknown()),
+}));
+vi.mock("./strategy.js", () => ({
+  startEngine: h.startEngine,
+  stopEngine: h.stopEngine,
+  waitForEngineIdle: h.waitForEngineIdle,
+  scheduleJitBoundary: h.scheduleJitBoundary,
+  schedulePreBoundaryPay: h.schedulePreBoundaryPay,
+  schedulePreBoundaryAudit: h.schedulePreBoundaryAudit,
+  resetJitState: h.resetJitState,
+  preflightSubmissionRecovery: h.preflightSubmissionRecovery,
+  recoverAuthorizedSubmissions: h.recoverAuthorizedSubmissions,
+}));
+vi.mock("./chain.js", () => ({
+  publicClient: { getBalance: vi.fn(async () => 0n) },
+  reinitClients: h.reinitClients,
+  accountFromPrivateKey: h.accountFromPrivateKey,
+  makeWalletClient: vi.fn(),
+  getChainId: h.getChainId,
+}));
+vi.mock("./activity.js", () => ({ activity: { recent: vi.fn(() => []), subscribe: vi.fn(() => () => {}) } }));
+vi.mock("./keystore.js", () => ({
+  encryptPrivateKey: vi.fn(() => ({ encrypted: true })),
+  decryptPrivateKey: h.decryptPrivateKey,
+  saveKeystore: h.saveKeystore,
+  loadKeystore: h.loadKeystore,
+  keystoreExists: h.keystoreExists,
+  normalizePrivateKey: vi.fn(),
+}));
+vi.mock("./contract.js", () => ({
+  getGameSnapshot: vi.fn(async () => ({
+    state: 1,
+    currentEpoch: 10n,
+    startTime: 0n,
+    citizensAddress: "0x00000000000000000000000000000000000000cc",
+    citizenSupply: 100n,
+  })),
+}));
+vi.mock("./service.js", () => ({ readOwnedStatuses: h.readOwnedStatuses, readTargets: vi.fn(async () => []) }));
+vi.mock("./index-tokens.js", () => ({ filterOwnedTokenIds: h.filterOwnedTokenIds }));
+vi.mock("./postmortem.js", () => ({ runPostMortem: vi.fn() }));
+vi.mock("./logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+
+const { buildServer } = await import("./api.js");
+const { AtomicWriteCommittedError } = await import("./durability.js");
+
+describe("revisioned API lifecycle", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.assign(h.strategy, { defenseEnabled: false, offenseEnabled: false, dryRun: true });
+    h.runtime.strategy = h.strategy;
+    h.runtime.strategyRevision = 0;
+    Object.assign(h.campaign, {
+      revision: 0,
+      state: "cancelled",
+      targetEpoch: null,
+      tokenIds: [],
+      autoStopOnCompletion: false,
+    });
+    h.runtime.jitCampaign = h.campaign;
+    h.runtime.unlocked = true;
+    h.runtime.running = false;
+    h.runtime.currentEpoch = 9n;
+    h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
+    h.appConfig.host = "127.0.0.1";
+    h.appConfig.allowedHosts = [];
+    h.appConfig.mode = "mainnet";
+    h.appConfig.httpUrl = "https://old.test";
+    h.appConfig.wsUrl = "wss://old.test";
+    h.appConfig.nftUrl = "https://old-nft.test";
+    h.appConfig.ownedTokensOverride = [];
+    h.appConfig.endpointOverrides = { http: false, ws: false, nft: false };
+    h.appConfig.modeConfiguredByEnvironment = false;
+    h.appConfig.keyConfiguredByEnvironment = false;
+    h.loadKeystore.mockReturnValue(null);
+    h.keystoreExists.mockReturnValue(false);
+    h.waitForEngineIdle.mockResolvedValue(undefined);
+    h.preflightSubmissionRecovery.mockResolvedValue(undefined);
+    h.recoverAuthorizedSubmissions.mockResolvedValue(undefined);
+    h.validateRpc.mockResolvedValue(undefined);
+    h.getChainId.mockResolvedValue(1);
+    h.filterOwnedTokenIds.mockImplementation(async (_citizens: unknown, tokenIds: bigint[]) =>
+      tokenIds.filter((tokenId) => tokenId === 7n || tokenId === 8n));
+  });
+
+  it("recovers durable submission state before starting the engine", async () => {
+    const account = { address: "0x2222222222222222222222222222222222222222" as const };
+    h.runtime.account = account;
+    const app = await buildServer();
+    const response = await app.inject({ method: "POST", url: "/api/start", headers: { host: "localhost" } });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.recoverAuthorizedSubmissions).toHaveBeenCalledWith(account.address);
+    expect(h.recoverAuthorizedSubmissions.mock.invocationCallOrder[0]).toBeLessThan(
+      h.startEngine.mock.invocationCallOrder[0]!,
+    );
+    await app.close();
+  });
+
+  it("keeps a running engine paused when a config rename commits without durability confirmation", async () => {
+    h.runtime.running = true;
+    h.runtime.saveStrategy.mockImplementationOnce((patch: Record<string, unknown>) => {
+      h.runtime.strategy = { ...h.runtime.strategy, ...patch } as typeof h.strategy;
+      h.runtime.strategyRevision += 1;
+      throw new AtomicWriteCommittedError("/tmp/config.json", {
+        cause: new Error("simulated directory fsync failure"),
+      });
+    });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/config",
+      headers: { host: "localhost" },
+      payload: { expectedRevision: 0, patch: { defenseEnabled: true } },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ revision: 1, config: { defenseEnabled: true } });
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+
+  it("keeps the engine paused when submission recovery fails", async () => {
+    h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
+    h.recoverAuthorizedSubmissions.mockRejectedValueOnce(new Error("journal checksum mismatch"));
+    const app = await buildServer();
+    const response = await app.inject({ method: "POST", url: "/api/start", headers: { host: "localhost" } });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: expect.stringContaining("journal checksum mismatch") });
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+
+  it("waits for an auto-stopped old tick to unwind before recovery", async () => {
+    let releaseIdle!: () => void;
+    h.waitForEngineIdle.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    }));
+    const app = await buildServer();
+    const pending = app.inject({ method: "POST", url: "/api/start", headers: { host: "localhost" } });
+
+    await vi.waitFor(() => expect(h.waitForEngineIdle).toHaveBeenCalledOnce());
+    expect(h.recoverAuthorizedSubmissions).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+
+    releaseIdle();
+    const response = await pending;
+    expect(response.statusCode).toBe(200);
+    expect(h.recoverAuthorizedSubmissions).toHaveBeenCalledOnce();
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("rebuilds submission state on unlock while leaving the engine paused", async () => {
+    h.loadKeystore.mockReturnValue({ encrypted: true });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/unlock", headers: { host: "localhost" },
+      payload: { passphrase: "correct horse" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.preflightSubmissionRecovery).toHaveBeenCalledWith(
+      "0x2222222222222222222222222222222222222222",
+    );
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+
+  it("reports unlock recovery failure as unavailable instead of bad credentials", async () => {
+    h.loadKeystore.mockReturnValue({ encrypted: true });
+    h.preflightSubmissionRecovery.mockRejectedValueOnce(new Error("corrupt journal JSON"));
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/unlock", headers: { host: "localhost" },
+      payload: { passphrase: "correct horse" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: expect.stringContaining("corrupt journal JSON"),
+      status: { running: false },
+    });
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("fails unlock closed when the RPC chain ID cannot be verified", async () => {
+    h.runtime.account = null;
+    h.loadKeystore.mockReturnValue({ encrypted: true });
+    h.getChainId.mockRejectedValueOnce(new Error("RPC unavailable"));
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/unlock", headers: { host: "localhost" },
+      payload: { passphrase: "correct horse" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: expect.stringContaining("Could not verify RPC chain ID") });
+    expect(h.runtime.account).toBeNull();
+    expect(h.preflightSubmissionRecovery).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("refuses a non-mainnet RPC identity outside local mode", async () => {
+    h.runtime.account = null;
+    h.loadKeystore.mockReturnValue({ encrypted: true });
+    h.getChainId.mockResolvedValueOnce(5);
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/unlock", headers: { host: "localhost" },
+      payload: { passphrase: "correct horse" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: expect.stringContaining("requires Ethereum mainnet") });
+    expect(h.runtime.account).toBeNull();
+    expect(h.preflightSubmissionRecovery).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("accepts the reported development chain identity in local mode", async () => {
+    h.runtime.account = null;
+    h.appConfig.mode = "local";
+    h.loadKeystore.mockReturnValue({ encrypted: true });
+    h.getChainId.mockResolvedValueOnce(31_337);
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/unlock", headers: { host: "localhost" },
+      payload: { passphrase: "correct horse" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.chainId).toBe(31_337);
+    expect(h.preflightSubmissionRecovery).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("refuses Ethereum mainnet identity in local direct-broadcast mode", async () => {
+    h.runtime.account = null;
+    h.appConfig.mode = "local";
+    h.loadKeystore.mockReturnValue({ encrypted: true });
+    h.getChainId.mockResolvedValueOnce(1);
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/unlock", headers: { host: "localhost" },
+      payload: { passphrase: "correct horse" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error).toContain("local mode refuses Ethereum mainnet");
+    expect(h.runtime.account).toBeNull();
+    expect(h.preflightSubmissionRecovery).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("reports a local explicit-RPC/owned-token setup as onboarding-ready", async () => {
+    h.appConfig.mode = "local";
+    h.appConfig.httpUrl = "http://127.0.0.1:8545";
+    h.appConfig.nftUrl = undefined;
+    h.appConfig.ownedTokensOverride = [7n];
+    h.appConfig.modeConfiguredByEnvironment = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "GET", url: "/api/settings", headers: { host: "localhost" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      rpcConfigured: true,
+      ownershipConfigured: true,
+      setupReady: true,
+      mode: "local",
+      modeConfiguredByEnvironment: true,
+    });
+    await app.close();
+  });
+
+  it("rejects cross-origin browser mutations on the loopback API", async () => {
+    const app = await buildServer();
+    const foreignOrigin = await app.inject({
+      method: "POST", url: "/api/start",
+      headers: { host: "localhost", origin: "https://evil.example" },
+    });
+    const crossSite = await app.inject({
+      method: "POST", url: "/api/start",
+      headers: { host: "localhost", "sec-fetch-site": "cross-site" },
+    });
+
+    expect(foreignOrigin.statusCode).toBe(403);
+    expect(crossSite.statusCode).toBe(403);
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.preflightSubmissionRecovery).not.toHaveBeenCalled();
+    expect(h.recoverAuthorizedSubmissions).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("allows local-dashboard origins as well as origin-less CLI requests", async () => {
+    h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
+    const app = await buildServer();
+    const dashboard = await app.inject({
+      method: "POST", url: "/api/start",
+      headers: { host: "localhost", origin: "http://127.0.0.1:5173", "sec-fetch-site": "same-site" },
+    });
+    h.runtime.running = false;
+    const cli = await app.inject({ method: "POST", url: "/api/start", headers: { host: "localhost" } });
+
+    expect(dashboard.statusCode).toBe(200);
+    expect(cli.statusCode).toBe(200);
+    expect(h.startEngine).toHaveBeenCalledTimes(2);
+    await app.close();
+  });
+
+  it("enforces browser origin checks on a non-loopback bind", async () => {
+    h.appConfig.host = "0.0.0.0";
+    h.appConfig.allowedHosts = ["192.168.1.20"];
+    h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
+    const app = await buildServer();
+    const foreign = await app.inject({
+      method: "POST", url: "/api/start",
+      headers: { host: "192.168.1.20:8787", origin: "https://evil.example" },
+    });
+    const sameHost = await app.inject({
+      method: "POST", url: "/api/start",
+      headers: { host: "192.168.1.20:8787", origin: "http://192.168.1.20:5173" },
+    });
+    const rebound = await app.inject({
+      method: "POST", url: "/api/start",
+      headers: { host: "attacker.example", origin: "https://attacker.example" },
+    });
+
+    expect(foreign.statusCode).toBe(403);
+    expect(rebound.statusCode).toBe(403);
+    expect(sameHost.statusCode).toBe(200);
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("applies only a field-scoped strategy patch and does not auto-start a paused engine", async () => {
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "PATCH", url: "/api/config", headers: { host: "localhost" },
+      payload: { expectedRevision: 0, patch: { defenseEnabled: true } },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ revision: 1, config: { defenseEnabled: true, dryRun: true } });
+    expect(h.runtime.saveStrategy).toHaveBeenCalledWith({ defenseEnabled: true }, 0);
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.runtime.saveJitCampaign).not.toHaveBeenCalled();
+    expect(h.runtime.jitCampaign.state).toBe("cancelled");
+    await app.close();
+  });
+
+  it("rejects a stale strategy write with 409 before stopping the engine", async () => {
+    h.runtime.strategyRevision = 3;
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/config", headers: { host: "localhost" },
+      payload: { expectedRevision: 2, patch: { dryRun: false } },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ currentRevision: 3 });
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("preserves the running state while waiting for a live strategy save", async () => {
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "PATCH", url: "/api/config", headers: { host: "localhost" },
+      payload: { expectedRevision: 0, patch: { dryRun: false } },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.waitForEngineIdle).toHaveBeenCalledOnce();
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("arms an explicit owned-token campaign without enabling defense", async () => {
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 11, tokenIds: ["007"] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: "armed",
+        targetEpoch: 11,
+        tokenIds: ["7"],
+        autoStopOnCompletion: true,
+      }),
+      0,
+    );
+    expect(h.runtime.strategy.defenseEnabled).toBe(false);
+    expect(response.json()).toMatchObject({ jitEnabled: true, jitTargetEpoch: 11, jitTokenIds: ["7"] });
+    expect(h.filterOwnedTokenIds).toHaveBeenCalledWith(
+      "0x00000000000000000000000000000000000000cc",
+      [7n],
+      "0x2222222222222222222222222222222222222222",
+    );
+    expect(h.readOwnedStatuses).not.toHaveBeenCalled();
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("does not claim auto-stop ownership when arming from an operator-run engine", async () => {
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 11, tokenIds: ["7"] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({ autoStopOnCompletion: false }),
+      0,
+    );
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("freezes a running engine before asynchronous JIT ownership validation", async () => {
+    let release!: (tokenIds: bigint[]) => void;
+    h.runtime.running = true;
+    h.filterOwnedTokenIds.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const app = await buildServer();
+    const pending = app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 11, tokenIds: ["7"] },
+    });
+
+    await vi.waitFor(() => expect(h.filterOwnedTokenIds).toHaveBeenCalledOnce());
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.runtime.running).toBe(false);
+    expect(h.startEngine).not.toHaveBeenCalled();
+
+    release([7n]);
+    const response = await pending;
+    expect(response.statusCode).toBe(200);
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it("preserves auto-stop ownership when re-arming its running campaign", async () => {
+    Object.assign(h.runtime.jitCampaign, {
+      state: "armed",
+      targetEpoch: 11,
+      tokenIds: ["7"],
+      autoStopOnCompletion: true,
+    });
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 11, tokenIds: ["7"] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({ autoStopOnCompletion: true }),
+      0,
+    );
+    expect(h.recoverAuthorizedSubmissions).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("does not persist or start a paused JIT campaign when recovery fails", async () => {
+    h.recoverAuthorizedSubmissions.mockRejectedValueOnce(new Error("prepared WAL is corrupt"));
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 11, tokenIds: ["7"] },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: expect.stringContaining("prepared WAL is corrupt") });
+    expect(h.runtime.saveJitCampaign).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("leaves the engine stopped when cancelling the campaign that auto-started it", async () => {
+    Object.assign(h.runtime.jitCampaign, {
+      state: "armed",
+      targetEpoch: 10,
+      tokenIds: ["7"],
+      autoStopOnCompletion: true,
+    });
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: false, expectedRevision: 0 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({ state: "cancelled", autoStopOnCompletion: false }),
+      0,
+    );
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+
+  it("rejects a JIT target using the fresh chain epoch, not stale runtime state", async () => {
+    h.runtime.currentEpoch = 9n;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 10, tokenIds: ["7"] },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "targetEpoch must be after current epoch 10" });
+    expect(h.runtime.saveJitCampaign).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("rejects past, unowned, and stale JIT campaigns", async () => {
+    const app = await buildServer();
+    const past = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 9, tokenIds: ["7"] },
+    });
+    expect(past.statusCode).toBe(400);
+    const unowned = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: true, expectedRevision: 0, targetEpoch: 11, tokenIds: ["999"] },
+    });
+    expect(unowned.statusCode).toBe(400);
+    h.runtime.jitCampaign.revision = 2;
+    const stale = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: false, expectedRevision: 1 },
+    });
+    expect(stale.statusCode).toBe(409);
+    await app.close();
+  });
+
+  it("keeps JIT paused when its campaign rename commits without durability confirmation", async () => {
+    h.runtime.running = true;
+    h.runtime.saveJitCampaign.mockImplementationOnce((patch: Record<string, unknown>) => {
+      h.runtime.jitCampaign = {
+        ...h.runtime.jitCampaign,
+        ...patch,
+        revision: h.runtime.jitCampaign.revision + 1,
+      } as typeof h.campaign;
+      throw new AtomicWriteCommittedError("/tmp/config.json", {
+        cause: new Error("simulated directory fsync failure"),
+      });
+    });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: false, expectedRevision: 0 },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: expect.stringContaining("JIT campaign was applied"),
+      status: { jitRevision: 1, jitEnabled: false },
+    });
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("validates a candidate RPC before stopping and swapping clients", async () => {
+    h.runtime.running = true;
+    h.validateRpc.mockRejectedValueOnce(new Error("wrong chain"));
+    const previous = {
+      httpUrl: h.appConfig.httpUrl,
+      wsUrl: h.appConfig.wsUrl,
+      nftUrl: h.appConfig.nftUrl,
+      mode: h.appConfig.mode,
+    };
+    const app = await buildServer();
+    const failed = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { alchemyApiKey: "invalid-key-value" },
+    });
+    expect(failed.statusCode).toBe(400);
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.saveSettings).not.toHaveBeenCalled();
+    expect(h.reinitClients).not.toHaveBeenCalled();
+    expect(h.appConfig).toMatchObject(previous);
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("rejects an incompatible mode before mutating or stopping a running engine", async () => {
+    h.appConfig.mode = "local";
+    h.runtime.running = true;
+    h.getChainId.mockResolvedValueOnce(31_337);
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { mode: "public" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: expect.stringContaining("requires Ethereum mainnet"),
+    });
+    expect(h.saveSettings).not.toHaveBeenCalled();
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.appConfig.mode).toBe("local");
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("never replaces a local RPC when an Alchemy-key update is requested", async () => {
+    h.appConfig.mode = "local";
+    h.appConfig.httpUrl = "http://127.0.0.1:8545";
+    h.appConfig.wsUrl = undefined;
+    h.appConfig.nftUrl = undefined;
+    h.appConfig.endpointOverrides = { http: true, ws: false, nft: false };
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { alchemyApiKey: "valid-looking-local-key" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain("cannot be changed at runtime in local mode");
+    expect(h.validateRpc).not.toHaveBeenCalled();
+    expect(h.saveSettings).not.toHaveBeenCalled();
+    expect(h.reinitClients).not.toHaveBeenCalled();
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.appConfig.httpUrl).toBe("http://127.0.0.1:8545");
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("preserves explicit RPC overrides while updating only key-derived endpoints", async () => {
+    h.appConfig.mode = "public";
+    h.appConfig.httpUrl = "https://operator-http.test";
+    h.appConfig.wsUrl = "wss://operator-ws.test";
+    h.appConfig.nftUrl = "https://old-nft.test";
+    h.appConfig.endpointOverrides = { http: true, ws: true, nft: false };
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { alchemyApiKey: "valid-looking-mainnet-key" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.validateRpc).toHaveBeenCalledWith(expect.objectContaining({
+      httpUrl: "https://operator-http.test",
+      nftUrl: "https://new-nft.test",
+    }));
+    expect(h.appConfig).toMatchObject({
+      httpUrl: "https://operator-http.test",
+      wsUrl: "wss://operator-ws.test",
+      nftUrl: "https://new-nft.test",
+    });
+    expect(h.reinitClients).toHaveBeenCalledWith(
+      "https://operator-http.test",
+      "wss://operator-ws.test",
+    );
+    await app.close();
+  });
+
+  it("fails start closed when no RPC URL is configured", async () => {
+    h.appConfig.httpUrl = "";
+    h.getChainId.mockRejectedValueOnce(new Error("RPC HTTP URL is not configured"));
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/start", headers: { host: "localhost" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error).toContain("RPC HTTP URL is not configured");
+    expect(h.recoverAuthorizedSubmissions).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("applies committed settings but stays paused when durability is unconfirmed", async () => {
+    h.runtime.running = true;
+    h.saveSettings.mockImplementationOnce(() => {
+      throw new AtomicWriteCommittedError("/tmp/settings.json", {
+        cause: new Error("simulated directory fsync failure"),
+      });
+    });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { mode: "public" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: expect.stringContaining("Settings were applied"),
+      mode: "public",
+    });
+    expect(h.appConfig.mode).toBe("public");
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("serializes a confirmed keystore overwrite and locks the old in-memory identity", async () => {
+    h.keystoreExists.mockReturnValue(true);
+    h.runtime.unlocked = true;
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/keystore", headers: { host: "localhost" },
+      payload: { mode: "generate", passphrase: "correct horse", overwrite: true },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.waitForEngineIdle).toHaveBeenCalledOnce();
+    expect(h.saveKeystore).toHaveBeenCalledOnce();
+    expect(h.runtime.lock).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("locks the old identity and stays paused when a keystore rename has committed", async () => {
+    h.keystoreExists.mockReturnValue(true);
+    h.runtime.unlocked = true;
+    h.runtime.running = true;
+    h.saveKeystore.mockImplementationOnce(() => {
+      throw new AtomicWriteCommittedError("/tmp/wallet.keystore.json", {
+        cause: new Error("simulated directory fsync failure"),
+      });
+    });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/keystore", headers: { host: "localhost" },
+      payload: { mode: "generate", passphrase: "correct horse", overwrite: true },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: expect.stringContaining("Keystore was replaced"),
+      address: "0x2222222222222222222222222222222222222222",
+    });
+    expect(h.runtime.lock).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("queues a concurrent lock behind an in-flight keystore overwrite", async () => {
+    let releaseOverwrite!: () => void;
+    h.keystoreExists.mockReturnValue(true);
+    h.runtime.unlocked = true;
+    h.runtime.running = true;
+    h.waitForEngineIdle
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseOverwrite = resolve; }))
+      .mockResolvedValue(undefined);
+    const app = await buildServer();
+
+    const overwrite = app.inject({
+      method: "POST", url: "/api/keystore", headers: { host: "localhost" },
+      payload: { mode: "generate", passphrase: "correct horse", overwrite: true },
+    });
+    await vi.waitFor(() => expect(h.stopEngine).toHaveBeenCalledOnce());
+    const lock = app.inject({ method: "POST", url: "/api/lock", headers: { host: "localhost" } });
+    await Promise.resolve();
+    expect(h.saveKeystore).not.toHaveBeenCalled();
+    expect(h.runtime.lock).not.toHaveBeenCalled();
+
+    releaseOverwrite();
+    const [overwriteResponse, lockResponse] = await Promise.all([overwrite, lock]);
+    expect(overwriteResponse.statusCode).toBe(200);
+    expect(lockResponse.statusCode).toBe(200);
+    expect(h.runtime.lock).toHaveBeenCalledTimes(2);
+    expect(h.saveKeystore.mock.invocationCallOrder[0]).toBeLessThan(
+      h.runtime.lock.mock.invocationCallOrder[0]!,
+    );
+    expect(h.waitForEngineIdle).toHaveBeenCalledTimes(2);
+    expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+});

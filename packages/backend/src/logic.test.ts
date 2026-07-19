@@ -12,6 +12,8 @@ import {
   canAffordSpend,
   preBoundaryTaxWei,
   cappedAutoPayEpochs,
+  nextReplacementFee,
+  cappedReplacementFees,
   orderBySalt,
 } from "./logic.js";
 
@@ -212,10 +214,12 @@ describe("resolveGas (per-category gas split)", () => {
     priorityFeeGwei: 2,
     dynamicTipEnabled: false,
     dynamicTipMaxGwei: 50,
+    replacementPriorityFeeCapGwei: 8,
     offenseMaxBaseFeeGwei: 80,
     offensePriorityFeeGwei: 25,
     offenseDynamicTipEnabled: true,
     offenseDynamicTipMaxGwei: 120,
+    offenseReplacementPriorityFeeCapGwei: 140,
   } as StrategyConfig;
 
   it("uses base settings for payments regardless of the split flag", () => {
@@ -225,6 +229,7 @@ describe("resolveGas (per-category gas split)", () => {
         priorityFeeGwei: 2,
         dynamicTipEnabled: false,
         dynamicTipMaxGwei: 50,
+        replacementPriorityFeeCapGwei: 8,
       });
     }
   });
@@ -235,6 +240,7 @@ describe("resolveGas (per-category gas split)", () => {
       priorityFeeGwei: 2,
       dynamicTipEnabled: false,
       dynamicTipMaxGwei: 50,
+      replacementPriorityFeeCapGwei: 8,
     });
   });
 
@@ -244,6 +250,7 @@ describe("resolveGas (per-category gas split)", () => {
       priorityFeeGwei: 25,
       dynamicTipEnabled: true,
       dynamicTipMaxGwei: 120,
+      replacementPriorityFeeCapGwei: 140,
     });
   });
 });
@@ -288,5 +295,52 @@ describe("effectiveTipGwei (what computeFees actually bids)", () => {
     // Offense here has dynamic tip off, so it stays flat at its static tip.
     const offGas = resolveGas(strategy, true);
     expect(effectiveTipGwei(offGas, threeQuarters, full)).toBe(2);
+  });
+});
+
+describe("replacement fee ceilings", () => {
+  const gas = {
+    maxBaseFeeGwei: 100,
+    priorityFeeGwei: 2,
+    dynamicTipEnabled: false,
+    dynamicTipMaxGwei: 50,
+    replacementPriorityFeeCapGwei: 2,
+  };
+
+  it("strictly exceeds a 12.5% bump even when the prior fee is divisible by eight", () => {
+    expect(nextReplacementFee(8_000_000_000n)).toBe(9_000_000_001n);
+  });
+
+  it("refuses a replacement above the configured tip or max-fee ceiling", () => {
+    expect(cappedReplacementFees(
+      4_000_000_000n,
+      2_000_000_000n,
+      250_000_000_000n,
+      50_000_000_000n,
+      gas,
+    )).toBeNull();
+  });
+
+  it("uses the explicit replacement ceiling independently of dynamic tips", () => {
+    expect(cappedReplacementFees(
+      20_000_000_000n,
+      2_000_000_000n,
+      20_000_000_000n,
+      2_000_000_000n,
+      gas,
+    )).toBeNull();
+  });
+
+  it("allows explicitly configured replacement headroom when dynamic tips are disabled", () => {
+    expect(cappedReplacementFees(
+      20_000_000_000n,
+      2_000_000_000n,
+      20_000_000_000n,
+      2_000_000_000n,
+      { ...gas, replacementPriorityFeeCapGwei: 50 },
+    )).toEqual({
+      maxFeePerGas: 22_500_000_001n,
+      maxPriorityFeePerGas: 2_250_000_001n,
+    });
   });
 });

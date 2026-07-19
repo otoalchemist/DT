@@ -2,12 +2,12 @@ import { useEffect, useState, useCallback } from "react";
 import {
   VERSION,
   type BotStatus,
-  type StrategyConfig,
+  type StrategySnapshot,
   type ActivityEntry,
   type OwnedTokenStatus,
   type TargetTokenStatus,
 } from "@dat-bot/shared";
-import { api } from "./api.js";
+import { ApiError, api } from "./api.js";
 import { Config } from "./Config.js";
 import { JitPanel } from "./JitPanel.js";
 import { PostMortem } from "./PostMortem.js";
@@ -77,14 +77,27 @@ export function Dashboard({
   connected: boolean;
   pushStatus: (s: BotStatus) => void;
 }) {
-  const [config, setConfig] = useState<StrategyConfig | null>(null);
+  const [strategy, setStrategy] = useState<StrategySnapshot | null>(null);
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    api.getConfig().then(setConfig).catch(() => {});
+    api.getConfig().then(setStrategy).catch(() => {});
   }, []);
+
+  // A strategy mutation from another client is announced on the status socket.
+  // Refresh the matching config before trusting an older local snapshot.
+  useEffect(() => {
+    if (
+      status?.strategyRevision === undefined
+      || strategy === null
+      || status.strategyRevision <= strategy.revision
+    ) return;
+    api.getConfig().then((fresh) => {
+      setStrategy((current) => current === null || fresh.revision >= current.revision ? fresh : current);
+    }).catch(() => {});
+  }, [status?.strategyRevision, strategy?.revision]);
 
   const refresh = useCallback(async () => {
     try {
@@ -104,11 +117,17 @@ export function Dashboard({
   }, [refresh]);
 
   const running = status?.running ?? false;
-  const dryRun = status?.dryRun ?? true;
+  // Prefer whichever authoritative channel carries the newer strategy revision.
+  // This keeps an own mutation accurate while WS is stale/disconnected and also
+  // prevents an old config snapshot from masking a newer live-fire WS update.
+  const strategyIsNewest = strategy !== null
+    && (status === null || strategy.revision >= status.strategyRevision);
+  const dryRun = strategyIsNewest ? strategy.config.dryRun : status?.dryRun ?? true;
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
 
+  const config = strategy?.config ?? null;
   const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
   const otherTargets = targets.filter((t) => !pinnedSet.has(t.tokenId));
@@ -136,9 +155,22 @@ export function Dashboard({
     setDryToggling(true);
     setToggleErr(null);
     try {
-      const cfg = await api.setConfig({ dryRun: next });
-      setConfig(cfg);
+      if (!strategy) throw new Error("Strategy configuration is still loading");
+      const snapshot = await api.setConfig(strategy.revision, { dryRun: next });
+      setStrategy(snapshot);
     } catch (e) {
+      if (e instanceof ApiError && (e.status === 409 || e.status === 503)) {
+        try {
+          const authoritative = await api.getConfig();
+          setStrategy(authoritative);
+          setToggleErr(e.status === 409
+            ? "Configuration changed elsewhere; refreshed it. Review the current mode and try again."
+            : "The configuration may have been applied but durability was not confirmed; refreshed authoritative state. The engine remains paused.");
+          return;
+        } catch {
+          // Fall through to the original mutation error when refetch also fails.
+        }
+      }
       setToggleErr((e as Error).message);
     } finally {
       setDryToggling(false);
@@ -199,13 +231,24 @@ export function Dashboard({
             <div className="stat"><span className="label">Game</span><span className="value">{gameStateLabel(status?.gameState ?? null)}</span></div>
             <div className="stat"><span className="label">Epoch</span><span className="value">{status?.currentEpoch ?? "—"}</span></div>
             <div className="stat"><span className="label">Citizens left</span><span className="value">{status?.citizenSupply ?? "—"}</span></div>
-            <div className="stat"><span className="label">Spent this epoch</span><span className="value">{weiToEth(status?.spentThisEpochWei ?? "0")} ETH</span></div>
+            <div className="stat"><span className="label">Confirmed this epoch</span><span className="value">{weiToEth(status?.confirmedSpendThisEpochWei ?? status?.spentThisEpochWei ?? "0")} ETH</span></div>
+            <div className="stat"><span className="label">Pending exposure</span><span className="value">{weiToEth(status?.pendingExposureWei ?? "0")} ETH</span></div>
+            <div className="stat"><span className="label">Journal</span><span className="value">{status?.journalHealthy === false ? "⚠ error" : "healthy"}</span></div>
             <div className="stat"><span className="label">Block</span><span className="value mono">{status?.lastBlock ?? "—"}</span></div>
           </div>
         </div>
+        {status?.journalHealthy === false && (
+          <p className="err">Transaction journal error: {status.journalError ?? "unknown error"}. New live submissions are unsafe until this is resolved.</p>
+        )}
 
         <div className="spacer" />
-        <JitPanel status={status} tokens={tokens} config={config} onConfigChange={setConfig} />
+        <JitPanel
+          status={status}
+          tokens={tokens}
+          strategy={strategy}
+          onStrategyChange={setStrategy}
+          onStatusChange={pushStatus}
+        />
 
         <div className="spacer" />
         <div className="panel">
@@ -244,7 +287,7 @@ export function Dashboard({
 
         <div className="spacer" />
         <div className="grid cols-2">
-          {config && <Config initial={config} />}
+          {strategy && <Config initial={strategy} onChange={setStrategy} />}
 
           <div className="panel">
             <h2>Activity</h2>

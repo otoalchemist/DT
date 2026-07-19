@@ -11,8 +11,15 @@ release/
 .env.*
 !.env.example
 data/settings.json
+data/settings.legacy.json
 data/activity.json
 data/config.json
 data/flashbots-signer.key
 data/*.keystore.json
+data/submission-flights/
+data/.*.tmp
 keystore/
+
+# Foundry integration-test build output
+packages/backend/test/foundry/cache/
+packages/backend/test/foundry/out/

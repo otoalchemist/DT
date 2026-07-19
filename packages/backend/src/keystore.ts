@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { writeFileAtomicDurableSync } from "./durability.js";
 
 // Encrypted keystore for the bot's hot-wallet private key.
 // Format v1: scrypt(passphrase) -> 32-byte AES key; AES-256-GCM.
@@ -101,10 +102,10 @@ export function keystoreExists(dataDir: string): boolean {
 }
 
 export function saveKeystore(dataDir: string, file: KeystoreFileV1): void {
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(keystorePath(dataDir), JSON.stringify(file, null, 2), {
-    mode: 0o600,
-  });
+  writeFileAtomicDurableSync(
+    keystorePath(dataDir),
+    `${JSON.stringify(file, null, 2)}\n`,
+  );
 }
 
 export function loadKeystore(dataDir: string): KeystoreFileV1 | null {

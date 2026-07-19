@@ -1,8 +1,8 @@
 import type { Address } from "viem";
 import type { OwnedTokenStatus, TargetTokenStatus } from "@dat-bot/shared";
 import { runtime } from "./runtime.js";
-import { getGameSnapshot, getOwnedTokenStatus, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
-import { fetchOwnedTokenIds, fetchCandidateTokenIds } from "./index-tokens.js";
+import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
+import { fetchOwnedTokenIds, filterOwnedTokenIds, fetchCandidateTokenIds } from "./index-tokens.js";
 
 // Read-only helpers used by the API for the dashboard (independent of the engine loop).
 
@@ -10,14 +10,13 @@ export async function readOwnedStatuses(): Promise<OwnedTokenStatus[]> {
   if (!runtime.account) return [];
   const snap = await getGameSnapshot();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const ids = await fetchOwnedTokenIds(snap.citizensAddress, runtime.account.address);
-  const out: OwnedTokenStatus[] = [];
-  for (const id of ids) {
-    out.push(
-      await getOwnedTokenStatus(id, snap.currentEpoch, nowSec, runtime.strategy.prepayEpochs),
-    );
-  }
-  return out;
+  const indexedIds = await fetchOwnedTokenIds(snap.citizensAddress, runtime.account.address);
+  const ids = await filterOwnedTokenIds(
+    snap.citizensAddress,
+    indexedIds,
+    runtime.account.address,
+  );
+  return batchGetOwnedStatuses(ids, snap.currentEpoch, nowSec, runtime.strategy.prepayEpochs);
 }
 
 export async function readTargets(outputLimit = 50): Promise<TargetTokenStatus[]> {

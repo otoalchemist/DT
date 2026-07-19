@@ -3,32 +3,72 @@ import { z } from "zod";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { GAME_CONTRACT_ADDRESS } from "@dat-bot/shared";
+import { encodeFunctionData } from "viem";
+import { GAME_CONTRACT_ADDRESS, deathAndTaxesAbi } from "@dat-bot/shared";
+import { writeFileAtomicDurableSync } from "./durability.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Walk up from packages/backend/src → monorepo root to find .env
 loadEnv({ path: path.resolve(__dirname, "../../../.env") });
 
-// Load UI-saved settings (data/settings.json) as fallback for env vars.
-const settingsPath = path.resolve(__dirname, "../../../data/settings.json");
-export interface AppSettings {
-  alchemyApiKey?: string;
-  mode?: "mainnet" | "public";
+export const bundledDataDir = path.resolve(__dirname, "../../../data");
+const configuredDataDir = path.resolve(process.env.DATA_DIR ?? bundledDataDir);
+// UI-saved settings follow DATA_DIR so separately configured bot instances do not
+// overwrite one another. The old repository-level path is read once for migration.
+const settingsPath = path.join(configuredDataDir, "settings.json");
+const legacySettingsPath = path.join(bundledDataDir, "settings.json");
+// Capture operator-owned environment authority before persisted settings are
+// copied into process.env below. A saved MODE is mutable from the dashboard; an
+// explicit MODE in .env/the process is not and must not pretend otherwise.
+const modeConfiguredByEnvironment = process.env.MODE !== undefined;
+const keyConfiguredByEnvironment = Boolean(process.env.ALCHEMY_API_KEY?.trim());
+const appSettingsSchema = z.object({
+  alchemyApiKey: z.string().trim().min(10).optional(),
+  mode: z.enum(["mainnet", "public"]).optional(),
+}).strict();
+export type AppSettings = z.infer<typeof appSettingsSchema>;
+
+export function writeJsonAtomic(filePath: string, value: unknown): void {
+  writeFileAtomicDurableSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-export function loadSettings(): AppSettings {
+function readSettings(filePath: string): AppSettings | null {
   try {
-    if (fs.existsSync(settingsPath)) {
-      return JSON.parse(fs.readFileSync(settingsPath, "utf8")) as AppSettings;
+    return appSettingsSchema.parse(JSON.parse(fs.readFileSync(filePath, "utf8")));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`Could not load settings from ${filePath}: ${
+      error instanceof Error ? error.message : String(error)
+    }`, { cause: error });
+  }
+}
+
+export function loadSettingsFromPaths(
+  currentPath: string,
+  legacyPath: string,
+): AppSettings {
+  const current = readSettings(currentPath);
+  if (current) return current;
+  if (currentPath !== legacyPath) {
+    const legacy = readSettings(legacyPath);
+    if (legacy) {
+      // Copy rather than remove: another legacy/default instance may still use it.
+      const backupPath = path.join(path.dirname(currentPath), "settings.legacy.json");
+      if (!fs.existsSync(backupPath)) writeJsonAtomic(backupPath, legacy);
+      writeJsonAtomic(currentPath, legacy);
+      return legacy;
     }
-  } catch {}
+  }
   return {};
 }
 
+export function loadSettings(): AppSettings {
+  return loadSettingsFromPaths(settingsPath, legacySettingsPath);
+}
+
 export function saveSettings(s: AppSettings): void {
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
+  writeJsonAtomic(settingsPath, s);
 }
 
 // Inject settings into process.env before schema parse (env vars take priority).
@@ -41,10 +81,11 @@ if (savedSettings.mode && !process.env.MODE) {
 }
 
 const schema = z.object({
-  /** "mainnet" (default) submits private bundles to the builders in BUILDER_URLS —
-   *  bundles sit in the block's top region regardless of tip, which is what wins a
-   *  boundary race; payments still mirror to the public mempool so they can't fail
-   *  to land. "public" broadcasts only to the mempool (seated after all bundles).
+  /** "mainnet" (default) submits private bundles to the builders in BUILDER_URLS;
+   *  payments also mirror to the public mempool for independent inclusion
+   *  coverage. Builders choose placement based on profitability and other
+   *  orderflow, so neither route guarantees ordering or inclusion. "public"
+   *  broadcasts only to the mempool.
    *  "local" targets an anvil fork. */
   MODE: z.enum(["mainnet", "public", "local"]).default("mainnet"),
   /** If set, HTTP/WS/NFT endpoints are derived from it unless explicitly overridden. */
@@ -61,7 +102,9 @@ const schema = z.object({
   BUILDER_URLS: z.string().optional(),
   PORT: z.coerce.number().default(8787),
   HOST: z.string().default("127.0.0.1"),
-  DATA_DIR: z.string().default(path.resolve(__dirname, "../../../data")),
+  /** Trusted HTTP Host/Origin names, required for wildcard/LAN binds. */
+  API_ALLOWED_HOSTS: z.string().optional(),
+  DATA_DIR: z.string().default(bundledDataDir),
   LOG_LEVEL: z.string().optional(),
   /** Comma-separated tokenId overrides for local/anvil testing (no NFT API). */
   OWNED_TOKENS: z.string().optional(),
@@ -83,12 +126,75 @@ export function deriveUrlsFromKey(key: string) {
   };
 }
 
+/** Validate a candidate RPC without mutating the active clients or persisted
+ * settings. `fetchImpl` is injectable so tests never need live network access. */
+export async function validateMainnetRpcCandidate(
+  candidate: { httpUrl: string; nftUrl: string; gameAddress: `0x${string}` },
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const rpc = async (id: number, method: string, params: unknown[]) => {
+      const response = await fetchImpl(candidate.httpUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`RPC returned HTTP ${response.status}`);
+      const payload = await response.json() as { result?: unknown; error?: { message?: string } };
+      if (payload.error) throw new Error(payload.error.message ?? `RPC rejected ${method}`);
+      return payload.result;
+    };
+    const currentEpochData = encodeFunctionData({
+      abi: deathAndTaxesAbi,
+      functionName: "currentEpoch",
+    });
+    const stateData = encodeFunctionData({ abi: deathAndTaxesAbi, functionName: "state" });
+    const [chainId, blockNumber, currentEpoch, gameState] = await Promise.all([
+      rpc(1, "eth_chainId", []),
+      rpc(2, "eth_blockNumber", []),
+      rpc(3, "eth_call", [{ to: candidate.gameAddress, data: currentEpochData }, "latest"]),
+      rpc(4, "eth_call", [{ to: candidate.gameAddress, data: stateData }, "latest"]),
+    ]);
+    if (typeof chainId !== "string" || BigInt(chainId) !== 1n) {
+      throw new Error(`Expected Ethereum mainnet chainId 1, received ${String(chainId)}`);
+    }
+    if (typeof blockNumber !== "string" || !/^0x[0-9a-f]+$/i.test(blockNumber)) {
+      throw new Error("RPC did not return a latest block number");
+    }
+    if (typeof currentEpoch !== "string" || !/^0x[0-9a-f]{64}$/i.test(currentEpoch)) {
+      throw new Error("Game contract currentEpoch call returned invalid data");
+    }
+    if (typeof gameState !== "string" || !/^0x[0-9a-f]{64}$/i.test(gameState)) {
+      throw new Error("Game contract state call returned invalid data");
+    }
+
+    const nftUrl = new URL(`${candidate.nftUrl.replace(/\/$/, "")}/getNFTsForOwner`);
+    nftUrl.searchParams.set("owner", "0x000000000000000000000000000000000000dEaD");
+    nftUrl.searchParams.set("withMetadata", "false");
+    nftUrl.searchParams.set("pageSize", "1");
+    const nftResponse = await fetchImpl(nftUrl, { signal: controller.signal });
+    if (!nftResponse.ok) throw new Error(`NFT endpoint returned HTTP ${nftResponse.status}`);
+    const nftPayload = await nftResponse.json() as { ownedNfts?: unknown };
+    if (!nftPayload || typeof nftPayload !== "object" || !Array.isArray(nftPayload.ownedNfts)) {
+      throw new Error("NFT endpoint returned invalid JSON");
+    }
+  } finally {
+    controller.abort();
+    clearTimeout(timeout);
+  }
+}
+
 // Well-known builders that accept `eth_sendBundle` with an X-Flashbots-Signature
 // header. A bundle can only be included by the builder that WINS the slot, so we
 // fan out to all of them. Endpoints do change — override with BUILDER_URLS.
 // Unreachable entries are tolerated: submission succeeds if ANY builder accepts.
-// NOTE: rpc.buildernet.org rate-limits to ~3 req/IP/s; we send 2 per builder per
-// tx (one per target block), so a burst of many tokens at once may get throttled.
+// NOTE: rpc.buildernet.org documents a ~3 req/IP/s limit. Each private batch sends
+// two requests there (one per target block), so back-to-back payment and offense
+// batches may be throttled; other builders and the public payment route continue
+// independently.
 // (rsync-builder.xyz was dropped — verified unreachable as of 2026-07; add it back
 // via BUILDER_URLS if it returns.)
 const DEFAULT_BUILDER_URLS = [
@@ -99,11 +205,21 @@ const DEFAULT_BUILDER_URLS = [
 ];
 
 function derive() {
-  const raw = schema.parse(process.env);
+  // Vitest sets MODE=test for the process it owns. That is a test-runner
+  // sentinel, not one of the bot's transport modes, so keep tests on the
+  // local/non-broadcasting path unless a real mode was supplied.
+  const source = process.env.VITEST === "true" && process.env.MODE === "test"
+    ? { ...process.env, MODE: "local" }
+    : process.env;
+  const raw = schema.parse(source);
   const key = raw.ALCHEMY_API_KEY;
 
   const httpUrl = raw.RPC_HTTP_URL ?? (key ? `https://eth-mainnet.g.alchemy.com/v2/${key}` : undefined);
-  const wsUrl = raw.RPC_WS_URL ?? (key ? `wss://eth-mainnet.g.alchemy.com/v2/${key}` : undefined);
+  // An explicit HTTP endpoint identifies a separately managed RPC environment.
+  // Do not silently pair it with an Alchemy mainnet websocket: in local mode
+  // that would make block notifications come from a different chain.
+  const wsUrl = raw.RPC_WS_URL
+    ?? (!raw.RPC_HTTP_URL && key ? `wss://eth-mainnet.g.alchemy.com/v2/${key}` : undefined);
   const nftUrl = raw.ALCHEMY_NFT_URL ?? (key ? `https://eth-mainnet.g.alchemy.com/nft/v3/${key}` : undefined);
 
   return {
@@ -118,10 +234,20 @@ function derive() {
       : [...new Set([raw.FLASHBOTS_RELAY_URL, ...DEFAULT_BUILDER_URLS])],
     port: raw.PORT,
     host: raw.HOST,
-    dataDir: raw.DATA_DIR,
+    allowedHosts: raw.API_ALLOWED_HOSTS
+      ? raw.API_ALLOWED_HOSTS.split(",").map((host) => host.trim().toLowerCase()).filter(Boolean)
+      : [],
+    dataDir: path.resolve(raw.DATA_DIR),
     ownedTokensOverride: parseIds(raw.OWNED_TOKENS),
     targetTokensOverride: parseIds(raw.TARGET_TOKENS),
     maxCandidates: raw.MAX_CANDIDATES,
+    endpointOverrides: {
+      http: raw.RPC_HTTP_URL !== undefined,
+      ws: raw.RPC_WS_URL !== undefined,
+      nft: raw.ALCHEMY_NFT_URL !== undefined,
+    },
+    modeConfiguredByEnvironment,
+    keyConfiguredByEnvironment,
   };
 }
 

@@ -8,6 +8,8 @@ export interface GasSettings {
   priorityFeeGwei: number;
   dynamicTipEnabled: boolean;
   dynamicTipMaxGwei: number;
+  /** Explicit ceiling for same-nonce priority-fee replacements. */
+  replacementPriorityFeeCapGwei?: number;
 }
 
 /**
@@ -24,6 +26,7 @@ export function resolveGas(s: StrategyConfig, offense: boolean): GasSettings {
       priorityFeeGwei: s.offensePriorityFeeGwei,
       dynamicTipEnabled: s.offenseDynamicTipEnabled,
       dynamicTipMaxGwei: s.offenseDynamicTipMaxGwei,
+      replacementPriorityFeeCapGwei: s.offenseReplacementPriorityFeeCapGwei,
     };
   }
   return {
@@ -31,7 +34,44 @@ export function resolveGas(s: StrategyConfig, offense: boolean): GasSettings {
     priorityFeeGwei: s.priorityFeeGwei,
     dynamicTipEnabled: s.dynamicTipEnabled,
     dynamicTipMaxGwei: s.dynamicTipMaxGwei,
+    replacementPriorityFeeCapGwei: s.replacementPriorityFeeCapGwei,
   };
+}
+
+/** Strictly exceed the common 12.5% txpool replacement threshold. The trailing
+ * +1 matters when `previous` is exactly divisible by eight. */
+export function nextReplacementFee(previous: bigint): bigint {
+  return (previous * 9n) / 8n + 1n;
+}
+
+/** Resolve a same-nonce replacement while honoring the operator's existing gas
+ * ceilings. Returns null once either EIP-1559 field would exceed those ceilings,
+ * preventing an unmined transaction from compounding fees without bound. */
+export function cappedReplacementFees(
+  currentMaxFeePerGas: bigint,
+  currentMaxPriorityFeePerGas: bigint,
+  priorMaxFeePerGas: bigint,
+  priorMaxPriorityFeePerGas: bigint,
+  gas: GasSettings,
+): { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null {
+  // The replacement cap is explicit rather than overloading dynamicTipMaxGwei:
+  // operators may choose replacement headroom independently of block-fullness
+  // bidding, including when dynamic tips are disabled. The fallback preserves a
+  // safe static ceiling while older persisted configs are migrated by Runtime.
+  const priorityCapGwei = Math.max(
+    gas.priorityFeeGwei,
+    gas.replacementPriorityFeeCapGwei ?? gas.priorityFeeGwei,
+  );
+  const priorityCap = BigInt(Math.round(priorityCapGwei * 1e9));
+  const maxFeeCap = BigInt(Math.round(2 * gas.maxBaseFeeGwei * 1e9)) + priorityCap;
+  const bumpedMax = nextReplacementFee(priorMaxFeePerGas);
+  const bumpedPriority = nextReplacementFee(priorMaxPriorityFeePerGas);
+  const maxFeePerGas = currentMaxFeePerGas > bumpedMax ? currentMaxFeePerGas : bumpedMax;
+  const maxPriorityFeePerGas = currentMaxPriorityFeePerGas > bumpedPriority
+    ? currentMaxPriorityFeePerGas
+    : bumpedPriority;
+  if (maxFeePerGas > maxFeeCap || maxPriorityFeePerGas > priorityCap) return null;
+  return { maxFeePerGas, maxPriorityFeePerGas };
 }
 
 /** A token is auditable once it is >= 2 epochs behind (matches contract `_audit`). */

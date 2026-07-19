@@ -1,6 +1,7 @@
 import {
   createPublicClient,
   createWalletClient,
+  custom,
   http,
   webSocket,
   type Block,
@@ -14,13 +15,24 @@ import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 
 function makeHttpTransport(url: string): Transport {
-  return http(url, { batch: true });
+  if (!url) {
+    return custom({
+      request: async () => {
+        throw new Error("RPC HTTP URL is not configured");
+      },
+    });
+  }
+  return http(url, {
+    batch: true,
+    timeout: 10_000,
+    retryCount: 1,
+  });
 }
 
 // `let` exports are live bindings in ES modules — importers always see the current value.
 export let publicClient: PublicClient = createPublicClient({
   chain: mainnet,
-  transport: appConfig.httpUrl ? makeHttpTransport(appConfig.httpUrl) : http(),
+  transport: makeHttpTransport(appConfig.httpUrl),
 });
 
 export let wsClient: PublicClient | null = appConfig.wsUrl
@@ -29,6 +41,7 @@ export let wsClient: PublicClient | null = appConfig.wsUrl
 
 /** Re-create viem clients after an API key is configured at runtime. */
 export function reinitClients(httpUrl: string, wsUrl?: string | null): void {
+  if (!httpUrl) throw new Error("RPC HTTP URL is not configured");
   publicClient = createPublicClient({ chain: mainnet, transport: makeHttpTransport(httpUrl) });
   wsClient = wsUrl ? createPublicClient({ chain: mainnet, transport: webSocket(wsUrl) }) : null;
   cachedBlock = null; // drop any block cached against the old client
@@ -67,10 +80,8 @@ export function accountFromPrivateKey(pk: `0x${string}`): PrivateKeyAccount {
 }
 
 export async function getChainId(): Promise<number> {
-  try {
-    return await publicClient.getChainId();
-  } catch (err) {
-    logger.warn("getChainId failed:", (err as Error).message);
-    return mainnet.id;
-  }
+  // Never infer mainnet from an unavailable/misconfigured RPC. Unlock and all
+  // signing paths must fail closed until the connected chain is verified.
+  if (!appConfig.httpUrl) throw new Error("RPC HTTP URL is not configured");
+  return publicClient.getChainId();
 }

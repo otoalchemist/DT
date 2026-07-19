@@ -3,9 +3,10 @@ import { api } from "./api.js";
 
 interface Props {
   onSaved: () => void;
+  localMode?: boolean;
 }
 
-export function AlchemySetup({ onSaved }: Props) {
+export function AlchemySetup({ onSaved, localMode = false }: Props) {
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -17,21 +18,47 @@ export function AlchemySetup({ onSaved }: Props) {
       await api.saveAlchemyKey(key.trim());
       onSaved();
     } catch (e) {
+      try {
+        if ((await api.getSettings()).setupReady) {
+          onSaved();
+          return;
+        }
+      } catch {
+        // Preserve the original mutation error when the refetch also fails.
+      }
       setError((e as Error).message);
     } finally {
       setBusy(false);
     }
   };
 
+  if (localMode) {
+    return (
+      <div className="center panel">
+        <h2>Complete local setup</h2>
+        <div className="warnbox">
+          Local mode has an RPC endpoint but cannot enumerate owned Citizens.
+          Set <span className="mono">OWNED_TOKENS</span> (recommended for an
+          Anvil fork) or <span className="mono">ALCHEMY_NFT_URL</span> in the
+          environment, then restart the bot. Runtime Alchemy-key changes are
+          disabled in local mode so they cannot swap the Anvil client to mainnet.
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="center panel">
       <h2>Connect to Alchemy</h2>
 
       <div className="warnbox">
-        This bot needs an <b>Alchemy API key</b> to read on-chain data and submit
-        transactions. Create a free key at{" "}
+        This bot needs an RPC endpoint plus a way to enumerate your Citizens.
+        An <b>Alchemy API key</b> configures both for the normal mainnet setup.
+        Create a free key at{" "}
         <span className="mono">alchemy.com</span>, then paste it below.
-        Your key is stored locally and never leaves this machine.
+        Your key is stored locally and is sent only as part of requests to the
+        configured Alchemy endpoints. Local/custom installations that set
+        RPC_HTTP_URL and OWNED_TOKENS in the environment bypass this step.
       </div>
       <div className="spacer" />
 

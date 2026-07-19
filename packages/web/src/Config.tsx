@@ -1,22 +1,28 @@
 import { useEffect, useState } from "react";
-import type { StrategyConfig } from "@dat-bot/shared";
-import { api } from "./api.js";
+import type { StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
+import { ApiError, api } from "./api.js";
 
-const MODE_TIPS: Record<"public" | "mainnet", string> = {
+type SubmissionMode = "public" | "mainnet" | "local";
+
+const MODE_TIPS: Record<SubmissionMode, string> = {
   public:
-    "Fastest path — transaction goes directly to the public mempool and every block builder sees it immediately. " +
-    "Recommended for this game since you're racing a clock, not a MEV searcher. " +
-    "Anyone can see the tx before it lands, but frontrunning tax payments isn't a meaningful risk here.",
+    "Public mempool only. Every connected builder can see the transaction, but there is no private bundle path.",
   mainnet:
-    "Sends your transaction privately to the Flashbots relay as a bundle. " +
-    "Nobody sees it until it lands in a block, so it can't be frontrun. " +
-    "Adds ~100–200 ms relay round-trip overhead and submits to the next two blocks for inclusion odds. " +
-    "Only useful if you have a specific reason to hide the transaction.",
+    "Fans out private bundles to configured builders. Survival payments also use a concurrent public fallback for broader coverage.",
+  local: "Local/anvil mode is selected by the MODE environment variable and is read-only in this dashboard.",
 };
 
-function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" }) {
+function AlchemyKeySection({
+  initialMode,
+  modeConfiguredByEnvironment,
+  keyConfiguredByEnvironment,
+}: {
+  initialMode: SubmissionMode;
+  modeConfiguredByEnvironment: boolean;
+  keyConfiguredByEnvironment: boolean;
+}) {
   const [key, setKey] = useState("");
-  const [mode, setMode] = useState<"mainnet" | "public">(initialMode);
+  const [mode, setMode] = useState<SubmissionMode>(initialMode);
   const [busyKey, setBusyKey] = useState(false);
   const [busyMode, setBusyMode] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -27,7 +33,7 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
   useEffect(() => setMode(initialMode), [initialMode]);
 
   const saveKey = async () => {
-    if (!key.trim()) return;
+    if (!key.trim() || mode === "local" || keyConfiguredByEnvironment) return;
     setBusyKey(true);
     setMsg(null);
     try {
@@ -35,6 +41,11 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
       setMsg("Saved — RPC clients updated.");
       setKey("");
     } catch (e) {
+      try {
+        setMode((await api.getSettings()).mode);
+      } catch {
+        // Preserve the mutation error below.
+      }
       setMsg(`Error: ${(e as Error).message}`);
     } finally {
       setBusyKey(false);
@@ -50,7 +61,11 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
       setMsg(`Mode switched to ${next}.`);
     } catch (e) {
       setMsg(`Error: ${(e as Error).message}`);
-      setMode(mode); // revert on failure
+      try {
+        setMode((await api.getSettings()).mode);
+      } catch {
+        setMode(mode); // last known authoritative value
+      }
     } finally {
       setBusyMode(false);
     }
@@ -63,19 +78,20 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
 
       <div style={{ marginBottom: 12 }}>
         <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Submission mode</div>
+        {mode === "local" && <span className="badge warn" style={{ marginBottom: 8 }}>local (environment)</span>}
         <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
           {(["public", "mainnet"] as const).map((m) => (
             <button
               key={m}
               onClick={() => switchMode(m)}
-              disabled={busyMode || mode === m}
+              disabled={busyMode || mode === m || mode === "local" || modeConfiguredByEnvironment}
               style={{
                 padding: "4px 14px",
                 borderRadius: 6,
                 border: mode === m ? "2px solid var(--accent, #6c7)" : "1px solid #555",
                 fontWeight: mode === m ? 700 : 400,
                 opacity: busyMode ? 0.6 : 1,
-                cursor: mode === m ? "default" : "pointer",
+                cursor: mode === m || mode === "local" ? "default" : "pointer",
               }}
             >
               {m}
@@ -85,6 +101,9 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
         <p style={{ fontSize: 12, color: "#aaa", margin: 0, lineHeight: 1.5 }}>
           {MODE_TIPS[mode]}
         </p>
+        {modeConfiguredByEnvironment && (
+          <p className="hint">Mode is fixed by the MODE environment variable; edit it and restart to change modes.</p>
+        )}
       </div>
 
       <label className="field">
@@ -94,34 +113,55 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
           value={key}
           onChange={(e) => setKey(e.target.value)}
           placeholder="paste new key to replace"
+          disabled={mode === "local" || keyConfiguredByEnvironment}
         />
       </label>
+      {mode === "local" && (
+        <p className="hint">Local RPC endpoints are environment-controlled. Change them there and restart.</p>
+      )}
+      {keyConfiguredByEnvironment && (
+        <p className="hint">The Alchemy key is fixed by ALCHEMY_API_KEY; edit the environment and restart to replace it.</p>
+      )}
       {msg && <p className={msg.startsWith("Error") ? "err" : "hint"}>{msg}</p>}
-      <button onClick={saveKey} disabled={busyKey || key.trim().length < 10} style={{ marginBottom: 8 }}>
+      <button onClick={saveKey} disabled={busyKey || mode === "local" || keyConfiguredByEnvironment || key.trim().length < 10} style={{ marginBottom: 8 }}>
         {busyKey ? "Saving…" : "Update key"}
       </button>
     </>
   );
 }
 
-// Strategy configuration form. Persists via POST /api/config.
-export function Config({ initial }: { initial: StrategyConfig }) {
-  const [cfg, setCfg] = useState<StrategyConfig>(initial);
+// Strategy configuration form. Persists via revisioned PATCH /api/config.
+export function Config({ initial, onChange }: { initial: StrategySnapshot; onChange: (snapshot: StrategySnapshot) => void }) {
+  const [cfg, setCfg] = useState<StrategyConfig>(initial.config);
+  const [revision, setRevision] = useState(initial.revision);
+  const [dirty, setDirty] = useState<Partial<StrategyConfig>>({});
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
   // Seed with the actual shipped default (mainnet) so the panel doesn't briefly
   // misreport before GET /api/settings resolves; corrected on load if it differs.
-  const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("mainnet");
-
-  useEffect(() => setCfg(initial), [initial]);
+  const [currentMode, setCurrentMode] = useState<SubmissionMode>("mainnet");
+  const [modeConfiguredByEnvironment, setModeConfiguredByEnvironment] = useState(false);
+  const [keyConfiguredByEnvironment, setKeyConfiguredByEnvironment] = useState(false);
 
   useEffect(() => {
-    api.getSettings().then((s) => setCurrentMode(s.mode)).catch(() => {});
+    if (initial.revision === revision) return;
+    setCfg(initial.config);
+    setRevision(initial.revision);
+    setDirty({});
+  }, [initial, revision]);
+
+  useEffect(() => {
+    api.getSettings().then((s) => {
+      setCurrentMode(s.mode);
+      setModeConfiguredByEnvironment(s.modeConfiguredByEnvironment);
+      setKeyConfiguredByEnvironment(s.keyConfiguredByEnvironment);
+    }).catch(() => {});
   }, []);
 
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
     setCfg((c) => ({ ...c, [k]: v }));
+    setDirty((patch) => ({ ...patch, [k]: v }));
     setSaved(false);
   };
 
@@ -129,9 +169,29 @@ export function Config({ initial }: { initial: StrategyConfig }) {
     setBusy(true);
     setSaveErr(null);
     try {
-      await api.setConfig(cfg);
+      if (Object.keys(dirty).length === 0) return;
+      const snapshot = await api.setConfig(revision, dirty);
+      setCfg(snapshot.config);
+      setRevision(snapshot.revision);
+      setDirty({});
+      onChange(snapshot);
       setSaved(true);
     } catch (e) {
+      if (e instanceof ApiError && (e.status === 409 || e.status === 503)) {
+        try {
+          const authoritative = await api.getConfig();
+          setCfg(authoritative.config);
+          setRevision(authoritative.revision);
+          setDirty({});
+          onChange(authoritative);
+          setSaveErr(e.status === 409
+            ? "Configuration changed elsewhere; refreshed the authoritative values. Review and try again."
+            : "The save may have committed but durability was not confirmed; refreshed authoritative values. The engine remains paused.");
+          return;
+        } catch {
+          // Fall through to the original mutation error.
+        }
+      }
       setSaveErr((e as Error).message);
     } finally {
       setBusy(false);
@@ -150,6 +210,32 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         Dry-run / live-fire is toggled from the badge in the top bar.
       </p>
 
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>DEFENSE</div>
+      <label className="check">
+        <input type="checkbox" checked={cfg.defenseEnabled} onChange={chk("defenseEnabled")} />
+        Enable continuous defense
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.proactivePay} onChange={chk("proactivePay")} disabled={!cfg.defenseEnabled} />
+        Proactively pay delinquent Citizens
+      </label>
+      <label className="field">
+        Clear audits with this many seconds remaining
+        <input type="number" min={0} step={60} value={cfg.auditSafetyBufferSeconds} onChange={num("auditSafetyBufferSeconds")} disabled={!cfg.defenseEnabled} />
+      </label>
+      <label className="field">
+        Epochs requested per defense payment (1–7)
+        <input type="number" min={1} max={7} step={1} value={cfg.prepayEpochs} onChange={num("prepayEpochs")} disabled={!cfg.defenseEnabled} />
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={cfg.autoUseBribe} onChange={chk("autoUseBribe")} disabled={!cfg.defenseEnabled} />
+        Allow automatic bribe use
+      </label>
+      <p className="muted" style={{ fontSize: 11 }}>
+        Continuous defense is independent from the one-shot JIT campaign. Enabling or saving either one never enables the other.
+      </p>
+
+      <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
       <label className="check">
         <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />
@@ -175,8 +261,8 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         Pre-submit audits/kills ~{cfg.preBoundaryLeadMs}ms before the deadline so they land in the first
         eligible block ahead of rivals, instead of the block after. Each is validated by simulating at the
         boundary/expiry instant, so an invalid one is skipped before spending gas. Lead is shared with the
-        JIT boundary race. Note: at the boundary, block position is decided by builder orderflow more than
-        tip — a defender who pre-pays can still beat your audit.
+        JIT boundary race. Note: builders choose block position from profitability, fees, and competing
+        orderflow — a defender who pre-pays can still beat your audit.
       </p>
       <label className="field">
         Only run offense when supply is within N of 69 winners (blank = always)
@@ -259,6 +345,17 @@ export function Config({ initial }: { initial: StrategyConfig }) {
           disabled={!cfg.separateOffenseGas || !cfg.offenseDynamicTipEnabled}
         />
       </label>
+      <label className="field">
+        Replacement priority-fee ceiling — offense (gwei)
+        <input
+          type="number"
+          min={0.1}
+          step={0.1}
+          value={cfg.offenseReplacementPriorityFeeCapGwei}
+          onChange={num("offenseReplacementPriorityFeeCapGwei")}
+          disabled={!cfg.separateOffenseGas}
+        />
+      </label>
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>LATENCY (offense)</div>
@@ -286,16 +383,10 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       </label>
       <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
         Also broadcasts time-critical offense txs to the public mempool alongside the Flashbots bundle,
-        so any builder can include them next block. Trades bundle privacy for speed. No effect in public mode.
+        so any builder can include them next block. Trades bundle privacy for speed. While defense/JIT is
+        active this fallback is always used, so a private offense nonce cannot block an emergency payment.
+        No effect in public mode.
       </p>
-
-      {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
-          JIT payment enables it automatically. The values still apply and remain
-          editable in data/config.json (enabled, proactivePay,
-          auditSafetyBufferSeconds, prepayEpochs, autoUseBribe). autoUseBribe is OFF
-          by default (pay taxes to clear audits, never auto-spend a bribe). The
-          per-payment epoch cap (maxAutoPayEpochs) is edited in the Just-in-time
-          panel. */}
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>
@@ -316,12 +407,16 @@ export function Config({ initial }: { initial: StrategyConfig }) {
         against a bad estimate or a badly-delinquent token draining the wallet in one shot.
       </p>
 
-      <button className="primary" onClick={save} disabled={busy}>
+      <button className="primary" onClick={save} disabled={busy || Object.keys(dirty).length === 0}>
         {busy ? "Saving…" : saved ? "Saved ✓" : "Save strategy"}
       </button>
       {saveErr && <p className="err" style={{ marginTop: 6 }}>{saveErr}</p>}
 
-      <AlchemyKeySection initialMode={currentMode} />
+      <AlchemyKeySection
+        initialMode={currentMode}
+        modeConfiguredByEnvironment={modeConfiguredByEnvironment}
+        keyConfiguredByEnvironment={keyConfiguredByEnvironment}
+      />
     </div>
   );
 }

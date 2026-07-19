@@ -46,8 +46,11 @@ export type ActivityKind =
 
 export type ActivityStatus =
   | "planned"
+  | "prepared"
   | "simulated"
   | "submitted"
+  | "delivery-uncertain"
+  | "rejected"
   | "included"
   | "reverted"
   | "skipped"
@@ -70,8 +73,9 @@ export interface ActivityEntry {
 }
 
 export interface StrategyConfig {
-  /** Master switch: when false, the engine observes but never submits. */
-  enabled: boolean;
+  /** Enables continuous audit defense and proactive tax payments. JIT and offense
+   *  are independently controlled and do not inherit this setting. */
+  defenseEnabled: boolean;
   /** Simulate/plan only; never actually send. Defaults true on first run. */
   dryRun: boolean;
 
@@ -97,29 +101,18 @@ export interface StrategyConfig {
    *  let proactive-pay / defense auto-catch-up multiple epochs in one payment. */
   maxAutoPayEpochs: number;
 
-  // --- Just-in-time single-epoch payment (one-shot) ---
-  /** When armed, pay exactly one epoch for each selected token the moment the
-   *  target epoch begins on-chain, then auto-disarm. */
-  jitEnabled: boolean;
-  /** The epoch to pay for. Set when arming (usually currentEpoch + 1). */
-  jitTargetEpoch: number | null;
-  /** Specific tokenIds to cover; empty = all owned citizens. */
-  jitTokenIds: string[];
-  /** ADVANCED: pre-submit the JIT payment ~preBoundaryLeadMs *before* the target
-   *  epoch boundary so it lands in the FIRST block of the epoch (ahead of a
-   *  batch-auditor), instead of the block after. The value is computed off-chain
-   *  for the upcoming epoch and validated by simulating AT the boundary timestamp,
-   *  so a wrong value is caught before spending gas. Off by default. */
+  // --- Boundary payment scheduling ---
+  /** ADVANCED: pre-submit needed proactive-defense payments, plus any armed JIT
+   *  payment, ~preBoundaryLeadMs before the target epoch boundary. The value is
+   *  computed off-chain for the upcoming epoch and validated by simulating at the
+   *  boundary timestamp. A normal on-chain-estimate tick remains the fallback. */
   preBoundaryPay: boolean;
-  /** How many ms before the target boundary to fire the pre-submit in
-   *  public/local mode (250–8000). Held tight because a public tx that lands in
-   *  the pre-boundary block carries a next-epoch value and overpay-reverts. */
+  /** How many ms before the target boundary to build and simulate the transaction
+   *  in public/local mode (250–8000). Broadcast waits for the boundary timestamp. */
   preBoundaryLeadMs: number;
-  /** Lead used in `mainnet` (bundle) mode (250–11000). Bundles target a specific
-   *  blockNumber, so they can't land in the wrong block, and a bundle that would
-   *  revert is dropped rather than mined — so pre-submitting earlier is free, and
-   *  gives builders more time to weigh it. Keep under a 12s slot so the bundle's
-   *  target block resolves to the boundary block. */
+  /** Lead used in `mainnet` (bundle) mode (250–11000). The bundle carries a
+   *  boundary minTimestamp and its public fallback waits for that timestamp.
+   *  Keep the lead under one 12s slot. */
   preBoundaryLeadMainnetMs: number;
 
   // --- Offense (optional) ---
@@ -134,12 +127,12 @@ export interface StrategyConfig {
   offenseTargetTokenIds: string[];
   /** ADVANCED: pre-submit audits ~preBoundaryLeadMs before the epoch boundary so
    *  they land in the FIRST block of the epoch (auditing rivals the instant they
-   *  become delinquent, like a batch-auditor) instead of the block after.
-   *  Unsimulated; a mis-timed audit reverts (gas only — the fee is refunded). */
+   *  become delinquent, like a batch-auditor) instead of the block after. The
+   *  future-timestamp semantic simulation must succeed before submission. */
   preBoundaryAudit: boolean;
   /** ADVANCED: pre-submit kills ~preBoundaryLeadMs before a target's audit-expiry
-   *  so the kill lands in the first eligible block. Unsimulated; a too-early kill
-   *  reverts (gas only). */
+   *  so the kill lands in the first eligible block. The future-timestamp semantic
+   *  simulation must succeed before submission. */
   preBoundaryKill: boolean;
 
   // --- Guardrails ---
@@ -151,6 +144,8 @@ export interface StrategyConfig {
   priorityFeeGwei: number;
   /** Never spend below this wallet balance (ether). */
   minBalanceEth: number;
+  /** Absolute priority-fee ceiling for same-nonce payment replacements. */
+  replacementPriorityFeeCapGwei: number;
 
   // --- Offense gas override (audit / kill) ---
   /** When true, audit/kill use the `offense*` gas fields below instead of the
@@ -167,6 +162,8 @@ export interface StrategyConfig {
   offenseDynamicTipEnabled: boolean;
   /** Dynamic-tip ceiling (gwei) for audit/kill. Used only when separateOffenseGas. */
   offenseDynamicTipMaxGwei: number;
+  /** Absolute priority-fee ceiling for same-nonce offense replacements. */
+  offenseReplacementPriorityFeeCapGwei: number;
 
   // --- Latency (mainnet mode only) ---
   /** Fire an extra tick just before each offense deadline (nearest audit
@@ -175,7 +172,8 @@ export interface StrategyConfig {
   offenseBoundaryScheduling: boolean;
   /** Also broadcast time-critical offense txs to the public mempool alongside
    *  the Flashbots bundle, so any builder can include them in the next block.
-   *  Trades bundle privacy for lower inclusion latency. */
+   *  Trades bundle privacy for lower inclusion latency. Defense/JIT overrides
+   *  this to true so a private offense nonce cannot fence a survival payment. */
   racePublicMempool: boolean;
   /** Scale the priority-fee tip up as the latest block fills, so we stay
    *  competitive for inclusion in contested blocks. When off, the static
@@ -190,6 +188,33 @@ export interface StrategyConfig {
    *  backstop against a bad estimate or many-epoch debt draining the wallet.
    *  0 disables the cap. */
   maxPaymentEth: number;
+}
+
+/** Independently revisioned, one-shot JIT campaign. Token IDs are always explicit
+ * so arming a subset can never broaden into payments for every owned Citizen. */
+export type JitCampaignState =
+  | "armed"
+  | "completed"
+  | "completed-dry-run"
+  | "cancelled"
+  | "failed";
+
+export interface JitCampaign {
+  revision: number;
+  state: JitCampaignState;
+  targetEpoch: number | null;
+  tokenIds: string[];
+  /** Stop an engine that this campaign auto-started once the one-shot work is
+   * terminal, unless another enabled strategy still needs it. */
+  autoStopOnCompletion: boolean;
+  message?: string;
+  completedAt?: number;
+}
+
+/** Authoritative strategy API representation. */
+export interface StrategySnapshot {
+  revision: number;
+  config: StrategyConfig;
 }
 
 /** One transaction resolved on-chain for a race post-mortem. */
@@ -247,10 +272,26 @@ export interface BotStatus {
   citizensAddress: string | null;
   lastBlock: string | null;
   spentThisEpochWei: string;
+  /** Confirmed on-chain spend for the current epoch. */
+  confirmedSpendThisEpochWei: string;
+  /** Value + maximum gas currently exposed in pending submissions. */
+  pendingExposureWei: string;
+  /** Whether the durable transaction journal is healthy. */
+  journalHealthy: boolean;
+  journalError: string | null;
   /** Game start time (unix seconds) — lets the UI compute epoch boundaries. */
   startTime: string | null;
   jitEnabled: boolean;
+  jitState: JitCampaignState;
   jitTargetEpoch: number | null;
+  /** Independently incremented whenever a JIT campaign is armed, cancelled, or completed. */
+  jitRevision: number;
+  /** Exact Citizen IDs covered by the active campaign. */
+  jitTokenIds: string[];
+  jitMessage: string | null;
+  jitCompletedAt: number | null;
+  /** Revision of the persistent strategy configuration. */
+  strategyRevision: number;
   /** True when the Alchemy NFT API (or token overrides) are configured. */
   nftConfigured: boolean;
 }

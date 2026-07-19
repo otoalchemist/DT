@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "./api.js";
+import { api, type AppSettingsStatus } from "./api.js";
 import { useSocket } from "./useSocket.js";
 import { AlchemySetup } from "./AlchemySetup.js";
 import { Setup } from "./Setup.js";
@@ -8,14 +8,14 @@ import { Dashboard } from "./Dashboard.js";
 export function App() {
   const { status, activity, connected, pushStatus } = useSocket();
   const [keystore, setKeystore] = useState<{ exists: boolean; address: string | null } | null>(null);
-  const [alchemyKeySet, setAlchemyKeySet] = useState<boolean | null>(null);
+  const [settings, setSettings] = useState<AppSettingsStatus | null>(null);
   const [checked, setChecked] = useState(false);
 
   const refreshKeystore = () => api.keystore().then(setKeystore);
 
   useEffect(() => {
     Promise.all([
-      api.getSettings().then((s) => setAlchemyKeySet(s.alchemyKeySet)),
+      api.getSettings().then(setSettings),
       refreshKeystore(),
     ]).finally(() => setChecked(true));
   }, []);
@@ -31,10 +31,13 @@ export function App() {
   }
 
   // Step 1: Alchemy RPC key must be configured first.
-  if (!alchemyKeySet) {
+  if (!settings?.setupReady) {
     return (
       <div className="app">
-        <AlchemySetup onSaved={() => setAlchemyKeySet(true)} />
+        <AlchemySetup
+          localMode={settings?.mode === "local"}
+          onSaved={() => { void api.getSettings().then(setSettings); }}
+        />
       </div>
     );
   }

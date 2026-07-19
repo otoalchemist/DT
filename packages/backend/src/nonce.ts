@@ -1,69 +1,254 @@
-import type { Address } from "viem";
+import type { Address, Hex } from "viem";
 import { publicClient } from "./chain.js";
 
-// Nonce state for the single hot wallet, held across engine ticks.
-//
-// In `public`/`local` mode our submitted txs land in the mempool, so
-// `getTransactionCount(pending)` reflects them and is the source of truth each
-// tick. In `mainnet` mode our txs go out as private Flashbots bundles the mempool
-// never sees, so pending can lag what we've actually used — if we blindly re-synced
-// to it we'd hand the same nonce to a *different* tx on the next tick and silently
-// drop one of them. So in mainnet mode we hold our own reserved ceiling until the
-// chain catches up (bundle mined) or the reservation goes stale (bundle dropped).
-
 export type SubmitMode = "public" | "mainnet" | "local";
+export type NonceDeliveryState = "prepared" | "accepted" | "rejected" | "ambiguous";
 
+export interface NonceFlightSnapshot {
+  nonce: number;
+  txHash?: Hex;
+  state: NonceDeliveryState;
+  publicExposure: boolean;
+  maxPrivateTargetBlock?: bigint;
+  retainBeyondPrivateTarget?: boolean;
+}
+
+interface NonceFlight extends NonceFlightSnapshot {
+  replacement: boolean;
+}
+
+/**
+ * Account-scoped nonce allocator. It deliberately has no time-based expiry:
+ * public/ambiguous transactions can remain live in a remote txpool for hours.
+ * A private-only flight is released only when the chain has passed its explicit
+ * final target block. Definite pre-dispatch failures are released explicitly.
+ */
 export class NonceManager {
+  private address: Address | null = null;
   private next: number | null = null;
-  private reservedCeil: number | null = null; // one past the highest nonce reserved this session
-  private lastOnchain = -1;
-  private lastOnchainChangeMs = 0;
-  // If pending hasn't advanced past our held reservation for this long, an
-  // un-mined bundle has almost certainly been dropped (bundles expire after ~2
-  // blocks), so we release the nonce rather than stick behind a permanent gap.
-  private static readonly STALE_MS = 90_000;
+  private lastConfirmed = -1;
+  private lastPending = -1;
+  private invisibleReservation = false;
+  private readonly flights = new Map<number, NonceFlight>();
+  private recoveryHook?: (
+    address: Address,
+    confirmedNonce: number,
+    pendingNonce: number,
+    currentBlock?: bigint,
+  ) => Promise<readonly NonceFlightSnapshot[]>;
+  private recoveredAddress: string | null = null;
 
-  /** Re-sync at the start of a tick. `mode` decides whether to trust the mempool
-   *  (public/local) or hold our own reserved ceiling (mainnet). */
-  async sync(address: Address, mode: SubmitMode): Promise<void> {
-    const onchain = await publicClient.getTransactionCount({ address, blockTag: "pending" });
-    const nowMs = Date.now();
-    if (onchain !== this.lastOnchain) {
-      this.lastOnchain = onchain;
-      this.lastOnchainChangeMs = nowMs;
-    }
-
-    const holding = mode === "mainnet" && this.reservedCeil !== null && onchain < this.reservedCeil;
-    if (holding && nowMs - this.lastOnchainChangeMs <= NonceManager.STALE_MS) {
-      // Keep our reserved nonce — the chain just hasn't seen the bundle yet.
-      this.next = Math.max(onchain, this.reservedCeil!);
-    } else {
-      // Chain is the truth: public/local always, or a mainnet reservation we've
-      // now released (chain caught up, or it went stale). Self-heals a bad gap.
-      this.next = onchain;
-      this.reservedCeil = null;
-    }
+  setRecoveryHook(
+    hook: (
+      address: Address,
+      confirmedNonce: number,
+      pendingNonce: number,
+      currentBlock?: bigint,
+    ) => Promise<readonly NonceFlightSnapshot[]>,
+  ): void {
+    this.recoveryHook = hook;
   }
 
-  /** Peek at the next nonce without consuming it (for simulation). */
+  async sync(address: Address, _mode: SubmitMode): Promise<void> {
+    if (this.address !== null && this.address.toLowerCase() !== address.toLowerCase()) {
+      this.clearAccountState();
+    }
+    this.address = address;
+    const getBlockNumber = (publicClient as unknown as { getBlockNumber?: () => Promise<bigint> }).getBlockNumber;
+    const currentBlock = getBlockNumber ? await getBlockNumber.call(publicClient) : undefined;
+    const [confirmedNonce, pendingNonce] = await Promise.all([
+      currentBlock === undefined
+        ? publicClient.getTransactionCount({ address, blockTag: "latest" })
+        : publicClient.getTransactionCount({ address, blockNumber: currentBlock }),
+      publicClient.getTransactionCount({ address, blockTag: "pending" }),
+    ]);
+    const effectivePendingNonce = Math.max(confirmedNonce, pendingNonce);
+    this.lastConfirmed = confirmedNonce;
+    this.lastPending = effectivePendingNonce;
+    const normalizedAddress = address.toLowerCase();
+    if (this.recoveryHook && this.recoveredAddress !== normalizedAddress) {
+      const recovered = await this.recoveryHook(address, confirmedNonce, effectivePendingNonce, currentBlock);
+      for (const snapshot of recovered) this.restoreFlight(snapshot);
+      this.recoveredAddress = normalizedAddress;
+    }
+
+    for (const nonce of [...this.flights.keys()]) {
+      // Pending advancement is not terminal: a public tx can remain replaceable,
+      // dropped, or reverted. Only confirmed chain consumption closes a flight.
+      if (nonce < confirmedNonce) this.flights.delete(nonce);
+    }
+
+    const expirable = [...this.flights.values()].filter(
+      (flight) => !flight.publicExposure
+        && !flight.retainBeyondPrivateTarget
+        && flight.maxPrivateTargetBlock !== undefined,
+    );
+    if (expirable.length > 0) {
+      if (currentBlock !== undefined) {
+        const expiredCandidates = expirable.filter(
+          (flight) => currentBlock > flight.maxPrivateTargetBlock!,
+        );
+        const expiredNonces = new Set(expiredCandidates.map((flight) => flight.nonce));
+        const highestStillLiveNonce = [...this.flights.values()].reduce((highest, flight) =>
+          !expiredNonces.has(flight.nonce) && flight.nonce > highest
+            ? flight.nonce
+            : highest, -1);
+        for (const flight of expiredCandidates) {
+          // Match durable-journal reconciliation: an expired private lower
+          // nonce remains a gap fence while any higher flight is still live.
+          // Otherwise sync could discard the recovered lower snapshot even
+          // though strategy still needs to replace/fill it before the suffix.
+          if (highestStillLiveNonce <= flight.nonce) this.flights.delete(flight.nonce);
+        }
+      }
+    }
+
+    const ceiling = this.reservationCeiling();
+    this.next = Math.max(effectivePendingNonce, ceiling);
+    this.invisibleReservation = [...this.flights.values()].some(
+      (flight) => flight.nonce >= confirmedNonce
+        && (!flight.publicExposure || flight.nonce >= effectivePendingNonce),
+    );
+  }
+
   peek(): number {
     if (this.next === null) throw new Error("NonceManager.peek called before sync");
     return this.next;
   }
 
-  /** Reserve the next nonce (call only after simulation passes). */
   reserve(): number {
     if (this.next === null) throw new Error("NonceManager.reserve called before sync");
-    const n = this.next;
-    this.next = n + 1;
-    if (this.reservedCeil === null || this.next > this.reservedCeil) this.reservedCeil = this.next;
-    return n;
+    if (this.invisibleReservation) {
+      throw new Error("NonceManager.reserve blocked by an unresolved nonce flight");
+    }
+    const nonce = this.next++;
+    this.flights.set(nonce, {
+      nonce,
+      state: "prepared",
+      publicExposure: false,
+      replacement: false,
+    });
+    return nonce;
   }
 
-  /** End-of-tick reset of the working nonce. The reserved ceiling persists so a
-   *  mainnet bundle's nonce isn't reused next tick before it mines. */
+  ensureNextAbove(nonce: number): void {
+    if (this.next === null) throw new Error("NonceManager.ensureNextAbove called before sync");
+    if (this.next <= nonce) this.next = nonce + 1;
+    const existing = this.flights.get(nonce);
+    if (!existing) {
+      this.flights.set(nonce, {
+        nonce,
+        state: "prepared",
+        publicExposure: false,
+        replacement: true,
+      });
+    }
+  }
+
+  /** Record delivery immediately; ambiguous/private-only states fence this tick. */
+  markDelivery(
+    nonce: number,
+    state: NonceDeliveryState,
+    options: {
+      txHash?: Hex;
+      publicExposure?: boolean;
+      maxPrivateTargetBlock?: bigint;
+      retainRejectedFence?: boolean;
+      retainBeyondPrivateTarget?: boolean;
+    } = {},
+  ): void {
+    const existing = this.flights.get(nonce) ?? {
+      nonce,
+      state: "prepared" as const,
+      publicExposure: false,
+      replacement: true,
+    };
+    const flight: NonceFlight = {
+      ...existing,
+      state,
+      txHash: options.txHash ?? existing.txHash,
+      publicExposure: options.publicExposure ?? existing.publicExposure,
+      maxPrivateTargetBlock: options.maxPrivateTargetBlock ?? existing.maxPrivateTargetBlock,
+      retainBeyondPrivateTarget: options.retainBeyondPrivateTarget
+        ?? existing.retainBeyondPrivateTarget,
+    };
+    if (state === "rejected" && !options.retainRejectedFence && !flight.publicExposure && flight.maxPrivateTargetBlock === undefined) {
+      this.flights.delete(nonce);
+    } else {
+      this.flights.set(nonce, flight);
+    }
+    if (
+      state === "ambiguous"
+      || options.retainRejectedFence
+      || (state === "accepted" && !flight.publicExposure)
+    ) {
+      this.invisibleReservation = true;
+    } else {
+      this.invisibleReservation = [...this.flights.values()].some(
+        (item) => item.state === "ambiguous"
+          || (item.state === "accepted" && !item.publicExposure),
+      );
+    }
+  }
+
+  /** Restore a durable flight before fresh allocation on process startup. */
+  restoreFlight(snapshot: NonceFlightSnapshot): void {
+    this.flights.set(snapshot.nonce, { ...snapshot, replacement: false });
+    this.invisibleReservation = this.lastConfirmed < 0 || [...this.flights.values()].some(
+      (flight) => flight.nonce >= this.lastConfirmed
+        && (!flight.publicExposure || flight.nonce >= this.lastPending),
+    );
+  }
+
+  flightSnapshots(): NonceFlightSnapshot[] {
+    return [...this.flights.values()].map(({ replacement: _replacement, ...flight }) => ({ ...flight }));
+  }
+
+  hasInvisibleReservation(): boolean {
+    return this.invisibleReservation;
+  }
+
+  pendingNonce(): number {
+    if (this.lastPending < 0) throw new Error("NonceManager.pendingNonce called before sync");
+    return this.lastPending;
+  }
+
+  releaseContiguous(nonces: readonly number[]): boolean {
+    if (this.next === null || nonces.length === 0) return false;
+    const sorted = [...nonces].sort((a, b) => a - b);
+    if (new Set(sorted).size !== sorted.length) return false;
+    for (let index = 1; index < sorted.length; index++) {
+      if (sorted[index] !== sorted[index - 1]! + 1) return false;
+    }
+    const start = sorted[0]!;
+    const end = sorted[sorted.length - 1]! + 1;
+    if (this.next !== end || this.reservationCeiling() !== end) return false;
+    for (const nonce of sorted) this.flights.delete(nonce);
+    this.next = start;
+    this.invisibleReservation = [...this.flights.values()].some(
+      (flight) => flight.nonce >= this.lastConfirmed
+        && (!flight.publicExposure || flight.nonce >= this.lastPending),
+    );
+    return true;
+  }
+
   reset(): void {
     this.next = null;
+  }
+
+  private reservationCeiling(): number {
+    let ceiling = Math.max(0, this.lastPending);
+    for (const nonce of this.flights.keys()) ceiling = Math.max(ceiling, nonce + 1);
+    return ceiling;
+  }
+
+  private clearAccountState(): void {
+    this.next = null;
+    this.lastConfirmed = -1;
+    this.lastPending = -1;
+    this.invisibleReservation = false;
+    this.flights.clear();
+    this.recoveredAddress = null;
   }
 }
 
