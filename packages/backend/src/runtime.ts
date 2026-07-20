@@ -44,11 +44,11 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // actually work, so they're pre-armed rather than left for them to discover.
   offenseEnabled: false,
   autoAudit: true,
-  autoKill: true,
+  autoKill: false, // opt-in: killing an expired-audit token is free but aggressive
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadDefaultRivalTargets(),
   preBoundaryAudit: true,
-  preBoundaryKill: true,
+  preBoundaryKill: false, // opt-in: race kills into the first block after audit expiry
   combinedBoundaryBundle: false, // opt-in: pay + audit in one atomic bundle
   // Payment gas — tuned to win the boundary bundle race: a ~15 gwei tip clears
   // the observed batch-audit bundles (~3 gwei) with margin, dynamic tip scales it

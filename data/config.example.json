@@ -14,7 +14,7 @@
   "preBoundaryLeadMainnetMs": 5000,
   "offenseEnabled": false,
   "autoAudit": true,
-  "autoKill": true,
+  "autoKill": false,
   "endgameOnlyWithin": null,
   "offenseTargetTokenIds": [
     "206",
@@ -67,7 +67,7 @@
     "6953"
   ],
   "preBoundaryAudit": true,
-  "preBoundaryKill": true,
+  "preBoundaryKill": false,
   "combinedBoundaryBundle": false,
   "maxBaseFeeGwei": 69.1,
   "priorityFeeGwei": 15.1,

@@ -451,7 +451,9 @@ async function firePreBoundaryAudit(): Promise<void> {
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
     await nonceManager.sync(address, appConfig.mode);
-    await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: false });
+    const queuedAudit = await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: false });
+    // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
+    if (queuedAudit) await maybeQueueCoinbaseBid();
   } catch (err) {
     logger.error("pre-boundary audit error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
@@ -570,6 +572,7 @@ async function firePreBoundaryKill(): Promise<void> {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
   const windowSec = BigInt(Math.ceil(effectiveLeadMs() / 1000) + 12);
+  let queuedKill = false;
   try {
     await nonceManager.sync(address, appConfig.mode);
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
@@ -593,7 +596,10 @@ async function firePreBoundaryKill(): Promise<void> {
         // Simulate one second past the audit-expiry, where kill() first becomes valid.
         { targetTokenId: t.tokenId, message: `Pre-boundary kill #${t.tokenId} (audit expiring, deadline race)`, race: true, simTimestamp: due + 1n },
       );
+      queuedKill = true;
     }
+    // Tail a coinbase bid so the kill bundle wins the slot (no-op unless configured).
+    if (queuedKill) await maybeQueueCoinbaseBid();
   } catch (err) {
     logger.error("pre-boundary kill error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary kill error: ${(err as Error).message}` });
