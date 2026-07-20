@@ -80,7 +80,27 @@ if (savedSettings.mode && !process.env.MODE) {
   process.env.MODE = savedSettings.mode;
 }
 
+export const API_LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "::1"] as const;
+const apiLoopbackHosts = new Set<string>(API_LOOPBACK_HOSTS);
+
+/** The wallet-control API is intentionally local-only. Keep this validation at
+ * configuration load so an unsafe bind fails before Fastify starts listening. */
+export const apiBindSchema = z.object({
+  HOST: z.string()
+    .trim()
+    .transform((host) => host.toLowerCase())
+    .refine((host) => apiLoopbackHosts.has(host), {
+      message: "HOST must be loopback-only for this release (127.0.0.1, localhost, or ::1)",
+    })
+    .default("127.0.0.1"),
+  API_ALLOWED_HOSTS: z.string().optional().refine(
+    (hosts) => hosts === undefined || hosts.trim() === "",
+    "API_ALLOWED_HOSTS is no longer supported; remove it because the API is loopback-only",
+  ),
+});
+
 const schema = z.object({
+  ...apiBindSchema.shape,
   /** "mainnet" (default) submits private bundles to the builders in BUILDER_URLS;
    *  payments also mirror to the public mempool for independent inclusion
    *  coverage. Builders choose placement based on profitability and other
@@ -101,9 +121,6 @@ const schema = z.object({
    *  many raises the odds. Defaults to DEFAULT_BUILDER_URLS below. */
   BUILDER_URLS: z.string().optional(),
   PORT: z.coerce.number().default(8787),
-  HOST: z.string().default("127.0.0.1"),
-  /** Trusted HTTP Host/Origin names, required for wildcard/LAN binds. */
-  API_ALLOWED_HOSTS: z.string().optional(),
   DATA_DIR: z.string().default(bundledDataDir),
   LOG_LEVEL: z.string().optional(),
   /** Comma-separated tokenId overrides for local/anvil testing (no NFT API). */
@@ -234,9 +251,6 @@ function derive() {
       : [...new Set([raw.FLASHBOTS_RELAY_URL, ...DEFAULT_BUILDER_URLS])],
     port: raw.PORT,
     host: raw.HOST,
-    allowedHosts: raw.API_ALLOWED_HOSTS
-      ? raw.API_ALLOWED_HOSTS.split(",").map((host) => host.trim().toLowerCase()).filter(Boolean)
-      : [],
     dataDir: path.resolve(raw.DATA_DIR),
     ownedTokensOverride: parseIds(raw.OWNED_TOKENS),
     targetTokensOverride: parseIds(raw.TARGET_TOKENS),

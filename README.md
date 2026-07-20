@@ -88,9 +88,16 @@ npm run build
 npm start          # backend only
 ```
 
-Serve `packages/web/dist` behind the same production host as the API, with
-`/api` and `/ws` reverse-proxied to the backend. A bare static host is not enough
-because the dashboard deliberately uses same-origin API and WebSocket paths.
+Serve `packages/web/dist` and reverse-proxy `/api` and `/ws` from a proxy whose
+listener is itself bound only to loopback, then open the dashboard through
+`localhost` on that same machine. A bare static host is not enough because the
+dashboard deliberately uses same-origin API and WebSocket paths.
+
+The wallet-control API has no client authentication. Do not expose either the
+backend or its proxy on a LAN/public interface, through port forwarding, or via
+an SSH, Cloudflare, ngrok, or similar tunnel. Do not rewrite an external
+`Host`/`Origin` to look loopback-local; that bypasses the security boundary the
+backend checks.
 
 ### Versioning & releases
 
@@ -99,6 +106,10 @@ The bot has a single version string (`VERSION` in
 the title) and **logged at startup**, so you can always confirm which build you're
 running — and the dashboard flags a warning if the running backend's version
 doesn't match the dashboard's (e.g. a half-updated copy).
+
+When installing, compare that displayed version with the version on the specific
+approved Git tag or Release you downloaded. Do not treat GitHub's unversioned
+*Code → Download ZIP* archive from a moving branch as a published release.
 
 To cut a release zip:
 
@@ -142,9 +153,8 @@ web UI or `gh release create`).
 | `RPC_HTTP_URL` / `RPC_WS_URL` / `ALCHEMY_NFT_URL` | Explicit overrides. They remain authoritative if a dashboard-saved Alchemy key changes; an explicit HTTP URL does not inherit a mainnet WebSocket. |
 | `MODE` | `mainnet` (**default** — private bundles to `BUILDER_URLS`; payments also mirror to the mempool for broader inclusion coverage), `public` (mempool only), or `local` (Anvil/non-mainnet direct broadcast). When absent from the environment it is switchable and persisted from the dashboard; an explicit environment value is read-only until restart. Local mode refuses chain ID 1. |
 | `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to [Flashbots](https://docs.flashbots.net/flashbots-auction/advanced/rpc-endpoint), [BuilderNet](https://buildernet.org/docs/send-orderflow), [beaverbuild](https://beaverbuild.org/docs.html), and [Titan](https://docs.titanbuilder.xyz/api/eth_sendbundle) (provider-documented for `eth_sendBundle` as of July 2026). Endpoints do change — verify against each builder's current docs. |
-| `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). |
-| `BACKEND_URL` | Development dashboard proxy target. Defaults to `http://127.0.0.1:<PORT>`; set it explicitly when the backend is on another host. |
-| `API_ALLOWED_HOSTS` | Comma-separated trusted Host/Origin names required for every non-loopback/LAN bind (for example `192.168.1.20,bot.internal.example`). Unlisted names fail closed. |
+| `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). `HOST` accepts only `127.0.0.1`, `localhost`, or `::1`; non-loopback startup fails closed. |
+| `BACKEND_URL` | Development dashboard proxy target. Defaults to `http://127.0.0.1:<PORT>`; override it only to select another loopback address, port, or scheme. |
 | `DATA_DIR` | Per-instance durable state directory (strategy, settings, campaign, journal, activity, and keystore). Put custom directories outside the checkout. |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
 | `MAX_CANDIDATES` | Offense-only cap on rival enumeration (default 500). Owned Citizens are always fully paginated and then verified with `ownerOf`. |
@@ -175,6 +185,8 @@ cp data/config.example.json "$DATA_DIR/config.json"
   cap** (skips any tax payment above a set ETH value — a backstop against a bad
   estimate or a badly-delinquent token draining the wallet in one shot; `0` = off),
   a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
+  Dry-run and pause prevent new dispatch/replay attempts; a transaction already
+  exposed to a public mempool or builder cannot be recalled and may still land.
   The min-balance floor is enforced **cumulatively** — several payments in one
   cycle can't sneak the wallet below it. The floor includes unresolved value and
   worst-case gas from prior ticks and restarts, deduplicated by nonce. Same-nonce
@@ -231,10 +243,10 @@ cp data/config.example.json "$DATA_DIR/config.json"
   rechecks the current balance against all live maximum exposure plus the current
   min-balance floor. Public or ambiguous transactions never become reusable merely
   because a wall-clock timeout elapsed; a corrupt journal fails closed.
-- **Local-only by default.** The API binds to `127.0.0.1` and validates both HTTP
+- **Local-only.** The API binds to `127.0.0.1` and validates both HTTP
   `Host` and browser `Origin` headers, blocking DNS-rebinding from a malicious web
-  page. LAN/wildcard binds require an explicit `API_ALLOWED_HOSTS` allowlist and
-  apply the same checks. Do not expose the API to the internet.
+  page. Non-loopback `HOST` values are rejected during startup; the API does not
+  support LAN or internet exposure in this release.
 
 ---
 

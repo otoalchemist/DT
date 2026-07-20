@@ -30,7 +30,8 @@ Never let viem select an undeclared default RPC. Environment-owned endpoint,
 mode, and key settings remain authoritative; dashboard mutations cannot silently
 override them. Local direct-broadcast mode rejects chain ID 1 and runtime Alchemy
 key replacement. Owned-token pagination is independent of the offense candidate
-cap, and every non-loopback API Host must be explicitly allowlisted.
+cap. Because the wallet-control API has no client authentication, bind it only to
+`127.0.0.1`, `localhost`, or `::1`; reject non-loopback hosts at configuration load.
 
 ## 2026-07-18 — Release version
 

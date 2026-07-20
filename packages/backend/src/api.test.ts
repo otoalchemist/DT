@@ -59,7 +59,6 @@ const h = vi.hoisted(() => {
   };
   const appConfig = {
     host: "127.0.0.1",
-    allowedHosts: [] as string[],
     mode: "mainnet" as "mainnet" | "public" | "local",
     dataDir: "/tmp/dat-api-test",
     httpUrl: "https://old.test",
@@ -105,6 +104,7 @@ const h = vi.hoisted(() => {
 
 vi.mock("./config.js", () => ({
   appConfig: h.appConfig,
+  API_LOOPBACK_HOSTS: ["127.0.0.1", "localhost", "::1"],
   loadSettings: vi.fn(() => ({})),
   saveSettings: h.saveSettings,
   deriveUrlsFromKey: vi.fn(() => ({ httpUrl: "https://new.test", wsUrl: "wss://new.test", nftUrl: "https://new-nft.test" })),
@@ -178,7 +178,6 @@ describe("revisioned API lifecycle", () => {
     h.runtime.currentEpoch = 9n;
     h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
     h.appConfig.host = "127.0.0.1";
-    h.appConfig.allowedHosts = [];
     h.appConfig.mode = "mainnet";
     h.appConfig.httpUrl = "https://old.test";
     h.appConfig.wsUrl = "wss://old.test";
@@ -432,28 +431,26 @@ describe("revisioned API lifecycle", () => {
     await app.close();
   });
 
-  it("enforces browser origin checks on a non-loopback bind", async () => {
-    h.appConfig.host = "0.0.0.0";
-    h.appConfig.allowedHosts = ["192.168.1.20"];
+  it("rejects non-loopback Host and Origin headers", async () => {
     h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
     const app = await buildServer();
-    const foreign = await app.inject({
+    const lanHost = await app.inject({
       method: "POST", url: "/api/start",
-      headers: { host: "192.168.1.20:8787", origin: "https://evil.example" },
+      headers: { host: "192.168.1.20:8787" },
     });
-    const sameHost = await app.inject({
+    const lanOrigin = await app.inject({
       method: "POST", url: "/api/start",
-      headers: { host: "192.168.1.20:8787", origin: "http://192.168.1.20:5173" },
+      headers: { host: "localhost", origin: "http://192.168.1.20:5173" },
     });
     const rebound = await app.inject({
       method: "POST", url: "/api/start",
       headers: { host: "attacker.example", origin: "https://attacker.example" },
     });
 
-    expect(foreign.statusCode).toBe(403);
+    expect(lanHost.statusCode).toBe(403);
+    expect(lanOrigin.statusCode).toBe(403);
     expect(rebound.statusCode).toBe(403);
-    expect(sameHost.statusCode).toBe(200);
-    expect(h.startEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
     await app.close();
   });
 

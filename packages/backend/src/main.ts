@@ -21,7 +21,8 @@ async function main(): Promise<void> {
 
   const app = await buildServer();
   await app.listen({ port: appConfig.port, host: appConfig.host });
-  logger.info(`API listening on http://${appConfig.host}:${appConfig.port}`);
+  const displayHost = appConfig.host.includes(":") ? `[${appConfig.host}]` : appConfig.host;
+  logger.info(`API listening on http://${displayHost}:${appConfig.port}`);
   logger.info(
     runtime.strategy.dryRun
       ? "DRY-RUN is ON — no transactions will be sent until you turn it off."

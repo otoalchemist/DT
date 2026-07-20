@@ -21,6 +21,14 @@ UI-saved settings now live at `<DATA_DIR>/settings.json`. When `DATA_DIR` differ
 by the environment. Explicit RPC/WS/NFT endpoint overrides remain authoritative.
 Local mode refuses Ethereum mainnet chain ID 1 and runtime Alchemy-key replacement.
 
+The wallet-control API is loopback-only in 0.3.0. `HOST` must be `127.0.0.1`,
+`localhost`, or `::1`; remove `API_ALLOWED_HOSTS` from existing environments.
+Startup now fails clearly for LAN and wildcard binds instead of treating a Host
+allowlist as client authentication. Any reverse proxy serving the dashboard must
+also listen only on loopback. Remove LAN/public listeners, port forwarding, and
+external tunnels, and do not rewrite a non-loopback `Host` or `Origin` as a
+loopback value.
+
 Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
 
 The local configuration API now uses revisioned, field-scoped writes. Integrations must read the current strategy or JIT revision before mutating it and handle HTTP 409 by refetching. JIT arm requests must send a future `targetEpoch` and a nonempty explicit `tokenIds` list.

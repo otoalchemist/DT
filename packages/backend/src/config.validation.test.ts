@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  apiBindSchema,
   loadSettingsFromPaths,
   validateMainnetRpcCandidate,
   writeJsonAtomic,
@@ -20,6 +21,31 @@ const candidate = {
   nftUrl: "https://nft.test/v3/key",
   gameAddress: "0x0000000000000000000000000000000000000001" as const,
 };
+
+describe("API bind validation", () => {
+  it.each(["127.0.0.1", "localhost", "::1", " LOCALHOST "])(
+    "accepts the loopback bind %s",
+    (host) => {
+      expect(apiBindSchema.parse({ HOST: host }).HOST).toBe(host.trim().toLowerCase());
+    },
+  );
+
+  it.each(["0.0.0.0", "192.168.1.20", "bot.internal.example", "[::1]"])(
+    "rejects the non-loopback or invalid Fastify bind %s",
+    (host) => {
+      expect(() => apiBindSchema.parse({ HOST: host })).toThrow(/HOST must be loopback-only/);
+    },
+  );
+
+  it("rejects the removed API_ALLOWED_HOSTS escape hatch", () => {
+    expect(() => apiBindSchema.parse({
+      HOST: "127.0.0.1",
+      API_ALLOWED_HOSTS: "192.168.1.20",
+    })).toThrow(/API_ALLOWED_HOSTS is no longer supported/);
+    expect(apiBindSchema.parse({ HOST: "localhost", API_ALLOWED_HOSTS: "" }).HOST)
+      .toBe("localhost");
+  });
+});
 
 function validFetch(overrides: Record<string, unknown> = {}): typeof fetch {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

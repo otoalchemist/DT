@@ -887,8 +887,37 @@ describe("prepared delivery campaigns", () => {
     expect(await flushBundle()).toEqual(new Map());
   });
 
-  it("fails a deterministic whole-prefix revert closed before any delivery", async () => {
-    fetchMock.mockResolvedValue(response({ results: [{}, { revert: "second obligation failed" }] }));
+  it("delivers a clean lower-nonce prefix and releases the failing dependent suffix", async () => {
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: [{}, { revert: "second obligation failed" }, {}] }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xprefix" }));
+    });
+    await queue(3);
+
+    const result = await flushBundle();
+    expect(result.get(7)).toMatchObject({ ok: true, txHash: expect.any(String) });
+    expect(result.get(8)).toMatchObject({ ok: false, error: expect.stringContaining("second obligation failed") });
+    expect(result.get(9)).toMatchObject({ ok: false, error: expect.stringContaining("second obligation failed") });
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(parseTransaction(
+      h.publicClient.sendRawTransaction.mock.calls[0]![0].serializedTransaction,
+    ).nonce).toBe(7);
+    expect(calls.filter((call) => call.method === "eth_sendBundle")).toHaveLength(4);
+    expect(calls.filter((call) => call.method === "eth_sendBundle").every(
+      (call) => call.params[0].txs.length === 1,
+    )).toBe(true);
+    expect(h.journal.upsertMany).toHaveBeenCalledTimes(1);
+    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(1);
+    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([8, 9]);
+  });
+
+  it("fails the whole queue when the first simulated transaction reverts", async () => {
+    fetchMock.mockResolvedValue(response({ results: [{ revert: "first obligation failed" }, {}] }));
     await queue(2);
 
     const result = await flushBundle();
@@ -943,7 +972,7 @@ describe("prepared delivery campaigns", () => {
     expect(result.get(107)).toMatchObject({ ok: true, bundleHash: undefined });
   }, 20_000);
 
-  it("bounds public transport concurrency to 32 while preserving nonce-order chunks", async () => {
+  it("refills a 32-send public pool as soon as any slot frees while preserving launch order", async () => {
     h.appConfig.mode = "public";
     const gates: Array<() => void> = [];
     h.publicClient.sendRawTransaction.mockImplementation(() => new Promise<Hex>((resolve) => {
@@ -952,9 +981,9 @@ describe("prepared delivery campaigns", () => {
     await queue(33);
     const flushing = flushBundle();
     await vi.waitFor(() => expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(32));
-    for (const release of gates.splice(0)) release();
+    gates[0]!();
     await vi.waitFor(() => expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(33));
-    for (const release of gates.splice(0)) release();
+    for (const release of gates) release();
     await flushing;
     const nonces = h.publicClient.sendRawTransaction.mock.calls.map(([arg]) =>
       parseTransaction(arg.serializedTransaction).nonce,
@@ -1177,7 +1206,7 @@ describe("durable prepared-flight recovery", () => {
     expect(h.journal.updateMany).not.toHaveBeenCalled();
   });
 
-  it("authorizes every current candidate before replay and retains semantic denials", async () => {
+  it("authorizes every current candidate before replay and treats a denial as a nonce barrier", async () => {
     const denied = await recoveredFlight(true, undefined, { nonce: 7, data: "0x71" });
     const allowed = await recoveredFlight(true, undefined, { nonce: 8, data: "0x72" });
     const retained = [denied, allowed];
@@ -1191,23 +1220,138 @@ describe("durable prepared-flight recovery", () => {
       expired: [],
     });
     const authorize = vi.fn(async (flight: { nonce: number }) => flight.nonce === 8);
-    h.publicClient.call.mockImplementation(async () => {
-      expect(authorize).toHaveBeenCalledTimes(2);
-      return { data: "0x" };
-    });
 
     await recoverPreparedSubmissions(ACCOUNT.address, undefined, authorize);
 
     expect(authorize).toHaveBeenNthCalledWith(1, denied);
     expect(authorize).toHaveBeenNthCalledWith(2, allowed);
+    expect(h.publicClient.getBalance).not.toHaveBeenCalled();
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(denied.state).toBe("prepared");
+    expect(allowed.state).toBe("prepared");
+    expect(h.journal.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not recover across a nonce missing from the pending frontier", async () => {
+    const first = await recoveredFlight(true, undefined, { nonce: 7, data: "0x75" });
+    const aboveGap = await recoveredFlight(true, undefined, { nonce: 9, data: "0x79" });
+    const retained = [first, aboveGap];
+    h.journal.load.mockReturnValue(retained);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained,
+      consumed: [],
+      expired: [],
+    });
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.publicClient.call).toHaveBeenCalledTimes(1);
     expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
     expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
-      serializedTransaction: allowed.rawSignedTx,
+      serializedTransaction: first.rawSignedTx,
     });
-    expect(denied.state).toBe("prepared");
+    expect(first.state).toBe("accepted");
+    expect(aboveGap.state).toBe("prepared");
     expect(h.journal.updateMany).toHaveBeenCalledWith(
       ACCOUNT.address,
-      [expect.objectContaining({ txHash: allowed.txHash })],
+      [expect.objectContaining({ txHash: first.txHash })],
+    );
+  });
+
+  it("extends the pending frontier even when confirmed nonce is lower", async () => {
+    const flight = await recoveredFlight(true, undefined, { nonce: 8, data: "0x78" });
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 8,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.publicClient.call).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
+      serializedTransaction: flight.rawSignedTx,
+    });
+  });
+
+  it("replays only the contiguous simulated prefix before a failed nonce", async () => {
+    const first = await recoveredFlight(true, undefined, { nonce: 7, data: "0x81" });
+    const failed = await recoveredFlight(true, undefined, { nonce: 8, data: "0x82" });
+    const higher = await recoveredFlight(true, undefined, { nonce: 9, data: "0x83" });
+    const retained = [first, failed, higher];
+    h.journal.load.mockReturnValue(retained);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained,
+      consumed: [],
+      expired: [],
+    });
+    h.publicClient.call.mockImplementation(async (request: { data: Hex }) => {
+      if (request.data === failed.obligation.data) {
+        throw new Error("obligation no longer valid");
+      }
+      return { data: "0x" };
+    });
+    h.publicClient.sendRawTransaction.mockImplementation(async () => {
+      // Read-only authorization and simulation finish before any prefix entry is
+      // exposed, even though a later simulation result is unusable.
+      expect(h.publicClient.call).toHaveBeenCalledTimes(3);
+      return `0x${"33".repeat(32)}`;
+    });
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
+      serializedTransaction: first.rawSignedTx,
+    });
+    expect(first.state).toBe("accepted");
+    expect(failed.state).toBe("prepared");
+    expect(higher.state).toBe("prepared");
+    expect(h.journal.updateMany).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      [expect.objectContaining({ txHash: first.txHash })],
+    );
+  });
+
+  it("stops the recovery prefix when a lower public delivery is not accepted", async () => {
+    const failed = await recoveredFlight(true, undefined, { nonce: 7, data: "0x91" });
+    const higher = await recoveredFlight(true, undefined, { nonce: 8, data: "0x92" });
+    const retained = [failed, higher];
+    h.journal.load.mockReturnValue(retained);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained,
+      consumed: [],
+      expired: [],
+    });
+    h.publicClient.sendRawTransaction.mockRejectedValueOnce(new Error("nonce too high"));
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.publicClient.call).toHaveBeenCalledTimes(2);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
+      serializedTransaction: failed.rawSignedTx,
+    });
+    expect(failed.state).toBe("ambiguous");
+    expect(failed.publicExposure).toBe(false);
+    expect(higher.state).toBe("prepared");
+    expect(h.journal.updateMany).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      [expect.objectContaining({ txHash: failed.txHash })],
     );
   });
 

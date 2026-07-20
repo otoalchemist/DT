@@ -26,6 +26,7 @@ const testState = vi.hoisted(() => ({
   submittedMaxFeePerGas: 20n,
   submittedMaxPriorityFeePerGas: 2n,
   submittedGasWei: 0n,
+  baseFeePerGas: 10_000_000_000n,
   signedCount: 0,
   balanceWei: 10_000_000_000_000_000_000n,
   balanceResponses: [] as bigint[],
@@ -79,7 +80,7 @@ function currentEpochAt(nowSec: bigint): bigint {
 vi.mock("./chain.js", () => ({
   publicClient: {
     getBlock: vi.fn(async () => ({
-      baseFeePerGas: 10_000_000_000n,
+      baseFeePerGas: testState.baseFeePerGas,
       gasUsed: 15_000_000n,
       gasLimit: 30_000_000n,
       timestamp: BigInt(Math.floor(Date.now() / 1000)),
@@ -169,7 +170,7 @@ vi.mock("./chain.js", () => ({
   getLatestBlockCached: vi.fn(async () => {
     if (testState.blockGate) await testState.blockGate;
     return {
-      baseFeePerGas: 10_000_000_000n,
+      baseFeePerGas: testState.baseFeePerGas,
       gasUsed: 15_000_000n,
       gasLimit: 30_000_000n,
       number: 100n,
@@ -429,6 +430,10 @@ function journalFlight(args: {
   notBeforeTimestamp?: bigint;
   maxPrivateTargetBlock?: bigint;
   publicExposure?: boolean;
+  publicAuthorized?: boolean;
+  gasLimit?: bigint;
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
 }) {
   const byte = (args.nonce + 1).toString(16).padStart(2, "0");
   return {
@@ -440,13 +445,13 @@ function journalFlight(args: {
       to: args.to ?? appConfig.gameAddress,
       data: args.data,
       valueWei: (args.valueWei ?? 0n).toString(),
-      gasLimit: "100",
-      maxFeePerGas: "2",
-      maxPriorityFeePerGas: "1",
+      gasLimit: (args.gasLimit ?? 100n).toString(),
+      maxFeePerGas: (args.maxFeePerGas ?? 2n).toString(),
+      maxPriorityFeePerGas: (args.maxPriorityFeePerGas ?? 1n).toString(),
     },
     lineage: { id: `${FAKE_ACCOUNT.address.toLowerCase()}:${args.nonce}` },
     recovery: {
-      publicAuthorized: true,
+      publicAuthorized: args.publicAuthorized ?? true,
       ...(args.notBeforeTimestamp === undefined
         ? {}
         : { notBeforeTimestamp: args.notBeforeTimestamp.toString() }),
@@ -577,6 +582,7 @@ describe("defensive payment scheduling and retries", () => {
     testState.submittedMaxFeePerGas = 20n;
     testState.submittedMaxPriorityFeePerGas = 2n;
     testState.submittedGasWei = 0n;
+    testState.baseFeePerGas = 10_000_000_000n;
     testState.signedCount = 0;
     testState.balanceWei = 10_000_000_000_000_000_000n;
     testState.balanceResponses = [];
@@ -696,6 +702,45 @@ describe("defensive payment scheduling and retries", () => {
     await vi.advanceTimersByTimeAsync(7_500);
 
     expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xAUDIT"]);
+  });
+
+  it("fires a pre-boundary audit immediately when startup is already inside its lead window", async () => {
+    const boundary = epochStart(6);
+    testState.lastEpochPaid = 5n;
+    testState.ownedIds = [2n];
+    testState.lastEpochPaidByToken = new Map([["2", 5n]]);
+    testState.auditLimitByToken = new Map([["2", 1n]]);
+    testState.candidateIds = [99n];
+    testState.liveTargets = [{
+      id: 99n,
+      owner: "0x9999999999999999999999999999999999999999",
+    }];
+    testState.targetStatuses = [{
+      tokenId: "99",
+      owner: "0x9999999999999999999999999999999999999999",
+      lastEpochPaid: "4",
+      delinquent: false,
+      epochsBehind: 1,
+      auditable: false,
+      auditDueTimestamp: "0",
+      killable: false,
+    }];
+    configure({
+      enabled: false,
+      proactivePay: false,
+      offenseEnabled: true,
+      autoAudit: true,
+      autoKill: false,
+      preBoundaryAudit: true,
+    });
+
+    // The normal audit fire time was 2.75s before the boundary. Starting one
+    // second before it must enqueue the immutable epoch-6 plan immediately.
+    await startAt(boundary - 1n);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xAUDIT"]);
+    expect(vi.mocked(submitTx).mock.calls[0]![1].simTimestamp).toBe(boundary);
   });
 
   it("immediately pays a delinquent unaudited citizen on a regular tick after a missed boundary", async () => {
@@ -1298,6 +1343,253 @@ describe("defensive payment scheduling and retries", () => {
       nonce: 0,
       data,
       valueWei: testState.estimatedPayWei,
+    }))).resolves.toBe(false);
+  });
+
+  it.each(["payment", "offense", "inert"] as const)(
+    "never authorizes a recovered %s transaction while dry-run is enabled",
+    async (kind) => {
+      const now = epochStart(20) + 100n;
+      vi.setSystemTime(new Date(Number(now) * 1000));
+      configure({
+        dryRun: true,
+        offenseEnabled: true,
+        autoKill: true,
+        offenseTargetTokenIds: [],
+      });
+      const data = kind === "payment"
+        ? encodeFunctionData({
+            abi: gameContract.abi,
+            functionName: "payTaxes",
+            args: [1n, 1],
+          })
+        : kind === "offense"
+          ? encodeFunctionData({
+              abi: gameContract.abi,
+              functionName: "kill",
+              args: [99n],
+            })
+          : "0x" as Hex;
+
+      await expect(recoveryDecisionFor(journalFlight({
+        nonce: 0,
+        to: kind === "inert" ? FAKE_ACCOUNT.address : undefined,
+        data,
+      }))).resolves.toBe(false);
+    },
+  );
+
+  it.each([
+    {
+      name: "current base-fee cap",
+      overrides: { maxBaseFeeGwei: 5 } as TestStrategyOverrides,
+    },
+    {
+      name: "offense base-fee cap when its original gas class is unknown",
+      overrides: {
+        separateOffenseGas: true,
+        offenseMaxBaseFeeGwei: 5,
+      } as TestStrategyOverrides,
+    },
+    {
+      name: "signed priority-fee ceiling",
+      maxPriorityFeePerGas: 3_000_000_000n,
+      overrides: {} as TestStrategyOverrides,
+    },
+    {
+      name: "signed max-fee ceiling",
+      maxFeePerGas: 203_000_000_000n,
+      overrides: {} as TestStrategyOverrides,
+    },
+  ])("rejects an inert recovery outside the current $name", async ({
+    overrides,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+  }) => {
+    configure({
+      maxBaseFeeGwei: 100,
+      priorityFeeGwei: 2,
+      dynamicTipEnabled: false,
+      replacementPriorityFeeCapGwei: 2,
+      ...overrides,
+    });
+
+    await expect(recoveryDecisionFor(journalFlight({
+      nonce: 0,
+      to: FAKE_ACCOUNT.address,
+      data: "0x",
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+    }))).resolves.toBe(false);
+  });
+
+  it.each([
+    {
+      name: "payment current base-fee cap",
+      kind: "payment" as const,
+      overrides: { maxBaseFeeGwei: 5 } as TestStrategyOverrides,
+    },
+    {
+      name: "offense current base-fee cap",
+      kind: "offense" as const,
+      overrides: { separateOffenseGas: true, offenseMaxBaseFeeGwei: 5 } as TestStrategyOverrides,
+    },
+    {
+      name: "payment signed priority-fee ceiling",
+      kind: "payment" as const,
+      maxPriorityFeePerGas: 3_000_000_000n,
+      overrides: {} as TestStrategyOverrides,
+    },
+    {
+      name: "offense signed priority-fee ceiling",
+      kind: "offense" as const,
+      maxPriorityFeePerGas: 3_000_000_000n,
+      overrides: {} as TestStrategyOverrides,
+    },
+    {
+      name: "payment signed max-fee ceiling",
+      kind: "payment" as const,
+      maxFeePerGas: 203_000_000_000n,
+      overrides: {} as TestStrategyOverrides,
+    },
+    {
+      name: "offense signed max-fee ceiling",
+      kind: "offense" as const,
+      maxFeePerGas: 203_000_000_000n,
+      overrides: {} as TestStrategyOverrides,
+    },
+  ])("rejects recovery after withdrawal of the $name", async ({
+    kind,
+    overrides,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+  }) => {
+    const now = epochStart(20) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1000));
+    testState.lastEpochPaid = 18n;
+    testState.estimatedPayWei = 20n * BASE_TAX_RATE_WEI;
+    testState.auditDueByToken.set("99", now - 1n);
+    configure({
+      enabled: kind === "payment",
+      proactivePay: true,
+      offenseEnabled: kind === "offense",
+      autoKill: true,
+      offenseTargetTokenIds: [],
+      maxBaseFeeGwei: 100,
+      priorityFeeGwei: 2,
+      dynamicTipEnabled: false,
+      replacementPriorityFeeCapGwei: 2,
+      separateOffenseGas: true,
+      offenseMaxBaseFeeGwei: 100,
+      offensePriorityFeeGwei: 2,
+      offenseDynamicTipEnabled: false,
+      offenseReplacementPriorityFeeCapGwei: 2,
+      ...overrides,
+    });
+    const data = kind === "payment"
+      ? encodeFunctionData({
+          abi: gameContract.abi,
+          functionName: "payTaxes",
+          args: [1n, 1],
+        })
+      : encodeFunctionData({
+          abi: gameContract.abi,
+          functionName: "kill",
+          args: [99n],
+        });
+
+    await expect(recoveryDecisionFor(journalFlight({
+      nonce: 0,
+      data,
+      valueWei: kind === "payment" ? testState.estimatedPayWei : 0n,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+    }))).resolves.toBe(false);
+  });
+
+  it.each([
+    {
+      name: "audit target allowlist",
+      kind: "audit" as const,
+      overrides: { offenseTargetTokenIds: ["100"] } as TestStrategyOverrides,
+    },
+    {
+      name: "kill target allowlist",
+      kind: "kill" as const,
+      overrides: { offenseTargetTokenIds: ["100"] } as TestStrategyOverrides,
+    },
+    {
+      name: "endgame window",
+      kind: "kill" as const,
+      overrides: { endgameOnlyWithin: 0 } as TestStrategyOverrides,
+    },
+    {
+      name: "pre-boundary audit setting",
+      kind: "audit" as const,
+      boundary: true,
+      overrides: { preBoundaryAudit: false } as TestStrategyOverrides,
+    },
+    {
+      name: "pre-boundary kill setting",
+      kind: "kill" as const,
+      boundary: true,
+      overrides: { preBoundaryKill: false } as TestStrategyOverrides,
+    },
+    {
+      name: "mainnet public-mempool permission",
+      kind: "kill" as const,
+      mainnet: true,
+      overrides: { racePublicMempool: false } as TestStrategyOverrides,
+    },
+  ])("rejects recovered offense after withdrawal of the $name", async ({
+    kind,
+    boundary,
+    mainnet,
+    overrides,
+  }) => {
+    const now = epochStart(20) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1000));
+    if (mainnet) appConfig.mode = "mainnet";
+    const notBeforeTimestamp = boundary
+      ? kind === "audit" ? epochStart(21) : now + 101n
+      : undefined;
+    testState.lastEpochPaidByToken.set("1", 20n);
+    testState.lastEpochPaidByToken.set("99", boundary ? 19n : 18n);
+    testState.auditLimitByToken.set("1", 1n);
+    testState.auditDueByToken.set(
+      "99",
+      kind === "kill" ? (notBeforeTimestamp ?? now) - 1n : 0n,
+    );
+    configure({
+      enabled: false,
+      proactivePay: false,
+      offenseEnabled: true,
+      autoAudit: true,
+      autoKill: true,
+      offenseTargetTokenIds: [],
+      endgameOnlyWithin: null,
+      preBoundaryAudit: true,
+      preBoundaryKill: true,
+      racePublicMempool: true,
+      ...overrides,
+    });
+    const data = kind === "audit"
+      ? encodeFunctionData({
+          abi: gameContract.abi,
+          functionName: "audit",
+          args: [1n, 99n],
+        })
+      : encodeFunctionData({
+          abi: gameContract.abi,
+          functionName: "kill",
+          args: [99n],
+        });
+
+    await expect(recoveryDecisionFor(journalFlight({
+      nonce: 0,
+      data,
+      valueWei: kind === "audit" ? 1n : 0n,
+      notBeforeTimestamp,
     }))).resolves.toBe(false);
   });
 

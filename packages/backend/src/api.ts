@@ -5,6 +5,7 @@ import type { StrategyConfig } from "@dat-bot/shared";
 import { generatePrivateKey } from "viem/accounts";
 import {
   appConfig,
+  API_LOOPBACK_HOSTS,
   loadSettings,
   saveSettings,
   deriveUrlsFromKey,
@@ -110,22 +111,16 @@ export async function buildServer(): Promise<FastifyInstance> {
     return run;
   };
 
-  // DNS-rebinding guard: loopback names work by default. Every non-loopback Host
-  // must be explicitly listed in API_ALLOWED_HOSTS, including a specific LAN
-  // bind address; network reachability alone is never authorization.
-  const loopbackHosts = new Set(["127.0.0.1", "localhost", "::1"]);
-  const trustedHosts = new Set([
-    ...loopbackHosts,
-    ...appConfig.allowedHosts,
-  ]);
+  // Defense in depth for the loopback-only listener: a hostile web page can
+  // still target localhost, so reject DNS-rebound Host names and foreign browser
+  // origins even though Fastify never listens on a LAN interface.
+  const loopbackHosts = new Set<string>(API_LOOPBACK_HOSTS);
   app.addHook("onRequest", async (req, reply) => {
     const requestHost = hostnameOf(req.headers.host ?? "");
-    if (!trustedHosts.has(requestHost)) {
+    if (!loopbackHosts.has(requestHost)) {
       return reply.code(403).send({ error: "Forbidden: unexpected Host header" });
     }
-    // Browser provenance checks apply on LAN binds too: network reachability is
-    // not consent for attacker.com to drive an unlocked wallet through fetch or
-    // a form POST. Origin-less CLI requests remain supported.
+    // Origin-less local CLI requests remain supported.
     if (req.headers["sec-fetch-site"]?.toLowerCase() === "cross-site") {
       return reply.code(403).send({ error: "Forbidden: cross-site browser request" });
     }
@@ -133,9 +128,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (origin !== undefined) {
       const originHost = originHostname(origin);
       const allowed = originHost !== null
-        && trustedHosts.has(originHost)
-        && (originHost === requestHost
-          || (loopbackHosts.has(originHost) && loopbackHosts.has(requestHost)));
+        && loopbackHosts.has(originHost);
       if (!allowed) {
         return reply.code(403).send({ error: "Forbidden: unexpected Origin header" });
       }

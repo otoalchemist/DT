@@ -590,6 +590,61 @@ let journalReconciledGeneration = -1;
 type RetainedJournalFlight = Awaited<ReturnType<typeof reconcileSubmissionJournal>>["retained"][number];
 type JournalReconciliationResult = Awaited<ReturnType<typeof reconcileSubmissionJournal>>;
 
+function signedFeesWithinCurrentLimits(
+  flight: RetainedJournalFlight,
+  offense: boolean,
+  baseFeePerGas: bigint,
+): boolean {
+  const gas = resolveGas(runtime.strategy, offense);
+  const maxBaseFeeWei = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
+  if (baseFeePerGas > maxBaseFeeWei) return false;
+
+  // A recovered raw may be either the first signed attempt or a same-nonce
+  // replacement. Honor every priority-fee source that can legitimately have
+  // produced it, while retaining the current absolute replacement ceiling.
+  const priorityCapGwei = Math.max(
+    gas.priorityFeeGwei,
+    gas.dynamicTipEnabled ? gas.dynamicTipMaxGwei : 0,
+    gas.replacementPriorityFeeCapGwei ?? gas.priorityFeeGwei,
+  );
+  const priorityCapWei = BigInt(Math.round(priorityCapGwei * 1e9));
+  const maxFeeCapWei = maxBaseFeeWei * 2n + priorityCapWei;
+  return BigInt(flight.obligation.maxPriorityFeePerGas) <= priorityCapWei
+    && BigInt(flight.obligation.maxFeePerGas) <= maxFeeCapWei;
+}
+
+function recoveredOffensePolicyAuthorized(
+  kind: "audit" | "kill",
+  targetTokenId: string,
+  notBeforeTimestamp: bigint | null,
+  citizenSupply: bigint,
+): boolean {
+  const strategy = runtime.strategy;
+  if (
+    strategy.offenseTargetTokenIds.length > 0
+    && !strategy.offenseTargetTokenIds.includes(targetTokenId)
+  ) return false;
+  if (
+    strategy.endgameOnlyWithin !== null
+    && citizenSupply - WINNERS > BigInt(strategy.endgameOnlyWithin)
+  ) return false;
+  if (notBeforeTimestamp !== null) {
+    if (kind === "audit" && !strategy.preBoundaryAudit) return false;
+    if (kind === "kill" && !strategy.preBoundaryKill) return false;
+  }
+  // Recovery always uses sendRawTransaction. In mainnet mode, re-check the same
+  // current authority that would let a fresh offense transaction leave the
+  // private bundle path; a previously public-authorized WAL entry is not a
+  // permanent grant after the operator withdraws that setting.
+  if (
+    appConfig.mode === "mainnet"
+    && !strategy.racePublicMempool
+    && !strategy.defenseEnabled
+    && !jitCampaignIsArmed()
+  ) return false;
+  return true;
+}
+
 function createRecoveryFlightAuthorizer(address: Address) {
   let snapshotPromise: ReturnType<typeof getGameSnapshot> | null = null;
   const snapshot = () => {
@@ -597,11 +652,27 @@ function createRecoveryFlightAuthorizer(address: Address) {
     return snapshotPromise;
   };
   return async (flight: RetainedJournalFlight): Promise<boolean> => {
+    // Dry-run is an absolute execution boundary. This check deliberately comes
+    // before the inert-filler fast path: nonce-clearing transactions still spend
+    // gas and must never escape while the operator is simulating.
+    if (runtime.strategy.dryRun || !flight.recovery.publicAuthorized) return false;
     const obligation = flight.obligation;
     const inert = obligation.to.toLowerCase() === address.toLowerCase()
       && obligation.data === "0x"
       && BigInt(obligation.valueWei) === 0n;
-    if (inert) return true;
+    if (inert) {
+      const blockNumber = await publicClient.getBlockNumber();
+      const block = await publicClient.getBlock({ blockNumber });
+      const baseFeePerGas = (block as { baseFeePerGas?: bigint }).baseFeePerGas ?? 0n;
+      // The WAL does not encode whether an inert nonce-clearing replacement came
+      // from a payment or an offense. Conservatively require both current gas
+      // profiles so a recovered filler cannot bypass either lowered operator cap.
+      return signedFeesWithinCurrentLimits(
+        flight,
+        false,
+        baseFeePerGas,
+      ) && signedFeesWithinCurrentLimits(flight, true, baseFeePerGas);
+    }
     if (obligation.to.toLowerCase() !== appConfig.gameAddress.toLowerCase()) return false;
 
     let decoded: { functionName: string; args?: readonly unknown[] };
@@ -643,6 +714,12 @@ function createRecoveryFlightAuthorizer(address: Address) {
     const block = await publicClient.getBlock({ blockNumber });
     const blockTimestamp = (block as { timestamp?: bigint }).timestamp;
     if (blockTimestamp === undefined) return false;
+    const offense = decoded.functionName === "audit" || decoded.functionName === "kill";
+    if (!signedFeesWithinCurrentLimits(
+      flight,
+      offense,
+      (block as { baseFeePerGas?: bigint }).baseFeePerGas ?? 0n,
+    )) return false;
 
     if (decoded.functionName === "payTaxes") {
       const tokenId = (args[0] as bigint).toString();
@@ -657,22 +734,6 @@ function createRecoveryFlightAuthorizer(address: Address) {
         ? parseEther(String(runtime.strategy.maxPaymentEth))
         : 0n;
       if (maxPaymentWei > 0n && valueWei > maxPaymentWei) return false;
-      // Recovery is an execution decision, so current gas-withdrawal settings
-      // apply to old signed raws too. Permit a prior replacement only within the
-      // current absolute replacement ceilings.
-      const gasProfile = resolveGas(runtime.strategy, false);
-      const priorityCapGwei = Math.max(
-        gasProfile.priorityFeeGwei,
-        gasProfile.dynamicTipEnabled ? gasProfile.dynamicTipMaxGwei : 0,
-        gasProfile.replacementPriorityFeeCapGwei ?? gasProfile.priorityFeeGwei,
-      );
-      const priorityCapWei = BigInt(Math.round(priorityCapGwei * 1e9));
-      const maxFeeCapWei = BigInt(Math.round(2 * gasProfile.maxBaseFeeGwei * 1e9))
-        + priorityCapWei;
-      if (
-        BigInt(obligation.maxPriorityFeePerGas) > priorityCapWei
-        || BigInt(obligation.maxFeePerGas) > maxFeeCapWei
-      ) return false;
       const results = await looseMulticall([
         {
           address: fresh.citizensAddress,
@@ -767,6 +828,16 @@ function createRecoveryFlightAuthorizer(address: Address) {
     const notBeforeTimestamp = flight.recovery.notBeforeTimestamp === undefined
       ? null
       : BigInt(flight.recovery.notBeforeTimestamp);
+    if (
+      (kind === "audit" || kind === "kill")
+      && targetTokenId !== undefined
+      && !recoveredOffensePolicyAuthorized(
+        kind,
+        targetTokenId,
+        notBeforeTimestamp,
+        fresh.citizenSupply,
+      )
+    ) return false;
     const assessment = await assessActionFlight({
       attemptId: 0,
       key: semanticActionKey(kind, tokenId, targetTokenId) ?? `recovery:${flight.nonce}`,
@@ -1647,8 +1718,16 @@ export function schedulePreBoundaryAudit(): void {
   // intentionally offset and never shares the payment's discovery/batch.
   const deltaMs = Number(plan.boundaryTs) * 1000 - nowMs - effectiveLeadMs()
     + PAYMENT_PRIORITY_OFFSET_MS;
-  if (deltaMs <= 0) return;
   const generation = engineGeneration;
+  if (deltaMs <= 0) {
+    if (Number(plan.boundaryTs) * 1000 > nowMs) {
+      preBoundaryAuditTimer = setTimeout(
+        () => void firePreBoundaryAudit(plan, generation),
+        0,
+      );
+    }
+    return;
+  }
   const maxTimerDelayMs = 2_000_000_000;
   preBoundaryAuditTimer = deltaMs > maxTimerDelayMs
     ? setTimeout(schedulePreBoundaryAudit, maxTimerDelayMs)

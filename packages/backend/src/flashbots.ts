@@ -675,6 +675,26 @@ function recoveryCandidates(
     .sort((left, right) => left.nonce - right.nonce);
 }
 
+/** Keep exact replays already covered by the node's pending sequence, then only
+ * extend that sequence one nonce at a time. `pendingNonce` is the first nonce
+ * not represented by the executable txpool prefix; broadcasting above it would
+ * create a queued transaction whose authorization could be stale when the gap
+ * is eventually repaired. Clamp against confirmed for inconsistent RPC views. */
+function contiguousRecoveryCandidates(
+  candidates: readonly JournalFlight[],
+  confirmedNonce: number,
+  pendingNonce: number,
+): JournalFlight[] {
+  let nextNonce = Math.max(confirmedNonce, pendingNonce);
+  let prefixLength = 0;
+  for (const flight of candidates) {
+    if (flight.nonce > nextNonce) break;
+    prefixLength++;
+    if (flight.nonce === nextNonce) nextNonce++;
+  }
+  return candidates.slice(0, prefixLength);
+}
+
 async function rebroadcastJournalFlight(flight: JournalFlight): Promise<DeliveryOutcome> {
   const endpoint = "public-rpc-recovery";
   try {
@@ -705,7 +725,11 @@ async function recoverJournalFlights(
   authorizeFlight?: (flight: JournalFlight) => Promise<boolean>,
 ): Promise<JournalReconciliation> {
   let reconciliation = initialReconciliation;
-  let candidates = recoveryCandidates(reconciliation.retained, Date.now());
+  let candidates = contiguousRecoveryCandidates(
+    recoveryCandidates(reconciliation.retained, Date.now()),
+    reconciliation.confirmedNonce,
+    reconciliation.pendingNonce,
+  );
   while (candidates.length > 0) {
     const notBefore = candidates.reduce((latest, flight) => {
       const candidate = flight.recovery.notBeforeTimestamp === undefined
@@ -718,7 +742,11 @@ async function recoverJournalFlights(
     // The wait may span many blocks. Reconcile nonce terminality again before
     // authorizing spend, then bind the balance read to that exact block.
     reconciliation = await reconcileSubmissionJournal(candidates[0]!.wallet);
-    candidates = recoveryCandidates(reconciliation.retained, Date.now());
+    candidates = contiguousRecoveryCandidates(
+      recoveryCandidates(reconciliation.retained, Date.now()),
+      reconciliation.confirmedNonce,
+      reconciliation.pendingNonce,
+    );
   }
   if (candidates.length === 0) return reconciliation;
 
@@ -736,9 +764,12 @@ async function recoverJournalFlights(
         { cause: error },
       );
     }
-    candidates = candidates.filter((_flight, index) => authorized[index] === true);
+    const firstDenied = authorized.findIndex((allowed) => !allowed);
+    if (firstDenied !== -1) candidates = candidates.slice(0, firstDenied);
     // An ordinary semantic denial leaves the exact prepared entry in the WAL so
     // strategy can replace it or fill its nonce without replaying stale work.
+    // It is also a nonce barrier: never expose a higher recovered transaction
+    // that could remain queued and execute after the denied intent becomes stale.
     if (candidates.length === 0) return reconciliation;
   }
 
@@ -769,6 +800,7 @@ async function recoverJournalFlights(
       updatedAtMs: number;
     };
   }> = [];
+  let prefixClosed = false;
   for (let start = 0; start < candidates.length; start += 32) {
     const chunk = candidates.slice(start, start + 32);
     const simulated = await Promise.all(chunk.map(async (flight) => {
@@ -782,16 +814,19 @@ async function recoverJournalFlights(
           maxFeePerGas: BigInt(flight.obligation.maxFeePerGas),
           maxPriorityFeePerGas: BigInt(flight.obligation.maxPriorityFeePerGas),
         });
-        return await rebroadcastJournalFlight(flight);
+        return true;
       } catch (error) {
         logger.warn(`journal recovery simulation (nonce ${flight.nonce}) failed closed:`, (error as Error).message);
-        return null;
+        return false;
       }
     }));
-    for (let index = 0; index < chunk.length; index++) {
+    const firstFailedSimulation = simulated.findIndex((passed) => !passed);
+    const simulatedPrefixLength = firstFailedSimulation === -1
+      ? chunk.length
+      : firstFailedSimulation;
+    for (let index = 0; index < simulatedPrefixLength; index++) {
       const flight = chunk[index]!;
-      const outcome = simulated[index];
-      if (!outcome) continue;
+      const outcome = await rebroadcastJournalFlight(flight);
       const attempt = journalAttempt(outcome)!;
       flight.state = outcome.state === "accepted" ? "accepted" : "ambiguous";
       flight.publicExposure = outcome.state !== "rejected";
@@ -806,7 +841,15 @@ async function recoverJournalFlights(
           updatedAtMs: now,
         },
       });
+      // A timeout or deterministic rejection does not establish that the lower
+      // nonce is currently executable. Retain the rest of the prefix in the WAL
+      // instead of exposing transactions that could execute much later.
+      if (outcome.state !== "accepted") {
+        prefixClosed = true;
+        break;
+      }
     }
+    if (prefixClosed || firstFailedSimulation !== -1) break;
   }
   if (updates.length > 0) submissionJournal.updateMany(candidates[0]!.wallet, updates);
   return reconciliation;
@@ -858,8 +901,8 @@ async function sendPublicBatch(
   abortIfCampaignStopped();
 
   // Preparation is complete for the whole nonce sequence before this one shared
-  // wait. Once the boundary arrives all raw sends start together; one slow RPC
-  // response cannot serialize later nonces past their inclusion window.
+  // wait. Once the boundary arrives, start sends in nonce order and keep every
+  // transport slot occupied so one slow RPC cannot hold up all later nonces.
   try {
     await waitUntilTimestamp(simTimestamp, waitAbort.signal);
   } catch (error) {
@@ -877,13 +920,19 @@ async function sendPublicBatch(
   }
 
   const PUBLIC_SEND_CONCURRENCY = 32;
-  for (let start = 0; start < publicQueue.length; start += PUBLIC_SEND_CONCURRENCY) {
-    const chunk = publicQueue.slice(start, start + PUBLIC_SEND_CONCURRENCY);
-    const results = await Promise.all(chunk.map((q) => sendPublic(q)));
-    for (let index = 0; index < chunk.length; index++) {
-      out.set(chunk[index]!.nonce, results[index]!);
-    }
-  }
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(PUBLIC_SEND_CONCURRENCY, publicQueue.length) },
+    async () => {
+      while (nextIndex < publicQueue.length) {
+        // This claim happens synchronously before the await, so transactions are
+        // launched in ascending-nonce order even when workers finish out of order.
+        const q = publicQueue[nextIndex++]!;
+        out.set(q.nonce, await sendPublic(q));
+      }
+    },
+  );
+  await Promise.all(workers);
   return out;
 }
 
@@ -1151,7 +1200,6 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
 
   // A bundle executes its txs in the given order, so nonces must ascend.
   queue.sort((a, b) => a.nonce - b.nonce);
-  const signedList = queue.map((q) => q.signed);
   const simulationTimestamps = [
     ...new Set(queue.flatMap((q) => q.simTimestamp === undefined ? [] : [q.simTimestamp.toString()])),
   ];
@@ -1193,27 +1241,42 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     // unavailability merely disables private delivery and preserves public safety.
     if (privateQueue.length > 0) {
       const privateSigned = privateQueue.map((q) => q.signed);
-    const simParams: Record<string, unknown> = {
-      txs: privateSigned,
-      blockNumber: toHex(targetBlock),
-      stateBlockNumber: "latest",
-    };
-    if (simTimestamp !== undefined) simParams.timestamp = Number(simTimestamp);
-    try {
-      const sim = await flashbotsRpcWithTimeout(
-        "eth_callBundle",
-        [simParams],
-        undefined,
-        BUNDLE_SIM_TIMEOUT_MS,
-      );
-      const issue = bundleSimulationIssue(sim);
-      if (issue) {
-        return failPreparedQueue(queue, out, `bundle simulation reverted: ${issue.failure}`);
-      }
-    } catch (err) {
-        privateDisabledReason = `bundle simulation unavailable: ${(err as Error).message}`;
-        privateQueue = [];
-        logger.warn(`${privateDisabledReason}; continuing with individually simulated public delivery`);
+      const simParams: Record<string, unknown> = {
+        txs: privateSigned,
+        blockNumber: toHex(targetBlock),
+        stateBlockNumber: "latest",
+      };
+      if (simTimestamp !== undefined) simParams.timestamp = Number(simTimestamp);
+      try {
+        const sim = await flashbotsRpcWithTimeout(
+          "eth_callBundle",
+          [simParams],
+          undefined,
+          BUNDLE_SIM_TIMEOUT_MS,
+        );
+        const issue = bundleSimulationIssue(sim);
+        if (issue) {
+          const error = `bundle simulation reverted: ${issue.failure}`;
+          if (issue.index === null || issue.index <= 0 || issue.index >= privateQueue.length) {
+            return failPreparedQueue(queue, out, error);
+          }
+
+          // The relay simulated this exact ordered sequence and reported clean
+          // results for every lower nonce. Those transactions are independently
+          // executable as a prefix. The failing nonce and every dependent higher
+          // nonce have not crossed the WAL/delivery barrier, so release them as
+          // one fresh top suffix and continue with only the validated prefix.
+          const failedSuffix = queue.splice(issue.index);
+          privateQueue = privateQueue.slice(0, issue.index);
+          failPreparedQueue(failedSuffix, out, error);
+          logger.warn(
+            `${error}; delivering validated nonce prefix ${privateQueue.length}/${privateQueue.length + failedSuffix.length}`,
+          );
+        }
+      } catch (err) {
+          privateDisabledReason = `bundle simulation unavailable: ${(err as Error).message}`;
+          privateQueue = [];
+          logger.warn(`${privateDisabledReason}; continuing with individually simulated public delivery`);
       }
     }
   }

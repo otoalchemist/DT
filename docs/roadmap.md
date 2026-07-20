@@ -12,9 +12,10 @@ Risks: provider ambiguity, nonce gaps in large campaigns, corrupt local state, e
 
 Automated gate: backend model/unit/integration tests, web component tests, Anvil boundary tests, production builds, and `git diff --check` pass on Node 20, Node 22, and Node 24, with persistence/build coverage on Windows.
 
-Local gate (2026-07-18): clean lockfile install, dependency audit/tree, 263
-backend tests, 7 web tests, 2 Anvil integration tests, typecheck, and production
-build passed. The pushed PR CI remains authoritative for the Node/Windows matrix.
+Local gate (2026-07-19): dependency audit/tree, 297 backend tests, 7 web tests,
+3 Anvil integration tests, 10 consecutive Anvil integration reruns, typecheck,
+production build, and diff checks passed. Exact-head Node/Windows CI must be
+rerun after these working-tree changes are committed and pushed.
 
 Owner gate: complete `docs/qa/pr-1-reliability.md` without a funded wallet or explicitly defer the gate.
 
