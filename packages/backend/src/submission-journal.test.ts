@@ -3,10 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import fc from "fast-check";
-import { keccak256 } from "viem";
+import { keccak256, toHex, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   JournalCorruptionError,
+  JournalChainUnavailableError,
+  JOURNAL_CONFIRMATION_DEPTH,
   SubmissionFlightJournal,
   type JournalFlight,
 } from "./submission-journal.js";
@@ -29,6 +31,18 @@ async function signed(nonce: number) {
 }
 const RAW_5 = await signed(5);
 const RAW_6 = await signed(6);
+
+function blockHash(lineage: string, number: bigint): Hex {
+  return keccak256(toHex(`${lineage}:${number}`));
+}
+
+function blockEvidence(number: bigint, lineage = "canonical") {
+  const canonicalHashes: Hex[] = [];
+  for (let offset = 0n; offset < JOURNAL_CONFIRMATION_DEPTH && offset <= number; offset++) {
+    canonicalHashes.push(blockHash(lineage, number - offset));
+  }
+  return { number, canonicalHashes };
+}
 
 function flight(overrides: Partial<JournalFlight> = {}): JournalFlight {
   return {
@@ -136,22 +150,153 @@ describe("SubmissionFlightJournal", () => {
     ]);
   });
 
-  it("does not consume a txpool-visible flight until latest confirms the nonce", () => {
+  it("retains tip inclusion through confirmation depth and survives a nonce regression", () => {
     journal.upsert(flight({
       state: "accepted",
       publicExposure: true,
       attempts: [{ channel: "public", endpoint: "rpc", state: "accepted" }],
     }));
 
-    const pending = journal.reconcile(WALLET, 5, 6, 1_000n);
+    const pending = journal.reconcile(WALLET, 5, 6, blockEvidence(1_000n));
     expect(pending.confirmedNonce).toBe(5);
     expect(pending.pendingNonce).toBe(6);
     expect(pending.retained).toHaveLength(1);
     expect(pending.consumed).toEqual([]);
 
-    const confirmed = journal.reconcile(WALLET, 6, 6, 1_001n);
-    expect(confirmed.retained).toEqual([]);
-    expect(confirmed.consumed).toHaveLength(1);
+    const tip = journal.reconcile(WALLET, 6, 6, blockEvidence(1_001n));
+    expect(tip.retained).toEqual([
+      expect.objectContaining({
+        observedConsumedAtBlock: "1001",
+        observedConsumedAtBlockHash: blockHash("canonical", 1_001n),
+      }),
+    ]);
+    expect(tip.provisional).toHaveLength(1);
+    expect(tip.consumed).toEqual([]);
+
+    const reorged = journal.reconcile(WALLET, 5, 5, blockEvidence(1_002n, "reorg"));
+    expect(reorged.retained).toHaveLength(1);
+    expect(reorged.retained[0]?.observedConsumedAtBlock).toBeUndefined();
+    expect(reorged.consumed).toEqual([]);
+
+    const reincluded = journal.reconcile(WALLET, 6, 6, blockEvidence(1_003n, "reorg"));
+    expect(reincluded.provisional).toHaveLength(1);
+    const almostFinal = journal.reconcile(
+      WALLET,
+      6,
+      6,
+      blockEvidence(1_003n + JOURNAL_CONFIRMATION_DEPTH - 2n, "reorg"),
+    );
+    expect(almostFinal.retained).toHaveLength(1);
+    const finalized = journal.reconcile(
+      WALLET,
+      6,
+      6,
+      blockEvidence(1_003n + JOURNAL_CONFIRMATION_DEPTH - 1n, "reorg"),
+    );
+    expect(finalized.retained).toEqual([]);
+    expect(finalized.consumed).toHaveLength(1);
+  });
+
+  it("restarts confirmation after a lateral reorg even when the nonce stays advanced", () => {
+    journal.upsert(flight({ state: "accepted", publicExposure: true }));
+
+    const oldTip = journal.reconcile(WALLET, 6, 6, blockEvidence(100n, "old"));
+    expect(oldTip.provisional).toHaveLength(1);
+
+    // The replacement chain also consumed nonce 5, but only at its current tip.
+    // Reusing height 100 would incorrectly declare this one-confirmation view
+    // terminal; the replaced ancestor hash must restart observation at 102.
+    const lateral = journal.reconcile(WALLET, 6, 6, blockEvidence(102n, "replacement"));
+    expect(lateral.consumed).toEqual([]);
+    expect(lateral.retained).toEqual([
+      expect.objectContaining({
+        observedConsumedAtBlock: "102",
+        observedConsumedAtBlockHash: blockHash("replacement", 102n),
+      }),
+    ]);
+
+    const finalized = journal.reconcile(WALLET, 6, 6, blockEvidence(104n, "replacement"));
+    expect(finalized.consumed).toHaveLength(1);
+  });
+
+  it("restarts legacy height-only observations before allowing finality", () => {
+    journal.upsert(flight({
+      state: "accepted",
+      publicExposure: true,
+      observedConsumedAtBlock: "1",
+    }));
+
+    const reconciliation = journal.reconcile(WALLET, 6, 6, blockEvidence(100n));
+
+    expect(reconciliation.consumed).toEqual([]);
+    expect(reconciliation.retained[0]).toMatchObject({
+      observedConsumedAtBlock: "100",
+      observedConsumedAtBlockHash: blockHash("canonical", 100n),
+    });
+  });
+
+  it("keeps nonce-conflict evidence monotonic across later updates", () => {
+    journal.upsert(flight({ nonceConflict: true }));
+
+    journal.update(WALLET, flight().txHash, {
+      state: "ambiguous",
+      nonceConflict: false,
+    });
+    journal.upsert(flight({ nonceConflict: false, state: "prepared" }));
+
+    expect(journal.load(WALLET)[0]).toMatchObject({
+      state: "ambiguous",
+      nonceConflict: true,
+    });
+  });
+
+  it("chain-scopes new journals and rejects signed transactions from another chain", async () => {
+    journal.upsert(flight());
+    expect(journal.pathFor(WALLET)).toContain(`${path.sep}chain-1${path.sep}`);
+    expect(JSON.parse(fs.readFileSync(journal.pathFor(WALLET), "utf8"))).toMatchObject({
+      version: 2,
+      chainId: 1,
+    });
+
+    const localRaw = await ACCOUNT.signTransaction({
+      chainId: 31_337,
+      type: "eip1559",
+      nonce: 5,
+      to: OTHER,
+      data: "0x0102",
+      value: 7n,
+      gas: 50_000n,
+      maxFeePerGas: 3_000_000_000n,
+      maxPriorityFeePerGas: 2_000_000_000n,
+    });
+    expect(() => journal.upsert(flight({
+      rawSignedTx: localRaw,
+      txHash: keccak256(localRaw),
+    }))).toThrow(/outside chain 1/);
+  });
+
+  it("migrates a verified legacy journal only on its signed chain", () => {
+    const legacyPath = journal.legacyPathFor(WALLET);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, JSON.stringify({ version: 1, flights: [flight()] }), {
+      mode: 0o600,
+    });
+
+    const wrongChain = new SubmissionFlightJournal(directory, "submission-flights", 31_337);
+    expect(wrongChain.load(WALLET)).toEqual([]);
+    expect(fs.existsSync(legacyPath)).toBe(false);
+    expect(fs.existsSync(wrongChain.pathFor(WALLET))).toBe(false);
+    expect(fs.existsSync(journal.pathFor(WALLET))).toBe(true);
+
+    expect(journal.load(WALLET)).toEqual([flight()]);
+    expect(fs.existsSync(journal.pathFor(WALLET))).toBe(true);
+    expect(fs.existsSync(`${legacyPath}.migrated-chain-1`)).toBe(true);
+  });
+
+  it("fails closed while chain identity is unavailable", () => {
+    const unresolved = new SubmissionFlightJournal(directory, "unresolved", () => null);
+    expect(() => unresolved.load(WALLET)).toThrow(JournalChainUnavailableError);
+    expect(() => unresolved.upsert(flight())).toThrow(JournalChainUnavailableError);
   });
 
   it("expires private-only delivery strictly after the final target block", () => {
@@ -166,8 +311,8 @@ describe("SubmissionFlightJournal", () => {
       }],
     }));
 
-    expect(journal.reconcile(WALLET, 5, 5, 101n).retained).toHaveLength(1);
-    const expired = journal.reconcile(WALLET, 5, 5, 102n);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(101n)).retained).toHaveLength(1);
+    const expired = journal.reconcile(WALLET, 5, 5, blockEvidence(102n));
     expect(expired.retained).toEqual([]);
     expect(expired.expired).toEqual([expect.objectContaining({ state: "expired" })]);
   });
@@ -195,7 +340,7 @@ describe("SubmissionFlightJournal", () => {
     });
     journal.upsertMany(WALLET, [lower, higher]);
 
-    const reconciliation = journal.reconcile(WALLET, 5, 6, 102n);
+    const reconciliation = journal.reconcile(WALLET, 5, 6, blockEvidence(102n));
 
     expect(reconciliation.expired).toEqual([]);
     expect(reconciliation.retained).toEqual([lower, higher]);
@@ -208,7 +353,7 @@ describe("SubmissionFlightJournal", () => {
       recovery: { publicAuthorized: true },
       maxPrivateTargetBlock: "101",
     }));
-    expect(journal.reconcile(WALLET, 5, 5, 10_000n).retained).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n)).retained).toHaveLength(1);
   });
 
   it("expires private-only prepared work after its provisional final target", () => {
@@ -217,8 +362,8 @@ describe("SubmissionFlightJournal", () => {
       recovery: { publicAuthorized: false },
       maxPrivateTargetBlock: "101",
     }));
-    expect(journal.reconcile(WALLET, 5, 5, 101n).retained).toHaveLength(1);
-    expect(journal.reconcile(WALLET, 5, 5, 102n).expired).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(101n)).retained).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).expired).toHaveLength(1);
   });
 
   it("terminalizes prepared work when every delivery route was disabled before WAL", () => {
@@ -227,7 +372,7 @@ describe("SubmissionFlightJournal", () => {
       recovery: { publicAuthorized: false },
       maxPrivateTargetBlock: undefined,
     }));
-    const reconciliation = journal.reconcile(WALLET, 5, 5, 100n);
+    const reconciliation = journal.reconcile(WALLET, 5, 5, blockEvidence(100n));
     expect(reconciliation.retained).toEqual([]);
     expect(reconciliation.expired).toHaveLength(1);
   });
@@ -241,7 +386,7 @@ describe("SubmissionFlightJournal", () => {
         maxPrivateTargetBlock: "101",
         attempts: [{ channel: "public", endpoint: "rpc", state: "ambiguous" }],
       }));
-      expect(isolated.reconcile(WALLET, 5, 6, block).retained).toHaveLength(1);
+      expect(isolated.reconcile(WALLET, 5, 6, blockEvidence(block)).retained).toHaveLength(1);
     }), { numRuns: 30 });
   });
 
@@ -259,9 +404,9 @@ describe("SubmissionFlightJournal", () => {
       }],
     });
     journal.upsert(privateAmbiguous);
-    expect(journal.reconcile(WALLET, 5, 5, 102n).expired).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).expired).toHaveLength(1);
 
     journal.upsert({ ...privateAmbiguous, nonceConflict: true });
-    expect(journal.reconcile(WALLET, 5, 5, 10_000n).retained).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n)).retained).toHaveLength(1);
   });
 });

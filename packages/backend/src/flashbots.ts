@@ -14,15 +14,16 @@ import {
   generatePrivateKey,
   type PrivateKeyAccount,
 } from "viem/accounts";
-import { mainnet } from "viem/chains";
 import { publicClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { nonceManager } from "./nonce.js";
 import { cappedReplacementFees, effectiveTipGwei, nextReplacementFee, resolveGas } from "./logic.js";
 import {
+  JOURNAL_CONFIRMATION_DEPTH,
   JournalCorruptionError,
   SubmissionFlightJournal,
+  type JournalBlockEvidence,
   type JournalDeliveryAttempt,
   type JournalFlight,
   type JournalReconciliation,
@@ -122,7 +123,19 @@ export class RecoveryFloorError extends Error {
   }
 }
 
-const submissionJournal = new SubmissionFlightJournal(appConfig.dataDir);
+const submissionJournal = new SubmissionFlightJournal(
+  appConfig.dataDir,
+  "submission-flights",
+  () => runtime.chainId,
+);
+
+function verifiedChainId(): number {
+  const chainId = runtime.chainId;
+  if (!Number.isSafeInteger(chainId) || (chainId ?? 0) <= 0) {
+    throw new Error("transaction signing requires a verified positive chain ID");
+  }
+  return chainId!;
+}
 
 function nonceSnapshot(flight: JournalFlight) {
   const boundedPrivateAmbiguity = flight.state === "ambiguous"
@@ -146,6 +159,9 @@ function nonceSnapshot(flight: JournalFlight) {
       ? undefined
       : BigInt(flight.maxPrivateTargetBlock),
     retainBeyondPrivateTarget: flight.nonceConflict,
+    observedConsumedAtBlock: flight.observedConsumedAtBlock === undefined
+      ? undefined
+      : BigInt(flight.observedConsumedAtBlock),
   };
 }
 
@@ -153,9 +169,36 @@ function reconcileAtCounts(
   address: Address,
   confirmedNonce: number,
   pendingNonce: number,
-  currentBlock: bigint,
+  blockEvidence: JournalBlockEvidence,
 ): JournalReconciliation {
-  return submissionJournal.reconcile(address, confirmedNonce, pendingNonce, currentBlock);
+  return submissionJournal.reconcile(address, confirmedNonce, pendingNonce, blockEvidence);
+}
+
+/** Select one canonical tip and retain the bounded parent-hash chain needed for
+ * the journal's three-observation finality proof. All account state used below is
+ * queried by this tip hash, never merely by a reusable block height. */
+async function journalBlockEvidence(): Promise<JournalBlockEvidence> {
+  let cursor = await publicClient.getBlock({ blockTag: "latest" });
+  if (cursor.number === null || cursor.hash === null) {
+    throw new Error("journal reconciliation requires a mined canonical block");
+  }
+  const number = cursor.number;
+  const canonicalHashes: Hex[] = [cursor.hash];
+  const required = Number(JOURNAL_CONFIRMATION_DEPTH);
+  while (canonicalHashes.length < required && cursor.number > 0n) {
+    canonicalHashes.push(cursor.parentHash);
+    if (canonicalHashes.length >= required || cursor.number === 1n) break;
+    const expectedNumber = cursor.number - 1n;
+    const parent = await publicClient.getBlock({ blockHash: cursor.parentHash });
+    if (
+      parent.number !== expectedNumber
+      || parent.hash?.toLowerCase() !== cursor.parentHash.toLowerCase()
+    ) {
+      throw new Error("journal reconciliation could not verify canonical block ancestry");
+    }
+    cursor = parent;
+  }
+  return { number, canonicalHashes };
 }
 
 async function validateJournalSigners(address: Address): Promise<void> {
@@ -176,17 +219,22 @@ async function validateJournalSigners(address: Address): Promise<void> {
   }
 }
 
-/** Reconcile durable flights without mistaking txpool visibility for finality.
- * Only the latest/confirmed nonce consumes a flight; pending advances allocation
- * while every liability remains available to strategy recovery. */
+/** Reconcile durable flights without mistaking txpool visibility or one tip for
+ * finality. Pending/latest advance allocation immediately, while raw exposure is
+ * retained through the journal's confirmation window for strategy accounting. */
 export async function reconcileSubmissionJournal(address: Address): Promise<JournalReconciliation> {
   await validateJournalSigners(address);
-  const currentBlock = await publicClient.getBlockNumber();
+  const blockEvidence = await journalBlockEvidence();
+  const currentBlockHash = blockEvidence.canonicalHashes[0]!;
   const [confirmedNonce, pendingNonce] = await Promise.all([
-    publicClient.getTransactionCount({ address, blockNumber: currentBlock }),
+    publicClient.getTransactionCount({
+      address,
+      blockHash: currentBlockHash,
+      requireCanonical: true,
+    }),
     publicClient.getTransactionCount({ address, blockTag: "pending" }),
   ]);
-  return reconcileAtCounts(address, confirmedNonce, pendingNonce, currentBlock);
+  return reconcileAtCounts(address, confirmedNonce, pendingNonce, blockEvidence);
 }
 
 /** Explicit, mutating recovery delivery. Call only from an operator-authorized
@@ -209,10 +257,10 @@ export async function recoverPreparedSubmissions(
     pendingNonce: number,
     currentBlock?: bigint,
   ) => Promise<readonly ReturnType<typeof nonceSnapshot>[]>) => void;
-}).setRecoveryHook?.(async (address, confirmedNonce, pendingNonce, currentBlock) => {
-  await validateJournalSigners(address);
-  const coherentBlock = currentBlock ?? await publicClient.getBlockNumber();
-  const reconciliation = reconcileAtCounts(address, confirmedNonce, pendingNonce, coherentBlock);
+}).setRecoveryHook?.(async (address) => {
+  // NonceManager's ordinary number-based sync cannot establish canonical
+  // continuity. Rebuild its initial snapshots only from the hash-bound journal.
+  const reconciliation = await reconcileSubmissionJournal(address);
   return reconciliation.retained.map(nonceSnapshot);
 });
 
@@ -349,7 +397,7 @@ async function signTx(
     nonce,
     maxFeePerGas,
     maxPriorityFeePerGas,
-    chainId: runtime.chainId ?? mainnet.id,
+    chainId: verifiedChainId(),
     type: "eip1559",
   });
 }
@@ -637,7 +685,8 @@ function liveMaximumExposure(flights: readonly JournalFlight[]): bigint {
 }
 
 function isRecoveryCandidate(flight: JournalFlight, now: number): boolean {
-  return flight.recovery.publicAuthorized
+  return flight.observedConsumedAtBlock === undefined
+    && flight.recovery.publicAuthorized
     && (flight.state === "prepared"
       || (
         flight.state === "ambiguous"
@@ -796,6 +845,7 @@ async function recoverJournalFlights(
     update: {
       state: "accepted" | "ambiguous";
       publicExposure: boolean;
+      nonceConflict: boolean;
       attempts: JournalDeliveryAttempt[];
       updatedAtMs: number;
     };
@@ -830,6 +880,8 @@ async function recoverJournalFlights(
       const attempt = journalAttempt(outcome)!;
       flight.state = outcome.state === "accepted" ? "accepted" : "ambiguous";
       flight.publicExposure = outcome.state !== "rejected";
+      flight.nonceConflict = flight.nonceConflict
+        || hasSameNonceExposureEvidence([outcome]);
       flight.attempts = [...flight.attempts, attempt];
       flight.updatedAtMs = now;
       updates.push({
@@ -837,6 +889,7 @@ async function recoverJournalFlights(
         update: {
           state: flight.state,
           publicExposure: flight.publicExposure,
+          nonceConflict: flight.nonceConflict,
           attempts: flight.attempts,
           updatedAtMs: now,
         },

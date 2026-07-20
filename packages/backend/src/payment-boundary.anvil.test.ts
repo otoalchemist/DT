@@ -355,6 +355,7 @@ describe("epoch-priced payment replacement", () => {
     const journalPath = path.join(
       transportDataDir!,
       "submission-flights",
+      `chain-${chain.id}`,
       `${account.address.toLowerCase()}.json`,
     );
     expect(fs.existsSync(journalPath)).toBe(true);
@@ -370,9 +371,15 @@ describe("epoch-priced payment replacement", () => {
     // Replace the client to bypass viem's short block-number cache and emulate
     // the next ordinary reconciliation cycle without a multi-second test sleep.
     reinitClients(rpcUrl, null);
-    const reconciliation = await transport.reconcileSubmissionJournal(account.address);
+    let reconciliation = await transport.reconcileSubmissionJournal(account.address);
     expect(reconciliation.confirmedNonce).toBe(prepared.nonce + 1);
     expect(reconciliation.expired).toHaveLength(0);
+    expect(reconciliation.provisional?.map((flight) => flight.txHash)).toContain(prepared.txHash);
+    expect(reconciliation.consumed).toHaveLength(0);
+    await publicClient.request({ method: "evm_mine" as never, params: [] as never });
+    await publicClient.request({ method: "evm_mine" as never, params: [] as never });
+    reinitClients(rpcUrl, null);
+    reconciliation = await transport.reconcileSubmissionJournal(account.address);
     expect(reconciliation.consumed.map((flight) => flight.txHash)).toContain(prepared.txHash);
     expect(reconciliation.retained).toHaveLength(0);
     nonceManager.reset();
@@ -477,7 +484,12 @@ describe("epoch-priced payment replacement", () => {
       // Recreate the client to bypass the short block cache, then prove both
       // engine-created transactions are terminal in the durable wallet journal.
       chainModule.reinitClients(rpcUrl, null);
-      const reconciliation = await transport.reconcileSubmissionJournal(account.address);
+      let reconciliation = await transport.reconcileSubmissionJournal(account.address);
+      expect(reconciliation.provisional).toHaveLength(2);
+      await publicClient.request({ method: "evm_mine" as never, params: [] as never });
+      await publicClient.request({ method: "evm_mine" as never, params: [] as never });
+      chainModule.reinitClients(rpcUrl, null);
+      reconciliation = await transport.reconcileSubmissionJournal(account.address);
       expect(reconciliation.retained).toHaveLength(0);
       expect(reconciliation.consumed).toHaveLength(2);
       expect(reconciliation.consumed.map((flight) => flight.nonce)).toEqual([
@@ -510,7 +522,11 @@ describe("epoch-priced payment replacement", () => {
       });
       const dryRunHash = keccak256(dryRunRaw);
       const { SubmissionFlightJournal } = await import("./submission-journal.js");
-      const recoveryJournal = new SubmissionFlightJournal(transportDataDir!);
+      const recoveryJournal = new SubmissionFlightJournal(
+        transportDataDir!,
+        "submission-flights",
+        chain.id,
+      );
       const recordedAt = Date.now();
       recoveryJournal.upsert({
         wallet: account.address,

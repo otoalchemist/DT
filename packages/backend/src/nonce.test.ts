@@ -198,7 +198,7 @@ describe("NonceManager flight model", () => {
     expect(manager.reserve()).toBe(6);
   });
 
-  it("removes a flight only when the confirmed nonce consumes it", async () => {
+  it("advances allocation but retains consumed flights for any later nonce regression", async () => {
     manager.setRecoveryHook(async () => [{
       nonce: 5,
       txHash: HASH,
@@ -208,8 +208,49 @@ describe("NonceManager flight model", () => {
     getCount.mockResolvedValue(6);
     await manager.sync(ADDR, "public");
 
-    expect(manager.flightSnapshots()).toEqual([]);
+    expect(manager.flightSnapshots()).toEqual([
+      expect.objectContaining({ nonce: 5 }),
+    ]);
     expect(manager.peek()).toBe(6);
+    expect(manager.hasInvisibleReservation()).toBe(false);
+
+    manager.reset();
+    getCount.mockResolvedValue(5);
+    getBlockNumber.mockResolvedValue(101n);
+    await manager.sync(ADDR, "public");
+    expect(manager.flightSnapshots()[0]?.observedConsumedAtBlock).toBeUndefined();
+    expect(manager.hasInvisibleReservation()).toBe(true);
+
+    manager.reset();
+    getCount.mockResolvedValue(6);
+    getBlockNumber.mockResolvedValue(102n);
+    await manager.sync(ADDR, "public");
+    manager.reset();
+    getBlockNumber.mockResolvedValue(104n);
+    await manager.sync(ADDR, "public");
+    expect(manager.flightSnapshots()).toEqual([
+      expect.objectContaining({ nonce: 5 }),
+    ]);
+    expect(manager.hasInvisibleReservation()).toBe(false);
+  });
+
+  it("does not target-expire a private flight during provisional inclusion", async () => {
+    manager.setRecoveryHook(async () => [{
+      nonce: 5,
+      txHash: HASH,
+      state: "accepted",
+      publicExposure: false,
+      maxPrivateTargetBlock: 101n,
+    }]);
+    getCount.mockResolvedValue(6);
+    getBlockNumber.mockResolvedValue(102n);
+
+    await manager.sync(ADDR, "mainnet");
+
+    expect(manager.flightSnapshots()).toEqual([
+      expect.objectContaining({ nonce: 5 }),
+    ]);
+    expect(manager.hasInvisibleReservation()).toBe(false);
   });
 
   it("never allocates below confirmed when a load-balanced pending response is stale", async () => {

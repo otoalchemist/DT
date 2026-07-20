@@ -23,13 +23,15 @@ export function JitPanel({
   const [, setNowTick] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [requestedTargetEpoch, setRequestedTargetEpoch] = useState<number | null>(null);
+  const armed = status?.jitEnabled ?? false;
+  const armedTokenIds = armed ? [...new Set(status?.jitTokenIds ?? [])] : [];
+  const displayedSelection = armed ? new Set(armedTokenIds) : selected;
 
-  // Default to all tokens, but restore the exact authoritative campaign scope
-  // after reload while a subset is armed.
+  // Local selection is only an unarmed draft. While armed, every display and
+  // exposure calculation reads the authoritative campaign IDs directly.
   useEffect(() => {
-    const ids = status?.jitEnabled ? status.jitTokenIds : tokens.map((t) => t.tokenId);
-    setSelected(new Set(ids));
-  }, [tokens.map((t) => t.tokenId).join(","), status?.jitRevision]);
+    if (!armed) setSelected(new Set(tokens.map((t) => t.tokenId)));
+  }, [tokens.map((t) => t.tokenId).join(","), armed, status?.jitRevision]);
 
   // 1s clock so the countdown updates.
   useEffect(() => {
@@ -39,7 +41,6 @@ export function JitPanel({
 
   const currentEpoch = status?.currentEpoch ? Number(status.currentEpoch) : null;
   const startTime = status?.startTime ? Number(status.startTime) : null;
-  const armed = status?.jitEnabled ?? false;
   const armedEpoch = status?.jitTargetEpoch ?? null;
 
   // The server requires an explicit epoch. Seed the form with the next epoch,
@@ -62,7 +63,7 @@ export function JitPanel({
     startTime !== null && targetEpoch !== null ? startTime + (targetEpoch - 1) * epochDur : null;
   const secondsToTarget = targetStart !== null ? targetStart - Math.floor(Date.now() / 1000) : null;
 
-  const nSelected = selected.size;
+  const nSelected = displayedSelection.size;
   const refreshAuthoritative = async () => {
     const [freshStatus, freshStrategy] = await Promise.all([api.status(), api.getConfig()]);
     onStatusChange(freshStatus);
@@ -74,6 +75,7 @@ export function JitPanel({
     targetEpoch !== null ? (BigInt(targetEpoch) * BASE_TAX_RATE_WEI * BigInt(nSelected)).toString() : "0";
 
   const toggleToken = (id: string) => {
+    if (armed) return;
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -213,7 +215,7 @@ export function JitPanel({
           )}
         </div>
         <div className="stat"><span className="label">Begins in</span><span className="value">{countdown(secondsToTarget, true)}</span></div>
-        <div className="stat"><span className="label">Selected</span><span className="value">{nSelected} / {tokens.length}</span></div>
+        <div className="stat"><span className="label">Selected</span><span className="value">{armed ? `${nSelected} armed` : `${nSelected} / ${tokens.length}`}</span></div>
         <div className="stat"><span className="label">Est. per token</span><span className="value">{weiToEth(perTokenWei, 5)} ETH</span></div>
         <div className="stat"><span className="label">Est. total</span><span className="value">{weiToEth(totalWei, 5)} ETH</span></div>
       </div>
@@ -226,11 +228,13 @@ export function JitPanel({
               className="ghost"
               style={{ fontSize: 11, padding: "1px 8px", marginLeft: 8 }}
               onClick={() => setSelected(new Set(tokens.map((t) => t.tokenId)))}
+              disabled={armed || busy}
             >all</button>
             <button
               className="ghost"
               style={{ fontSize: 11, padding: "1px 8px", marginLeft: 4 }}
               onClick={() => setSelected(new Set())}
+              disabled={armed || busy}
             >none</button>
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -239,16 +243,16 @@ export function JitPanel({
                 key={t.tokenId}
                 style={{
                   display: "flex", alignItems: "center", gap: 5,
-                  padding: "3px 10px", borderRadius: 6, cursor: "pointer",
-                  border: `1px solid ${selected.has(t.tokenId) ? "var(--accent)" : "var(--border)"}`,
-                  background: selected.has(t.tokenId) ? "rgba(91,157,255,0.1)" : "transparent",
+                  padding: "3px 10px", borderRadius: 6, cursor: armed ? "default" : "pointer",
+                  border: `1px solid ${displayedSelection.has(t.tokenId) ? "var(--accent)" : "var(--border)"}`,
+                  background: displayedSelection.has(t.tokenId) ? "rgba(91,157,255,0.1)" : "transparent",
                   fontSize: 12, fontFamily: "monospace",
                 }}
               >
                 <input
                   type="checkbox"
                   style={{ width: "auto" }}
-                  checked={selected.has(t.tokenId)}
+                  checked={displayedSelection.has(t.tokenId)}
                   onChange={() => toggleToken(t.tokenId)}
                   disabled={armed}
                 />
@@ -260,10 +264,17 @@ export function JitPanel({
       )}
 
       {armed ? (
-        <div className="row wrap" style={{ gap: 10 }}>
-          <span className="badge warn">ARMED · epoch {armedEpoch}</span>
-          <button className="danger" onClick={disarm} disabled={busy}>Disarm</button>
-        </div>
+        <>
+          <div className="row wrap" style={{ gap: 10 }}>
+            <span className="badge warn">ARMED · epoch {armedEpoch}</span>
+            <button className="danger" onClick={disarm} disabled={busy}>Disarm</button>
+          </div>
+          <p className="hint" aria-label="Armed Citizen IDs">
+            Armed Citizen IDs: {armedTokenIds.length > 0
+              ? armedTokenIds.map((tokenId) => `#${tokenId}`).join(", ")
+              : "none"}
+          </p>
+        </>
       ) : (
         <button
           className="primary"

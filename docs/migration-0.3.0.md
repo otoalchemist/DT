@@ -1,6 +1,20 @@
 # Migrating to 0.3.0
 
-Back up `DATA_DIR` before upgrading, then run `npm ci` and `npm run build`.
+Use Node.js 20.19+, 22.12+, or 24+. Upgrade one installation in this order:
+
+1. Pause the bot, then stop the old backend/dashboard processes and wait for them
+   to exit. Confirm no other process is using this installation's `DATA_DIR`.
+   Never run old and new backends concurrently against the same directory.
+2. Back up the complete `DATA_DIR` while it is offline.
+3. Install and build the selected release with `npm ci` and `npm run build`.
+4. Start the backend and dashboard from that same release. The dashboard blocks
+   before consuming release-coupled settings when the backend version or bootstrap
+   status schema does not match; stop, rebuild, and restart both sides rather than
+   bypassing that page.
+
+Before enabling live fire, run the automated and owner gates documented in
+[`qa/pr-1-reliability.md`](qa/pr-1-reliability.md). A previous release's test
+results do not establish the gate for a changed checkout.
 
 On first startup, the bot atomically migrates the old flat strategy file to the versioned 0.3.0 envelope:
 
@@ -29,7 +43,7 @@ also listen only on loopback. Remove LAN/public listeners, port forwarding, and
 external tunnels, and do not rewrite a non-loopback `Host` or `Origin` as a
 loopback value.
 
-Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
+Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. Treat it as exclusive to one running backend; use a distinct directory, port, and keystore for every concurrent instance. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
 
 The local configuration API now uses revisioned, field-scoped writes. Integrations must read the current strategy or JIT revision before mutating it and handle HTTP 409 by refetching. JIT arm requests must send a future `targetEpoch` and a nonempty explicit `tokenIds` list.
 

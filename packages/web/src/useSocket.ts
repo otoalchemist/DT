@@ -9,13 +9,19 @@ interface LiveState {
 }
 
 // Subscribes to the backend WebSocket for live status + activity.
-export function useSocket(): LiveState {
+export function useSocket(enabled = true): LiveState {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [connected, setConnected] = useState(false);
   const ref = useRef<WebSocket | null>(null);
 
   useEffect(() => {
+    if (!enabled) {
+      setConnected(false);
+      setStatus(null);
+      setActivity([]);
+      return;
+    }
     let closed = false;
     let retry: ReturnType<typeof setTimeout>;
 
@@ -52,7 +58,7 @@ export function useSocket(): LiveState {
       clearTimeout(retry);
       ref.current?.close();
     };
-  }, []);
+  }, [enabled]);
 
   return { status, activity, connected, pushStatus: setStatus };
 }

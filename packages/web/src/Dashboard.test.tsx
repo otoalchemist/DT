@@ -2,7 +2,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { BotStatus, StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
+import type { ActivityEntry, BotStatus, StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
 import { ApiError, api } from "./api.js";
 import { Dashboard } from "./Dashboard.js";
 
@@ -155,5 +155,31 @@ describe("Dashboard dry-run revision conflicts", () => {
     expect(screen.getByTestId("strategy-snapshot").textContent).toContain("revision 2 / live");
     expect(screen.getByRole("button", { name: "⚠ LIVE FIRE" })).toBeTruthy();
     expect(api.setConfig).toHaveBeenCalledOnce();
+  });
+
+  it("renders delivery-uncertain activity with its dedicated state and complete message", async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(initialStrategy);
+    const message = "Builder delivery is uncertain; preserve nonce 42 until reconciliation confirms the complete transaction outcome.";
+    const activity: ActivityEntry[] = [{
+      id: "uncertain-1",
+      ts: Date.now(),
+      kind: "pay-taxes",
+      status: "delivery-uncertain",
+      txHash: `0x${"ab".repeat(32)}`,
+      message,
+    }];
+
+    const { container } = render(
+      <Dashboard
+        status={status}
+        activity={activity}
+        connected={true}
+        pushStatus={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("delivery-uncertain")).toBeTruthy();
+    expect(container.querySelector(".log-row > span:last-child")?.textContent).toContain(message);
+    expect(container.querySelector(".pill.delivery-uncertain")?.textContent).toBe("delivery-uncertain");
   });
 });

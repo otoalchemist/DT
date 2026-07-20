@@ -2,11 +2,19 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { VERSION, type BotStatus } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { App } from "./App.js";
 
 vi.mock("./api.js", () => ({
+  inspectBackendCompatibility: vi.fn((payload: BotStatus) => ({
+    compatible: true,
+    backendVersion: payload.version,
+    status: payload,
+  })),
   api: {
+    compatibility: vi.fn(),
+    status: vi.fn(),
     getSettings: vi.fn(),
     keystore: vi.fn(),
     saveAlchemyKey: vi.fn(),
@@ -15,9 +23,9 @@ vi.mock("./api.js", () => ({
 
 vi.mock("./useSocket.js", () => ({
   useSocket: () => ({
-    status: { unlocked: false },
+    status: null,
     activity: [],
-    connected: true,
+    connected: false,
     pushStatus: vi.fn(),
   }),
 }));
@@ -35,11 +43,46 @@ const baseSettings = {
   keyConfiguredByEnvironment: false,
 };
 
+const bootstrapStatus: BotStatus = {
+  version: VERSION,
+  running: false,
+  unlocked: false,
+  dryRun: true,
+  address: null,
+  balanceWei: null,
+  chainId: 31_337,
+  currentEpoch: null,
+  gameState: null,
+  citizenSupply: null,
+  citizensAddress: null,
+  lastBlock: null,
+  spentThisEpochWei: "0",
+  confirmedSpendThisEpochWei: "0",
+  pendingExposureWei: "0",
+  journalHealthy: true,
+  journalError: null,
+  startTime: null,
+  jitEnabled: false,
+  jitState: "cancelled",
+  jitTargetEpoch: null,
+  jitRevision: 0,
+  jitTokenIds: [],
+  jitMessage: null,
+  jitCompletedAt: null,
+  strategyRevision: 0,
+  nftConfigured: true,
+};
+
 afterEach(cleanup);
 
 describe("App setup readiness", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.compatibility).mockResolvedValue({
+      compatible: true,
+      backendVersion: VERSION,
+      status: bootstrapStatus,
+    });
     vi.mocked(api.keystore).mockResolvedValue({ exists: false, address: null });
   });
 
@@ -62,5 +105,35 @@ describe("App setup readiness", () => {
     expect(await screen.findByText("Complete local setup")).toBeTruthy();
     expect(screen.getByText(/OWNED_TOKENS/)).toBeTruthy();
     expect(screen.queryByLabelText("Alchemy API key")).toBeNull();
+  });
+
+  it.each(["0.2.9", "0.4.0"])(
+    "blocks backend v%s before consuming release-coupled settings",
+    async (backendVersion) => {
+      vi.mocked(api.compatibility).mockResolvedValue({
+        compatible: false,
+        backendVersion,
+        reason: `Dashboard v${VERSION} cannot use backend v${backendVersion}.`,
+      });
+
+      render(<App />);
+
+      expect(await screen.findByText("Dashboard/backend mismatch")).toBeTruthy();
+      expect(screen.getByText(new RegExp(`Backend: v${backendVersion.replaceAll(".", "\\.")}`))).toBeTruthy();
+      expect(api.getSettings).not.toHaveBeenCalled();
+      expect(api.keystore).not.toHaveBeenCalled();
+      expect(screen.queryByText("Wallet setup")).toBeNull();
+    },
+  );
+
+  it("blocks when compatibility cannot be verified", async () => {
+    vi.mocked(api.compatibility).mockRejectedValue(new Error("status endpoint unavailable"));
+
+    render(<App />);
+
+    expect(await screen.findByText("Cannot verify backend compatibility")).toBeTruthy();
+    expect(screen.getByText("status endpoint unavailable")).toBeTruthy();
+    expect(api.getSettings).not.toHaveBeenCalled();
+    expect(api.keystore).not.toHaveBeenCalled();
   });
 });

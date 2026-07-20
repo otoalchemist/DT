@@ -197,7 +197,43 @@ describe("JitPanel campaign scope", () => {
     });
     expect(tokenSeven.disabled).toBe(true);
     expect(tokenEight.disabled).toBe(true);
+    const all = screen.getByRole("button", { name: "all" }) as HTMLButtonElement;
+    const none = screen.getByRole("button", { name: "none" }) as HTMLButtonElement;
+    expect(all.disabled).toBe(true);
+    expect(none.disabled).toBe(true);
+    fireEvent.click(all);
+    fireEvent.click(none);
+    expect(tokenSeven.checked).toBe(false);
+    expect(tokenEight.checked).toBe(true);
+    expect(screen.getByText("1 armed")).toBeTruthy();
+    expect(screen.getByLabelText("Armed Citizen IDs").textContent).toContain("#8");
     expect(screen.getByText("ARMED · epoch 15")).toBeTruthy();
+  });
+
+  it("derives armed count, exposure, and ID display from the authoritative campaign", async () => {
+    render(
+      <JitPanel
+        status={status({
+          jitEnabled: true,
+          jitState: "armed",
+          jitTargetEpoch: 15,
+          jitRevision: 8,
+          jitTokenIds: ["8", "9"],
+        })}
+        tokens={[token("7"), token("8")]}
+        strategy={strategy}
+        onStatusChange={vi.fn()}
+        onStrategyChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((screen.getByLabelText("#7") as HTMLInputElement).checked).toBe(false);
+      expect((screen.getByLabelText("#8") as HTMLInputElement).checked).toBe(true);
+    });
+    expect(screen.getByText("2 armed")).toBeTruthy();
+    expect(screen.getByText("0.0207 ETH")).toBeTruthy();
+    expect(screen.getByLabelText("Armed Citizen IDs").textContent).toContain("#8, #9");
   });
 
   it("refetches authoritative campaign and strategy state after a 409", async () => {

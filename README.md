@@ -6,7 +6,10 @@ A self-hosted automation bot for the on-chain game **[Death & Taxes](https://eth
 - **Just-in-time epoch payment (one-shot):** arm the bot for one explicit future epoch and an explicit set of Citizens. It pays exactly one epoch for only those Citizens as that epoch begins on-chain, then records the campaign as complete and disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per selected citizen. JIT is independent of recurring Defense: arming one Citizen never enables payments for the rest of the wallet.
 - **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. It audits **multiple rivals per epoch** — up to each eligible citizen's **`auditLimit`** (auditor-role tokens can audit several times per epoch; the bot reads each token's remaining capacity and uses all of it), instead of just one. This is a game strategy, not a profit engine — see below.
 - **Reliable submission paths:** choose **`mainnet`** (the default: private **bundles** fanned out to several block builders, with tax payments also mirrored to the public mempool as an independent fallback) or **`public`** (mempool only). [Builders decide inclusion and ordering](https://docs.flashbots.net/flashbots-auction/advanced/bundle-pricing) from profitability and available orderflow; neither route guarantees inclusion or block position. Latency edges let payments/offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
-- **Live activity log:** every action is timestamped with its status; submitted transactions link to Etherscan and auto-update from **submitted → included / reverted** once the receipt lands.
+- **Live activity log:** every action is timestamped with a distinct planning,
+  simulation, submission, delivery-uncertain, rejection, inclusion, or revert
+  state. Submitted transactions link to Etherscan and update when the outcome is
+  reconciled.
 - **Race post-mortem:** after the fact, paste your tx hash and a rival's to see whether you lost on **timing** (later block) or **fee** (same block, out-priced) — in the dashboard or from the CLI.
 
 You run it on your own machine with your own key. It ships with a local web dashboard.
@@ -104,8 +107,9 @@ backend checks.
 The bot has a single version string (`VERSION` in
 `packages/shared/src/constants.ts`). It's shown **in the dashboard header** (next to
 the title) and **logged at startup**, so you can always confirm which build you're
-running — and the dashboard flags a warning if the running backend's version
-doesn't match the dashboard's (e.g. a half-updated copy).
+running. The dashboard performs a version/schema check before reading settings or
+opening its live socket; an older or newer backend shows a blocking compatibility
+page instead of operating a half-updated copy.
 
 When installing, compare that displayed version with the version on the specific
 approved Git tag or Release you downloaded. Do not treat GitHub's unversioned
@@ -154,8 +158,8 @@ web UI or `gh release create`).
 | `MODE` | `mainnet` (**default** — private bundles to `BUILDER_URLS`; payments also mirror to the mempool for broader inclusion coverage), `public` (mempool only), or `local` (Anvil/non-mainnet direct broadcast). When absent from the environment it is switchable and persisted from the dashboard; an explicit environment value is read-only until restart. Local mode refuses chain ID 1. |
 | `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to [Flashbots](https://docs.flashbots.net/flashbots-auction/advanced/rpc-endpoint), [BuilderNet](https://buildernet.org/docs/send-orderflow), [beaverbuild](https://beaverbuild.org/docs.html), and [Titan](https://docs.titanbuilder.xyz/api/eth_sendbundle) (provider-documented for `eth_sendBundle` as of July 2026). Endpoints do change — verify against each builder's current docs. |
 | `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). `HOST` accepts only `127.0.0.1`, `localhost`, or `::1`; non-loopback startup fails closed. |
-| `BACKEND_URL` | Development dashboard proxy target. Defaults to `http://127.0.0.1:<PORT>`; override it only to select another loopback address, port, or scheme. |
-| `DATA_DIR` | Per-instance durable state directory (strategy, settings, campaign, journal, activity, and keystore). Put custom directories outside the checkout. |
+| `BACKEND_URL` | Development dashboard proxy target. When unset it follows `HOST` and `PORT` (default `http://127.0.0.1:8787`); IPv6 loopback is normalized to `http://[::1]:<PORT>`. Override it only to select another loopback address, port, or scheme. |
+| `DATA_DIR` | Per-instance durable state directory (strategy, settings, campaign, journal, activity, and keystore). It is exclusive to one running backend: stop the old process completely before starting another against the same directory. Put custom directories outside the checkout. |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
 | `MAX_CANDIDATES` | Offense-only cap on rival enumeration (default 500). Owned Citizens are always fully paginated and then verified with `ownerOf`. |
 
@@ -231,8 +235,11 @@ cp data/config.example.json "$DATA_DIR/config.json"
 - **Connection watchdog:** WebSocket block events trigger low-latency ticks, and a
   12-second poll runs alongside them so a silent provider subscription cannot stop
   the engine indefinitely.
-- **One active wallet per instance.** To automate multiple wallets, use separate
-  processes with separate data directories, ports, and keystores.
+- **One active wallet per instance.** `DATA_DIR` is single-process state: never
+  overlap two backends against the same directory, including during upgrades or
+  restarts. Stop and await the old process before starting its replacement. To
+  automate multiple wallets, use separate processes with separate data
+  directories, ports, and keystores.
 - **Keep the host clock synchronized.** Boundary timers use Unix time. Private
   bundles carry an on-chain timestamp floor and normal ticks recover from a miss,
   but meaningful system-clock skew can still make a first-block attempt late.

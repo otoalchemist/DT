@@ -85,6 +85,7 @@ const h = vi.hoisted(() => {
     resetJitState: vi.fn(),
     preflightSubmissionRecovery: vi.fn(async () => {}),
     recoverAuthorizedSubmissions: vi.fn(async () => {}),
+    hasUnresolvedJitCampaignWork: vi.fn(() => false),
     saveSettings: vi.fn(),
     validateRpc: vi.fn(async () => {}),
     reinitClients: vi.fn(),
@@ -125,6 +126,7 @@ vi.mock("./strategy.js", () => ({
   resetJitState: h.resetJitState,
   preflightSubmissionRecovery: h.preflightSubmissionRecovery,
   recoverAuthorizedSubmissions: h.recoverAuthorizedSubmissions,
+  hasUnresolvedJitCampaignWork: h.hasUnresolvedJitCampaignWork,
 }));
 vi.mock("./chain.js", () => ({
   publicClient: { getBalance: vi.fn(async () => 0n) },
@@ -191,6 +193,7 @@ describe("revisioned API lifecycle", () => {
     h.waitForEngineIdle.mockResolvedValue(undefined);
     h.preflightSubmissionRecovery.mockResolvedValue(undefined);
     h.recoverAuthorizedSubmissions.mockResolvedValue(undefined);
+    h.hasUnresolvedJitCampaignWork.mockReturnValue(false);
     h.validateRpc.mockResolvedValue(undefined);
     h.getChainId.mockResolvedValue(1);
     h.filterOwnedTokenIds.mockImplementation(async (_citizens: unknown, tokenIds: bigint[]) =>
@@ -603,7 +606,7 @@ describe("revisioned API lifecycle", () => {
     await app.close();
   });
 
-  it("leaves the engine stopped when cancelling the campaign that auto-started it", async () => {
+  it("leaves the engine stopped when an auto-started campaign has no cancellation cleanup", async () => {
     Object.assign(h.runtime.jitCampaign, {
       state: "armed",
       targetEpoch: 10,
@@ -619,12 +622,118 @@ describe("revisioned API lifecycle", () => {
 
     expect(response.statusCode).toBe(200);
     expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
-      expect.objectContaining({ state: "cancelled", autoStopOnCompletion: false }),
+      expect.objectContaining({
+        state: "cancelled",
+        targetEpoch: null,
+        tokenIds: [],
+        autoStopOnCompletion: false,
+      }),
       0,
     );
+    expect(h.hasUnresolvedJitCampaignWork).toHaveBeenCalledWith(expect.objectContaining({
+      targetEpoch: 10,
+      tokenIds: ["7"],
+      autoStopOnCompletion: true,
+    }));
     expect(h.stopEngine).toHaveBeenCalledOnce();
     expect(h.startEngine).not.toHaveBeenCalled();
     expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+
+  it("persists and restarts unresolved cleanup for a campaign-owned engine", async () => {
+    Object.assign(h.runtime.jitCampaign, {
+      state: "armed",
+      targetEpoch: 10,
+      tokenIds: ["7"],
+      autoStopOnCompletion: true,
+    });
+    h.runtime.running = true;
+    h.hasUnresolvedJitCampaignWork.mockReturnValueOnce(true);
+    const app = await buildServer();
+
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: false, expectedRevision: 0 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: "cancelled",
+        targetEpoch: 10,
+        tokenIds: ["7"],
+        autoStopOnCompletion: true,
+        completedAt: undefined,
+        message: expect.stringContaining("cleanup in progress"),
+      }),
+      0,
+    );
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("restarts unresolved cancellation without taking ownership from an operator-run engine", async () => {
+    Object.assign(h.runtime.jitCampaign, {
+      state: "armed",
+      targetEpoch: 10,
+      tokenIds: ["7"],
+      autoStopOnCompletion: false,
+    });
+    h.runtime.running = true;
+    h.hasUnresolvedJitCampaignWork.mockReturnValueOnce(true);
+    const app = await buildServer();
+
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: false, expectedRevision: 0 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: "cancelled",
+        targetEpoch: 10,
+        tokenIds: ["7"],
+        autoStopOnCompletion: false,
+      }),
+      0,
+    );
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("temporarily owns cleanup when cancelling unresolved work from a paused engine", async () => {
+    Object.assign(h.runtime.jitCampaign, {
+      state: "armed",
+      targetEpoch: 10,
+      tokenIds: ["7"],
+      autoStopOnCompletion: false,
+    });
+    h.runtime.running = false;
+    h.hasUnresolvedJitCampaignWork.mockReturnValueOnce(true);
+    const app = await buildServer();
+
+    const response = await app.inject({
+      method: "POST", url: "/api/jit", headers: { host: "localhost" },
+      payload: { enable: false, expectedRevision: 0 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveJitCampaign).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetEpoch: 10,
+        tokenIds: ["7"],
+        autoStopOnCompletion: true,
+      }),
+      0,
+    );
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.startEngine).toHaveBeenCalledOnce();
     await app.close();
   });
 
@@ -712,6 +821,61 @@ describe("revisioned API lifecycle", () => {
     expect(h.reinitClients).not.toHaveBeenCalled();
     expect(h.appConfig).toMatchObject(previous);
     expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("lets Stop preempt slow settings validation and prevents a later restart", async () => {
+    let releaseValidation!: () => void;
+    h.runtime.running = true;
+    h.validateRpc.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    }));
+    const app = await buildServer();
+    const settings = app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { alchemyApiKey: "replacement-key-value" },
+    });
+
+    await vi.waitFor(() => expect(h.validateRpc).toHaveBeenCalledOnce());
+    const stopping = app.inject({ method: "POST", url: "/api/stop", headers: { host: "localhost" } });
+    await vi.waitFor(() => expect(h.runtime.running).toBe(false));
+    expect(h.stopEngine).toHaveBeenCalledOnce();
+    expect(h.waitForEngineIdle).not.toHaveBeenCalled();
+
+    releaseValidation();
+    const [settingsResponse, stopResponse] = await Promise.all([settings, stopping]);
+    expect(settingsResponse.statusCode).toBe(200);
+    expect(stopResponse.statusCode).toBe(200);
+    expect(h.stopEngine).toHaveBeenCalledTimes(2);
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.running).toBe(false);
+    await app.close();
+  });
+
+  it("lets Lock preempt slow settings validation before clearing the identity", async () => {
+    let releaseValidation!: () => void;
+    h.runtime.running = true;
+    h.validateRpc.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    }));
+    const app = await buildServer();
+    const settings = app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { alchemyApiKey: "replacement-key-value" },
+    });
+
+    await vi.waitFor(() => expect(h.validateRpc).toHaveBeenCalledOnce());
+    const locking = app.inject({ method: "POST", url: "/api/lock", headers: { host: "localhost" } });
+    await vi.waitFor(() => expect(h.runtime.running).toBe(false));
+    expect(h.runtime.lock).not.toHaveBeenCalled();
+
+    releaseValidation();
+    const [settingsResponse, lockResponse] = await Promise.all([settings, locking]);
+    expect(settingsResponse.statusCode).toBe(200);
+    expect(lockResponse.statusCode).toBe(200);
+    expect(h.runtime.lock).toHaveBeenCalledOnce();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.unlocked).toBe(false);
     await app.close();
   });
 

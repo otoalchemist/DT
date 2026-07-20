@@ -35,6 +35,7 @@ import {
   resetJitState,
   preflightSubmissionRecovery,
   recoverAuthorizedSubmissions,
+  hasUnresolvedJitCampaignWork,
 } from "./strategy.js";
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { filterOwnedTokenIds } from "./index-tokens.js";
@@ -316,12 +317,19 @@ export async function buildServer(): Promise<FastifyInstance> {
     return runtime.status();
   }));
 
-  app.post("/api/lock", async () => runLifecycle(async () => {
+  app.post("/api/lock", async () => {
+    // Lock and Stop are emergency controls. Invalidate live execution before
+    // waiting behind a slow settings/unlock validation already in lifecycleTail.
+    // Repeat the stop inside the queue as well so an older operation cannot
+    // restart the engine in its finally block after this request arrived.
     stopEngine();
-    await waitForEngineIdle();
-    runtime.lock();
-    return { ok: true };
-  }));
+    return runLifecycle(async () => {
+      stopEngine();
+      await waitForEngineIdle();
+      runtime.lock();
+      return { ok: true };
+    });
+  });
 
   // --- engine control ---
   app.post("/api/start", async (_req, reply) => runLifecycle(async () => {
@@ -360,11 +368,16 @@ export async function buildServer(): Promise<FastifyInstance> {
     return runtime.status();
   }));
 
-  app.post("/api/stop", async () => runLifecycle(async () => {
+  app.post("/api/stop", async () => {
+    // Fail-safe immediately even when another lifecycle request is doing remote
+    // validation. The queued stop closes the race with an older finally/restart.
     stopEngine();
-    await waitForEngineIdle();
-    return runtime.status();
-  }));
+    return runLifecycle(async () => {
+      stopEngine();
+      await waitForEngineIdle();
+      return runtime.status();
+    });
+  });
 
   // --- just-in-time single-epoch payment ---
   app.post("/api/jit", async (req, reply) => runLifecycle(async () => {
@@ -386,7 +399,11 @@ export async function buildServer(): Promise<FastifyInstance> {
     let target: number | null = null;
     let selectedIds: string[] = [];
     const wasRunning = runtime.running;
-    const campaignOwnedEngine = runtime.jitCampaign.autoStopOnCompletion;
+    const campaignSnapshot = {
+      ...runtime.jitCampaign,
+      tokenIds: [...runtime.jitCampaign.tokenIds],
+    };
+    const campaignOwnedEngine = campaignSnapshot.autoStopOnCompletion;
     if (enable && !runtime.unlocked) {
       return reply.code(400).send({ error: "Unlock the wallet first" });
     }
@@ -400,6 +417,8 @@ export async function buildServer(): Promise<FastifyInstance> {
     await waitForEngineIdle();
     let saved = false;
     let durabilityFailed = false;
+    let unresolvedCancellation = false;
+    let cancellationCleanupOwnsEngine = false;
     try {
       if (enable) {
         let fresh;
@@ -459,6 +478,14 @@ export async function buildServer(): Promise<FastifyInstance> {
           }
         }
       }
+      if (!enable) {
+        unresolvedCancellation = hasUnresolvedJitCampaignWork(campaignSnapshot);
+        // Preserve an operator-owned running engine. If the engine was already
+        // paused, this request owns the temporary cleanup run and strategy will
+        // stop it again after the retained same-nonce work becomes terminal.
+        cancellationCleanupOwnsEngine = unresolvedCancellation
+          && (campaignOwnedEngine || !wasRunning);
+      }
       runtime.saveJitCampaign(
         enable
           ? {
@@ -471,11 +498,13 @@ export async function buildServer(): Promise<FastifyInstance> {
             }
           : {
               state: "cancelled",
-              targetEpoch: null,
-              tokenIds: [],
-              autoStopOnCompletion: false,
-              message: "Cancelled by operator",
-              completedAt: Date.now(),
+              targetEpoch: unresolvedCancellation ? campaignSnapshot.targetEpoch : null,
+              tokenIds: unresolvedCancellation ? campaignSnapshot.tokenIds : [],
+              autoStopOnCompletion: cancellationCleanupOwnsEngine,
+              message: unresolvedCancellation
+                ? "Cancelled by operator; pending transaction cleanup in progress"
+                : "Cancelled by operator",
+              completedAt: unresolvedCancellation ? undefined : Date.now(),
             },
         expectedRevision,
       );
@@ -497,12 +526,14 @@ export async function buildServer(): Promise<FastifyInstance> {
       const completedOwnedCancellation = !enable
         && saved
         && campaignOwnedEngine
+        && !unresolvedCancellation
         && !runtime.strategy.defenseEnabled
         && !runtime.strategy.offenseEnabled;
+      const restartForCleanup = !enable && saved && unresolvedCancellation;
       if (
         !durabilityFailed
         && !completedOwnedCancellation
-        && (wasRunning || (enable && saved))
+        && (wasRunning || (enable && saved) || restartForCleanup)
         && runtime.unlocked
         && !runtime.running
       ) {

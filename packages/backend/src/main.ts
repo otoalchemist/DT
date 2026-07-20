@@ -1,12 +1,57 @@
 import { VERSION } from "@dat-bot/shared";
-import { appConfig } from "./config.js";
-import { logger } from "./logger.js";
-import { runtime } from "./runtime.js";
-import { buildServer } from "./api.js";
-import { getChainId } from "./chain.js";
-import { stopEngine, waitForEngineIdle } from "./strategy.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { config as loadEnv } from "dotenv";
+import { acquireDataDirLock, type DataDirLock } from "./data-dir-lock.js";
+
+let dataDirLock: DataDirLock | null = null;
+let logError: (...args: unknown[]) => void = (...args) => console.error(...args);
+
+function releaseDataDirLock(): void {
+  if (!dataDirLock) return;
+  const owned = dataDirLock;
+  dataDirLock = null;
+  try {
+    owned.release();
+  } catch (error) {
+    logError(`Failed to release DATA_DIR lock: ${(error as Error).message}`);
+  }
+}
 
 async function main(): Promise<void> {
+  // Acquire DATA_DIR before importing config/runtime/activity singletons: config
+  // migration can write during module evaluation, so locking later in startup
+  // would still permit two processes to race that first mutation.
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+  loadEnv({ path: path.resolve(moduleDirectory, "../../../.env") });
+  const startupDataDir = path.resolve(
+    process.env.DATA_DIR ?? path.resolve(moduleDirectory, "../../../data"),
+  );
+  dataDirLock = acquireDataDirLock(startupDataDir);
+  process.once("exit", releaseDataDirLock);
+
+  const [
+    { appConfig },
+    { logger },
+    { runtime },
+    { buildServer },
+    { getChainId },
+    { stopEngine, waitForEngineIdle },
+  ] = await Promise.all([
+    import("./config.js"),
+    import("./logger.js"),
+    import("./runtime.js"),
+    import("./api.js"),
+    import("./chain.js"),
+    import("./strategy.js"),
+  ]);
+  logError = (...args) => logger.error(...args);
+  if (path.resolve(appConfig.dataDir) !== startupDataDir) {
+    throw new Error(
+      `startup DATA_DIR changed during configuration load: locked ${startupDataDir}, `
+      + `configured ${path.resolve(appConfig.dataDir)}`,
+    );
+  }
   logger.info(`DeathAndTaxes bot v${VERSION} starting in ${appConfig.mode} mode`);
   logger.info(`Game contract: ${appConfig.gameAddress}`);
 
@@ -37,6 +82,7 @@ async function main(): Promise<void> {
     stopEngine();
     await waitForEngineIdle();
     await app.close();
+    releaseDataDirLock();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -44,6 +90,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  logger.error("Fatal:", err);
+  logError("Fatal:", err);
+  releaseDataDirLock();
   process.exit(1);
 });

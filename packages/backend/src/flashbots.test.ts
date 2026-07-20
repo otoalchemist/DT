@@ -8,6 +8,7 @@ const h = vi.hoisted(() => {
   const publicClient = {
     estimateGas: vi.fn(),
     getBalance: vi.fn(),
+    getBlock: vi.fn(),
     getBlockNumber: vi.fn(),
     getTransactionCount: vi.fn(),
     call: vi.fn(),
@@ -86,6 +87,7 @@ vi.mock("./durability.js", async () => {
 vi.mock("./submission-journal.js", async () => {
   class JournalCorruptionError extends Error {}
   return {
+    JOURNAL_CONFIRMATION_DEPTH: 3n,
     JournalCorruptionError,
     SubmissionFlightJournal: class {
       upsert = h.journal.upsert;
@@ -144,6 +146,9 @@ const { AtomicWriteCommittedError } = await import("./durability.js");
 
 const ACCOUNT = privateKeyToAccount(`0x${"11".repeat(32)}`);
 const TO = "0x00000000000000000000000000000000000000aa" as const;
+const BLOCK_100_HASH = `0x${"64".repeat(32)}` as Hex;
+const BLOCK_99_HASH = `0x${"63".repeat(32)}` as Hex;
+const BLOCK_98_HASH = `0x${"62".repeat(32)}` as Hex;
 
 type RpcCall = { url: string; method: string; params: any[]; signal?: AbortSignal };
 function rpcCall(url: string | URL | Request, init?: RequestInit): RpcCall {
@@ -246,6 +251,12 @@ beforeEach(() => {
     gasLimit: 30_000_000n,
   });
   h.publicClient.getBlockNumber.mockResolvedValue(100n);
+  h.publicClient.getBlock.mockImplementation(async ({ blockHash }: { blockHash?: Hex } = {}) => {
+    if (blockHash === BLOCK_99_HASH) {
+      return { number: 99n, hash: BLOCK_99_HASH, parentHash: BLOCK_98_HASH };
+    }
+    return { number: 100n, hash: BLOCK_100_HASH, parentHash: BLOCK_99_HASH };
+  });
   h.publicClient.getBalance.mockResolvedValue(parseEther("100"));
   h.publicClient.getTransactionCount.mockResolvedValue(7);
   h.publicClient.call.mockResolvedValue({ data: "0x" });
@@ -264,10 +275,10 @@ beforeEach(() => {
   h.journal.removeMany.mockImplementation(() => undefined);
   h.journal.load.mockReturnValue([]);
   h.journal.pathFor.mockReturnValue("/tmp/mock-journal.json");
-  h.journal.reconcile.mockImplementation((_wallet, confirmedNonce, pendingNonce, currentBlock) => ({
+  h.journal.reconcile.mockImplementation((_wallet, confirmedNonce, pendingNonce, blockEvidence) => ({
     confirmedNonce,
     pendingNonce,
-    currentBlock,
+    currentBlock: blockEvidence.number,
     retained: [],
     consumed: [],
     expired: [],
@@ -1149,9 +1160,55 @@ describe("durable prepared-flight recovery", () => {
 
     const result = await reconcileSubmissionJournal(ACCOUNT.address);
     expect(result.retained).toHaveLength(1);
+    expect(h.publicClient.getTransactionCount).toHaveBeenCalledWith({
+      address: ACCOUNT.address,
+      blockHash: BLOCK_100_HASH,
+      requireCanonical: true,
+    });
+    expect(h.journal.reconcile).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      7,
+      7,
+      {
+        number: 100n,
+        canonicalHashes: [BLOCK_100_HASH, BLOCK_99_HASH, BLOCK_98_HASH],
+      },
+    );
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
     expect(h.journal.updateMany).not.toHaveBeenCalled();
     expect(h.nonceManager.restoreFlight).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the provider rejects the canonical hash-bound nonce read", async () => {
+    h.publicClient.getTransactionCount.mockImplementation(async (args: {
+      blockHash?: Hex;
+      blockTag?: string;
+    }) => {
+      if (args.blockHash !== undefined) throw new Error("block is not canonical");
+      return 7;
+    });
+
+    await expect(reconcileSubmissionJournal(ACCOUNT.address)).rejects.toThrow(
+      "block is not canonical",
+    );
+
+    expect(h.journal.reconcile).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the provider returns an incoherent parent block", async () => {
+    h.publicClient.getBlock.mockImplementation(async ({ blockHash }: { blockHash?: Hex } = {}) => {
+      if (blockHash === BLOCK_99_HASH) {
+        return { number: 98n, hash: BLOCK_99_HASH, parentHash: BLOCK_98_HASH };
+      }
+      return { number: 100n, hash: BLOCK_100_HASH, parentHash: BLOCK_99_HASH };
+    });
+
+    await expect(reconcileSubmissionJournal(ACCOUNT.address)).rejects.toThrow(
+      "could not verify canonical block ancestry",
+    );
+
+    expect(h.publicClient.getTransactionCount).not.toHaveBeenCalled();
+    expect(h.journal.reconcile).not.toHaveBeenCalled();
   });
 
   it("re-simulates and replays an authorized prepared hash only at not-before", async () => {
@@ -1201,6 +1258,30 @@ describe("durable prepared-flight recovery", () => {
     });
 
     await recoverPreparedSubmissions(ACCOUNT.address);
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(h.journal.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never replays a tip-included flight while confirmation is provisional", async () => {
+    const flight = {
+      ...await recoveredFlight(true),
+      observedConsumedAtBlock: "100",
+    };
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 8,
+      pendingNonce: 8,
+      currentBlock: 100n,
+      retained: [flight],
+      provisional: [flight],
+      consumed: [],
+      expired: [],
+    });
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.publicClient.getBalance).not.toHaveBeenCalled();
     expect(h.publicClient.call).not.toHaveBeenCalled();
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
     expect(h.journal.updateMany).not.toHaveBeenCalled();
@@ -1353,6 +1434,36 @@ describe("durable prepared-flight recovery", () => {
       ACCOUNT.address,
       [expect.objectContaining({ txHash: failed.txHash })],
     );
+  });
+
+  it("durably and monotonically records same-nonce conflict during recovery", async () => {
+    const flight = await recoveredFlight(true);
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+    h.publicClient.sendRawTransaction.mockRejectedValueOnce(
+      new Error("replacement transaction underpriced"),
+    );
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(flight).toMatchObject({
+      state: "ambiguous",
+      publicExposure: false,
+      nonceConflict: true,
+    });
+    expect(h.journal.updateMany).toHaveBeenCalledWith(ACCOUNT.address, [
+      expect.objectContaining({
+        txHash: flight.txHash,
+        update: expect.objectContaining({ nonceConflict: true }),
+      }),
+    ]);
   });
 
   it("fails recovery authorization errors before balance, simulation, or replay", async () => {

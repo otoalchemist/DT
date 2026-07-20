@@ -11,6 +11,10 @@ export interface NonceFlightSnapshot {
   publicExposure: boolean;
   maxPrivateTargetBlock?: bigint;
   retainBeyondPrivateTarget?: boolean;
+  /** Durable journal observation metadata. The allocator may advance
+   * immediately, but never uses number-only sync to declare this snapshot
+   * terminal. */
+  observedConsumedAtBlock?: bigint;
 }
 
 interface NonceFlight extends NonceFlightSnapshot {
@@ -72,14 +76,18 @@ export class NonceManager {
       this.recoveredAddress = normalizedAddress;
     }
 
-    for (const nonce of [...this.flights.keys()]) {
-      // Pending advancement is not terminal: a public tx can remain replaceable,
-      // dropped, or reverted. Only confirmed chain consumption closes a flight.
-      if (nonce < confirmedNonce) this.flights.delete(nonce);
+    for (const [nonce, flight] of this.flights) {
+      // Number-based nonce sync is allocation evidence, not canonical finality.
+      // Keep every consumed snapshot in memory: it is ignored while confirmed is
+      // above it, but becomes an immediate reservation fence if the nonce regresses.
+      // Only the hash-bound durable journal is allowed to discard the raw flight.
+      if (nonce >= confirmedNonce) delete flight.observedConsumedAtBlock;
     }
 
     const expirable = [...this.flights.values()].filter(
-      (flight) => !flight.publicExposure
+      (flight) => flight.nonce >= confirmedNonce
+        && flight.observedConsumedAtBlock === undefined
+        && !flight.publicExposure
         && !flight.retainBeyondPrivateTarget
         && flight.maxPrivateTargetBlock !== undefined,
     );

@@ -38,6 +38,7 @@ const testState = vi.hoisted(() => ({
   auditsUsedByToken: new Map<string, bigint>(),
   ownerByToken: new Map<string, `0x${string}`>(),
   ownerOfFailures: new Set<string>(),
+  multicallFailureCalls: new Set<string>(),
   multicallRejectFunctions: new Set<string>(),
   receipts: new Map<Hex, Promise<{
     status: "success" | "reverted";
@@ -99,6 +100,12 @@ vi.mock("./chain.js", () => ({
       }
       return contracts.map((contract) => {
       const tokenId = contract.args?.[0]?.toString();
+      if (
+        contract.functionName !== undefined
+        && testState.multicallFailureCalls.has(`${contract.functionName}:${tokenId ?? ""}`)
+      ) {
+        return { status: "failure", error: new Error("mocked per-call failure") };
+      }
       if (contract.functionName === "ownerOf" && tokenId !== undefined) {
         if (testState.ownerOfFailures.has(tokenId)) {
           return { status: "failure", error: new Error("ownerOf unavailable") };
@@ -162,6 +169,11 @@ vi.mock("./chain.js", () => ({
       });
     }),
     waitForTransactionReceipt: vi.fn(async ({ hash }: { hash: Hex }) => {
+      const receipt = testState.receipts.get(hash);
+      if (!receipt) throw new Error(`no mocked receipt for ${hash}`);
+      return receipt;
+    }),
+    getTransactionReceipt: vi.fn(async ({ hash }: { hash: Hex }) => {
       const receipt = testState.receipts.get(hash);
       if (!receipt) throw new Error(`no mocked receipt for ${hash}`);
       return receipt;
@@ -294,7 +306,13 @@ vi.mock("./flashbots.js", () => ({
     pendingNonce: testState.pendingNonce,
     currentBlock: 100n,
     retained: [],
-    consumed: [],
+    // Most strategy tests use confirmedNonce advancement as shorthand for a
+    // journal-deep terminal. Dedicated finality tests override this with a
+    // retained flight to prove an independent nonce read cannot settle it.
+    consumed: Array.from(
+      { length: testState.confirmedNonce },
+      (_unused, nonce) => journalFlight({ nonce, data: "0x" }),
+    ),
     expired: [],
   })),
 }));
@@ -384,7 +402,7 @@ const { reconcileSubmissionJournal } = await import("./flashbots.js");
 const { nonceManager } = await import("./nonce.js");
 const { getLatestBlockCached, wsClient } = await import("./chain.js");
 const { appConfig } = await import("./config.js");
-const { encodePayTaxes, encodeAudit, gameContract } = await import("./contract.js");
+const { encodePayTaxes, encodeAudit, filterLiveTokenIds, gameContract } = await import("./contract.js");
 const { AtomicWriteCommittedError } = await import("./durability.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const {
@@ -434,6 +452,7 @@ function journalFlight(args: {
   gasLimit?: bigint;
   maxFeePerGas?: bigint;
   maxPriorityFeePerGas?: bigint;
+  observedConsumedAtBlock?: bigint;
 }) {
   const byte = (args.nonce + 1).toString(16).padStart(2, "0");
   return {
@@ -457,6 +476,9 @@ function journalFlight(args: {
         : { notBeforeTimestamp: args.notBeforeTimestamp.toString() }),
     },
     nonceConflict: false,
+    ...(args.observedConsumedAtBlock === undefined
+      ? {}
+      : { observedConsumedAtBlock: args.observedConsumedAtBlock.toString() }),
     state: args.state ?? "accepted",
     publicExposure: args.publicExposure ?? (args.attempts ?? []).some(
       (attempt) => attempt.channel === "public" && attempt.state !== "rejected",
@@ -594,6 +616,7 @@ describe("defensive payment scheduling and retries", () => {
     testState.auditsUsedByToken = new Map();
     testState.ownerByToken = new Map();
     testState.ownerOfFailures = new Set();
+    testState.multicallFailureCalls = new Set();
     testState.multicallRejectFunctions = new Set();
     testState.receipts = new Map();
     testState.flushResults = new Map();
@@ -669,12 +692,54 @@ describe("defensive payment scheduling and retries", () => {
     },
   );
 
+  it.each(["per-call", "top-level"] as const)(
+    "fail-closes pre-boundary offense when payment discovery has a %s failure",
+    async (failureKind) => {
+      testState.lastEpochPaid = 4n;
+      testState.ownedIds = [1n, 2n];
+      testState.lastEpochPaidByToken = new Map([["1", 4n], ["2", 5n]]);
+      testState.auditLimitByToken = new Map([["2", 1n]]);
+      testState.liveTargets = [{
+        id: 99n,
+        owner: "0x9999999999999999999999999999999999999999",
+      }];
+      testState.targetStatuses = [{
+        tokenId: "99",
+        owner: "0x9999999999999999999999999999999999999999",
+        lastEpochPaid: "4",
+        delinquent: false,
+        epochsBehind: 1,
+        auditable: false,
+        auditDueTimestamp: "0",
+        killable: false,
+      }];
+      if (failureKind === "per-call") {
+        testState.multicallFailureCalls.add("lastEpochPaid:1");
+      } else {
+        testState.multicallRejectFunctions.add("lastEpochPaid");
+      }
+      configure({
+        offenseEnabled: true,
+        autoAudit: true,
+        autoKill: false,
+        preBoundaryAudit: true,
+        offenseTargetTokenIds: ["99"],
+      });
+
+      await startAt(epochStart(6) - 10n);
+      await vi.advanceTimersByTimeAsync(7_500);
+
+      expect(submitTx).not.toHaveBeenCalled();
+      expect(encodeAudit).not.toHaveBeenCalled();
+    },
+  );
+
   it("still runs a standalone boundary audit when no survival payment is due", async () => {
     testState.lastEpochPaid = 5n;
     testState.ownedIds = [2n];
     testState.lastEpochPaidByToken = new Map([["2", 5n]]);
     testState.auditLimitByToken = new Map([["2", 1n]]);
-    testState.candidateIds = [99n];
+    testState.candidateIds = [];
     testState.liveTargets = [{
       id: 99n,
       owner: "0x9999999999999999999999999999999999999999",
@@ -696,12 +761,16 @@ describe("defensive payment scheduling and retries", () => {
       autoAudit: true,
       autoKill: false,
       preBoundaryAudit: true,
+      offenseTargetTokenIds: ["99"],
     });
 
     await startAt(epochStart(6) - 10n);
     await vi.advanceTimersByTimeAsync(7_500);
 
     expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xAUDIT"]);
+    expect(vi.mocked(filterLiveTokenIds).mock.calls.at(-1)?.[1]).toEqual(
+      expect.arrayContaining([99n]),
+    );
   });
 
   it("fires a pre-boundary audit immediately when startup is already inside its lead window", async () => {
@@ -1670,6 +1739,155 @@ describe("defensive payment scheduling and retries", () => {
     expect(saveJitCampaign).toHaveBeenCalledWith(expect.objectContaining({ state: "completed" }));
   });
 
+  it("retains provisional payment exposure and restores the original obligation after nonce regression", async () => {
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    const provisionalFlight = journalFlight({
+      nonce: 0,
+      data,
+      valueWei: 20n * BASE_TAX_RATE_WEI,
+      observedConsumedAtBlock: 100n,
+    });
+    const provisional = {
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 100n,
+      retained: [provisionalFlight],
+      provisional: [provisionalFlight],
+      consumed: [],
+      expired: [],
+    };
+    const regressedFlight = journalFlight({
+      nonce: 0,
+      data,
+      valueWei: 20n * BASE_TAX_RATE_WEI,
+    });
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce(provisional);
+    vi.mocked(recoverPreparedSubmissions)
+      .mockResolvedValueOnce(provisional)
+      .mockResolvedValueOnce({
+        confirmedNonce: 0,
+        pendingNonce: 1,
+        currentBlock: 101n,
+        retained: [regressedFlight],
+        provisional: [],
+        consumed: [],
+        expired: [],
+      });
+    testState.confirmedNonce = 1;
+    testState.lastEpochPaid = 20n;
+    testState.estimatedPayWei = 20n * BASE_TAX_RATE_WEI;
+    configure({ enabled: true, proactivePay: true, preBoundaryPay: false });
+
+    await startAt(epochStart(20) + 100n);
+
+    expect(BigInt(runtime.status().pendingExposureWei)).toBeGreaterThan(0n);
+    expect(submitTx).not.toHaveBeenCalled();
+
+    testState.confirmedNonce = 0;
+    testState.lastEpochPaid = 18n;
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xPAYTAXES",
+    ]);
+  });
+
+  it("does not settle a payment from an independent nonce read while its journal flight remains", async () => {
+    testState.lastEpochPaid = 20n;
+    testState.estimatedPayWei = 500_000_000_000_000_000n;
+    testState.submittedGasWei = 200n;
+    configure({ preBoundaryPay: false });
+
+    await startAt(epochStart(22) + 100n);
+    expect(submitTx).toHaveBeenCalledTimes(1);
+    const exposure = runtime.status().pendingExposureWei;
+
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    const retained = journalFlight({
+      nonce: 0,
+      data,
+      valueWei: testState.estimatedPayWei,
+    });
+    testState.confirmedNonce = 1;
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 101n,
+      retained: [retained],
+      consumed: [],
+      expired: [],
+    });
+
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(submitTx).toHaveBeenCalledTimes(1);
+    expect(runtime.status().pendingExposureWei).toBe(exposure);
+    expect(testState.nextNonce).toBe(1);
+  });
+
+  it("does not settle an action from an independent nonce read while its journal flight remains", async () => {
+    const now = epochStart(15) + 100n;
+    testState.lastEpochPaid = 15n;
+    testState.submittedGasWei = 200n;
+    testState.candidateIds = [99n];
+    testState.liveTargets = [{
+      id: 99n,
+      owner: "0x9999999999999999999999999999999999999999",
+    }];
+    testState.targetStatuses = [{
+      tokenId: "99",
+      owner: "0x9999999999999999999999999999999999999999",
+      lastEpochPaid: "1",
+      delinquent: true,
+      epochsBehind: 14,
+      auditable: false,
+      auditDueTimestamp: (now - 1n).toString(),
+      killable: true,
+    }];
+    configure({
+      enabled: false,
+      proactivePay: false,
+      preBoundaryPay: false,
+      offenseEnabled: true,
+      autoAudit: false,
+      autoKill: true,
+      preBoundaryAudit: false,
+      preBoundaryKill: false,
+    });
+
+    await startAt(now);
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xKILL"]);
+    const exposure = runtime.status().pendingExposureWei;
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "kill",
+      args: [99n],
+    });
+    testState.confirmedNonce = 1;
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 101n,
+      retained: [journalFlight({ nonce: 0, data })],
+      consumed: [],
+      expired: [],
+    });
+
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xKILL"]);
+    expect(runtime.status().pendingExposureWei).toBe(exposure);
+    expect(testState.nextNonce).toBe(1);
+  });
+
   it("reports an unhealthy journal and rejects paused recovery", async () => {
     vi.mocked(reconcileSubmissionJournal).mockRejectedValueOnce(new Error("journal checksum mismatch"));
 
@@ -1723,7 +1941,7 @@ describe("defensive payment scheduling and retries", () => {
     expect(flushBundle).toHaveBeenCalledTimes(1);
   });
 
-  it("never pays a configured JIT token that the active wallet does not own", async () => {
+  it("fails transparently without paying when the wallet does not own a configured JIT token", async () => {
     testState.ownedIds = [1n];
     testState.lastEpochPaid = 15n;
     configure({
@@ -1738,7 +1956,60 @@ describe("defensive payment scheduling and retries", () => {
 
     expect(submitTx).not.toHaveBeenCalled();
     expect(encodePayTaxes).not.toHaveBeenCalledWith(2n, expect.any(Number));
+    expect(runtime.jitCampaign.state).toBe("failed");
+    expect(saveJitCampaign).toHaveBeenCalledWith(expect.objectContaining({
+      state: "failed",
+      message: expect.stringContaining("#2"),
+    }));
+  });
+
+  it("keeps JIT armed when authoritative ownership is temporarily unknown", async () => {
+    testState.ownedIds = [1n];
+    testState.ownerOfFailures.add("1");
+    testState.lastEpochPaid = 15n;
+    configure({
+      enabled: false,
+      proactivePay: false,
+      preBoundaryPay: false,
+      jitEnabled: true,
+      jitTargetEpoch: 16,
+      jitTokenIds: ["1"],
+    });
+
+    await startAt(epochStart(16) + 100n);
+
+    expect(submitTx).not.toHaveBeenCalled();
     expect(runtime.jitCampaign.state).toBe("armed");
+    expect(saveJitCampaign).not.toHaveBeenCalled();
+  });
+
+  it("waits for owned JIT work to settle before failing a mixed-ownership campaign", async () => {
+    testState.ownedIds = [1n, 2n];
+    testState.onChainOwnedIds = [1n];
+    testState.lastEpochPaidByToken.set("1", 15n);
+    configure({
+      enabled: false,
+      proactivePay: false,
+      preBoundaryPay: false,
+      jitEnabled: true,
+      jitTargetEpoch: 16,
+      jitTokenIds: ["1", "2"],
+    });
+
+    await startAt(epochStart(16) + 100n);
+
+    expect(submitTx).toHaveBeenCalledTimes(1);
+    expect(runtime.jitCampaign.state).toBe("armed");
+
+    testState.lastEpochPaidByToken.set("1", 16n);
+    testState.confirmedNonce = 1;
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(runtime.jitCampaign.state).toBe("failed");
+    expect(saveJitCampaign).toHaveBeenCalledWith(expect.objectContaining({
+      state: "failed",
+      message: expect.stringContaining("#2"),
+    }));
   });
 
   it("does not allocate a fresh payment above an unresolved private nonce", async () => {
@@ -1752,6 +2023,52 @@ describe("defensive payment scheduling and retries", () => {
     vi.mocked(nonceManager.hasInvisibleReservation).mockReturnValue(false);
     await vi.advanceTimersByTimeAsync(12_000);
     expect(submitTx).toHaveBeenCalledTimes(1);
+  });
+
+  it("inert-fills a live proactive payment after proactive authority is withdrawn", async () => {
+    testState.lastEpochPaid = 14n;
+
+    await startAt(epochStart(16) + 100n);
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xPAYTAXES",
+    ]);
+
+    runtime.strategy = { ...runtime.strategy, proactivePay: false };
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xPAYTAXES",
+      "0x",
+    ]);
+    expect(vi.mocked(submitTx).mock.calls[1]![1].replacement?.nonce).toBe(0);
+  });
+
+  it("does not grant blanket defense authority to a cold recovered proactive raw", async () => {
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce({
+      confirmedNonce: 0,
+      pendingNonce: 1,
+      currentBlock: 100n,
+      retained: [journalFlight({
+        nonce: 0,
+        data,
+        valueWei: 20n * BASE_TAX_RATE_WEI,
+      })],
+      consumed: [],
+      expired: [],
+    });
+    testState.lastEpochPaid = 18n;
+    configure({ enabled: true, proactivePay: false, preBoundaryPay: false });
+
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    await startAt(epochStart(20) + 100n);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0x"]);
+    expect(vi.mocked(submitTx).mock.calls[0]![1].replacement?.nonce).toBe(0);
   });
 
   it("removes a failed proactive marker so the next regular tick retries", async () => {
@@ -2262,7 +2579,7 @@ describe("defensive payment scheduling and retries", () => {
       autoAudit: false,
       autoKill: true,
       preBoundaryAudit: false,
-      preBoundaryKill: false,
+      preBoundaryKill: true,
     });
 
     await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
@@ -2414,6 +2731,23 @@ describe("defensive payment scheduling and retries", () => {
     originalReceipt.resolve({ status: "reverted", blockNumber: 101n });
     await vi.advanceTimersByTimeAsync(0);
     testState.auditDueTimestamp = 0n;
+    testState.confirmedNonce = 1;
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [journalFlight({
+        nonce: 0,
+        data: encodeFunctionData({
+          abi: gameContract.abi,
+          functionName: "payTaxes",
+          args: [1n, 1],
+        }),
+        valueWei: 22n * BASE_TAX_RATE_WEI,
+      })],
+      expired: [],
+    });
 
     await vi.advanceTimersByTimeAsync(12_000);
     expect(submitTx).toHaveBeenCalledTimes(3);
@@ -2679,6 +3013,30 @@ describe("defensive payment scheduling and retries", () => {
     });
     await vi.advanceTimersByTimeAsync(0);
 
+    // Tip inclusion remains a liability until journal confirmation depth.
+    expect(runtime.status().pendingExposureWei).toBe(testState.estimatedPayWei.toString());
+    expect(BigInt(runtime.status().confirmedSpendThisEpochWei) - before).toBe(0n);
+
+    testState.lastEpochPaid = 21n;
+    testState.confirmedNonce = 1;
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [journalFlight({
+        nonce: 0,
+        data: encodeFunctionData({
+          abi: gameContract.abi,
+          functionName: "payTaxes",
+          args: [1n, 1],
+        }),
+        valueWei: testState.estimatedPayWei,
+      })],
+      expired: [],
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+
     expect(runtime.status().pendingExposureWei).toBe("0");
     expect(BigInt(runtime.status().confirmedSpendThisEpochWei) - before).toBe(
       testState.estimatedPayWei + 63_000n,
@@ -2922,6 +3280,49 @@ describe("defensive payment scheduling and retries", () => {
     expect(vi.mocked(submitTx).mock.calls[0]![1].race).toBe(true);
   });
 
+  it("unions an explicit ordinary offense target and inert-fills it after allowlist withdrawal", async () => {
+    const now = epochStart(15) + 100n;
+    testState.lastEpochPaid = 15n;
+    testState.candidateIds = [];
+    testState.liveTargets = [{
+      id: 99n,
+      owner: "0x9999999999999999999999999999999999999999",
+    }];
+    testState.targetStatuses = [{
+      tokenId: "99",
+      owner: "0x9999999999999999999999999999999999999999",
+      lastEpochPaid: "1",
+      delinquent: true,
+      epochsBehind: 14,
+      auditable: false,
+      auditDueTimestamp: (now - 1n).toString(),
+      killable: true,
+    }];
+    configure({
+      enabled: false,
+      proactivePay: false,
+      offenseEnabled: true,
+      autoAudit: false,
+      autoKill: true,
+      offenseTargetTokenIds: ["99"],
+    });
+
+    await startAt(now);
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xKILL"]);
+    expect(vi.mocked(filterLiveTokenIds).mock.calls.at(-1)?.[1]).toEqual(
+      expect.arrayContaining([99n]),
+    );
+
+    runtime.strategy = { ...runtime.strategy, offenseTargetTokenIds: ["100"] };
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xKILL",
+      "0x",
+    ]);
+    expect(vi.mocked(submitTx).mock.calls[1]![1].replacement?.nonce).toBe(0);
+  });
+
   it("never attacks a stale-negative candidate whose authoritative owner is this wallet", async () => {
     const now = epochStart(15) + 100n;
     testState.lastEpochPaid = 15n;
@@ -2957,7 +3358,7 @@ describe("defensive payment scheduling and retries", () => {
     testState.lastEpochPaid = 15n;
     testState.submitQueued = true;
     testState.flushResults = new Map([[0, { ok: true }], [1, { ok: true }]]);
-    testState.candidateIds = [99n, 100n];
+    testState.candidateIds = [];
     testState.liveTargets = [99n, 100n].map((id) => ({
       id,
       owner: "0x9999999999999999999999999999999999999999" as const,
@@ -2990,6 +3391,7 @@ describe("defensive payment scheduling and retries", () => {
       autoAudit: false,
       autoKill: true,
       preBoundaryKill: true,
+      offenseTargetTokenIds: ["99", "100"],
     });
 
     await startAt(now);
@@ -2999,6 +3401,9 @@ describe("defensive payment scheduling and retries", () => {
 
     expect(submitTx).toHaveBeenCalledTimes(1);
     expect(vi.mocked(submitTx).mock.calls[0]![1].simTimestamp).toBe(firstDue + 1n);
+    expect(vi.mocked(filterLiveTokenIds).mock.calls.at(-1)?.[1]).toEqual(
+      expect.arrayContaining([99n, 100n]),
+    );
     await vi.advanceTimersByTimeAsync(1_000);
     expect(submitTx).toHaveBeenCalledTimes(2);
     expect(vi.mocked(submitTx).mock.calls[1]![1].simTimestamp).toBe(firstDue + 2n);

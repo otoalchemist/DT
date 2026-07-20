@@ -118,7 +118,10 @@ interface PaymentFlight {
   cancelRequired: boolean;
   inertFiller: boolean;
   recoveredGap: boolean;
+  recoveredFromJournal: boolean;
   source: PaymentSource;
+  /** Exact payTaxes epoch count encoded in the semantic raw. */
+  epochs: bigint;
   /** Epoch whose tax schedule produced valueWei. */
   pricedEpoch: bigint;
   /** Target-scoped obligations carried across same-nonce replacements. */
@@ -209,6 +212,10 @@ const actionFlights = new Map<string, ActionFlight>();
 let nextActionAttemptId = 0;
 let paymentFlightAccount: Address | null = null;
 const pendingLiabilities = new Map<string, PendingLiability>();
+// Tip inclusion is not terminal. A journaled nonce remains a live liability and
+// semantic dedupe fence until its first coherent inclusion observation reaches
+// the journal's confirmation-depth threshold.
+const provisionalJournalNonces = new Set<string>();
 let committedNoncesThisTick = new Set<string>();
 let liabilitySettlementRevision = 0;
 let spendableBalanceRevision = -1;
@@ -263,6 +270,28 @@ function liabilityKey(account: Address, nonce: number): string {
   return `${account.toLowerCase()}:${nonce}`;
 }
 
+function nonceIsProvisionallyConsumed(account: Address, nonce: number): boolean {
+  return provisionalJournalNonces.has(liabilityKey(account, nonce));
+}
+
+function refreshProvisionalJournalNonces(
+  address: Address,
+  retained: readonly RetainedJournalFlight[],
+): void {
+  const prefix = `${address.toLowerCase()}:`;
+  for (const key of provisionalJournalNonces) {
+    if (key.startsWith(prefix)) provisionalJournalNonces.delete(key);
+  }
+  for (const flight of retained) {
+    if (
+      flight.wallet.toLowerCase() === address.toLowerCase()
+      && flight.observedConsumedAtBlock !== undefined
+    ) {
+      provisionalJournalNonces.add(liabilityKey(address, flight.nonce));
+    }
+  }
+}
+
 function publishPendingExposure(): void {
   const account = runtime.account?.address.toLowerCase();
   const total = account === undefined
@@ -294,6 +323,7 @@ function restorePendingLiability(previous: PendingLiability | undefined, account
 }
 
 function settlePendingLiability(account: Address, nonce: number, terminalBlock?: bigint): boolean {
+  if (nonceIsProvisionallyConsumed(account, nonce)) return false;
   const deleted = pendingLiabilities.delete(liabilityKey(account, nonce));
   if (deleted) {
     // Terminal nonce evidence may be newer than the balance snapshot used by
@@ -543,23 +573,90 @@ function jitCampaignIsArmed(): boolean {
 }
 
 function paymentAutomationAuthorized(
-  tokenId: string,
-  pricedEpoch?: bigint,
-  explicitTargetEpoch?: number | null,
+  flight: PaymentFlight,
+  observedLastEpochPaid: bigint | null,
+  auditDueTimestamp: bigint | null,
+  bribeBalance: bigint | null,
+  nowSec: bigint,
 ): boolean {
-  const inferredTarget = explicitTargetEpoch ?? (
-    pricedEpoch !== undefined && pricedEpoch > 0n ? Number(pricedEpoch) : null
+  if (runtime.gameState !== 1) return false;
+  const strategy = runtime.strategy;
+  const inferredJitTarget = flight.jitTargetEpoch ?? (
+    // Cold journal recovery predates target-scoped in-memory fields. Only those
+    // flights may infer a JIT target from their value-derived priced epoch.
+    flight.recoveredFromJournal && flight.pricedEpoch > 0n
+      ? Number(flight.pricedEpoch)
+      : null
   );
-  return runtime.strategy.defenseEnabled || (
+  const jitAuthorized = (
     jitCampaignIsArmed()
-    && runtime.jitCampaign.tokenIds.includes(tokenId)
+    && runtime.jitCampaign.tokenIds.includes(flight.tokenId)
     && runtime.jitCampaign.targetEpoch !== null
-    && inferredTarget === runtime.jitCampaign.targetEpoch
+    && inferredJitTarget === runtime.jitCampaign.targetEpoch
+    && flight.epochs === 1n
+    && (
+      flight.jitCampaignRevision === null
+      || flight.jitCampaignRevision === runtime.jitCampaign.revision
+    )
     && (
       runtime.currentEpoch === null
       || runtime.currentEpoch <= BigInt(runtime.jitCampaign.targetEpoch)
     )
   );
+
+  const coldRecovered = flight.recoveredFromJournal;
+  if (coldRecovered) {
+    if (jitAuthorized) return true;
+    if (
+      !strategy.defenseEnabled
+      || observedLastEpochPaid === null
+      || auditDueTimestamp === null
+      || bribeBalance === null
+      || runtime.currentEpoch === null
+    ) return false;
+    const configuredEpochs = BigInt(cappedAutoPayEpochs(
+      strategy.prepayEpochs,
+      strategy.maxAutoPayEpochs,
+    ));
+    if (flight.pricedEpoch > runtime.currentEpoch) {
+      return strategy.proactivePay
+        && strategy.preBoundaryPay
+        && flight.epochs === 1n
+        && flight.pricedEpoch === runtime.currentEpoch + 1n
+        && observedLastEpochPaid + 2n <= flight.pricedEpoch;
+    }
+    const auditedPaymentDue = auditDueTimestamp !== 0n
+      && Number(auditDueTimestamp - nowSec) <= strategy.auditSafetyBufferSeconds
+      && !(strategy.autoUseBribe && bribeBalance > 0n);
+    const proactivePaymentDue = strategy.proactivePay
+      && auditDueTimestamp === 0n
+      && isAuditable(observedLastEpochPaid, runtime.currentEpoch);
+    return flight.pricedEpoch === runtime.currentEpoch
+      && flight.epochs === configuredEpochs
+      && (auditedPaymentDue || proactivePaymentDue);
+  }
+
+  const proactiveEpoch = flight.proactiveEpoch ?? (
+    flight.source === "pre-boundary" ? flight.pricedEpoch : null
+  );
+  const carriesProactiveAuthority = flight.source === "proactive"
+    || flight.source === "pre-boundary"
+    || flight.proactiveEpoch !== null;
+  const stillBeforeProactiveBoundary = proactiveEpoch !== null && (
+    runtime.currentEpoch === null
+      ? flight.source === "pre-boundary"
+      : runtime.currentEpoch < proactiveEpoch
+  );
+  const proactiveAuthorized = carriesProactiveAuthority
+    && strategy.defenseEnabled
+    && strategy.proactivePay
+    && (!stillBeforeProactiveBoundary || strategy.preBoundaryPay);
+
+  // Audit-triggered defense is an independent authority. Same-nonce
+  // replacements can carry more than one obligation, so any still-current
+  // source keeps the lineage live; withdrawing every source triggers cleanup.
+  const auditDefenseAuthorized = flight.source === "defense" && strategy.defenseEnabled;
+  return jitAuthorized || proactiveAuthorized || auditDefenseAuthorized;
 }
 
 // JIT one-shot bookkeeping: tokenIds confirmed for one exact campaign revision.
@@ -617,7 +714,7 @@ function recoveredOffensePolicyAuthorized(
   kind: "audit" | "kill",
   targetTokenId: string,
   notBeforeTimestamp: bigint | null,
-  citizenSupply: bigint,
+  citizenSupply: bigint | null,
 ): boolean {
   const strategy = runtime.strategy;
   if (
@@ -626,7 +723,10 @@ function recoveredOffensePolicyAuthorized(
   ) return false;
   if (
     strategy.endgameOnlyWithin !== null
-    && citizenSupply - WINNERS > BigInt(strategy.endgameOnlyWithin)
+    && (
+      citizenSupply === null
+      || citizenSupply - WINNERS > BigInt(strategy.endgameOnlyWithin)
+    )
   ) return false;
   if (notBeforeTimestamp !== null) {
     if (kind === "audit" && !strategy.preBoundaryAudit) return false;
@@ -643,6 +743,24 @@ function recoveredOffensePolicyAuthorized(
     && !jitCampaignIsArmed()
   ) return false;
   return true;
+}
+
+function includeExplicitOffenseCandidates(
+  indexed: readonly bigint[],
+  explicit: readonly string[],
+): bigint[] {
+  const byId = new Map(indexed.map((tokenId) => [tokenId.toString(), tokenId]));
+  for (const tokenId of explicit) {
+    const parsed = BigInt(tokenId);
+    byId.set(parsed.toString(), parsed);
+  }
+  return [...byId.values()];
+}
+
+function explicitOffenseTargetSet(explicit: readonly string[]): Set<string> | null {
+  return explicit.length === 0
+    ? null
+    : new Set(explicit.map((tokenId) => BigInt(tokenId).toString()));
 }
 
 function createRecoveryFlightAuthorizer(address: Address) {
@@ -866,6 +984,7 @@ function createRecoveryFlightAuthorizer(address: Address) {
     }, blockNumber, blockTimestamp, fresh.currentEpoch, {
       citizensAddress: fresh.citizensAddress,
       startTime: fresh.startTime,
+      citizenSupply: fresh.citizenSupply,
       propagateRpcError: true,
     });
     return assessment === "live";
@@ -879,6 +998,7 @@ function restoreJournalFlights(
   retained: readonly RetainedJournalFlight[],
   currentBlock?: bigint,
 ): void {
+  refreshProvisionalJournalNonces(address, retained);
   const normalized = address.toLowerCase();
   const byNonce = new Map<number, RetainedJournalFlight[]>();
   const uuidNonces = new Map<string, Set<number>>();
@@ -900,7 +1020,11 @@ function restoreJournalFlights(
       (a, b) => b.updatedAtMs - a.updatedAtMs || b.createdAtMs - a.createdAtMs,
     );
     const latest = newestFirst[0]!;
-    const retryImmediately = [...byNonce.keys()].some((higherNonce) => higherNonce > nonce)
+    const provisionallyConsumed = lineage.some(
+      (flight) => flight.observedConsumedAtBlock !== undefined,
+    );
+    const retryImmediately = !provisionallyConsumed
+      && [...byNonce.keys()].some((higherNonce) => higherNonce > nonce)
       && lineage.some((flight) => {
         const rejectedGap = flight.state === "ambiguous"
           && flight.attempts.length > 0
@@ -976,7 +1100,7 @@ function restoreJournalFlights(
         ),
         retryImmediately,
         submittedAtMs: latest.updatedAtMs,
-        delivery: "submitted" as const,
+        delivery: provisionallyConsumed ? "included" as const : "submitted" as const,
       };
       const args = decoded.args ?? [];
       if (decoded.functionName === "payTaxes") {
@@ -998,6 +1122,10 @@ function restoreJournalFlights(
           current.cancelRequired = current.cancelRequired || durableGapFiller;
           current.inertFiller = current.inertFiller || durableGapFiller;
           current.recoveredGap = current.recoveredGap || retryImmediately || durableGapFiller;
+          // The hash-bound journal is the sole finality authority. Its latest
+          // retained state must also undo a receipt-derived `included` marker
+          // after a canonical nonce regression.
+          current.delivery = common.delivery;
           if (latest.updatedAtMs >= current.submittedAtMs) {
             current.valueWei = common.valueWei;
             current.gasWei = common.gasWei;
@@ -1006,7 +1134,6 @@ function restoreJournalFlights(
             current.txHash = common.txHash;
             current.lineageId = common.lineageId;
             current.submittedAtMs = common.submittedAtMs;
-            current.delivery = common.delivery;
           }
           continue;
         }
@@ -1023,7 +1150,9 @@ function restoreJournalFlights(
           cancelRequired: durableGapFiller,
           inertFiller: durableGapFiller,
           recoveredGap: retryImmediately || durableGapFiller,
+          recoveredFromJournal: true,
           source: "defense",
+          epochs,
           pricedEpoch: inferredPricedEpoch,
           jitTargetEpoch: null,
           jitCampaignRevision: null,
@@ -1072,6 +1201,7 @@ function restoreJournalFlights(
         );
         currentAction.obsolete = currentAction.obsolete || durableGapFiller;
         currentAction.inertFiller = currentAction.inertFiller || durableGapFiller;
+        currentAction.delivery = common.delivery;
         if (notBeforeTimestamp !== null) {
           currentAction.notBeforeTimestamp ??= notBeforeTimestamp;
           currentAction.urgency = "boundary";
@@ -1084,7 +1214,6 @@ function restoreJournalFlights(
           currentAction.txHash = common.txHash;
           currentAction.lineageId = common.lineageId;
           currentAction.submittedAtMs = common.submittedAtMs;
-          currentAction.delivery = common.delivery;
         }
         continue;
       }
@@ -1116,16 +1245,79 @@ async function applyJournalTerminals(
   reconciliation: JournalReconciliationResult,
 ): Promise<void> {
   const retainedNonces = new Set(reconciliation.retained.map((flight) => flight.nonce));
+  const provisionalFlights = reconciliation.provisional ?? reconciliation.retained.filter(
+    (flight) => flight.observedConsumedAtBlock !== undefined,
+  );
+  for (const flight of provisionalFlights) {
+    if (flight.wallet.toLowerCase() === address.toLowerCase()) {
+      provisionalJournalNonces.add(liabilityKey(address, flight.nonce));
+    }
+  }
+  const provisionalNonces = new Set(provisionalFlights.map((flight) => flight.nonce));
   const terminal = [...reconciliation.consumed, ...reconciliation.expired];
   const terminalNonces = new Set(terminal.map((flight) => flight.nonce));
+  const consumedNonces = new Set(reconciliation.consumed.map((flight) => flight.nonce));
   const getReceipt = (publicClient as unknown as {
     getTransactionReceipt?: (args: { hash: Hex }) => Promise<PricedReceipt>;
   }).getTransactionReceipt;
 
+  // Journal finality owns deletion, but semantic bookkeeping still needs the
+  // coherent post-transaction state before that deletion. In particular, a
+  // one-epoch JIT payment can start several epochs behind; merely observing that
+  // the Citizen is still behind the current epoch cannot tell a later JIT pass
+  // whether this exact one-epoch obligation succeeded. Snapshot the covered
+  // marker at the journal's terminal block while the in-memory flight still has
+  // its signing-time baseline. A failed/unknown call does not invent coverage.
+  const terminalPaymentFlights = [...paymentFlights.values()].filter((flight) =>
+    flight.account.toLowerCase() === address.toLowerCase()
+    && consumedNonces.has(flight.nonce)
+    && !retainedNonces.has(flight.nonce)
+    && !provisionalNonces.has(flight.nonce)
+  );
+  if (terminalPaymentFlights.length > 0) {
+    try {
+      const results = await publicClient.multicall({
+        allowFailure: true,
+        contracts: terminalPaymentFlights.map((flight) => ({
+          ...gameContract,
+          functionName: "lastEpochPaid" as const,
+          args: [BigInt(flight.tokenId)] as const,
+        })),
+        blockNumber: reconciliation.currentBlock,
+      });
+      for (let i = 0; i < terminalPaymentFlights.length; i++) {
+        const snapshot = terminalPaymentFlights[i]!;
+        const current = paymentFlights.get(snapshot.tokenId);
+        const result = results[i];
+        if (
+          !current
+          || current.attemptId !== snapshot.attemptId
+          || result?.status !== "success"
+        ) continue;
+        const observed = result.result as bigint;
+        if (
+          observed >= current.expectedLastEpochPaid
+          || (
+            current.recoveredGap
+            && current.pricedEpoch > 0n
+            && observed >= current.pricedEpoch
+          )
+        ) {
+          markPaymentObligationCovered(current);
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        "terminal payment coverage snapshot failed:",
+        (err as Error).message,
+      );
+    }
+  }
+
   for (const nonce of terminalNonces) {
     // A replacement lineage may contain an expired private alternative alongside
     // a retained public one. The nonce remains live until every route is terminal.
-    if (retainedNonces.has(nonce)) continue;
+    if (retainedNonces.has(nonce) || provisionalNonces.has(nonce)) continue;
     const key = liabilityKey(address, nonce);
     const liability = pendingLiabilities.get(key);
     const consumed = reconciliation.consumed.filter((flight) => flight.nonce === nonce);
@@ -1150,7 +1342,7 @@ async function applyJournalTerminals(
     if (!accounted) settlePendingLiability(address, nonce, reconciliation.currentBlock);
     for (const [tokenId, flight] of paymentFlights) {
       if (flight.account.toLowerCase() !== address.toLowerCase() || flight.nonce !== nonce) continue;
-      clearSourceMarker(flight);
+      if (!flight.obligationCovered) clearSourceMarker(flight);
       paymentFlights.delete(tokenId);
     }
     for (const [actionKey, flight] of actionFlights) {
@@ -1246,6 +1438,7 @@ export function resetPaymentTracking(): void {
   paymentFlights.clear();
   actionFlights.clear();
   pendingLiabilities.clear();
+  provisionalJournalNonces.clear();
   committedNoncesThisTick = new Set();
   survivalOffenseFenceUntilMs = 0;
   nextPaymentAttemptId = 0;
@@ -1375,6 +1568,38 @@ function selectedOwnedJitTokenIds(
     const owned = ownedById.get(BigInt(id).toString());
     return owned === undefined ? [] : [owned];
   });
+}
+
+async function mergeAuthoritativeJitOwnership(
+  citizensAddress: Address,
+  address: Address,
+  ownedIds: readonly bigint[],
+  configured: readonly string[],
+): Promise<bigint[]> {
+  const tokenIds = [...new Set(configured)].flatMap((tokenId) =>
+    /^\d+$/.test(tokenId) ? [BigInt(tokenId)] : []);
+  if (tokenIds.length === 0) return [...ownedIds];
+  const results = await publicClient.multicall({
+    allowFailure: true,
+    contracts: tokenIds.map((tokenId) => ({
+      address: citizensAddress,
+      abi: citizensAbi,
+      functionName: "ownerOf" as const,
+      args: [tokenId] as const,
+    })),
+  });
+  if (results.some((result) => result.status !== "success")) {
+    throw new Error("configured JIT ownership could not be verified; campaign remains armed");
+  }
+  const byId = new Map(ownedIds.map((tokenId) => [tokenId.toString(), tokenId]));
+  for (let i = 0; i < tokenIds.length; i++) {
+    if ((results[i]!.result as Address).toLowerCase() === address.toLowerCase()) {
+      byId.set(tokenIds[i]!.toString(), tokenIds[i]!);
+    } else {
+      byId.delete(tokenIds[i]!.toString());
+    }
+  }
+  return [...byId.values()];
 }
 
 /** Pick the next future epoch that needs a pre-boundary payment. In addition to
@@ -1566,11 +1791,19 @@ async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineG
       ...indexedOwnedIds,
       ...(includeJit ? plan.jitTokenIds.map((tokenId) => BigInt(tokenId)) : []),
     ];
-    const ownedIds = await filterOwnedTokenIds(
+    let ownedIds = await filterOwnedTokenIds(
       fresh.citizensAddress,
       ownershipCandidates,
       address,
     );
+    if (includeJit) {
+      ownedIds = await mergeAuthoritativeJitOwnership(
+        fresh.citizensAddress,
+        address,
+        ownedIds,
+        plan.jitTokenIds,
+      );
+    }
     await reconcileSubmissionTerminals(address);
     // A receipt watcher can miss a revert or another wallet transaction can
     // consume the nonce. Reconcile those terminal flights before dedupe so a stale
@@ -1597,7 +1830,13 @@ async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineG
     const candidates: BoundaryPaymentCandidate[] = [];
     for (let i = 0; i < selected.length; i++) {
       const r = results[i];
-      if (r?.status !== "success") continue;
+      if (r?.status !== "success") {
+        // Unknown survival work must fence lower-priority offense until the
+        // boundary passes; otherwise offense can consume the nonce a payment
+        // still needed but could not safely discover.
+        markPaymentWorkUnsafe();
+        continue;
+      }
       const lastEpochPaid = r.result as bigint;
       const key = selected[i]!.toString();
       const jitDue = includeJit && jit.has(key) && lastEpochPaid < targetEpoch;
@@ -1648,6 +1887,7 @@ async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineG
           : []);
     await submitBoundaryPaymentBatch(finalCandidates, targetEpoch, boundaryTs);
   } catch (err) {
+    markPaymentWorkUnsafe();
     logger.error("pre-boundary pay error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
   } finally {
@@ -1785,11 +2025,14 @@ async function firePreBoundaryAudit(
       address,
     );
 
-    const candidateIds = await fetchCandidateTokenIds(fresh.citizensAddress);
+    const candidateIds = includeExplicitOffenseCandidates(
+      await fetchCandidateTokenIds(fresh.citizensAddress),
+      s.offenseTargetTokenIds,
+    );
     const liveRaw = await filterLiveTokenIds(fresh.citizensAddress, candidateIds);
     const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
     const owned = new Set(ownedIds.map((x) => x.toString()));
-    const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+    const pinned = explicitOffenseTargetSet(s.offenseTargetTokenIds);
     // Auditable AT the target epoch, not already under audit.
     const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
     let idx = 0;
@@ -1886,11 +2129,14 @@ async function firePreBoundaryKill(
     const citizensAddress = runtime.citizensAddress as Address;
     const indexedOwnedIds = await fetchOwnedTokenIds(citizensAddress, address);
     const ownedIds = await filterOwnedTokenIds(citizensAddress, indexedOwnedIds, address);
-    const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
+    const candidateIds = includeExplicitOffenseCandidates(
+      await fetchCandidateTokenIds(runtime.citizensAddress as Address),
+      s.offenseTargetTokenIds,
+    );
     const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
     const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
     const owned = new Set(ownedIds.map((x) => x.toString()));
-    const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+    const pinned = explicitOffenseTargetSet(s.offenseTargetTokenIds);
     const statuses = await batchGetTargetStatuses(live, runtime.currentEpoch ?? 0n, nowSec);
     const imminent = statuses.flatMap((t) => {
       if (t.owner.toLowerCase() === address.toLowerCase()) return [];
@@ -2246,31 +2492,6 @@ function accountForReceipt(liability: PendingLiability, receipt: PricedReceipt):
   runtime.recordConfirmedSpend(transferredValue + actualGasWei);
 }
 
-/** Resolve a terminal payment discovered by chain-state reconciliation. A cold
- * restart has no receipt watcher, so query the known hash once; confirmed nonce
- * consumption still clears pending exposure if the receipt RPC is unavailable. */
-async function settleTerminalFlightLiability(
-  flight: ReplacementFlight,
-  terminalBlock?: bigint,
-): Promise<void> {
-  const liability = pendingLiabilities.get(liabilityKey(flight.account, flight.nonce));
-  if (!liability) return;
-  const getReceipt = (publicClient as unknown as {
-    getTransactionReceipt?: (args: { hash: Hex }) => Promise<PricedReceipt>;
-  }).getTransactionReceipt;
-  if (flight.txHash && getReceipt) {
-    try {
-      const receipt = await getReceipt.call(publicClient, { hash: flight.txHash });
-      accountForReceipt(liability, receipt);
-      return;
-    } catch {
-      // The confirmed nonce/state is authoritative even if this provider pruned
-      // the receipt; clear exposure below without inventing confirmed gas spend.
-    }
-  }
-  settlePendingLiability(flight.account, flight.nonce, terminalBlock);
-}
-
 /**
  * Poll for a submitted tx's receipt and flip its activity entry from "submitted"
  * to "included" (mined OK) or "reverted" (mined but failed). Fire-and-forget:
@@ -2296,7 +2517,12 @@ async function trackReceipt(
         targetBlock: block,
       });
     }
-    accountForReceipt(liability, receipt as PricedReceipt);
+    // A tip receipt is provisional evidence, not terminal authority. Preserve
+    // the nonce's maximum liability and every same-nonce semantic alternative
+    // until durable journal reconciliation reaches confirmation depth.
+    if (pendingLiabilities.has(liabilityKey(liability.account, liability.nonce))) {
+      provisionalJournalNonces.add(liabilityKey(liability.account, liability.nonce));
+    }
     if (receiptFlight) {
       const current = paymentFlights.get(receiptFlight.tokenId);
       // Every alternative signed with this nonce is terminal once any one of
@@ -2307,12 +2533,7 @@ async function trackReceipt(
         && current.account === receiptFlight.account
         && current.nonce === receiptFlight.nonce
       ) {
-        if (receipt.status === "success") {
-          current.delivery = "included";
-        } else {
-          clearSourceMarker(current);
-          paymentFlights.delete(receiptFlight.tokenId);
-        }
+        current.delivery = "included";
       }
     }
     if (receiptActionFlight) {
@@ -2322,7 +2543,7 @@ async function trackReceipt(
         && current.account.toLowerCase() === receiptActionFlight.account.toLowerCase()
         && current.nonce === receiptActionFlight.nonce
       ) {
-        actionFlights.delete(receiptActionFlight.key);
+        current.delivery = "included";
       }
     }
   } catch (err) {
@@ -2335,6 +2556,7 @@ interface PaymentActContext {
   startingLastEpochPaid: bigint | null;
   expectedLastEpochPaid: bigint;
   source: PaymentSource;
+  epochs?: bigint;
   pricedEpoch: bigint;
   replace?: PaymentFlight;
   jitTargetEpoch?: number;
@@ -2422,18 +2644,11 @@ function markPaymentObligationCovered(flight: PaymentFlight): void {
 function pendingPaymentFor(tokenId: string, observedLastEpochPaid: bigint): PaymentFlight | undefined {
   const flight = paymentFlights.get(tokenId);
   if (!flight) return undefined;
-  const observedCovered = flight.obligationCovered
-    || observedLastEpochPaid >= flight.expectedLastEpochPaid
-    || (
-      flight.recoveredGap
-      && flight.pricedEpoch > 0n
-      && observedLastEpochPaid >= flight.pricedEpoch
-    );
-  // This status read suppresses another semantic payment immediately, but only
-  // reconcilePaymentFlights pairs progress with the confirmed nonce at one
-  // explicit block and gains authority to sign an inert cancellation.
-  if (observedCovered && flight.delivery === "included") paymentFlights.delete(tokenId);
-  return flight.delivery === "included" ? undefined : flight;
+  // Even a receipt-observed inclusion remains provisional. Keep semantic dedupe
+  // and maximum exposure until the journal reports the nonce deeply consumed;
+  // a nonce regression then makes this same flight replaceable again.
+  void observedLastEpochPaid;
+  return flight;
 }
 
 /** A definitively rejected lower transaction cannot simply be forgotten once a
@@ -2446,7 +2661,8 @@ async function fillCoveredPaymentGap(flight: PaymentFlight): Promise<void> {
     !current
     || current.attemptId !== flight.attemptId
     || !current.cancelRequired
-    || current.delivery === "queued"
+    || current.delivery !== "submitted"
+    || nonceIsProvisionallyConsumed(current.account, current.nonce)
   ) return;
   if (
     current.inertFiller
@@ -2474,16 +2690,15 @@ async function fillCoveredPaymentGap(flight: PaymentFlight): Promise<void> {
         cancelRequired: true,
         inertFiller: true,
         recoveredGap: current.recoveredGap,
+        epochs: current.epochs,
       },
     },
   );
 }
 
-/** Reconcile payment flights at one explicit block. A receipt watcher can time
- * out, and another wallet transaction (or a reverted payment) can consume the
- * nonce without advancing lastEpochPaid. Once the confirmed nonce is beyond a
- * flight, stale tax state proves the flight is terminal and the next pass must
- * use a fresh nonce instead of replacing an impossible one forever. */
+/** Reconcile payment semantics at one explicit block. Receipt and independent
+ * nonce reads may mark likely inclusion or obligation coverage, but only the
+ * hash-bound submission journal may delete a flight or settle its liability. */
 async function reconcilePaymentFlights(
   address: Address,
   atBlockNumber: bigint | null = runtime.lastBlock,
@@ -2493,10 +2708,13 @@ async function reconcilePaymentFlights(
   const blockNumber = atBlockNumber;
   try {
     const citizensAddress = runtime.citizensAddress as Address | null;
-    const [confirmedNonce, results, auditResults, owners] = await Promise.all([
+    const [confirmedNonce, block, results, auditResults, bribeResults, owners] = await Promise.all([
       blockNumber === null
         ? publicClient.getTransactionCount({ address, blockTag: "latest" })
         : publicClient.getTransactionCount({ address, blockNumber }),
+      blockNumber === null
+        ? publicClient.getBlock({ blockTag: "latest" })
+        : publicClient.getBlock({ blockNumber }),
       publicClient.multicall({
         allowFailure: true,
         contracts: flights.map((flight) => ({
@@ -2511,6 +2729,15 @@ async function reconcilePaymentFlights(
         contracts: flights.map((flight) => ({
           ...gameContract,
           functionName: "auditDueTimestamp" as const,
+          args: [BigInt(flight.tokenId)] as const,
+        })),
+        ...(blockNumber === null ? {} : { blockNumber }),
+      }),
+      publicClient.multicall({
+        allowFailure: true,
+        contracts: flights.map((flight) => ({
+          ...gameContract,
+          functionName: "bribeBalance" as const,
           args: [BigInt(flight.tokenId)] as const,
         })),
         ...(blockNumber === null ? {} : { blockNumber }),
@@ -2532,6 +2759,13 @@ async function reconcilePaymentFlights(
       const snapshot = flights[i]!;
       const current = paymentFlights.get(snapshot.tokenId);
       if (!current || current.attemptId !== snapshot.attemptId) continue;
+      if (confirmedNonce > current.nonce) {
+        // This independently sampled nonce can identify likely inclusion, but it
+        // cannot prove canonical continuity. Keep exposure and semantic identity
+        // until applyJournalTerminals receives the hash-bound journal verdict.
+        current.delivery = "included";
+        continue;
+      }
       const result = results[i];
       const observed = result?.status === "success" ? result.result as bigint : null;
       let obligationCovered = current.obligationCovered;
@@ -2585,25 +2819,24 @@ async function reconcilePaymentFlights(
       const owner = owners[i];
       const ownerProvesTransfer = owner?.status === "success"
         && (owner.result as Address).toLowerCase() !== current.account.toLowerCase();
+      const auditResult = auditResults[i];
+      const auditDueTimestamp = auditResult?.status === "success"
+        ? auditResult.result as bigint
+        : null;
+      const bribeResult = bribeResults[i];
+      const bribeBalance = bribeResult?.status === "success"
+        ? bribeResult.result as bigint
+        : null;
       const scopeDisabled = !paymentAutomationAuthorized(
-        current.tokenId,
-        current.pricedEpoch,
-        current.jitTargetEpoch,
+        current,
+        observed,
+        auditDueTimestamp,
+        bribeBalance,
+        (block as { timestamp?: bigint }).timestamp
+          ?? BigInt(Math.floor(Date.now() / 1000)),
       );
       if (ownerProvesTransfer || scopeDisabled) current.cancelRequired = true;
-      if (confirmedNonce > current.nonce) {
-        await settleTerminalFlightLiability(current, blockNumber ?? undefined);
-        if (!obligationCovered) clearSourceMarker(current);
-        paymentFlights.delete(current.tokenId);
-        if (!obligationCovered) {
-          activity.add({
-            kind: "info",
-            status: "info",
-            tokenId: current.tokenId,
-            message: `Payment nonce ${current.nonce} was consumed without advancing #${current.tokenId}; retrying with fresh chain state`,
-          });
-        }
-      } else if (current.cancelRequired) {
+      if (current.cancelRequired) {
         await fillCoveredPaymentGap(current);
       }
     }
@@ -2619,6 +2852,7 @@ type ActionAssessment = "live" | "obsolete" | "unknown";
 interface ActionAssessmentContext {
   citizensAddress?: Address | null;
   startTime?: bigint | null;
+  citizenSupply?: bigint | null;
   propagateRpcError?: boolean;
 }
 
@@ -2641,14 +2875,24 @@ async function looseMulticall(
   return multicall({ allowFailure: true, contracts, blockNumber });
 }
 
-function actionAutomationAuthorized(flight: ActionFlight): boolean {
+function actionAutomationAuthorized(
+  flight: ActionFlight,
+  citizenSupply: bigint | null,
+): boolean {
   if (flight.kind === "use-bribe") {
     return runtime.strategy.defenseEnabled && runtime.strategy.autoUseBribe;
   }
-  if (flight.kind === "audit") {
-    return runtime.strategy.offenseEnabled && runtime.strategy.autoAudit;
-  }
-  return runtime.strategy.offenseEnabled && runtime.strategy.autoKill;
+  const actionEnabled = runtime.strategy.offenseEnabled && (
+    flight.kind === "audit" ? runtime.strategy.autoAudit : runtime.strategy.autoKill
+  );
+  return actionEnabled
+    && flight.targetTokenId !== undefined
+    && recoveredOffensePolicyAuthorized(
+      flight.kind,
+      flight.targetTokenId,
+      flight.notBeforeTimestamp,
+      citizenSupply,
+    );
 }
 
 async function assessActionFlight(
@@ -2659,7 +2903,10 @@ async function assessActionFlight(
   context: ActionAssessmentContext = {},
 ): Promise<ActionAssessment> {
   if (flight.obsolete || flight.inertFiller) return "obsolete";
-  if (!actionAutomationAuthorized(flight)) return "obsolete";
+  const citizenSupply = context.citizenSupply === undefined
+    ? runtime.citizenSupply
+    : context.citizenSupply;
+  if (!actionAutomationAuthorized(flight, citizenSupply)) return "obsolete";
   const citizensAddress = context.citizensAddress === undefined
     ? runtime.citizensAddress as Address | null
     : context.citizensAddress;
@@ -2784,7 +3031,8 @@ async function fillObsoleteAction(flight: ActionFlight): Promise<boolean> {
     !current
     || current.attemptId !== flight.attemptId
     || !current.obsolete
-    || current.delivery === "queued"
+    || current.delivery !== "submitted"
+    || nonceIsProvisionallyConsumed(current.account, current.nonce)
   ) return Boolean(current?.inertFiller);
   if (
     current.inertFiller
@@ -2861,8 +3109,8 @@ async function reconcileActionFlights(
       const current = actionFlights.get(snapshot.key);
       if (!current || current.attemptId !== snapshot.attemptId) continue;
       if (confirmedNonce > current.nonce) {
-        await settleTerminalFlightLiability(current, blockNumber);
-        actionFlights.delete(current.key);
+        // Journal ancestry, not this number-only account read, owns finality.
+        current.delivery = "included";
         continue;
       }
       if (blockTimestamp === undefined) continue;
@@ -2893,7 +3141,8 @@ function actionUrgencyRank(urgency: ActionUrgency): number {
 }
 
 function actionReplacementDue(flight: ActionFlight, requestedUrgency: ActionUrgency): boolean {
-  if (flight.delivery === "queued") return false;
+  if (nonceIsProvisionallyConsumed(flight.account, flight.nonce)) return false;
+  if (flight.delivery !== "submitted") return false;
   if (flight.retryImmediately) return true;
   if (actionUrgencyRank(requestedUrgency) > actionUrgencyRank(flight.urgency)) return true;
   return Date.now() - flight.submittedAtMs >= ACTION_REPLACEMENT_AFTER_MS;
@@ -2905,7 +3154,8 @@ function replacementDue(
   requiredEpoch: bigint,
   urgent: boolean,
 ): boolean {
-  if (flight.delivery === "queued") return false;
+  if (nonceIsProvisionallyConsumed(flight.account, flight.nonce)) return false;
+  if (flight.delivery !== "submitted") return false;
   if (flight.cancelRequired) return false;
   if (flight.retryImmediately) return true;
   // A stale value or tax epoch can no longer satisfy the current obligation and
@@ -3142,7 +3392,15 @@ async function act(
         recoveredGap:
           Boolean(ctx.payment.recoveredGap)
           || Boolean(previousPaymentFlight?.recoveredGap),
+        recoveredFromJournal: Boolean(previousPaymentFlight?.recoveredFromJournal),
         source: ctx.payment.source,
+        epochs: ctx.payment.epochs
+          ?? previousPaymentFlight?.epochs
+          ?? (
+            ctx.payment.startingLastEpochPaid !== null
+              ? ctx.payment.expectedLastEpochPaid - ctx.payment.startingLastEpochPaid
+              : 1n
+          ),
         pricedEpoch: ctx.payment.pricedEpoch,
         jitTargetEpoch: ctx.payment.jitTargetEpoch ?? previousPaymentFlight?.jitTargetEpoch ?? null,
         jitCampaignRevision:
@@ -3407,10 +3665,14 @@ function terminalizeJitCampaign(
   return true;
 }
 
-function hasUnresolvedJitCampaignFlight(
-  campaign: typeof runtime.jitCampaign,
-  target: number,
+/** Read-only cancellation hook: callers must snapshot the campaign before
+ * clearing its target/token scope, then keep the engine running while this is
+ * true so same-nonce inert cleanup can finish. */
+export function hasUnresolvedJitCampaignWork(
+  campaign: Pick<typeof runtime.jitCampaign, "revision" | "targetEpoch" | "tokenIds">,
 ): boolean {
+  const target = campaign.targetEpoch;
+  if (target === null) return false;
   const account = runtime.account?.address.toLowerCase();
   if (account === undefined) return false;
   return [...paymentFlights.values()].some((flight) =>
@@ -3428,6 +3690,47 @@ function hasUnresolvedJitCampaignFlight(
     ));
 }
 
+function maybeTerminalizeCancelledJitCleanup(): boolean {
+  const campaign = runtime.jitCampaign;
+  if (
+    campaign.state !== "cancelled"
+    || !campaign.autoStopOnCompletion
+    || hasUnresolvedJitCampaignWork(campaign)
+  ) return false;
+  const shouldStop = !runtime.strategy.defenseEnabled && !runtime.strategy.offenseEnabled;
+  const message = "Cancelled JIT cleanup is terminal";
+  try {
+    // Relinquish the persisted cleanup ownership immediately. If continuous
+    // strategies are active now, a later operator change must not unexpectedly
+    // stop their independently-owned engine.
+    runtime.saveJitCampaign({
+      state: "cancelled",
+      targetEpoch: null,
+      tokenIds: [],
+      autoStopOnCompletion: false,
+      message,
+      completedAt: Date.now(),
+    });
+  } catch (err) {
+    if (!(err instanceof AtomicWriteCommittedError)) throw err;
+    stopEngine();
+    activity.add({
+      kind: "error",
+      status: "skipped",
+      message: `JIT cleanup terminal state committed but durability is uncertain; engine paused: ${err.message}`,
+    });
+    logger.error("JIT cleanup terminal durability failure:", err.message);
+    throw err;
+  }
+  activity.add({
+    kind: "info",
+    status: "info",
+    message: shouldStop ? `${message}; engine stopped` : message,
+  });
+  if (shouldStop) stopEngine();
+  return shouldStop;
+}
+
 async function jitPass(
   ownedIds: bigint[],
   currentEpoch: bigint,
@@ -3442,7 +3745,7 @@ async function jitPass(
     // A stale target is terminal only after every already-authorized raw for the
     // campaign has either consumed its nonce or been inert-filled. Auto-stopping
     // sooner would discard the cancellation work and leave a live old payment.
-    if (hasUnresolvedJitCampaignFlight(campaign, target)) return;
+    if (hasUnresolvedJitCampaignWork(campaign)) return;
     terminalizeJitCampaign(
       campaign,
       "failed",
@@ -3454,7 +3757,11 @@ async function jitPass(
   prepareJitBookkeeping();
 
   const selected = selectedOwnedJitTokenIds(ownedIds, campaign.tokenIds);
-  if (selected.length === 0) return; // nothing owned yet — stay armed
+  const selectedKeys = new Set(selected.map((tokenId) => tokenId.toString()));
+  const missingTokenIds = [...new Set(campaign.tokenIds)].filter((configured) => {
+    const canonical = /^\d+$/.test(configured) ? BigInt(configured).toString() : configured;
+    return !selectedKeys.has(canonical) && !jitSubmitted.has(canonical);
+  });
 
   const statuses = await batchGetOwnedStatuses(selected, currentEpoch, nowSec, 1);
   for (const st of statuses) {
@@ -3508,7 +3815,7 @@ async function jitPass(
   }
 
   // One-shot: disarm once every selected token has been submitted/covered.
-  const unresolvedCampaignFlight = hasUnresolvedJitCampaignFlight(campaign, target);
+  const unresolvedCampaignFlight = hasUnresolvedJitCampaignWork(campaign);
   if (
     selected.every((t) => jitSubmitted.has(t.toString()))
     && !unresolvedCampaignFlight
@@ -3516,11 +3823,19 @@ async function jitPass(
     && runtime.jitCampaign.revision === campaignRevision
     && runtime.jitCampaign.targetEpoch === target
   ) {
-    terminalizeJitCampaign(
-      campaign,
-      runtime.strategy.dryRun ? "completed-dry-run" : "completed",
-      `JIT payment complete for epoch ${target}; campaign is terminal`,
-    );
+    if (missingTokenIds.length > 0) {
+      terminalizeJitCampaign(
+        campaign,
+        "failed",
+        `JIT campaign incomplete for epoch ${target}; wallet does not own configured Citizen(s): ${missingTokenIds.map((tokenId) => `#${tokenId}`).join(", ")}`,
+      );
+    } else {
+      terminalizeJitCampaign(
+        campaign,
+        runtime.strategy.dryRun ? "completed-dry-run" : "completed",
+        `JIT payment complete for epoch ${target}; campaign is terminal`,
+      );
+    }
   }
 }
 
@@ -3574,11 +3889,14 @@ async function offensePass(
     if (supply - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   }
 
-  const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
+  const candidateIds = includeExplicitOffenseCandidates(
+    await fetchCandidateTokenIds(runtime.citizensAddress as Address),
+    s.offenseTargetTokenIds,
+  );
   const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
   const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
   const owned = new Set(ownedIds.map((x) => x.toString()));
-  const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+  const pinned = explicitOffenseTargetSet(s.offenseTargetTokenIds);
 
   // Narrow to tokens we could actually act on BEFORE reading their status, then
   // fetch all their statuses in ONE multicall — a serial getTargetStatus per
@@ -3680,6 +3998,11 @@ async function tick(generation = engineGeneration): Promise<void> {
       nonceManager.sync(address, appConfig.mode),
     ]);
     await reconcileSubmissionTerminals(address);
+    // Terminal/cancellation reconciliation is valid even after the game leaves
+    // LIVE: inert same-nonce cleanup targets the wallet, not the game contract.
+    await reconcilePaymentFlights(address);
+    await reconcileActionFlights(address);
+    if (maybeTerminalizeCancelledJitCleanup()) return;
 
     if (runtime.gameState !== 1) {
       // Not LIVE — nothing to do.
@@ -3694,9 +4017,15 @@ async function tick(generation = engineGeneration): Promise<void> {
       ...indexedOwnedIds,
       ...(jitCampaignIsArmed() ? runtime.jitCampaign.tokenIds.map((tokenId) => BigInt(tokenId)) : []),
     ];
-    const ownedIds = await filterOwnedTokenIds(citizensAddress, ownershipCandidates, address);
-    await reconcilePaymentFlights(address);
-    await reconcileActionFlights(address);
+    let ownedIds = await filterOwnedTokenIds(citizensAddress, ownershipCandidates, address);
+    if (jitCampaignIsArmed()) {
+      ownedIds = await mergeAuthoritativeJitOwnership(
+        citizensAddress,
+        address,
+        ownedIds,
+        runtime.jitCampaign.tokenIds,
+      );
+    }
     await refreshSpendableBalance(address);
 
     if (runtime.strategy.defenseEnabled) {

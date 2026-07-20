@@ -7,6 +7,7 @@ import type {
   PostMortemResult,
   StrategySnapshot,
 } from "@dat-bot/shared";
+import { VERSION } from "@dat-bot/shared";
 
 export class ApiError extends Error {
   constructor(
@@ -29,6 +30,56 @@ export interface AppSettingsStatus {
   keyConfiguredByEnvironment: boolean;
 }
 
+export type BackendCompatibility =
+  | { compatible: true; backendVersion: string; status: BotStatus }
+  | { compatible: false; backendVersion: string | null; reason: string };
+
+/**
+ * `/api/status` is the bootstrap compatibility envelope. Keep this check small
+ * and independent from strategy/settings parsing so a stale dashboard never
+ * consumes a newer schema (and a newer dashboard never consumes a legacy one).
+ */
+export function inspectBackendCompatibility(payload: unknown): BackendCompatibility {
+  if (!payload || typeof payload !== "object") {
+    return {
+      compatible: false,
+      backendVersion: null,
+      reason: "The backend returned an unreadable status document.",
+    };
+  }
+
+  const status = payload as Record<string, unknown>;
+  const backendVersion = typeof status.version === "string" ? status.version : null;
+  if (backendVersion !== VERSION) {
+    return {
+      compatible: false,
+      backendVersion,
+      reason: backendVersion === null
+        ? "The backend does not expose a compatible versioned status schema."
+        : `Dashboard v${VERSION} cannot use backend v${backendVersion}.`,
+    };
+  }
+
+  const schemaCompatible = typeof status.unlocked === "boolean"
+    && typeof status.jitEnabled === "boolean"
+    && typeof status.jitRevision === "number"
+    && Array.isArray(status.jitTokenIds)
+    && status.jitTokenIds.every((tokenId) => typeof tokenId === "string")
+    && typeof status.strategyRevision === "number"
+    && typeof status.pendingExposureWei === "string"
+    && typeof status.journalHealthy === "boolean"
+    && typeof status.nftConfigured === "boolean";
+  if (!schemaCompatible) {
+    return {
+      compatible: false,
+      backendVersion,
+      reason: `Backend v${backendVersion} returned an incompatible status schema.`,
+    };
+  }
+
+  return { compatible: true, backendVersion, status: payload as BotStatus };
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -44,6 +95,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  compatibility: async () => inspectBackendCompatibility(await req<unknown>("/api/status")),
   status: () => req<BotStatus>("/api/status"),
   keystore: () => req<{ exists: boolean; address: string | null }>("/api/keystore"),
   createKeystore: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string }) =>

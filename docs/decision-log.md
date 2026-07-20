@@ -38,3 +38,13 @@ cap. Because the wallet-control API has no client authentication, bind it only t
 Ship the safety and local API changes as 0.3.0. Do not perform live financial QA automatically.
 
 Release archives are built only from a clean commit and must agree with every manifest and lockfile version. Support the Node 20, 22, and 24+ release lines accepted by the build toolchain; verify portable persistence on Windows without claiming POSIX permission bits there.
+
+## 2026-07-20 — Direct builder incentives
+
+Treat direct `block.coinbase` payments as a separate, disabled-by-default feature,
+not a synonym for raising the ordinary gas tip. The game owner checks rule out a
+wrapper for owner-scoped calls; the viable design is a trailing transaction to a
+verified stateless payer inside the same atomic private bundle. Do not ship it
+until the extra nonce/value is cohort-journaled, balance-capped, simulation-gated,
+private-only, and covered by replacement, cancellation, recovery, and reorg tests.
+See `docs/builder-incentives.md`.
