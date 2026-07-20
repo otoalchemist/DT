@@ -229,6 +229,20 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   wrong value is caught before spending gas; the normal post-boundary JIT pay still
   runs as a fallback. Off by default; enable it under *Just-in-time epoch payment →
   Payment gas*.
+- **Coinbase bid (advanced, opt-in, `mainnet` only)** — a **flat ETH payment straight
+  to the block builder** added to the pre-boundary payment bundle, to bid it to the
+  **top of the boundary block regardless of tip**. This is the lever the strongest
+  batch-auditors use: at the boundary the required `payTaxes` amount is only valid in
+  the first slots of the block, so *position is correctness* — a payment that lands
+  deep reverts. A coinbase transfer is a fixed cost independent of gas (unlike a
+  priority tip, which scales with it), so it's the capital-efficient way to buy the
+  top slot. It rides the bundle **allowed-to-revert** and is **never mirrored** to the
+  mempool, so it only ever spends when the bundle wins the slot, and a misconfigured
+  payer can't drop your payment. Set `coinbaseBidEth` (0 = off) and
+  `coinbasePayerAddress` under *Just-in-time epoch payment → Coinbase bid*. Requires a
+  one-time deploy of **`contracts/CoinbasePayer.sol`** (a tiny forwarder whose
+  `receive()` sends to `block.coinbase`) — deploy it once (e.g. in Remix), then paste
+  its address into the config. **Off by default.**
 - **Atomic multi-tx bundles (`mainnet` mode, automatic)** — every Citizen you hold
   is owned by the same wallet, so paying/auditing several in one cycle produces
   multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only

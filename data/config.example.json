@@ -80,5 +80,7 @@
   "racePublicMempool": true,
   "dynamicTipEnabled": true,
   "dynamicTipMaxGwei": 50.1,
+  "coinbaseBidEth": 0,
+  "coinbasePayerAddress": "",
   "maxPaymentEth": 0
 }

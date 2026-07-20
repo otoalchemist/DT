@@ -64,6 +64,7 @@ vi.mock("./flashbots.js", () => ({
   })),
   beginBundle: vi.fn(),
   flushBundle: vi.fn(async () => new Map()),
+  queueCoinbaseBid: vi.fn(async () => false),
 }));
 
 vi.mock("./contract.js", () => ({

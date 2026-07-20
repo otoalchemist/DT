@@ -84,7 +84,7 @@ export function JitPanel({
   const [gasBusy, setGasBusy] = useState(false);
   const [gasSaved, setGasSaved] = useState(false);
   const [gasErr, setGasErr] = useState<string | null>(null);
-  const gasField = (k: keyof StrategyConfig, v: number | boolean) => {
+  const gasField = (k: keyof StrategyConfig, v: number | boolean | string) => {
     if (!config) return;
     onConfigChange({ ...config, [k]: v });
     setGasSaved(false);
@@ -103,6 +103,8 @@ export function JitPanel({
         preBoundaryLeadMs: config.preBoundaryLeadMs,
         preBoundaryLeadMainnetMs: config.preBoundaryLeadMainnetMs,
         maxAutoPayEpochs: config.maxAutoPayEpochs,
+        coinbaseBidEth: config.coinbaseBidEth,
+        coinbasePayerAddress: config.coinbasePayerAddress,
       });
       onConfigChange(next);
       setGasSaved(true);
@@ -287,6 +289,42 @@ export function JitPanel({
               is free and gives builders more time, hence the larger mainnet default. Keep it under 12s.
             </p>
           </div>
+
+          <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>⚠ COINBASE BID (advanced, mainnet)</div>
+            <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5 }}>
+              A <b>flat payment straight to the block builder</b> added to the pre-boundary payment bundle,
+              to bid it to the <b>top of the boundary block</b> — independent of tip. This is the lever
+              sophisticated batch-auditors use to guarantee position. <b>Default 0 (off).</b> It only spends
+              if the bundle wins the slot (it rides the bundle, allowed-to-revert), and never mirrors to the
+              mempool. Requires a one-time deploy of <code>contracts/CoinbasePayer.sol</code> — paste its
+              address below.
+            </p>
+            <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
+              <label className="field" style={{ flex: "1 1 130px" }}>
+                Coinbase bid (ETH, 0 = off)
+                <input
+                  type="number" min={0} step={0.001}
+                  value={config.coinbaseBidEth}
+                  onChange={(e) => gasField("coinbaseBidEth", Math.max(0, Number(e.target.value) || 0))}
+                />
+              </label>
+              <label className="field" style={{ flex: "2 1 260px" }}>
+                CoinbasePayer address
+                <input
+                  type="text" placeholder="0x… (deploy CoinbasePayer.sol)"
+                  value={config.coinbasePayerAddress}
+                  onChange={(e) => gasField("coinbasePayerAddress", e.target.value.trim() as never)}
+                />
+              </label>
+            </div>
+            {config.coinbaseBidEth > 0 && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
+              <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
+                Set a valid CoinbasePayer address, or the bid won't fire.
+              </p>
+            )}
+          </div>
+
           <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>
             {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment settings"}
           </button>

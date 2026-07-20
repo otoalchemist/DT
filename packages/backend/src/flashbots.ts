@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { keccak256, toHex, type Address, type Block, type Hex } from "viem";
+import { keccak256, toHex, formatEther, type Address, type Block, type Hex } from "viem";
 import {
   privateKeyToAccount,
   generatePrivateKey,
@@ -223,6 +223,10 @@ interface QueuedTx {
   signed: Hex;
   nonce: number;
   race: boolean;
+  /** Allowed to revert without invalidating the bundle (eth_sendBundle
+   *  revertingTxHashes). Used for the coinbase bid so a misconfigured payer can
+   *  never drop the payment from the bundle. */
+  revertible?: boolean;
 }
 let bundleQueue: QueuedTx[] | null = null;
 
@@ -255,6 +259,9 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   // A bundle executes its txs in the given order, so nonces must ascend.
   queue.sort((a, b) => a.nonce - b.nonce);
   const signedList = queue.map((q) => q.signed);
+  // Txs allowed to revert without invalidating the bundle (the coinbase bid), so a
+  // misconfigured payer can never drop a payment. A tx hash is keccak(signed tx).
+  const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
   const targetBlock = (await publicClient.getBlockNumber()) + 1n;
 
   // One multi-tx bundle, fanned out to every builder for the next two blocks.
@@ -262,12 +269,9 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   const bundleHashes: string[] = [];
   const attempts = appConfig.builderUrls.flatMap((url) =>
     [targetBlock, targetBlock + 1n].map(async (blk) => {
-      const r = await flashbotsRpcWithTimeout(
-        "eth_sendBundle",
-        [{ txs: signedList, blockNumber: toHex(blk) }],
-        url,
-        SEND_BUNDLE_TIMEOUT_MS,
-      );
+      const params: Record<string, unknown> = { txs: signedList, blockNumber: toHex(blk) };
+      if (revertingTxHashes.length > 0) params.revertingTxHashes = revertingTxHashes;
+      const r = await flashbotsRpcWithTimeout("eth_sendBundle", [params], url, SEND_BUNDLE_TIMEOUT_MS);
       return { url, bundleHash: r?.bundleHash as string | undefined };
     }),
   );
@@ -317,6 +321,44 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     });
   }
   return out;
+}
+
+// Enough gas for CoinbasePayer.receive(): one CALL forwarding value to coinbase.
+const COINBASE_BID_GAS = 60_000n;
+
+/**
+ * Queue a bundle-only tx that forwards `bidWei` ETH to the block's builder, to bid
+ * for top-of-block placement with a FLAT payment (independent of gas — unlike a
+ * priority tip). It sends the ETH to the user-deployed CoinbasePayer `payer`, whose
+ * receive() forwards it to `block.coinbase`, so it lands with whichever builder
+ * wins the slot. Queued into the CURRENT open bundle (mainnet only), placed after
+ * the payments, marked allowed-to-revert (a misconfigured payer can never drop a
+ * payment), and never mirrored to the mempool (coinbase is only meaningful in the
+ * winning block). Returns whether it queued.
+ */
+export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<boolean> {
+  if (bundleQueue === null || appConfig.mode !== "mainnet" || bidWei <= 0n) return false;
+  const account = runtime.account;
+  if (!account) return false;
+  try {
+    const latest = await getLatestBlockCached();
+    const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(false, latest);
+    const nonce = nonceManager.reserve();
+    const signed = await signTx(
+      account,
+      { to: payer, data: "0x", value: bidWei },
+      nonce,
+      COINBASE_BID_GAS,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+    );
+    bundleQueue.push({ signed, nonce, race: false, revertible: true });
+    logger.info(`coinbase bid queued: ${formatEther(bidWei)} ETH to builder via ${payer.slice(0, 10)}… (nonce ${nonce})`);
+    return true;
+  } catch (err) {
+    logger.warn(`coinbase bid failed to queue: ${(err as Error).message}`);
+    return false;
+  }
 }
 
 export async function submitTx(

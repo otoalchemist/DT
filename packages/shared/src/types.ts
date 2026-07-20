@@ -184,6 +184,17 @@ export interface StrategyConfig {
   /** Upper bound (gwei) the dynamic tip may scale to at a 100%-full block.
    *  Ignored when dynamicTipEnabled is false. */
   dynamicTipMaxGwei: number;
+  /** ADVANCED. Flat ETH paid directly to the block builder (a coinbase transfer)
+   *  alongside the pre-boundary payment bundle, to bid for top-of-block placement
+   *  independent of tip — the lever sophisticated batch-auditors use. `0` = off
+   *  (default). Requires `coinbasePayerAddress` set to a deployed CoinbasePayer
+   *  forwarder (see contracts/CoinbasePayer.sol). Only fires in mainnet mode when
+   *  a pre-boundary payment is queued; the bid rides the bundle (allowed-to-revert,
+   *  never mirrored), so it only spends when the bundle wins the slot. */
+  coinbaseBidEth: number;
+  /** Address of the deployed CoinbasePayer forwarder used for coinbaseBidEth. Its
+   *  receive() forwards ETH to block.coinbase. Empty = coinbase bidding disabled. */
+  coinbasePayerAddress: string;
 
   /** Hard cap (ETH) on the value of any single transaction (payments in
    *  particular). A tx whose value exceeds this is skipped, not sent — a

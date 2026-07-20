@@ -68,6 +68,8 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   racePublicMempool: true,
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,
+  coinbaseBidEth: 0, // off; flat builder payment for top-of-block, opt-in
+  coinbasePayerAddress: "",
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 

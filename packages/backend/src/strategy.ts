@@ -21,7 +21,7 @@ import {
   fetchCandidateTokenIds,
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
-import { submitTx, beginBundle, flushBundle, type TxIntent, type SubmitResult } from "./flashbots.js";
+import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, type TxIntent, type SubmitResult } from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
@@ -279,6 +279,7 @@ async function firePreBoundaryPay(): Promise<void> {
       allowFailure: true,
       contracts: selected.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
     });
+    let queuedPayment = false;
     for (let i = 0; i < selected.length; i++) {
       const r = results[i];
       if (r?.status !== "success") continue;
@@ -296,11 +297,20 @@ async function firePreBoundaryPay(): Promise<void> {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
         continue;
       }
-      await act(
+      const res = await act(
         { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
         "pay-taxes",
         { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`, race: true, simTimestamp: boundaryTs },
       );
+      if (res?.ok) queuedPayment = true;
+    }
+
+    // Optional flat builder payment (coinbase transfer) to bid this payment bundle
+    // to the top of the boundary block — the lever sophisticated batch-auditors use.
+    // Only when a payment actually queued; it rides the bundle (allowed-to-revert,
+    // never mirrored), so it only spends if the bundle wins the slot.
+    if (queuedPayment && s.coinbaseBidEth > 0 && s.coinbasePayerAddress) {
+      await queueCoinbaseBid(s.coinbasePayerAddress as Address, parseEther(String(s.coinbaseBidEth)));
     }
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
