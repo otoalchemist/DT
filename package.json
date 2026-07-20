@@ -14,7 +14,7 @@
     "dev:backend": "npm run dev -w @dat-bot/backend",
     "dev:web": "npm run dev -w @dat-bot/web",
     "dev": "npm run build:shared && concurrently -n backend,web -c blue,magenta \"npm:dev:backend\" \"npm:dev:web\"",
-    "install:launcher": "npm install --include=dev",
+    "install:launcher": "npm install --include=dev --no-save",
     "build": "npm run build:shared && npm run build -w @dat-bot/backend && npm run build -w @dat-bot/web",
     "start": "npm run build:shared && node packages/backend/dist/main.js",
     "test": "npm run build:shared && npm run typecheck -w @dat-bot/backend && npm run test -w @dat-bot/backend && npm run test -w @dat-bot/web",
