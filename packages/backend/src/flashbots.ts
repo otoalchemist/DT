@@ -259,8 +259,9 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   // A bundle executes its txs in the given order, so nonces must ascend.
   queue.sort((a, b) => a.nonce - b.nonce);
   const signedList = queue.map((q) => q.signed);
-  // Txs allowed to revert without invalidating the bundle (the coinbase bid), so a
-  // misconfigured payer can never drop a payment. A tx hash is keccak(signed tx).
+  // Txs allowed to revert without invalidating the bundle (audits riding a payment
+  // bundle, and the coinbase bid), so a defended target or misconfigured payer can
+  // never drop a mandatory payment. A tx hash is keccak(signed tx).
   const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
   const targetBlock = (await publicClient.getBlockNumber()) + 1n;
 
