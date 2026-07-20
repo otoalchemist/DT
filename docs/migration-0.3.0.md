@@ -40,21 +40,29 @@ Version 0.3.0 implements the optional combined boundary cohort, but it remains
 disabled by default. When separately enabled, at least one mandatory boundary
 payment leads the cohort and keeps public fallback; optional audits are
 revertible privately and keep an authorized public fallback; the one final
-builder incentive is revertible, private-only, finite-target, and never recovered
-as an independent public transaction. A cohort that does not fit the private
+builder incentive is revertible, private-only, on-chain bounded to its signed
+`notBeforeTimestamp`/`validThroughBlock` window, and never recovered as an
+independent public transaction. A
+cohort that does not fit the private
 count, byte, or gas limits is excluded from private delivery as a whole. This
 mechanism does not guarantee inclusion, block position, ordering, or audit
 success.
 
 Do not enable it merely to complete an upgrade. First complete the no-funded-wallet
 QA gate, run the exact compiler comparison, independently review and deploy the
-recorded `CoinbasePayer` creation bytecode,
-verify its on-chain runtime byte-for-byte and by the pinned hash, keep Dry Run on,
+recorded `CoinbasePayer` creation bytecode, wait for deployment finality, verify
+its finalized on-chain runtime byte-for-byte and by the pinned hash, keep Dry Run on,
 and require the loopback capability endpoint/dashboard to report the expected
 mainnet payer, bid, and verified capability. The operator-specific deployment,
 exact runtime verification, and switch-disable procedure are in
 [`builder-incentives.md`](builder-incentives.md). Deployment and funded
 mainnet validation are operator actions outside release/owner QA.
+
+Any payer deployed from an earlier pre-release artifact that accepted an
+empty-calldata value transfer is incompatible with this release. Do not enable it
+or attempt to recover its old bid WAL as if it had an on-chain expiry. Deploy and
+verify the currently pinned
+`payCoinbase(notBeforeTimestamp, validThroughBlock)` artifact instead.
 
 UI-saved settings now live at `<DATA_DIR>/settings.json`. When `DATA_DIR` differs from the repository default, the old settings file is copied once and retained as a migration backup.
 
@@ -70,7 +78,7 @@ also listen only on loopback. Remove LAN/public listeners, port forwarding, and
 external tunnels, and do not rewrite a non-loopback `Host` or `Origin` as a
 loopback value.
 
-Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. Treat the whole directory as secret: it can contain a plaintext dashboard-saved provider key and replayable raw signed transactions as well as wallet/reputation-key material. Treat it as exclusive to one running backend; use a distinct directory, port, and keystore for every concurrent instance. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
+Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. Treat the whole directory as secret: it can contain a plaintext dashboard-saved provider key and replayable raw signed transactions as well as wallet/reputation-key material. Treat it as exclusive to one running backend; use a distinct directory, port, and keystore for every concurrent instance. Treat the wallet signer as exclusive too: while the bot is running or its journal contains unresolved flights, do not use MetaMask, another script, or another process to submit from that wallet. Stop and lock the bot and wait for every pending flight to finalize and clear before signing elsewhere. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
 
 The local configuration API now uses revisioned, field-scoped writes. Integrations must read the current strategy or JIT revision before mutating it and handle HTTP 409 by refetching. JIT arm requests must send a future `targetEpoch` and a nonempty explicit `tokenIds` list.
 

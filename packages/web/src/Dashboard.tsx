@@ -83,9 +83,17 @@ export function Dashboard({
   const [err, setErr] = useState<string | null>(null);
   const [capabilityRefreshToken, setCapabilityRefreshToken] = useState(0);
 
-  useEffect(() => {
-    api.getConfig().then(setStrategy).catch(() => {});
+  // Mutation and refresh responses can arrive out of order across the two
+  // configuration panels. Never let an older authoritative revision regress
+  // the parent snapshot or the top-bar live-fire state.
+  const acceptStrategy = useCallback((candidate: StrategySnapshot) => {
+    setStrategy((current) =>
+      current === null || candidate.revision >= current.revision ? candidate : current);
   }, []);
+
+  useEffect(() => {
+    api.getConfig().then(acceptStrategy).catch(() => {});
+  }, [acceptStrategy]);
 
   // A strategy mutation from another client is announced on the status socket.
   // Refresh the matching config before trusting an older local snapshot.
@@ -96,9 +104,9 @@ export function Dashboard({
       || status.strategyRevision <= strategy.revision
     ) return;
     api.getConfig().then((fresh) => {
-      setStrategy((current) => current === null || fresh.revision >= current.revision ? fresh : current);
+      acceptStrategy(fresh);
     }).catch(() => {});
-  }, [status?.strategyRevision, strategy?.revision]);
+  }, [status?.strategyRevision, strategy?.revision, acceptStrategy]);
 
   const refresh = useCallback(async () => {
     try {
@@ -158,12 +166,12 @@ export function Dashboard({
     try {
       if (!strategy) throw new Error("Strategy configuration is still loading");
       const snapshot = await api.setConfig(strategy.revision, { dryRun: next });
-      setStrategy(snapshot);
+      acceptStrategy(snapshot);
     } catch (e) {
       if (e instanceof ApiError && (e.status === 409 || e.status === 503)) {
         try {
           const authoritative = await api.getConfig();
-          setStrategy(authoritative);
+          acceptStrategy(authoritative);
           setToggleErr(e.status === 409
             ? "Configuration changed elsewhere; refreshed it. Review the current mode and try again."
             : "The configuration may have been applied but durability was not confirmed; refreshed authoritative state. The engine remains paused.");
@@ -247,7 +255,7 @@ export function Dashboard({
           status={status}
           tokens={tokens}
           strategy={strategy}
-          onStrategyChange={setStrategy}
+          onStrategyChange={acceptStrategy}
           onStatusChange={pushStatus}
           capabilityRefreshToken={capabilityRefreshToken}
         />
@@ -292,7 +300,7 @@ export function Dashboard({
           {strategy && (
             <Config
               initial={strategy}
-              onChange={setStrategy}
+              onChange={acceptStrategy}
               onSettingsChange={() => setCapabilityRefreshToken((token) => token + 1)}
             />
           )}

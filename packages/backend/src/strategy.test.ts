@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { encodeFunctionData, type Hex } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
+import { decodeCoinbasePayment } from "./coinbase-payer.js";
 
 const EPOCH_SECONDS = 86_400n;
 const BASE_TAX_RATE_WEI = 690_000_000_000_000n;
@@ -41,6 +42,7 @@ const testState = vi.hoisted(() => ({
   ownerOfFailures: new Set<string>(),
   multicallFailureCalls: new Set<string>(),
   multicallRejectFunctions: new Set<string>(),
+  epochByBlock: new Map<string, bigint>(),
   receipts: new Map<Hex, Promise<{
     status: "success" | "reverted";
     blockNumber: bigint;
@@ -82,6 +84,7 @@ const testState = vi.hoisted(() => ({
         runtimeCodeHash: Hex;
       }
     | { active: false; reason: string },
+  payerRuntimeError: undefined as string | undefined,
   nextActivityId: 0,
 }));
 
@@ -104,10 +107,10 @@ vi.mock("./chain.js", () => ({
     getBalance: vi.fn(async () => testState.balanceResponses.shift() ?? testState.balanceWei),
     getBlockNumber: vi.fn(async () => 1_000n),
     getTransactionCount: vi.fn(async () => testState.confirmedNonce),
-    multicall: vi.fn(async ({ contracts }: { contracts: Array<{
+    multicall: vi.fn(async ({ contracts, blockNumber }: { contracts: Array<{
       functionName?: string;
       args?: readonly unknown[];
-    }> }) => {
+    }>; blockNumber?: bigint }) => {
       if (contracts.some((contract) =>
         contract.functionName !== undefined
         && testState.multicallRejectFunctions.has(contract.functionName))) {
@@ -139,7 +142,10 @@ vi.mock("./chain.js", () => ({
       if (contract.functionName === "currentEpoch") {
         return {
           status: "success",
-          result: currentEpochAt(BigInt(Math.floor(Date.now() / 1000))),
+          result: (blockNumber === undefined
+            ? undefined
+            : testState.epochByBlock.get(blockNumber.toString()))
+            ?? currentEpochAt(BigInt(Math.floor(Date.now() / 1000))),
         };
       }
       if (contract.functionName === "lastEpochPaid" && tokenId !== undefined) {
@@ -252,6 +258,7 @@ vi.mock("./index-tokens.js", () => ({
 vi.mock("./builder-incentive.js", () => ({
   COINBASE_PAYER_GAS: 100_000n,
   resolveBuilderIncentive: vi.fn(async () => testState.builderIncentive),
+  verifyCoinbasePayerRuntime: vi.fn(async () => testState.payerRuntimeError),
 }));
 
 vi.mock("./flashbots.js", () => ({
@@ -266,6 +273,7 @@ vi.mock("./flashbots.js", () => ({
         id: string;
         role: "mandatory" | "allowed-revert" | "builder-incentive";
       };
+      validThroughBlock?: bigint;
       replacement?: { nonce: number };
       authorize?: (quote: {
         valueWei: bigint;
@@ -335,6 +343,8 @@ vi.mock("./flashbots.js", () => ({
   flushBundle: vi.fn(async () => new Map(testState.flushResults)),
   discardBundle: vi.fn(() => new Map()),
   waitForBundleFallbacks: vi.fn(async () => {}),
+  acknowledgeFinalizedSubmissionFlights: vi.fn(),
+  annotateFinalizedSubmissionSpend: vi.fn(),
   reconcileSubmissionJournal: vi.fn(async () => ({
     confirmedNonce: 0,
     pendingNonce: 0,
@@ -438,7 +448,12 @@ vi.mock("./contract.js", () => ({
   },
 }));
 
-const { submitTx, recoverPreparedSubmissions } = await import("./flashbots.js");
+const {
+  submitTx,
+  recoverPreparedSubmissions,
+  acknowledgeFinalizedSubmissionFlights,
+  annotateFinalizedSubmissionSpend,
+} = await import("./flashbots.js");
 const { beginBundle, flushBundle, discardBundle } = await import("./flashbots.js");
 const { reconcileSubmissionJournal } = await import("./flashbots.js");
 const { nonceManager } = await import("./nonce.js");
@@ -481,7 +496,7 @@ function journalFlight(args: {
   to?: `0x${string}`;
   data: Hex;
   valueWei?: bigint;
-  state?: "prepared" | "accepted" | "rejected" | "ambiguous" | "expired";
+  state?: "prepared" | "accepted" | "rejected" | "ambiguous" | "expired" | "confirmed";
   attempts?: Array<{
     channel: "public" | "private";
     endpoint: string;
@@ -497,6 +512,19 @@ function journalFlight(args: {
   maxFeePerGas?: bigint;
   maxPriorityFeePerGas?: bigint;
   observedConsumedAtBlock?: bigint;
+  confirmedSpend?: { epoch: string; spendWei: string };
+  payment?: {
+    tokenId: string;
+    startingLastEpochPaid: string | null;
+    expectedLastEpochPaid: string;
+    source: "pre-boundary" | "defense" | "proactive" | "jit";
+    epochs: string;
+    pricedEpoch: string;
+    jitTargetEpoch?: number;
+    jitCampaignRevision?: number;
+    proactiveEpoch?: string;
+    proactiveMarkerReserved: boolean;
+  };
 }) {
   const byte = (args.nonce + 1).toString(16).padStart(2, "0");
   return {
@@ -518,11 +546,13 @@ function journalFlight(args: {
       ...(args.notBeforeTimestamp === undefined
         ? {}
         : { notBeforeTimestamp: args.notBeforeTimestamp.toString() }),
+      ...(args.payment === undefined ? {} : { payment: args.payment }),
     },
     nonceConflict: false,
     ...(args.observedConsumedAtBlock === undefined
       ? {}
       : { observedConsumedAtBlock: args.observedConsumedAtBlock.toString() }),
+    ...(args.confirmedSpend === undefined ? {} : { confirmedSpend: args.confirmedSpend }),
     state: args.state ?? "accepted",
     publicExposure: args.publicExposure ?? (args.attempts ?? []).some(
       (attempt) => attempt.channel === "public" && attempt.state !== "rejected",
@@ -701,6 +731,7 @@ describe("defensive payment scheduling and retries", () => {
     testState.ownerOfFailures = new Set();
     testState.multicallFailureCalls = new Set();
     testState.multicallRejectFunctions = new Set();
+    testState.epochByBlock = new Map();
     testState.receipts = new Map();
     testState.flushResults = new Map();
     testState.candidateIds = [];
@@ -712,6 +743,7 @@ describe("defensive payment scheduling and retries", () => {
       bidWei: 15_000_000_000_000_000n,
       runtimeCodeHash: `0x${"ab".repeat(32)}` as Hex,
     };
+    testState.payerRuntimeError = undefined;
     testState.nextActivityId = 0;
     appConfig.mode = "public";
     vi.mocked(nonceManager.hasInvisibleReservation).mockReturnValue(false);
@@ -789,7 +821,7 @@ describe("defensive payment scheduling and retries", () => {
     await vi.advanceTimersByTimeAsync(5_000);
 
     const calls = vi.mocked(submitTx).mock.calls;
-    expect(calls.map(([intent]) => intent.data)).toEqual(["0xPAYTAXES", "0xAUDIT", "0x"]);
+    expect(calls.slice(0, 2).map(([intent]) => intent.data)).toEqual(["0xPAYTAXES", "0xAUDIT"]);
     const cohortIds = calls.map(([, opts]) => opts.privateCohort?.id);
     expect(cohortIds[0]).toEqual(expect.any(String));
     expect(cohortIds.every((id) => id === cohortIds[0])).toBe(true);
@@ -809,10 +841,15 @@ describe("defensive payment scheduling and retries", () => {
         : 0n,
       gas: 100_000n,
     });
+    expect(decodeCoinbasePayment(calls[2]![0].data!)).toEqual({
+      notBeforeTimestamp: calls[2]![1].simTimestamp,
+      validThroughBlock: 102n,
+    });
     expect(calls[2]![1]).toMatchObject({
       race: false,
       revertible: true,
       purpose: "builder-incentive",
+      validThroughBlock: 102n,
       privateCohort: { role: "builder-incentive" },
     });
     expect(calls.filter(([, opts]) => opts.purpose === "builder-incentive")).toHaveLength(1);
@@ -821,6 +858,27 @@ describe("defensive payment scheduling and retries", () => {
       0n,
     );
     expect(runtime.status().pendingExposureWei).toBe(expectedExposure.toString());
+  });
+
+  it("raises a low payment lead to the combined-discovery safety floor", async () => {
+    arrangeCombinedBoundaryScenario({ preBoundaryLeadMainnetMs: 250 });
+    testState.flushResults = new Map([
+      [0, { ok: true }],
+      [1, { ok: true }],
+      [2, { ok: true }],
+    ]);
+    const boundary = epochStart(6);
+
+    await startAt(boundary - 10n);
+    await vi.advanceTimersByTimeAsync(8_250);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([, opts]) => opts.privateCohort?.role)).toEqual([
+      "mandatory",
+      "allowed-revert",
+      "builder-incentive",
+    ]);
+    expect(Date.now()).toBeLessThan(Number(boundary) * 1_000 - 1_000);
   });
 
   it("never creates an audit-only or bid-only cohort when no mandatory payment is due", async () => {
@@ -1021,17 +1079,47 @@ describe("defensive payment scheduling and retries", () => {
     expect(calls.every(([, opts]) => opts.purpose === undefined)).toBe(true);
   });
 
+  it("skips the bid when the payer runtime changes after discovery but before signing", async () => {
+    arrangeCombinedBoundaryScenario();
+    // Discovery already returned an active, code-hash-pinned capability. The
+    // final authorization models a deployment reorg that removes that code.
+    testState.payerRuntimeError = "CoinbasePayer address has no deployed bytecode";
+    testState.flushResults = new Map([
+      [0, { ok: true }],
+      [1, { ok: true }],
+    ]);
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([, opts]) => opts.privateCohort?.role)).toEqual([
+      "mandatory",
+      "allowed-revert",
+      "builder-incentive",
+    ]);
+    // The builder call reached exact authorization but never consumed a nonce
+    // or became a signed/queued liability; mandatory work still flushed.
+    expect(testState.signedCount).toBe(2);
+    expect(testState.nextNonce).toBe(2);
+    expect(flushBundle).toHaveBeenCalledTimes(1);
+  });
+
   it("models a combined cohort in dry-run without signing, queuing, or exposing a nonce", async () => {
     arrangeCombinedBoundaryScenario({ dryRun: true });
 
     await startAt(epochStart(6) - 10n);
     await vi.advanceTimersByTimeAsync(5_000);
 
-    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+    const dryCalls = vi.mocked(submitTx).mock.calls;
+    expect(dryCalls.slice(0, 2).map(([intent]) => intent.data)).toEqual([
       "0xPAYTAXES",
       "0xAUDIT",
-      "0x",
     ]);
+    expect(decodeCoinbasePayment(dryCalls[2]![0].data!)).toEqual({
+      notBeforeTimestamp: dryCalls[2]![1].simTimestamp,
+      validThroughBlock: 102n,
+    });
     expect(vi.mocked(submitTx).mock.calls.every(([, opts]) => opts.dryRun)).toBe(true);
     expect(testState.signedCount).toBe(0);
     expect(testState.nextNonce).toBe(0);
@@ -1051,14 +1139,18 @@ describe("defensive payment scheduling and retries", () => {
     await startAt(epochStart(6) - 10n);
     await vi.advanceTimersByTimeAsync(5_000);
 
-    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.slice(0, 2).map(([intent]) => intent.data)).toEqual([
       "0xPAYTAXES",
       "0xAUDIT",
-      "0x",
     ]);
+    expect(decodeCoinbasePayment(calls[2]![0].data!)).toEqual({
+      notBeforeTimestamp: calls[2]![1].simTimestamp,
+      validThroughBlock: 102n,
+    });
     expect(flushBundle).toHaveBeenCalledTimes(1);
     expect(testState.nextNonce).toBe(2);
-    const deliveredExposure = vi.mocked(submitTx).mock.calls.slice(0, 2).reduce(
+    const deliveredExposure = calls.slice(0, 2).reduce(
       (sum, [intent]) => sum + intent.value + testState.submittedGasWei,
       0n,
     );
@@ -1211,6 +1303,44 @@ describe("defensive payment scheduling and retries", () => {
     );
   });
 
+  it("raises a 250ms payment lead so a standalone audit still fires before the boundary", async () => {
+    const boundary = epochStart(6);
+    testState.lastEpochPaid = 5n;
+    testState.ownedIds = [2n];
+    testState.lastEpochPaidByToken = new Map([["2", 5n]]);
+    testState.auditLimitByToken = new Map([["2", 1n]]);
+    testState.candidateIds = [99n];
+    testState.liveTargets = [{
+      id: 99n,
+      owner: "0x9999999999999999999999999999999999999999",
+    }];
+    testState.targetStatuses = [{
+      tokenId: "99",
+      owner: "0x9999999999999999999999999999999999999999",
+      lastEpochPaid: "4",
+      delinquent: false,
+      epochsBehind: 1,
+      auditable: false,
+      auditDueTimestamp: "0",
+      killable: false,
+    }];
+    configure({
+      enabled: false,
+      proactivePay: false,
+      offenseEnabled: true,
+      autoAudit: true,
+      preBoundaryAudit: true,
+      preBoundaryLeadMs: 250,
+      offenseTargetTokenIds: ["99"],
+    });
+
+    await startAt(boundary - 10n);
+    await vi.advanceTimersByTimeAsync(8_250);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xAUDIT"]);
+    expect(Date.now()).toBeLessThan(Number(boundary) * 1_000);
+  });
+
   it("fires a pre-boundary audit immediately when startup is already inside its lead window", async () => {
     const boundary = epochStart(6);
     testState.lastEpochPaid = 5n;
@@ -1332,6 +1462,19 @@ describe("defensive payment scheduling and retries", () => {
 
     expect(submitTx).toHaveBeenCalledTimes(1);
     expect(encodePayTaxes).toHaveBeenCalledWith(1n, 1);
+    expect(vi.mocked(submitTx).mock.calls[0]![1]).toMatchObject({
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: "8",
+        expectedLastEpochPaid: "9",
+        source: "jit",
+        epochs: "1",
+        pricedEpoch: "9",
+        jitTargetEpoch: 9,
+        jitCampaignRevision: runtime.jitCampaign.revision,
+        proactiveMarkerReserved: false,
+      },
+    });
   });
 
   it("auto-stops after terminal JIT only when no continuous strategy still needs the engine", async () => {
@@ -2175,6 +2318,232 @@ describe("defensive payment scheduling and retries", () => {
     await vi.advanceTimersByTimeAsync(12_000);
     expect(runtime.jitCampaign.state).toBe("completed");
     expect(saveJitCampaign).toHaveBeenCalledWith(expect.objectContaining({ state: "completed" }));
+  });
+
+  it("does not duplicate a deeply-behind finalized JIT payment across repeated cold recovery", async () => {
+    const now = epochStart(20) + 100n;
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    testState.lastEpochPaid = 2n;
+    configure({
+      enabled: false,
+      proactivePay: false,
+      preBoundaryPay: false,
+      jitEnabled: true,
+      jitTargetEpoch: 20,
+    });
+    const campaignRevision = runtime.jitCampaign.revision;
+    const finalized = journalFlight({
+      nonce: 0,
+      data,
+      valueWei: 20n * BASE_TAX_RATE_WEI,
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: "1",
+        expectedLastEpochPaid: "2",
+        source: "jit",
+        epochs: "1",
+        pricedEpoch: "20",
+        jitTargetEpoch: 20,
+        jitCampaignRevision: campaignRevision,
+        proactiveMarkerReserved: false,
+      },
+    });
+    const reconciliation = {
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 100n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    };
+    vi.mocked(reconcileSubmissionJournal)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation);
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce(reconciliation);
+
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    // Model a crash after finality reconciliation but before the campaign can be
+    // terminalized. Only durable WAL/campaign state survives.
+    resetPaymentTracking();
+    resetJitState();
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    await startAt(now);
+
+    expect(submitTx).not.toHaveBeenCalled();
+    expect(runtime.jitCampaign.state).toBe("completed");
+    expect(saveJitCampaign).toHaveBeenCalledWith(expect.objectContaining({ state: "completed" }));
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+  });
+
+  it("does not repeat a finalized proactive catch-up payment after restart in the same epoch", async () => {
+    const now = epochStart(20) + 100n;
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    testState.lastEpochPaid = 2n;
+    configure({ enabled: true, proactivePay: true, preBoundaryPay: false });
+    const finalized = journalFlight({
+      nonce: 0,
+      data,
+      valueWei: 20n * BASE_TAX_RATE_WEI,
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: "1",
+        expectedLastEpochPaid: "2",
+        source: "proactive",
+        epochs: "1",
+        pricedEpoch: "20",
+        proactiveEpoch: "20",
+        proactiveMarkerReserved: true,
+      },
+    });
+    const reconciliation = {
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 100n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    };
+    vi.mocked(reconcileSubmissionJournal)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation);
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce(reconciliation);
+
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    resetPaymentTracking();
+    resetJitState();
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    await startAt(now);
+
+    expect(submitTx).not.toHaveBeenCalled();
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+  });
+
+  it("keeps a newer retained defense flight fenced beside an active proactive tombstone", async () => {
+    const now = epochStart(20) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1_000));
+    runtime.currentEpoch = 20n;
+    runtime.gameState = 1;
+    testState.lastEpochPaid = 2n;
+    testState.auditDueTimestamp = now + 60n;
+    testState.estimatedPayWei = 20n * BASE_TAX_RATE_WEI;
+    testState.nextNonce = 2;
+    configure({ enabled: true, proactivePay: true, preBoundaryPay: false });
+    const data = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    const liveDefense = journalFlight({
+      nonce: 1,
+      data,
+      valueWei: testState.estimatedPayWei,
+      createdAtMs: Number(now) * 1_000,
+      updatedAtMs: Number(now) * 1_000,
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: "2",
+        expectedLastEpochPaid: "3",
+        source: "defense",
+        epochs: "1",
+        pricedEpoch: "20",
+        proactiveMarkerReserved: false,
+      },
+    });
+    const proactiveTombstone = journalFlight({
+      nonce: 0,
+      data,
+      valueWei: testState.estimatedPayWei,
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: "1",
+        expectedLastEpochPaid: "2",
+        source: "proactive",
+        epochs: "1",
+        pricedEpoch: "20",
+        proactiveEpoch: "20",
+        proactiveMarkerReserved: true,
+      },
+    });
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 2,
+      currentBlock: 103n,
+      retained: [liveDefense],
+      consumed: [proactiveTombstone],
+      expired: [],
+    });
+
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    const liveExposure = BigInt(runtime.status().pendingExposureWei);
+    await startAt(now);
+
+    expect(liveExposure).toBeGreaterThan(0n);
+    expect(runtime.status().pendingExposureWei).toBe(liveExposure.toString());
+    expect(submitTx).not.toHaveBeenCalled();
+  });
+
+  it("keeps a cold terminal payment fenced while coverage and receipt evidence are unavailable", async () => {
+    const now = epochStart(20) + 100n;
+    testState.lastEpochPaid = 2n;
+    testState.auditDueTimestamp = now + 60n;
+    testState.estimatedPayWei = 20n * BASE_TAX_RATE_WEI;
+    testState.confirmedNonce = 1;
+    configure({ enabled: true, proactivePay: true, preBoundaryPay: false });
+    const finalized = journalFlight({
+      nonce: 0,
+      data: encodeFunctionData({
+        abi: gameContract.abi,
+        functionName: "payTaxes",
+        args: [1n, 1],
+      }),
+      valueWei: testState.estimatedPayWei,
+      observedConsumedAtBlock: 100n,
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: "1",
+        expectedLastEpochPaid: "2",
+        source: "proactive",
+        epochs: "1",
+        pricedEpoch: "20",
+        proactiveEpoch: "20",
+        proactiveMarkerReserved: true,
+      },
+    });
+    const reconciliation = {
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    };
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce(reconciliation);
+    vi.mocked(recoverPreparedSubmissions).mockResolvedValueOnce(reconciliation);
+    testState.multicallRejectFunctions.add("lastEpochPaid");
+
+    await startAt(now);
+
+    expect(submitTx).not.toHaveBeenCalled();
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
   });
 
   it("retains provisional payment exposure and restores the original obligation after nonce regression", async () => {
@@ -3478,6 +3847,281 @@ describe("defensive payment scheduling and retries", () => {
     expect(runtime.status().pendingExposureWei).toBe("0");
     expect(BigInt(runtime.status().confirmedSpendThisEpochWei) - before).toBe(
       testState.estimatedPayWei + 63_000n,
+    );
+  });
+
+  it("retains finalized WAL accounting after a transient receipt lookup and records it once", async () => {
+    const now = epochStart(22) + 100n;
+    const receipt = {
+      status: "success" as const,
+      blockNumber: 103n,
+      gasUsed: 21_000n,
+      effectiveGasPrice: 3n,
+    };
+    testState.submitTxHashes = [TX_HASH_0];
+    testState.receipts.set(TX_HASH_0, Promise.resolve(receipt));
+    testState.lastEpochPaid = 20n;
+    testState.auditDueTimestamp = now + 100n;
+    testState.estimatedPayWei = 1_000_000_000_000_000n;
+    configure({ proactivePay: false, preBoundaryPay: false });
+    const restoreSpend = vi.spyOn(runtime, "restoreConfirmedSpend");
+
+    await startAt(now);
+    const before = BigInt(runtime.status().confirmedSpendThisEpochWei);
+    vi.mocked(acknowledgeFinalizedSubmissionFlights).mockClear();
+    testState.lastEpochPaid = 21n;
+    testState.auditDueTimestamp = 0n;
+    const finalized = journalFlight({
+      nonce: 0,
+      data: encodeFunctionData({
+        abi: gameContract.abi,
+        functionName: "payTaxes",
+        args: [1n, 1],
+      }),
+      valueWei: testState.estimatedPayWei,
+    });
+    const reconciliation = {
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    };
+    vi.mocked(recoverPreparedSubmissions)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation);
+    vi.mocked(publicClient.getTransactionReceipt)
+      .mockRejectedValueOnce(new Error("temporary receipt RPC failure"))
+      .mockResolvedValueOnce(receipt as never);
+
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(BigInt(runtime.status().confirmedSpendThisEpochWei) - before).toBe(0n);
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+
+    // Model a process restart after the failed lookup. The displayed accounting
+    // state is rebuilt from the still-durable confirmed tombstone.
+    stopEngine();
+    await waitForEngineIdle();
+    resetPaymentTracking();
+    resetJitState();
+    runtime.currentEpoch = null;
+    startEngine();
+    await vi.advanceTimersByTimeAsync(0);
+    const expectedSpend = testState.estimatedPayWei + 63_000n;
+    expect(BigInt(runtime.status().confirmedSpendThisEpochWei)).toBe(expectedSpend);
+    expect(annotateFinalizedSubmissionSpend).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(annotateFinalizedSubmissionSpend).mock.invocationCallOrder[0]).toBeLessThan(
+      restoreSpend.mock.invocationCallOrder[0]!,
+    );
+    // Current-epoch accounting stays durable for the whole epoch, even after
+    // the process-local display has been rebuilt.
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+
+    // The mocked transport intentionally returns the same tombstone once more;
+    // exact reconstruction must not add it a second time.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(BigInt(runtime.status().confirmedSpendThisEpochWei)).toBe(expectedSpend);
+    expect(annotateFinalizedSubmissionSpend).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not publish or acknowledge spend before its WAL annotation is durable", async () => {
+    const now = epochStart(22) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1_000));
+    runtime.currentEpoch = 22n;
+    testState.epochByBlock.set("103", 22n);
+    const finalized = journalFlight({
+      nonce: 0,
+      data: "0x",
+      valueWei: 1_000n,
+      state: "confirmed",
+    });
+    testState.receipts.set(finalized.txHash, Promise.resolve({
+      status: "success",
+      blockNumber: 103n,
+      gasUsed: 21n,
+      effectiveGasPrice: 3n,
+    }));
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    });
+    vi.mocked(annotateFinalizedSubmissionSpend).mockImplementationOnce(() => {
+      throw new Error("mocked annotation fsync failure");
+    });
+
+    await expect(preflightSubmissionRecovery(FAKE_ACCOUNT.address)).rejects.toThrow(
+      "mocked annotation fsync failure",
+    );
+
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("0");
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+  });
+
+  it("rebuilds an exact current-epoch total from durable tombstones after Lock", async () => {
+    const now = epochStart(22) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1_000));
+    runtime.currentEpoch = 22n;
+    testState.epochByBlock.set("103", 22n);
+    const first = journalFlight({
+      nonce: 0,
+      data: "0x",
+      state: "confirmed",
+      confirmedSpend: { epoch: "22", spendWei: "123" },
+    });
+    const second = journalFlight({
+      nonce: 1,
+      data: "0x",
+      state: "confirmed",
+      confirmedSpend: { epoch: "22", spendWei: "456" },
+    });
+    const reconciliation = {
+      confirmedNonce: 2,
+      pendingNonce: 2,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [first, second],
+      expired: [],
+    };
+    vi.mocked(reconcileSubmissionJournal)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation);
+
+    runtime.resetWalletAccounting();
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("579");
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("579");
+    expect(publicClient.getTransactionReceipt).not.toHaveBeenCalled();
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([first.txHash, second.txHash]),
+    );
+
+    runtime.currentEpoch = 23n;
+    testState.epochByBlock.set("103", 23n);
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("0");
+    expect(acknowledgeFinalizedSubmissionFlights).toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([first.txHash, second.txHash]),
+    );
+  });
+
+  it("never charges an old receipt to the epoch in which it is discovered", async () => {
+    const now = epochStart(22) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1_000));
+    runtime.currentEpoch = 22n;
+    testState.epochByBlock.set("90", 21n);
+    testState.epochByBlock.set("103", 22n);
+    const finalized = journalFlight({
+      nonce: 0,
+      data: "0x",
+      valueWei: 1_000n,
+      state: "confirmed",
+    });
+    testState.receipts.set(finalized.txHash, Promise.resolve({
+      status: "success",
+      blockNumber: 90n,
+      gasUsed: 21n,
+      effectiveGasPrice: 3n,
+    }));
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce({
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    });
+
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+
+    expect(annotateFinalizedSubmissionSpend).toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      finalized.txHash,
+      { epoch: "21", spendWei: "1063" },
+    );
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("0");
+    expect(acknowledgeFinalizedSubmissionFlights).toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+  });
+
+  it("finishes legacy payment semantics after a crash behind the spend annotation", async () => {
+    const now = epochStart(22) + 100n;
+    vi.setSystemTime(new Date(Number(now) * 1_000));
+    runtime.currentEpoch = 22n;
+    testState.lastEpochPaid = 0n;
+    testState.epochByBlock.set("103", 22n);
+    const finalized = journalFlight({
+      nonce: 0,
+      data: encodeFunctionData({
+        abi: gameContract.abi,
+        functionName: "payTaxes",
+        args: [1n, 1],
+      }),
+      valueWei: 1_000n,
+      state: "confirmed",
+      confirmedSpend: { epoch: "22", spendWei: "1063" },
+      payment: {
+        tokenId: "1",
+        startingLastEpochPaid: null,
+        expectedLastEpochPaid: "2",
+        source: "defense",
+        epochs: "1",
+        pricedEpoch: "22",
+        proactiveMarkerReserved: false,
+      },
+    });
+    testState.receipts.set(finalized.txHash, Promise.resolve({
+      status: "success",
+      blockNumber: 103n,
+      gasUsed: 21n,
+      effectiveGasPrice: 3n,
+    }));
+    const reconciliation = {
+      confirmedNonce: 1,
+      pendingNonce: 1,
+      currentBlock: 103n,
+      retained: [],
+      consumed: [finalized],
+      expired: [],
+    };
+    vi.mocked(reconcileSubmissionJournal)
+      .mockResolvedValueOnce(reconciliation)
+      .mockResolvedValueOnce(reconciliation);
+
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    expect(publicClient.getTransactionReceipt).toHaveBeenCalledWith({ hash: finalized.txHash });
+    expect(annotateFinalizedSubmissionSpend).not.toHaveBeenCalled();
+    expect(acknowledgeFinalizedSubmissionFlights).not.toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
+    );
+
+    runtime.currentEpoch = 23n;
+    testState.epochByBlock.set("103", 23n);
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    expect(acknowledgeFinalizedSubmissionFlights).toHaveBeenCalledWith(
+      FAKE_ACCOUNT.address,
+      expect.arrayContaining([finalized.txHash]),
     );
   });
 

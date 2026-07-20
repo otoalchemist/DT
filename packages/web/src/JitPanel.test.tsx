@@ -76,6 +76,12 @@ const config: StrategyConfig = {
 
 const strategy: StrategySnapshot = { revision: 1, config };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 function status(overrides: Partial<BotStatus> = {}): BotStatus {
   return {
     version: "0.3.0",
@@ -321,6 +327,8 @@ describe("JitPanel campaign scope", () => {
 
     expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("Non-refundable ETH");
     expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("does not guarantee");
+    expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("raw signed cohort");
+    expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("publicly retires");
     expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("No bid-only submission");
     expect(await screen.findByText("Backend state: Direct builder incentives are disabled")).toBeTruthy();
     expect(screen.queryByText(/CONFIG \/ CHAIN \/ CODE VERIFIED/)).toBeNull();
@@ -482,14 +490,85 @@ describe("JitPanel campaign scope", () => {
       expect(confirm).toHaveBeenCalledOnce();
       expect(api.setConfig).toHaveBeenCalledWith(
         1,
-        expect.objectContaining({
+        {
           coinbaseBidEnabled: true,
-          coinbaseBidEth: "0.01",
-          coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
           combinedBoundaryBundle: true,
-        }),
+        },
         true,
       );
+    });
+  });
+
+  it("preserves an unsaved payment draft when strategy settings advance the revision", async () => {
+    const strategySave: StrategySnapshot = {
+      revision: 2,
+      config: { ...config, defenseEnabled: true },
+    };
+    const saved: StrategySnapshot = {
+      revision: 3,
+      config: { ...strategySave.config, priorityFeeGwei: 23.5 },
+    };
+    vi.mocked(api.setConfig).mockResolvedValue(saved);
+    const onStrategyChange = vi.fn();
+    const shared = {
+      status: status(),
+      tokens: [token("7")],
+      onStatusChange: vi.fn(),
+      onStrategyChange,
+    };
+    const view = render(<JitPanel {...shared} strategy={strategy} />);
+
+    const priority = screen.getByLabelText("Priority fee / tip (gwei)") as HTMLInputElement;
+    fireEvent.change(priority, { target: { value: "23.5" } });
+    expect(priority.value).toBe("23.5");
+
+    view.rerender(<JitPanel {...shared} strategy={strategySave} />);
+
+    expect(await screen.findByText(/unsaved payment edits were preserved/)).toBeTruthy();
+    expect(priority.value).toBe("23.5");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save payment settings" }));
+    await waitFor(() => {
+      expect(api.setConfig).toHaveBeenCalledWith(2, { priorityFeeGwei: 23.5 });
+      expect(onStrategyChange).toHaveBeenCalledWith(saved);
+    });
+  });
+
+  it("preserves payment edits made while an older save is in flight", async () => {
+    const firstSave = deferred<StrategySnapshot>();
+    const firstSnapshot: StrategySnapshot = {
+      revision: 2,
+      config: { ...config, priorityFeeGwei: 23.5 },
+    };
+    const finalSnapshot: StrategySnapshot = {
+      revision: 3,
+      config: { ...firstSnapshot.config, maxBaseFeeGwei: 80 },
+    };
+    vi.mocked(api.setConfig)
+      .mockReturnValueOnce(firstSave.promise)
+      .mockResolvedValueOnce(finalSnapshot);
+    const shared = {
+      status: status(),
+      tokens: [token("7")],
+      onStatusChange: vi.fn(),
+      onStrategyChange: vi.fn(),
+    };
+    render(<JitPanel {...shared} strategy={strategy} />);
+
+    fireEvent.change(screen.getByLabelText("Priority fee / tip (gwei)"), {
+      target: { value: "23.5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save payment settings" }));
+    await waitFor(() => expect(api.setConfig).toHaveBeenCalledWith(1, { priorityFeeGwei: 23.5 }));
+
+    const baseFee = screen.getByLabelText("Max base fee (gwei)") as HTMLInputElement;
+    fireEvent.change(baseFee, { target: { value: "80" } });
+    firstSave.resolve(firstSnapshot);
+
+    await waitFor(() => expect(baseFee.value).toBe("80"));
+    fireEvent.click(screen.getByRole("button", { name: "Save payment settings" }));
+    await waitFor(() => {
+      expect(api.setConfig).toHaveBeenNthCalledWith(2, 2, { maxBaseFeeGwei: 80 });
     });
   });
 });

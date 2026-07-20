@@ -2,10 +2,46 @@ import fs from "node:fs";
 import path from "node:path";
 import { keccak256, parseTransaction, type Address, type Hex } from "viem";
 import { writeFileAtomicDurableSync } from "./durability.js";
+import { decodeCoinbasePayment } from "./coinbase-payer.js";
 
-export type JournalDeliveryState = "prepared" | "accepted" | "rejected" | "ambiguous" | "expired";
+export type JournalDeliveryState =
+  | "prepared"
+  | "accepted"
+  | "rejected"
+  | "ambiguous"
+  | "expired"
+  | "confirmed";
 
-export type SubmissionPurpose = "builder-incentive";
+export type JournalPaymentSource = "pre-boundary" | "defense" | "proactive" | "jit";
+
+/**
+ * Strategy identity attached to a signed payTaxes transaction before the WAL
+ * barrier. The calldata proves what can execute; these fields preserve why the
+ * operator authorized it and the exact progress baseline used for one-shot
+ * deduplication after a restart.
+ */
+export interface JournalPaymentMetadata {
+  tokenId: string;
+  startingLastEpochPaid: string | null;
+  expectedLastEpochPaid: string;
+  source: JournalPaymentSource;
+  epochs: string;
+  pricedEpoch: string;
+  jitTargetEpoch?: number;
+  jitCampaignRevision?: number;
+  proactiveEpoch?: string;
+  proactiveMarkerReserved: boolean;
+}
+
+/** Receipt-priced spend bound to the epoch in which this exact transaction
+ * mined. This annotation is written durably before runtime accounting changes,
+ * making the current-epoch total reconstructible after a crash or Lock. */
+export interface JournalConfirmedSpend {
+  epoch: string;
+  spendWei: string;
+}
+
+export type SubmissionPurpose = "builder-incentive" | "nonce-retirement";
 export type PrivateCohortRole = "mandatory" | "allowed-revert" | "builder-incentive";
 
 export interface PrivateCohortMetadata {
@@ -16,7 +52,7 @@ export interface PrivateCohortMetadata {
 export interface JournalDeliveryAttempt {
   channel: "public" | "private";
   endpoint: string;
-  state: Exclude<JournalDeliveryState, "prepared" | "expired">;
+  state: Exclude<JournalDeliveryState, "prepared" | "expired" | "confirmed">;
   targetBlock?: string;
   replacementUuid?: string;
   cancellationSupported?: boolean;
@@ -51,6 +87,11 @@ export interface JournalFlight {
     publicAuthorized: boolean;
     /** Do not replay a future-valid tx before this unix-second boundary. */
     notBeforeTimestamp?: string;
+    /** Durable semantic identity for a payTaxes transaction. */
+    payment?: JournalPaymentMetadata;
+    /** Last block accepted by the signed CoinbasePayer calldata. Present only
+     * for a private-only builder incentive. */
+    validThroughBlock?: string;
   };
   state: JournalDeliveryState;
   /** True once a public dispatch is accepted or ambiguous. Kept explicitly so
@@ -67,6 +108,8 @@ export interface JournalFlight {
    * sufficient: a lateral reorg can keep the nonce advanced while replacing the
    * block that established the first observation. */
   observedConsumedAtBlockHash?: Hex;
+  /** Durable accounting tombstone for the exact mined same-nonce alternative. */
+  confirmedSpend?: JournalConfirmedSpend;
   attempts: JournalDeliveryAttempt[];
   maxPrivateTargetBlock?: string;
   createdAtMs: number;
@@ -107,6 +150,7 @@ export interface JournalBlockEvidence {
 export type JournalFlightUpdate = Partial<Pick<JournalFlight,
   "state" | "publicExposure" | "nonceConflict" | "observedConsumedAtBlock"
   | "observedConsumedAtBlockHash"
+  | "confirmedSpend"
   | "attempts" | "maxPrivateTargetBlock" | "updatedAtMs"
 >>;
 
@@ -116,7 +160,7 @@ export interface JournalMutation {
 }
 
 const DELIVERY_STATES = new Set<JournalDeliveryState>([
-  "prepared", "accepted", "rejected", "ambiguous", "expired",
+  "prepared", "accepted", "rejected", "ambiguous", "expired", "confirmed",
 ]);
 const ATTEMPT_STATES = new Set(["accepted", "rejected", "ambiguous"]);
 
@@ -146,12 +190,86 @@ function isPrivateCohort(value: unknown): value is PrivateCohortMetadata {
       || cohort.role === "builder-incentive");
 }
 
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function isJournalPaymentMetadata(value: unknown): value is JournalPaymentMetadata {
+  if (!value || typeof value !== "object") return false;
+  const payment = value as Partial<JournalPaymentMetadata>;
+  if (
+    !isDecimal(payment.tokenId)
+    || (payment.startingLastEpochPaid !== null && !isDecimal(payment.startingLastEpochPaid))
+    || !isDecimal(payment.expectedLastEpochPaid)
+    || !isDecimal(payment.epochs)
+    || BigInt(payment.epochs) <= 0n
+    || !isDecimal(payment.pricedEpoch)
+    || !(["pre-boundary", "defense", "proactive", "jit"] as const).includes(
+      payment.source as JournalPaymentSource,
+    )
+    || typeof payment.proactiveMarkerReserved !== "boolean"
+    || (
+      payment.jitTargetEpoch !== undefined
+      && (!isSafeNonNegativeInteger(payment.jitTargetEpoch) || payment.jitTargetEpoch < 1)
+    )
+    || (
+      payment.jitCampaignRevision !== undefined
+      && !isSafeNonNegativeInteger(payment.jitCampaignRevision)
+    )
+    || ((payment.jitTargetEpoch === undefined) !== (payment.jitCampaignRevision === undefined))
+    || (payment.proactiveEpoch !== undefined && !isDecimal(payment.proactiveEpoch))
+    || (payment.proactiveMarkerReserved && payment.proactiveEpoch === undefined)
+    || (payment.source === "jit" && payment.jitTargetEpoch === undefined)
+    || (payment.source === "proactive" && payment.proactiveEpoch === undefined)
+  ) return false;
+  if (payment.startingLastEpochPaid !== null) {
+    return BigInt(payment.expectedLastEpochPaid)
+      === BigInt(payment.startingLastEpochPaid) + BigInt(payment.epochs);
+  }
+  return true;
+}
+
+function isJournalConfirmedSpend(value: unknown): value is JournalConfirmedSpend {
+  if (!value || typeof value !== "object") return false;
+  const spend = value as Partial<JournalConfirmedSpend>;
+  return isDecimal(spend.epoch) && isDecimal(spend.spendWei);
+}
+
 function privateMetadataIsValid(flight: Partial<JournalFlight>): boolean {
-  if (flight.purpose !== undefined && flight.purpose !== "builder-incentive") return false;
+  if (
+    flight.purpose !== undefined
+    && flight.purpose !== "builder-incentive"
+    && flight.purpose !== "nonce-retirement"
+  ) return false;
   if (flight.privateCohort !== undefined && !isPrivateCohort(flight.privateCohort)) return false;
   const builderPurpose = flight.purpose === "builder-incentive";
+  const retirementPurpose = flight.purpose === "nonce-retirement";
   const builderRole = flight.privateCohort?.role === "builder-incentive";
   if (builderPurpose !== builderRole) return false;
+  const validThroughBlock = flight.recovery?.validThroughBlock;
+  if (retirementPurpose) {
+    return flight.privateCohort === undefined
+      && validThroughBlock === undefined
+      && flight.recovery?.publicAuthorized === true
+      && flight.obligation?.to.toLowerCase() === flight.wallet?.toLowerCase()
+      && flight.obligation?.data === "0x"
+      && flight.obligation?.valueWei === "0"
+      && flight.lineage?.replacesTxHash !== undefined;
+  }
+  if (!builderPurpose) return validThroughBlock === undefined;
+  const signedWindow = isHex(flight.obligation?.data)
+    ? decodeCoinbasePayment(flight.obligation.data)
+    : null;
+  if (
+    !isDecimal(validThroughBlock)
+    || !isDecimal(flight.recovery?.notBeforeTimestamp)
+    || signedWindow === null
+    || signedWindow.validThroughBlock !== BigInt(validThroughBlock)
+    || signedWindow.notBeforeTimestamp !== BigInt(flight.recovery.notBeforeTimestamp)
+    || flight.maxPrivateTargetBlock === undefined
+    || !isDecimal(flight.maxPrivateTargetBlock)
+    || BigInt(flight.maxPrivateTargetBlock) > BigInt(validThroughBlock)
+  ) return false;
   // Builder incentives are private-only by construction. Persisting public
   // authorization here would make restart recovery capable of paying an EOA or
   // stale payer outside the protected bundle.
@@ -185,6 +303,14 @@ function isJournalFlight(value: unknown): value is JournalFlight {
       flight.recovery?.notBeforeTimestamp === undefined
       || isDecimal(flight.recovery.notBeforeTimestamp)
     )
+    && (
+      flight.recovery?.payment === undefined
+      || isJournalPaymentMetadata(flight.recovery.payment)
+    )
+    && (
+      flight.recovery?.validThroughBlock === undefined
+      || isDecimal(flight.recovery.validThroughBlock)
+    )
     && typeof flight.state === "string"
     && DELIVERY_STATES.has(flight.state as JournalDeliveryState)
     && typeof flight.publicExposure === "boolean"
@@ -203,6 +329,10 @@ function isJournalFlight(value: unknown): value is JournalFlight {
     && !(
       flight.observedConsumedAtBlock === undefined
       && flight.observedConsumedAtBlockHash !== undefined
+    )
+    && (
+      flight.confirmedSpend === undefined
+      || (flight.state === "confirmed" && isJournalConfirmedSpend(flight.confirmedSpend))
     )
     && Array.isArray(flight.attempts)
     && flight.attempts.every((attempt) =>
@@ -273,9 +403,32 @@ function mergeSameHashFlight(existing: JournalFlight, incoming: JournalFlight): 
     && existing.observedConsumedAtBlock === incoming.observedConsumedAtBlock
     && existing.observedConsumedAtBlockHash.toLowerCase()
       === incoming.observedConsumedAtBlockHash?.toLowerCase();
-  const incomingState = incoming.state === "prepared" && existing.state !== "prepared"
-    ? existing.state
-    : incoming.state;
+  const incomingState = existing.state === "confirmed"
+    ? "confirmed"
+    : incoming.state === "prepared" && existing.state !== "prepared"
+      ? existing.state
+      : incoming.state;
+  const existingPayment = existing.recovery.payment;
+  const incomingPayment = incoming.recovery.payment;
+  const existingSpend = existing.confirmedSpend;
+  const incomingSpend = incoming.confirmedSpend;
+  if (existing.recovery.validThroughBlock !== incoming.recovery.validThroughBlock) {
+    throw new Error(`submission journal block deadline conflict for ${incoming.txHash}`);
+  }
+  if (
+    existingPayment !== undefined
+    && incomingPayment !== undefined
+    && JSON.stringify(existingPayment) !== JSON.stringify(incomingPayment)
+  ) {
+    throw new Error(`submission journal payment metadata conflict for ${incoming.txHash}`);
+  }
+  if (
+    existingSpend !== undefined
+    && incomingSpend !== undefined
+    && JSON.stringify(existingSpend) !== JSON.stringify(incomingSpend)
+  ) {
+    throw new Error(`submission journal confirmed-spend conflict for ${incoming.txHash}`);
+  }
   const notBeforeValues = [
     existing.recovery.notBeforeTimestamp,
     incoming.recovery.notBeforeTimestamp,
@@ -298,8 +451,17 @@ function mergeSameHashFlight(existing: JournalFlight, incoming: JournalFlight): 
       publicAuthorized: existing.recovery.publicAuthorized
         || incoming.recovery.publicAuthorized,
       ...(notBeforeTimestamp === undefined ? {} : { notBeforeTimestamp }),
+      ...((incomingPayment ?? existingPayment) === undefined
+        ? {}
+        : { payment: incomingPayment ?? existingPayment }),
+      ...(incoming.recovery.validThroughBlock === undefined
+        ? {}
+        : { validThroughBlock: incoming.recovery.validThroughBlock }),
     },
     ...(maxPrivateTargetBlock === undefined ? {} : { maxPrivateTargetBlock }),
+    ...((incomingSpend ?? existingSpend) === undefined
+      ? {}
+      : { confirmedSpend: incomingSpend ?? existingSpend }),
     attempts,
     createdAtMs: Math.min(existing.createdAtMs, incoming.createdAtMs),
     updatedAtMs: Math.max(existing.updatedAtMs, incoming.updatedAtMs),
@@ -533,12 +695,22 @@ export class SubmissionFlightJournal {
       const flight = flights.find((item) => item.txHash === txHash);
       changed.push(flight);
       if (!flight) throw new Error(`submission journal flight not found: ${txHash}`);
+      if (
+        flight.confirmedSpend !== undefined
+        && update.confirmedSpend !== undefined
+        && JSON.stringify(flight.confirmedSpend) !== JSON.stringify(update.confirmedSpend)
+      ) {
+        throw new Error(`submission journal confirmed-spend conflict for ${txHash}`);
+      }
       Object.assign(flight, update, {
         // Once a node has shown same-nonce exposure, a later endpoint response
         // cannot disprove it. Only deep chain consumption removes the flight.
         nonceConflict: flight.nonceConflict || update.nonceConflict === true,
         updatedAtMs: update.updatedAtMs ?? Date.now(),
       });
+      if (!isJournalFlight(flight)) {
+        throw new Error(`submission journal update is invalid for ${txHash}`);
+      }
     }
     const chainId = this.chainId();
     this.write(wallet, {
@@ -559,9 +731,10 @@ export class SubmissionFlightJournal {
 
   /**
    * Startup hook: latest-nonce consumption becomes terminal only after a short
-   * confirmation window. A private-only flight expires only after its last
-   * target block. Public or ambiguous flights never expire from wall-clock age
-   * or hash absence.
+   * confirmation window. Signed private raws never expire merely because their
+   * value-transfer authorization or relay target ended: an old reverting raw
+   * can still consume a reused nonce. Public or ambiguous flights likewise
+   * never expire from wall-clock age or hash absence.
    */
   reconcile(
     wallet: Address,
@@ -583,6 +756,13 @@ export class SubmissionFlightJournal {
       flight: JournalFlight;
       state: "retained" | "consumed" | "expirable";
     } => {
+      // Strategy-scoped one-shot payment markers may deliberately retain a
+      // deeply finalized transaction until their campaign/epoch ends. Once the
+      // journal has established finality, do not restart the confirmation proof
+      // merely because the retained marker outlives our short ancestry window.
+      if (flight.state === "confirmed") {
+        return { flight, state: "consumed" };
+      }
       flight.publicExposure = flight.publicExposure ?? flight.attempts.some(
         (attempt) => attempt.channel === "public" && attempt.state !== "rejected",
       );
@@ -619,6 +799,8 @@ export class SubmissionFlightJournal {
             === observedHash.toLowerCase()
           && observedDelta + 1n >= JOURNAL_CONFIRMATION_DEPTH
         ) {
+          flight.state = "confirmed";
+          flight.updatedAtMs = Date.now();
           return { flight, state: "consumed" };
         }
         provisional.push(flight);
@@ -633,11 +815,13 @@ export class SubmissionFlightJournal {
       // A crash can leave the WAL at `prepared` after the public request left but
       // before its outcome commit. Public-authorized prepared work is therefore
       // potential exposure and never block-expires.
-      const hasPublicExposure = flight.publicExposure
-        || (flight.state === "prepared" && flight.recovery.publicAuthorized);
       const maxTarget = flight.maxPrivateTargetBlock === undefined
         ? undefined
         : BigInt(flight.maxPrivateTargetBlock);
+      // Transport target metadata is not an on-chain validity constraint: a
+      // relay may retain and later disclose any raw transaction it received.
+      // The builder payer's signed deadline bounds value transfer, but not nonce
+      // consumption—a later inclusion can still revert and preempt a new tx.
       if (
         flight.state === "prepared"
         && !flight.recovery.publicAuthorized
@@ -645,14 +829,6 @@ export class SubmissionFlightJournal {
       ) {
         // The private route was disabled before the WAL barrier and no public
         // route was authorized, so no request could have left this process.
-        return { flight, state: "expirable" };
-      }
-      if (
-        !hasPublicExposure
-        && !flight.nonceConflict
-        && maxTarget !== undefined
-        && currentBlock > maxTarget
-      ) {
         return { flight, state: "expirable" };
       }
       return { flight, state: "retained" };
@@ -685,7 +861,10 @@ export class SubmissionFlightJournal {
     this.write(wallet, {
       version: 2,
       chainId: this.chainId(),
-      flights: retained,
+      // Consumed entries remain as inert, non-replayable tombstones until the
+      // strategy acknowledges their semantic bookkeeping. This closes the
+      // crash window between WAL finality and durable JIT/proactive dedupe.
+      flights: [...retained, ...consumed],
     });
     return {
       confirmedNonce,

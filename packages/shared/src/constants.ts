@@ -33,6 +33,11 @@ export const DAILY_AUDIT_LIMIT = 1n;
 /** Max epochs that can be prepaid in a single payTaxes call. */
 export const EPOCHS_CAN_PAY_AT_ONE_TIME = 7;
 
+/** Minimum effective preparation window for optional boundary discovery and
+ * offense pre-simulation. Lower configured leads remain valid for payment-only
+ * races, but advanced combined/audit/kill routes are raised to this safety floor. */
+export const MIN_ADVANCED_BOUNDARY_LEAD_MS = 2_000;
+
 /** Protocol fee (basis points) taken on payments. */
 export const FEE_BPS = 690n;
 export const BASIS = 10_000n;

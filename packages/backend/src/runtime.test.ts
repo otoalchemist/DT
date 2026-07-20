@@ -55,6 +55,19 @@ describe("versioned strategy persistence", () => {
     unsubscribe();
   });
 
+  it("restores confirmed spend exactly and keeps it bound to its epoch", () => {
+    const runtime = new Runtime(tempDir());
+    runtime.currentEpoch = 7n;
+    runtime.recordConfirmedSpend(999n);
+
+    runtime.restoreConfirmedSpend(7n, 123n);
+    runtime.restoreConfirmedSpend(7n, 123n);
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("123");
+
+    runtime.currentEpoch = 8n;
+    expect(runtime.status().confirmedSpendThisEpochWei).toBe("0");
+  });
+
   it("migrates the shipped 10800-second buffer and legacy enabled/JIT fields", () => {
     const dir = tempDir();
     fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({

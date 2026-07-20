@@ -53,6 +53,24 @@ import { filterOwnedTokenIds } from "./index-tokens.js";
 import { runPostMortem } from "./postmortem.js";
 import { redactSensitiveText } from "./redaction.js";
 
+interface ApiExecutionControl {
+  revokeAndDrain: () => Promise<void>;
+}
+
+const apiExecutionControls = new WeakMap<FastifyInstance, ApiExecutionControl>();
+
+/** Permanently revoke this server's authority to replay signed WAL entries and
+ * wait for every already-entered lifecycle mutation to unwind. Revocation is
+ * synchronous: callers can start closing the listener immediately after this
+ * function returns its promise without leaving a new replay window. */
+export function revokeAndDrainApiExecution(app: FastifyInstance): Promise<void> {
+  const control = apiExecutionControls.get(app);
+  if (!control) {
+    return Promise.reject(new Error("API execution control is not initialized"));
+  }
+  return control.revokeAndDrain();
+}
+
 const strategyMutationSchema = z.object({
   expectedRevision: z.number().int().min(0),
   patch: strategyPatchSchema.refine((patch) => Object.keys(patch).length > 0, "patch must not be empty"),
@@ -144,6 +162,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   // or Lock therefore revokes authority immediately, even while the lifecycle
   // queue is waiting on authorization, balance, or simulation RPCs.
   let executionAuthorityGeneration = 0;
+  let executionAuthorityPermanentlyRevoked = false;
   const activeRecoveryControllers = new Set<AbortController>();
   const revokeExecutionAuthority = (): void => {
     executionAuthorityGeneration += 1;
@@ -153,21 +172,51 @@ export async function buildServer(): Promise<FastifyInstance> {
     address: `0x${string}`,
     generation: number,
   ): Promise<void> => {
-    if (generation !== executionAuthorityGeneration) {
-      throw new Error("submission recovery cancelled by a later Stop or Lock");
+    if (
+      executionAuthorityPermanentlyRevoked
+      || generation !== executionAuthorityGeneration
+    ) {
+      throw new Error("submission recovery cancelled because execution authority was revoked");
     }
     const controller = new AbortController();
     activeRecoveryControllers.add(controller);
-    if (generation !== executionAuthorityGeneration) controller.abort();
+    if (
+      executionAuthorityPermanentlyRevoked
+      || generation !== executionAuthorityGeneration
+    ) controller.abort();
     try {
       await recoverAuthorizedSubmissions(address, controller.signal);
-      if (controller.signal.aborted || generation !== executionAuthorityGeneration) {
-        throw new Error("submission recovery cancelled by a later Stop or Lock");
+      if (
+        controller.signal.aborted
+        || executionAuthorityPermanentlyRevoked
+        || generation !== executionAuthorityGeneration
+      ) {
+        throw new Error("submission recovery cancelled because execution authority was revoked");
       }
     } finally {
       activeRecoveryControllers.delete(controller);
     }
   };
+  let shutdownDrain: Promise<void> | null = null;
+  const revokeAndDrain = (): Promise<void> => {
+    if (!executionAuthorityPermanentlyRevoked) {
+      executionAuthorityPermanentlyRevoked = true;
+      revokeExecutionAuthority();
+    }
+    shutdownDrain ??= (async () => {
+      // lifecycleTail also covers recovery-bearing Start/JIT handlers. Observe
+      // it until stable so a request accepted just before Fastify begins closing
+      // cannot outlive DATA_DIR lock release.
+      let observedTail = lifecycleTail;
+      for (;;) {
+        await observedTail;
+        if (observedTail === lifecycleTail) break;
+        observedTail = lifecycleTail;
+      }
+    })();
+    return shutdownDrain;
+  };
+  apiExecutionControls.set(app, { revokeAndDrain });
 
   // Defense in depth for the loopback-only listener: a hostile web page can
   // still target localhost, so reject DNS-rebound Host names and foreign browser
@@ -240,15 +289,22 @@ export async function buildServer(): Promise<FastifyInstance> {
       ...parsed.data.patch,
     });
     if (!candidate.success) return reply.code(400).send({ error: candidate.error.message });
+    const incentiveRiskIncreases = builderIncentiveRiskIncreases(
+      runtime.strategy,
+      candidate.data,
+    );
     if (
-      builderIncentiveRiskIncreases(runtime.strategy, candidate.data)
+      incentiveRiskIncreases
       && parsed.data.acknowledgeCoinbaseBidRisk !== true
     ) {
       return reply.code(422).send({
         error: "This change increases direct builder-incentive risk; explicit acknowledgement is required",
       });
     }
-    if (candidate.data.coinbaseBidEnabled) {
+    // Revalidate before persisting a change that can increase live incentive
+    // exposure. An unchanged bid is deliberately inert outside mainnet, so it
+    // must not prevent unrelated defense/gas edits in public or local mode.
+    if (incentiveRiskIncreases) {
       let chainId = runtime.chainId;
       try {
         chainId ??= await getChainId();
@@ -286,7 +342,13 @@ export async function buildServer(): Promise<FastifyInstance> {
     } finally {
       // A config save preserves the prior run/pause state and never starts a
       // manually paused engine merely because a feature was enabled.
-      if (!durabilityFailed && wasRunning && runtime.unlocked && !runtime.running) startEngine();
+      if (
+        !executionAuthorityPermanentlyRevoked
+        && !durabilityFailed
+        && wasRunning
+        && runtime.unlocked
+        && !runtime.running
+      ) startEngine();
       schedulePreBoundaryPay();
       scheduleJitBoundary();
       schedulePreBoundaryAudit();
@@ -341,7 +403,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       saveKeystore(appConfig.dataDir, file);
     } catch (err) {
       if (!(err instanceof AtomicWriteCommittedError)) {
-        if (wasRunning && runtime.unlocked) startEngine();
+        if (wasRunning && runtime.unlocked && !executionAuthorityPermanentlyRevoked) startEngine();
         throw err;
       }
       durabilityFailed = true;
@@ -449,6 +511,12 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.post("/api/start", async (_req, reply) => {
     const executionAuthority = executionAuthorityGeneration;
     return runLifecycle(async () => {
+    if (
+      executionAuthorityPermanentlyRevoked
+      || executionAuthority !== executionAuthorityGeneration
+    ) {
+      return reply.code(503).send({ error: "Cannot start engine: execution authority was revoked" });
+    }
     if (!runtime.unlocked) return reply.code(400).send({ error: "Unlock the wallet first" });
     if (!runtime.running) {
       // An auto-stopping JIT tick can set running=false before its journal/nonce
@@ -480,6 +548,12 @@ export async function buildServer(): Promise<FastifyInstance> {
         });
       }
     }
+    if (
+      executionAuthorityPermanentlyRevoked
+      || executionAuthority !== executionAuthorityGeneration
+    ) {
+      return reply.code(503).send({ error: "Cannot start engine: execution authority was revoked" });
+    }
     startEngine();
     return runtime.status();
     });
@@ -501,6 +575,12 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.post("/api/jit", async (req, reply) => {
     const executionAuthority = executionAuthorityGeneration;
     return runLifecycle(async () => {
+    if (
+      executionAuthorityPermanentlyRevoked
+      || executionAuthority !== executionAuthorityGeneration
+    ) {
+      return reply.code(503).send({ error: "Cannot change JIT campaign: execution authority was revoked" });
+    }
     const schema = z.object({
       enable: z.boolean(),
       expectedRevision: z.number().int().min(0),
@@ -651,7 +731,9 @@ export async function buildServer(): Promise<FastifyInstance> {
         && !runtime.strategy.offenseEnabled;
       const restartForCleanup = !enable && saved && unresolvedCancellation;
       if (
-        !durabilityFailed
+        !executionAuthorityPermanentlyRevoked
+        && executionAuthority === executionAuthorityGeneration
+        && !durabilityFailed
         && !completedOwnedCancellation
         && (wasRunning || (enable && saved) || restartForCleanup)
         && runtime.unlocked
@@ -841,7 +923,12 @@ export async function buildServer(): Promise<FastifyInstance> {
 
       return { ok: true, mode: appConfig.mode };
     } finally {
-      if (wasRunning && runtime.unlocked && restartValidated) startEngine();
+      if (
+        !executionAuthorityPermanentlyRevoked
+        && wasRunning
+        && runtime.unlocked
+        && restartValidated
+      ) startEngine();
     }
   }));
 

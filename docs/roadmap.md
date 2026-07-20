@@ -41,7 +41,8 @@ The implemented combined path starts only from one or more mandatory boundary
 payments. Payments keep their ordinary public fallback. Optional audits follow,
 are explicitly revertible in the private bundle, and keep public fallback when
 the offense/race policy authorizes it. A single final `builder-incentive` is
-private-only, finite-target, cohort-journaled, and never independently replayed.
+private-only, on-chain bounded to its signed timestamp/block window, cohort-journaled, and
+never independently replayed.
 If the complete cohort would exceed private count, byte, or gas limits, none of
 that cohort is sent privately; public-authorized work retains its normal route
 and the bid is omitted.
@@ -50,7 +51,8 @@ Release gates cover exact compiler comparison of the pinned stateless
 `CoinbasePayer` creation/runtime bytecode, mainnet chain and deployed-runtime
 verification, healthy journal, explicit risk acknowledgement,
 balance/spend accounting, dry-run side-effect freedom, simulation allowlisting,
-replacement/expiry behavior, and disposable-Anvil payer behavior. An operator
+replacement/retirement behavior, signed-window calldata/WAL consistency, and
+Foundry/disposable-Anvil deadline behavior. An operator
 may consider a separately reviewed deployment only after following
 `docs/builder-incentives.md`. A bid can affect builder economics but never
 guarantees inclusion, placement, or ordering.

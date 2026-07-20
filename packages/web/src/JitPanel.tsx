@@ -1,6 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { BotStatus, OwnedTokenStatus, StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
-import { EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
+import {
+  EPOCH_DURATION_SECONDS,
+  BASE_TAX_RATE_WEI,
+  MIN_ADVANCED_BOUNDARY_LEAD_MS,
+} from "@dat-bot/shared";
 import { ApiError, api, type BuilderIncentiveCapability } from "./api.js";
 import { countdown, weiToEth } from "./util.js";
 
@@ -17,6 +21,34 @@ type BuilderSettings = Pick<
   StrategyConfig,
   "coinbaseBidEnabled" | "coinbaseBidEth" | "coinbasePayerAddress" | "combinedBoundaryBundle"
 >;
+
+type PaymentSettings = Pick<
+  StrategyConfig,
+  | "maxBaseFeeGwei"
+  | "priorityFeeGwei"
+  | "dynamicTipEnabled"
+  | "dynamicTipMaxGwei"
+  | "replacementPriorityFeeCapGwei"
+  | "preBoundaryPay"
+  | "preBoundaryLeadMs"
+  | "preBoundaryLeadMainnetMs"
+  | "maxAutoPayEpochs"
+  | "coinbaseBidEnabled"
+  | "coinbaseBidEth"
+  | "coinbasePayerAddress"
+  | "combinedBoundaryBundle"
+>;
+
+function remainingPaymentDraft(
+  current: Partial<PaymentSettings>,
+  submitted: Partial<PaymentSettings>,
+): Partial<PaymentSettings> {
+  const remaining = { ...current };
+  for (const key of Object.keys(submitted) as Array<keyof PaymentSettings>) {
+    if (Object.is(current[key], submitted[key])) delete remaining[key];
+  }
+  return remaining;
+}
 
 function builderSettings(config: StrategyConfig): BuilderSettings {
   return {
@@ -52,7 +84,7 @@ export function JitPanel({
   onStatusChange: (status: BotStatus) => void;
   capabilityRefreshToken?: number;
 }) {
-  const config = strategy?.config ?? null;
+  const authoritativeConfig = strategy?.config ?? null;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [, setNowTick] = useState(0);
@@ -103,6 +135,7 @@ export function JitPanel({
     const [freshStatus, freshStrategy] = await Promise.all([api.status(), api.getConfig()]);
     onStatusChange(freshStatus);
     onStrategyChange(freshStrategy);
+    return freshStrategy;
   };
   const perTokenWei =
     targetEpoch !== null ? (BigInt(targetEpoch) * BASE_TAX_RATE_WEI).toString() : "0";
@@ -180,18 +213,31 @@ export function JitPanel({
   const [gasBusy, setGasBusy] = useState(false);
   const [gasSaved, setGasSaved] = useState(false);
   const [gasErr, setGasErr] = useState<string | null>(null);
+  const [gasNotice, setGasNotice] = useState<string | null>(null);
+  const [config, setConfig] = useState<StrategyConfig | null>(() => authoritativeConfig);
+  const [gasRevision, setGasRevision] = useState<number | null>(() => strategy?.revision ?? null);
+  const [gasDirty, setGasDirty] = useState<Partial<PaymentSettings>>({});
+  const gasDirtyRef = useRef<Partial<PaymentSettings>>({});
   const [savedBuilder, setSavedBuilder] = useState<BuilderSettings | null>(
-    () => config ? builderSettings(config) : null,
+    () => authoritativeConfig ? builderSettings(authoritativeConfig) : null,
   );
   const [builderCapability, setBuilderCapability] = useState<BuilderIncentiveCapability | null>(null);
   const [builderCapabilityLoading, setBuilderCapabilityLoading] = useState(false);
 
   useEffect(() => {
-    if (config) setSavedBuilder(builderSettings(config));
-  }, [strategy?.revision]);
+    if (!strategy || (gasRevision !== null && strategy.revision <= gasRevision)) return;
+    const hasDraft = Object.keys(gasDirty).length > 0;
+    setConfig({ ...strategy.config, ...gasDirty });
+    setGasRevision(strategy.revision);
+    setSavedBuilder(builderSettings(strategy.config));
+    setGasSaved(false);
+    setGasNotice(hasDraft
+      ? "Configuration changed elsewhere; your unsaved payment edits were preserved on the latest revision."
+      : null);
+  }, [strategy, gasRevision, gasDirty]);
 
   useEffect(() => {
-    if (!config) return;
+    if (!authoritativeConfig) return;
     let cancelled = false;
     setBuilderCapabilityLoading(true);
     api.builderIncentive()
@@ -218,30 +264,45 @@ export function JitPanel({
     capabilityRefreshToken,
   ]);
 
-  const gasField = (k: keyof StrategyConfig, v: number | boolean | string) => {
+  const gasField = <K extends keyof PaymentSettings>(k: K, v: PaymentSettings[K]) => {
     if (!config) return;
-    onStrategyChange({ ...strategy!, config: { ...config, [k]: v } });
+    setConfig((current) => current === null ? null : { ...current, [k]: v });
+    setGasDirty((patch) => {
+      const next = { ...patch, [k]: v };
+      gasDirtyRef.current = next;
+      return next;
+    });
     setGasSaved(false);
+    setGasNotice(null);
   };
   const saveGas = async () => {
-    if (!config) return;
-    const bidWei = ethWei(config.coinbaseBidEth);
-    if (config.coinbaseBidEnabled && (bidWei === null || bidWei === 0n)) {
+    if (!config || gasRevision === null || Object.keys(gasDirty).length === 0) return;
+    const hasNewerAuthoritative = strategy !== null && strategy.revision > gasRevision;
+    const candidateConfig = hasNewerAuthoritative
+      ? { ...strategy.config, ...gasDirty }
+      : config;
+    const bidWei = ethWei(candidateConfig.coinbaseBidEth);
+    if (candidateConfig.coinbaseBidEnabled && (bidWei === null || bidWei === 0n)) {
       setGasErr("Enter a positive canonical ETH amount with at most 18 decimal places.");
       return;
     }
-    if (config.coinbaseBidEnabled && !ADDRESS.test(config.coinbasePayerAddress)) {
+    if (candidateConfig.coinbaseBidEnabled && !ADDRESS.test(candidateConfig.coinbasePayerAddress)) {
       setGasErr("Enter the deployed CoinbasePayer address before enabling the incentive.");
       return;
     }
-    const nextBuilder = builderSettings(config);
-    const acknowledgesRisk = savedBuilder === null
+    const nextBuilder = builderSettings(candidateConfig);
+    const currentBuilder = hasNewerAuthoritative
+      ? builderSettings(strategy.config)
+      : savedBuilder;
+    const acknowledgesRisk = currentBuilder === null
       ? nextBuilder.coinbaseBidEnabled
-      : builderRiskIncreases(savedBuilder, nextBuilder);
+      : builderRiskIncreases(currentBuilder, nextBuilder);
     if (acknowledgesRisk && !window.confirm(
       "Confirm direct builder-incentive risk\n\n"
       + "An included incentive irreversibly sends ETH to the block fee recipient, plus gas. "
-      + "It does not guarantee inclusion, top-of-block placement, transaction order, or audit success. Continue?",
+      + "Configured builders receive the raw signed cohort transactions. The payer's signed window bounds "
+      + "when bid value can transfer, but successful payment-first ordering still relies on the builder honoring "
+      + "bundle rules. It does not guarantee inclusion, top-of-block placement, transaction order, or audit success. Continue?",
     )) {
       setGasErr("Builder-incentive changes were not saved because risk acknowledgement was cancelled.");
       return;
@@ -249,27 +310,20 @@ export function JitPanel({
     setGasBusy(true);
     setGasErr(null);
     try {
-      const patch = {
-        maxBaseFeeGwei: config.maxBaseFeeGwei,
-        priorityFeeGwei: config.priorityFeeGwei,
-        dynamicTipEnabled: config.dynamicTipEnabled,
-        dynamicTipMaxGwei: config.dynamicTipMaxGwei,
-        replacementPriorityFeeCapGwei: config.replacementPriorityFeeCapGwei,
-        preBoundaryPay: config.preBoundaryPay,
-        preBoundaryLeadMs: config.preBoundaryLeadMs,
-        preBoundaryLeadMainnetMs: config.preBoundaryLeadMainnetMs,
-        maxAutoPayEpochs: config.maxAutoPayEpochs,
-        coinbaseBidEnabled: config.coinbaseBidEnabled,
-        coinbaseBidEth: config.coinbaseBidEth,
-        coinbasePayerAddress: config.coinbasePayerAddress,
-        combinedBoundaryBundle: config.combinedBoundaryBundle,
-      };
+      const baseRevision = Math.max(gasRevision, strategy?.revision ?? gasRevision);
+      const patch = { ...gasDirty };
       const next = acknowledgesRisk
-        ? await api.setConfig(strategy!.revision, patch, true)
-        : await api.setConfig(strategy!.revision, patch);
+        ? await api.setConfig(baseRevision, patch, true)
+        : await api.setConfig(baseRevision, patch);
+      const remaining = remainingPaymentDraft(gasDirtyRef.current, patch);
+      gasDirtyRef.current = remaining;
+      setConfig({ ...next.config, ...remaining });
+      setGasRevision(next.revision);
+      setGasDirty(remaining);
+      setGasNotice(null);
       onStrategyChange(next);
       setSavedBuilder(builderSettings(next.config));
-      setGasSaved(true);
+      setGasSaved(Object.keys(remaining).length === 0);
       try {
         setBuilderCapability(await api.builderIncentive());
       } catch (error) {
@@ -281,10 +335,14 @@ export function JitPanel({
     } catch (e) {
       if (e instanceof ApiError && (e.status === 409 || e.status === 503)) {
         try {
-          await refreshAuthoritative();
+          const authoritative = await refreshAuthoritative();
+          setConfig({ ...authoritative.config, ...gasDirtyRef.current });
+          setGasRevision(authoritative.revision);
+          setSavedBuilder(builderSettings(authoritative.config));
+          setGasSaved(false);
           setGasErr(e.status === 409
-            ? "Payment settings changed elsewhere; refreshed authoritative values."
-            : "Payment settings may have committed but durability was not confirmed; refreshed authoritative values. The engine remains paused.");
+            ? "Payment settings changed elsewhere; refreshed authoritative values and preserved your unsaved edits."
+            : "Payment settings may have committed but durability was not confirmed; refreshed authoritative values and preserved your unsaved edits. The engine remains paused.");
           return;
         } catch {
           // Fall through to the mutation error.
@@ -508,7 +566,9 @@ export function JitPanel({
             <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
               The bot uses whichever lead matches your submission mode. Future-valid public transactions wait
               for the boundary timestamp; mainnet bundles also carry that timestamp as an inclusion floor. Keep
-              both leads under one 12-second slot. The larger mainnet default gives builders more time.
+              both leads under one 12-second slot. Combined cohorts and optional audit/kill races use at least
+              {" "}{MIN_ADVANCED_BOUNDARY_LEAD_MS}ms internally even if a lower payment-only lead is configured.
+              The larger mainnet default gives builders more time.
             </p>
           </div>
 
@@ -565,6 +625,16 @@ export function JitPanel({
               <p className="muted" style={{ margin: "0 0 4px 0" }}>
                 <b>No guarantee:</b> paying a builder does not guarantee bundle inclusion, top-of-block
                 position, transaction order, or a successful payment/audit outcome.
+              </p>
+              <p className="muted" style={{ margin: "0 0 4px 0" }}>
+                <b>Builder trust:</b> configured relays/builders receive the raw signed cohort transactions.
+                The payer window limits when bid value can transfer; it cannot prove that the preceding payment
+                succeeded if a builder ignores the submitted bundle rules.
+              </p>
+              <p className="muted" style={{ margin: "0 0 4px 0" }}>
+                <b>Expired raw:</b> after its signed window the bid cannot transfer, but the transaction can still
+                revert and consume bounded gas and its nonce. The bot keeps that nonce fenced and publicly retires
+                it before reuse.
               </p>
               <p className="muted" style={{ margin: "0 0 4px 0" }}>
                 <b>Private mainnet only:</b> the backend requires Ethereum mainnet, a healthy submission
@@ -667,6 +737,7 @@ export function JitPanel({
             onClick={saveGas}
             disabled={
               gasBusy
+              || Object.keys(gasDirty).length === 0
               || (config.coinbaseBidEnabled && (
                 (ethWei(config.coinbaseBidEth) ?? 0n) === 0n
                 || !ADDRESS.test(config.coinbasePayerAddress)
@@ -676,6 +747,7 @@ export function JitPanel({
           >
             {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment settings"}
           </button>
+          {gasNotice && <p className="hint" style={{ marginTop: 6 }}>{gasNotice}</p>}
           {gasErr && <p className="err" style={{ marginTop: 6 }}>{gasErr}</p>}
         </div>
       )}

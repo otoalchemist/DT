@@ -118,6 +118,25 @@ describe("atomic JSON persistence", () => {
     expect(fs.readdirSync(dir)).toEqual(["settings.json"]);
   });
 
+  it.skipIf(process.platform === "win32")(
+    "tightens an existing legacy-permission settings file before loading its credential",
+    () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "dat-settings-mode-"));
+      dirs.push(root);
+      const currentPath = path.join(root, "settings.json");
+      fs.writeFileSync(
+        currentPath,
+        JSON.stringify({ alchemyApiKey: "existing-secret" }),
+        { mode: 0o644 },
+      );
+
+      expect(loadSettingsFromPaths(currentPath, currentPath)).toEqual({
+        alchemyApiKey: "existing-secret",
+      });
+      expect(fs.statSync(currentPath).mode & 0o777).toBe(0o600);
+    },
+  );
+
   it("leaves the previous file intact and cleans the temp file when replacement fails", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dat-atomic-failure-"));
     dirs.push(dir);
@@ -171,7 +190,49 @@ describe("atomic JSON persistence", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, "instance", "settings.legacy.json"), "utf8")))
       .toEqual({ alchemyApiKey: "legacy-key", mode: "public" });
     expect(fs.existsSync(legacyPath)).toBe(true);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(legacyPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(currentPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.join(root, "instance", "settings.legacy.json")).mode & 0o777)
+        .toBe(0o600);
+    }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "hardens retained legacy and backup secrets even when current settings already exist",
+    () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "dat-settings-retained-"));
+      dirs.push(root);
+      const legacyPath = path.join(root, "legacy", "settings.json");
+      const currentPath = path.join(root, "instance", "settings.json");
+      const backupPath = path.join(root, "instance", "settings.legacy.json");
+      fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+      fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+      fs.writeFileSync(legacyPath, JSON.stringify({ alchemyApiKey: "legacy-secret" }), { mode: 0o644 });
+      fs.writeFileSync(currentPath, JSON.stringify({ mode: "public" }), { mode: 0o600 });
+      fs.writeFileSync(backupPath, JSON.stringify({ alchemyApiKey: "backup-secret" }), { mode: 0o644 });
+
+      expect(loadSettingsFromPaths(currentPath, legacyPath)).toEqual({ mode: "public" });
+      expect(fs.statSync(legacyPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(backupPath).mode & 0o777).toBe(0o600);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a symlinked settings path instead of following it to a secret target",
+    () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "dat-settings-symlink-"));
+      dirs.push(root);
+      const targetPath = path.join(root, "target.json");
+      const currentPath = path.join(root, "settings.json");
+      fs.writeFileSync(targetPath, JSON.stringify({ alchemyApiKey: "linked-secret" }), { mode: 0o644 });
+      fs.symlinkSync(targetPath, currentPath);
+
+      expect(() => loadSettingsFromPaths(currentPath, currentPath))
+        .toThrow(/Could not secure settings permissions/);
+      expect(fs.statSync(targetPath).mode & 0o777).toBe(0o644);
+    },
+  );
 
   it("fails closed without overwriting a present corrupt or invalid settings file", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "dat-settings-corrupt-"));

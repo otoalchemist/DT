@@ -202,7 +202,11 @@ vi.mock("./index-tokens.js", () => ({ filterOwnedTokenIds: h.filterOwnedTokenIds
 vi.mock("./postmortem.js", () => ({ runPostMortem: vi.fn() }));
 vi.mock("./logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
-const { buildServer, builderIncentiveRiskIncreases } = await import("./api.js");
+const {
+  buildServer,
+  builderIncentiveRiskIncreases,
+  revokeAndDrainApiExecution,
+} = await import("./api.js");
 const { AtomicWriteCommittedError } = await import("./durability.js");
 
 describe("revisioned API lifecycle", () => {
@@ -328,6 +332,70 @@ describe("revisioned API lifecycle", () => {
     expect(h.startEngine).not.toHaveBeenCalled();
     expect(h.runtime.running).toBe(false);
     await app.close();
+  });
+
+  it.each([
+    {
+      name: "Start",
+      request: {
+        method: "POST" as const,
+        url: "/api/start",
+        headers: { host: "localhost" },
+      },
+    },
+    {
+      name: "JIT arm",
+      request: {
+        method: "POST" as const,
+        url: "/api/jit",
+        headers: { host: "localhost" },
+        payload: {
+          enable: true,
+          expectedRevision: 0,
+          targetEpoch: 11,
+          tokenIds: ["7"],
+        },
+      },
+    },
+  ])("revokes and drains a future-boundary $name recovery during shutdown", async ({ request }) => {
+    let markRecoveryStarted!: () => void;
+    const recoveryStarted = new Promise<void>((resolve) => {
+      markRecoveryStarted = resolve;
+    });
+    const broadcast = vi.fn();
+    let observedSignal: AbortSignal | undefined;
+    h.recoverAuthorizedSubmissions.mockImplementationOnce(async (_address, signal) => {
+      observedSignal = signal;
+      markRecoveryStarted();
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          broadcast();
+          resolve();
+        }, 60_000);
+        const abort = () => {
+          clearTimeout(timer);
+          reject(new Error("future-boundary recovery aborted by shutdown"));
+        };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+    });
+    const app = await buildServer();
+    const activeRequest = app.inject(request);
+
+    await recoveryStarted;
+    const drain = revokeAndDrainApiExecution(app);
+    const close = app.close();
+
+    expect(observedSignal?.aborted).toBe(true);
+    await expect(drain).resolves.toBeUndefined();
+    const response = await activeRequest;
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error).toContain("aborted by shutdown");
+    expect(broadcast).not.toHaveBeenCalled();
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.saveJitCampaign).not.toHaveBeenCalled();
+    await close;
   });
 
   it("keeps a running engine paused when a config rename commits without durability confirmation", async () => {
@@ -586,6 +654,30 @@ describe("revisioned API lifecycle", () => {
     expect(h.stopEngine).not.toHaveBeenCalled();
     expect(h.runtime.saveJitCampaign).not.toHaveBeenCalled();
     expect(h.runtime.jitCampaign.state).toBe("cancelled");
+    await app.close();
+  });
+
+  it("lets unrelated configuration changes preserve an inert public-mode builder bid", async () => {
+    h.appConfig.mode = "public";
+    h.runtime.strategy = {
+      ...h.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    };
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/config",
+      headers: { host: "localhost" },
+      payload: { expectedRevision: 0, patch: { defenseEnabled: true } },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.runtime.saveStrategy).toHaveBeenCalledWith({ defenseEnabled: true }, 0);
+    expect(h.getChainId).not.toHaveBeenCalled();
+    expect(h.resolveBuilderIncentive).not.toHaveBeenCalled();
     await app.close();
   });
 

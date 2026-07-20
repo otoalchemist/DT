@@ -16,6 +16,12 @@ import { logger } from "./logger.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
 import { AtomicWriteCommittedError } from "./durability.js";
 import { redactSensitiveText } from "./redaction.js";
+import {
+  configuredEthToWei,
+  configuredGweiToWei,
+  MAX_CONFIG_ETH,
+  MAX_CONFIG_GWEI,
+} from "./amounts.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
@@ -85,6 +91,43 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 
+const nonNegativeEthNumberSchema = z.number()
+  .finite()
+  .min(0)
+  .max(MAX_CONFIG_ETH)
+  .refine((value) => {
+    try {
+      configuredEthToWei(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }, "must be a finite ETH amount with at most 18 decimal places");
+
+const nonNegativeGweiNumberSchema = z.number()
+  .finite()
+  .min(0)
+  .max(MAX_CONFIG_GWEI)
+  .refine((value) => {
+    try {
+      configuredGweiToWei(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }, "must be a finite safely-convertible gwei amount");
+
+const positiveGweiNumberSchema = nonNegativeGweiNumberSchema.refine(
+  (value) => {
+    try {
+      return configuredGweiToWei(value) > 0n;
+    } catch {
+      return false;
+    }
+  },
+  "must resolve to at least one wei",
+);
+
 const strategyCommonShape = {
   defenseEnabled: z.boolean(),
   dryRun: z.boolean(),
@@ -105,20 +148,20 @@ const strategyCommonShape = {
   ),
   preBoundaryAudit: z.boolean(),
   preBoundaryKill: z.boolean(),
-  maxBaseFeeGwei: z.number().positive(),
-  priorityFeeGwei: z.number().min(0),
-  minBalanceEth: z.number().min(0),
-  replacementPriorityFeeCapGwei: z.number().positive(),
+  maxBaseFeeGwei: positiveGweiNumberSchema,
+  priorityFeeGwei: nonNegativeGweiNumberSchema,
+  minBalanceEth: nonNegativeEthNumberSchema,
+  replacementPriorityFeeCapGwei: positiveGweiNumberSchema,
   separateOffenseGas: z.boolean(),
-  offenseMaxBaseFeeGwei: z.number().positive(),
-  offensePriorityFeeGwei: z.number().min(0),
+  offenseMaxBaseFeeGwei: positiveGweiNumberSchema,
+  offensePriorityFeeGwei: nonNegativeGweiNumberSchema,
   offenseDynamicTipEnabled: z.boolean(),
-  offenseDynamicTipMaxGwei: z.number().positive(),
-  offenseReplacementPriorityFeeCapGwei: z.number().positive(),
+  offenseDynamicTipMaxGwei: positiveGweiNumberSchema,
+  offenseReplacementPriorityFeeCapGwei: positiveGweiNumberSchema,
   racePublicMempool: z.boolean(),
   dynamicTipEnabled: z.boolean(),
-  dynamicTipMaxGwei: z.number().positive(),
-  maxPaymentEth: z.number().min(0),
+  dynamicTipMaxGwei: positiveGweiNumberSchema,
+  maxPaymentEth: nonNegativeEthNumberSchema,
 };
 
 const canonicalCoinbaseBidEthSchema = z.string()
@@ -127,7 +170,11 @@ const canonicalCoinbaseBidEthSchema = z.string()
     /^(0|[1-9]\d*)(\.\d{1,18})?$/,
     "must be a non-negative base-10 ETH amount with at most 18 decimal places",
   )
-  .transform((value) => formatEther(parseEther(value)));
+  .transform((value) => formatEther(parseEther(value)))
+  .refine(
+    (value) => parseEther(value) <= (1n << 256n) - 1n,
+    "must fit the transaction uint256 value range",
+  );
 
 const coinbasePayerAddressSchema = z.string()
   .trim()
@@ -508,6 +555,17 @@ export class Runtime {
       this.spentThisEpoch = 0n;
     }
     this.spentThisEpoch += wei;
+    this.emitStatus();
+  }
+
+  /** Replace, rather than increment, the receipt-priced total reconstructed
+   * from durable same-epoch journal tombstones. The epoch remains explicit so
+   * an old receipt can never be displayed as spend in a newer epoch. */
+  restoreConfirmedSpend(epoch: bigint, wei: bigint): void {
+    if (epoch < 0n || wei < 0n) throw new Error("confirmed spend cannot be negative");
+    if (this.spendEpoch === epoch && this.spentThisEpoch === wei) return;
+    this.spendEpoch = epoch;
+    this.spentThisEpoch = wei;
     this.emitStatus();
   }
 

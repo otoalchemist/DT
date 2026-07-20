@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   keccak256,
-  parseEther,
   recoverTransactionAddress,
   toHex,
   type Address,
@@ -24,8 +23,10 @@ import {
   JournalCorruptionError,
   SubmissionFlightJournal,
   type JournalBlockEvidence,
+  type JournalConfirmedSpend,
   type JournalDeliveryAttempt,
   type JournalFlight,
+  type JournalPaymentMetadata,
   type JournalReconciliation,
   type PrivateCohortMetadata,
   type SubmissionPurpose,
@@ -33,8 +34,16 @@ import {
 import { logger } from "./logger.js";
 import { AtomicWriteCommittedError, writeFileAtomicDurableSync } from "./durability.js";
 import { redactSensitiveText } from "./redaction.js";
+import { decodeCoinbasePayment } from "./coinbase-payer.js";
+import { configuredEthToWei, configuredGweiToWei } from "./amounts.js";
 
-export type { PrivateCohortMetadata, PrivateCohortRole, SubmissionPurpose } from "./submission-journal.js";
+export type {
+  JournalConfirmedSpend,
+  JournalPaymentMetadata,
+  PrivateCohortMetadata,
+  PrivateCohortRole,
+  SubmissionPurpose,
+} from "./submission-journal.js";
 
 export interface TxIntent {
   to: Address;
@@ -128,6 +137,22 @@ export class RecoveryFloorError extends Error {
   }
 }
 
+export class BuilderNonceRetirementError extends Error {
+  constructor(readonly nonce: number, reason: string) {
+    super(`builder-incentive nonce ${nonce} retirement blocked: ${reason}`);
+    this.name = "BuilderNonceRetirementError";
+  }
+}
+
+export class UntrackedPendingPrefixError extends Error {
+  constructor(readonly wallet: Address, readonly nonce: number) {
+    super(
+      `submission recovery blocked: pending nonce ${nonce} for ${wallet} is not represented in the durable journal`,
+    );
+    this.name = "UntrackedPendingPrefixError";
+  }
+}
+
 class SubmissionRecoveryAbortedError extends Error {
   constructor() {
     super("submission recovery aborted before delivery");
@@ -201,7 +226,12 @@ function nonceSnapshot(flight: JournalFlight) {
     maxPrivateTargetBlock: flight.maxPrivateTargetBlock === undefined
       ? undefined
       : BigInt(flight.maxPrivateTargetBlock),
-    retainBeyondPrivateTarget: flight.nonceConflict,
+    // Only the hash-bound journal may release a durable private target. A
+    // height-only NonceManager sync cannot detect a lateral reorg that replaces
+    // the last authorized block.
+    retainBeyondPrivateTarget: flight.nonceConflict
+      || flight.maxPrivateTargetBlock !== undefined
+      || flight.recovery.validThroughBlock !== undefined,
     observedConsumedAtBlock: flight.observedConsumedAtBlock === undefined
       ? undefined
       : BigInt(flight.observedConsumedAtBlock),
@@ -214,7 +244,23 @@ function reconcileAtCounts(
   pendingNonce: number,
   blockEvidence: JournalBlockEvidence,
 ): JournalReconciliation {
-  return submissionJournal.reconcile(address, confirmedNonce, pendingNonce, blockEvidence);
+  const reconciliation = submissionJournal.reconcile(
+    address,
+    confirmedNonce,
+    pendingNonce,
+    blockEvidence,
+  );
+  const retainedNonces = new Set(reconciliation.retained.map((flight) => flight.nonce));
+  nonceManager.releaseJournalExpired([
+    ...new Set(reconciliation.expired.flatMap((flight) =>
+      // A signed builder deadline ends value transfer, not nonce validity. An
+      // old reverting payer raw must be retired by confirmed same-nonce
+      // consumption and can never enter the ordinary expiry-release path.
+      retainedNonces.has(flight.nonce) || flight.purpose === "builder-incentive"
+        ? []
+        : [flight.nonce])),
+  ]);
+  return reconciliation;
 }
 
 /** Select one canonical tip and retain the bounded parent-hash chain needed for
@@ -280,6 +326,241 @@ export async function reconcileSubmissionJournal(address: Address): Promise<Jour
   return reconcileAtCounts(address, confirmedNonce, pendingNonce, blockEvidence);
 }
 
+/**
+ * Remove finalized WAL tombstones only after the strategy has made their
+ * one-shot bookkeeping durable (or their authorization scope has ended).
+ */
+export function acknowledgeFinalizedSubmissionFlights(
+  address: Address,
+  txHashes: readonly Hex[],
+): void {
+  if (txHashes.length === 0) return;
+  submissionJournal.removeMany(address, txHashes);
+}
+
+/** Bind receipt-priced spend to the exact finalized raw before any in-memory
+ * metric is changed. A conflicting retry is corruption, not an additive spend. */
+export function annotateFinalizedSubmissionSpend(
+  address: Address,
+  txHash: Hex,
+  confirmedSpend: JournalConfirmedSpend,
+): void {
+  const flight = submissionJournal.load(address).find((candidate) =>
+    candidate.txHash.toLowerCase() === txHash.toLowerCase());
+  if (!flight || flight.state !== "confirmed") {
+    throw new Error(`cannot annotate non-final submission ${txHash}`);
+  }
+  if (
+    flight.confirmedSpend !== undefined
+    && (
+      flight.confirmedSpend.epoch !== confirmedSpend.epoch
+      || flight.confirmedSpend.spendWei !== confirmedSpend.spendWei
+    )
+  ) {
+    throw new Error(`submission journal confirmed-spend conflict for ${txHash}`);
+  }
+  if (flight.confirmedSpend !== undefined) return;
+  submissionJournal.update(address, txHash, { confirmedSpend });
+}
+
+function builderDeadlineCanonicallyFinal(
+  flight: JournalFlight,
+  currentBlock: bigint,
+): boolean {
+  if (
+    flight.purpose !== "builder-incentive"
+    || flight.recovery.validThroughBlock === undefined
+    || flight.observedConsumedAtBlock !== undefined
+  ) return false;
+  const deadline = BigInt(flight.recovery.validThroughBlock);
+  return currentBlock >= deadline
+    && currentBlock - deadline + 1n >= JOURNAL_CONFIRMATION_DEPTH;
+}
+
+function isInertSelfTransfer(flight: JournalFlight, address: Address): boolean {
+  return (flight.purpose === "nonce-retirement" || flight.purpose === undefined)
+    && flight.recovery.publicAuthorized
+    && flight.obligation.to.toLowerCase() === address.toLowerCase()
+    && flight.obligation.data === "0x"
+    && BigInt(flight.obligation.valueWei) === 0n;
+}
+
+function signedGeneralFeesWithinCurrentLimits(
+  flight: JournalFlight,
+  baseFeePerGas: bigint,
+): boolean {
+  const gas = resolveGas(runtime.strategy, false);
+  const maxBaseFeeWei = configuredGweiToWei(gas.maxBaseFeeGwei);
+  if (baseFeePerGas > maxBaseFeeWei) return false;
+  const priorityCapGwei = Math.max(
+    gas.priorityFeeGwei,
+    gas.replacementPriorityFeeCapGwei ?? gas.priorityFeeGwei,
+  );
+  const priorityCapWei = configuredGweiToWei(priorityCapGwei);
+  const maxFeeCapWei = maxBaseFeeWei * 2n + priorityCapWei;
+  return BigInt(flight.obligation.maxPriorityFeePerGas) <= priorityCapWei
+    && BigInt(flight.obligation.maxFeePerGas) <= maxFeeCapWei;
+}
+
+interface BuilderRetirementCandidate {
+  builder: JournalFlight;
+  prior: JournalFlight;
+}
+
+function retirementBuilderByNonce(
+  reconciliation: JournalReconciliation,
+): Map<number, BuilderRetirementCandidate> {
+  const byNonce = new Map<number, JournalFlight[]>();
+  for (const flight of reconciliation.retained) {
+    const group = byNonce.get(flight.nonce) ?? [];
+    group.push(flight);
+    byNonce.set(flight.nonce, group);
+  }
+  const out = new Map<number, BuilderRetirementCandidate>();
+  for (const [nonce, lineage] of byNonce) {
+    const builders = lineage.filter((flight) => flight.purpose === "builder-incentive");
+    // Every signed builder alternative at this nonce can preempt the filler.
+    // Retiring after only the oldest deadline would race a newer still-live bid.
+    if (
+      builders.length === 0
+      || !builders.every((flight) =>
+        builderDeadlineCanonicallyFinal(flight, reconciliation.currentBlock))
+    ) continue;
+    const eligible = builders;
+    const inert = lineage
+      .filter((flight) => isInertSelfTransfer(flight, eligible[0]!.wallet))
+      .sort((left, right) =>
+        right.updatedAtMs - left.updatedAtMs || right.createdAtMs - left.createdAtMs);
+    const conflicting = lineage.find((flight) =>
+      flight.purpose !== "builder-incentive"
+      && !isInertSelfTransfer(flight, eligible[0]!.wallet));
+    if (conflicting) {
+      throw new BuilderNonceRetirementError(
+        nonce,
+        "same nonce already has a non-retirement signed alternative; retaining every lineage",
+      );
+    }
+    eligible.sort((left, right) =>
+      right.updatedAtMs - left.updatedAtMs || right.createdAtMs - left.createdAtMs);
+    const latestRetirement = inert[0];
+    if (latestRetirement?.state === "prepared") continue;
+    if (
+      latestRetirement !== undefined
+      && Date.now() - latestRetirement.updatedAtMs < RECOVERY_REBROADCAST_AFTER_MS
+    ) continue;
+    out.set(nonce, {
+      builder: eligible[0]!,
+      prior: latestRetirement ?? eligible[0]!,
+    });
+  }
+  return out;
+}
+
+async function retirementSpendAuthorized(
+  address: Address,
+  nonce: number,
+  quote: { valueWei: bigint; gasWei: bigint },
+  signal?: AbortSignal,
+): Promise<true | string> {
+  throwIfRecoveryAborted(signal);
+  if (runtime.strategy.dryRun) return "dry-run mode forbids nonce-retirement delivery";
+  if (!runtime.unlocked || runtime.account?.address.toLowerCase() !== address.toLowerCase()) {
+    return "wallet is locked or changed before nonce-retirement authorization";
+  }
+  const block = await beforeRecoveryAbort(
+    publicClient.getBlock({ blockTag: "latest" }),
+    signal,
+  );
+  if (block.number === null) return "latest block is not mined";
+  const balanceWei = await beforeRecoveryAbort(
+    publicClient.getBalance({ address, blockNumber: block.number }),
+    signal,
+  );
+  throwIfRecoveryAborted(signal);
+  const live = submissionJournal.load(address);
+  const totalExposure = liveMaximumExposure(live);
+  const priorNonceExposure = live
+    .filter((flight) => flight.nonce === nonce)
+    .reduce((maximum, flight) => {
+      const exposure = journalFlightMaximumExposure(flight);
+      return exposure > maximum ? exposure : maximum;
+    }, 0n);
+  const replacementExposure = quote.valueWei + quote.gasWei;
+  const nextNonceExposure = replacementExposure > priorNonceExposure
+    ? replacementExposure
+    : priorNonceExposure;
+  const maximumExposureWei = totalExposure - priorNonceExposure + nextNonceExposure;
+  const floorWei = configuredEthToWei(runtime.strategy.minBalanceEth);
+  return balanceWei >= maximumExposureWei + floorWei
+    ? true
+    : `balance ${balanceWei} wei cannot cover ${maximumExposureWei} wei of live maximum exposure plus ${floorWei} wei configured floor`;
+}
+
+async function retireFinalizedBuilderNonces(
+  reconciliation: JournalReconciliation,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const candidates = retirementBuilderByNonce(reconciliation);
+  if (candidates.size === 0) return false;
+  assertPendingPrefixIsTracked(reconciliation);
+  if (bundleQueue !== null && bundleQueue.length > 0) {
+    throw new BuilderNonceRetirementError(
+      Math.min(...candidates.keys()),
+      "an active transaction batch already contains prepared work",
+    );
+  }
+  const account = runtime.account;
+  if (
+    !account
+    || account.address.toLowerCase()
+      !== candidates.values().next().value?.builder.wallet.toLowerCase()
+  ) {
+    throw new BuilderNonceRetirementError(
+      Math.min(...candidates.keys()),
+      "wallet is locked or changed",
+    );
+  }
+  for (const [nonce, candidate] of [...candidates].sort(([left], [right]) => left - right)) {
+    throwIfRecoveryAborted(signal);
+    const { builder, prior } = candidate;
+    const result = await submitTx(
+      { to: account.address, data: "0x", value: 0n, gas: 21_000n },
+      {
+        dryRun: false,
+        race: true,
+        purpose: "nonce-retirement",
+        publicOnly: true,
+        signal,
+        replacement: {
+          nonce,
+          priorMaxFeePerGas: BigInt(prior.obligation.maxFeePerGas),
+          priorMaxPriorityFeePerGas: BigInt(prior.obligation.maxPriorityFeePerGas),
+          priorTxHash: prior.txHash,
+          lineageId: builder.lineage.id,
+        },
+        authorize: async (quote) => {
+          const authorized = await retirementSpendAuthorized(account.address, nonce, quote, signal);
+          return authorized === true
+            ? { ok: true, stillValid: () => !signal?.aborted
+                && runtime.unlocked
+                && runtime.account?.address.toLowerCase() === account.address.toLowerCase() }
+            : { ok: false, error: authorized };
+        },
+      },
+    );
+    if (!result.ok) {
+      throw new BuilderNonceRetirementError(
+        nonce,
+        result.error ?? "same-nonce inert replacement was not delivered",
+      );
+    }
+    logger.warn(
+      `builder-incentive nonce ${nonce} remains fenced while its public inert replacement confirms`,
+    );
+  }
+  return true;
+}
+
 /** Explicit, mutating recovery delivery. Call only from an operator-authorized
  * engine start/JIT-arm path; unlock/preflight reconciliation stays read-only. */
 export async function recoverPreparedSubmissions(
@@ -287,12 +568,67 @@ export async function recoverPreparedSubmissions(
   signal?: AbortSignal,
   authorizeFlight?: (flight: JournalFlight) => Promise<boolean>,
 ): Promise<JournalReconciliation> {
+  // Hash-bound recovery replaces the NonceManager's in-memory snapshot and may
+  // expire undisclosed WAL entries. Neither mutation may interleave work that
+  // has already been reserved/signed in the current live batch.
+  if (bundleQueue !== null && bundleQueue.length > 0) {
+    throw new Error("submission recovery cannot interleave a non-empty transaction batch");
+  }
   throwIfRecoveryAborted(signal);
-  const reconciliation = await beforeRecoveryAbort(
+  let reconciliation = await beforeRecoveryAbort(
     reconcileSubmissionJournal(address),
     signal,
   );
-  return recoverJournalFlights(reconciliation, signal, authorizeFlight);
+  nonceManager.initializeFromJournal(
+    address,
+    reconciliation.confirmedNonce,
+    reconciliation.pendingNonce,
+    reconciliation.retained.map(nonceSnapshot),
+  );
+  const retired = await retireFinalizedBuilderNonces(reconciliation, signal);
+  if (retired) {
+    reconciliation = await beforeRecoveryAbort(
+      reconcileSubmissionJournal(address),
+      signal,
+    );
+    nonceManager.initializeFromJournal(
+      address,
+      reconciliation.confirmedNonce,
+      reconciliation.pendingNonce,
+      reconciliation.retained.map(nonceSnapshot),
+    );
+  }
+  const builderNonces = new Set(reconciliation.retained
+    .filter((flight) => flight.purpose === "builder-incentive")
+    .map((flight) => flight.nonce));
+  let feeBlock: Promise<Block> | undefined;
+  const authorizeWithRetirementPolicy = async (flight: JournalFlight): Promise<boolean> => {
+    if (builderNonces.has(flight.nonce) && isInertSelfTransfer(flight, address)) {
+      throwIfRecoveryAborted(signal);
+      if (
+        runtime.strategy.dryRun
+        || !runtime.unlocked
+        || runtime.account?.address.toLowerCase() !== address.toLowerCase()
+      ) {
+        throw new BuilderNonceRetirementError(
+          flight.nonce,
+          "wallet authority was withdrawn before prepared retirement replay",
+        );
+      }
+      feeBlock ??= publicClient.getBlock({ blockNumber: reconciliation.currentBlock });
+      const block = await beforeRecoveryAbort(feeBlock, signal);
+      if (!signedGeneralFeesWithinCurrentLimits(flight, block.baseFeePerGas ?? 0n)) {
+        throw new BuilderNonceRetirementError(
+          flight.nonce,
+          "prepared retirement fees exceed current general cleanup caps",
+        );
+      }
+      return true;
+    }
+    if (authorizeFlight && !(await authorizeFlight(flight))) return false;
+    return true;
+  };
+  return recoverJournalFlights(reconciliation, signal, authorizeWithRetirementPolicy);
 }
 
 // NonceManager can also recover independently when callers sync it before the
@@ -418,7 +754,7 @@ function computeFees(offense: boolean, block: Block): {
   // Priority tip: static by default, or scaled up by block fullness when the
   // dynamic-tip edge is enabled (helps win inclusion in contested blocks).
   const tipGwei = effectiveTipGwei(gas, block.gasUsed, block.gasLimit);
-  const priority = BigInt(Math.round(tipGwei * 1e9));
+  const priority = configuredGweiToWei(tipGwei);
   const maxFeePerGas = baseFee * 2n + priority;
   return { maxFeePerGas, maxPriorityFeePerGas: priority, baseFee };
 }
@@ -588,6 +924,14 @@ interface QueuedTx {
   revertible: boolean;
   purpose?: SubmissionPurpose;
   privateCohort?: PrivateCohortMetadata;
+  /** Payment baseline/campaign identity written under the same WAL barrier as
+   * the signed transaction. */
+  payment?: JournalPaymentMetadata;
+  /** Last block authorized by the calldata of a private builder payment. */
+  validThroughBlock?: bigint;
+  /** Conservative WAL fence for signed private raws with no on-chain expiry.
+   * Set before the first external disclosure so a crash cannot downgrade it. */
+  unboundedPrivateExposure?: boolean;
   /** Optional cohort work must cross the delivery-start barrier before this
    * wall-clock instant. Mandatory members intentionally ignore this at flush so
    * an expired suffix can never suppress their public safety fallback. */
@@ -595,12 +939,17 @@ interface QueuedTx {
 }
 let bundleQueue: QueuedTx[] | null = null;
 
-function validateSubmissionMetadata(opts: {
+function validateSubmissionMetadata(intent: TxIntent, opts: {
   race?: boolean;
+  simTimestamp?: bigint;
   revertible?: boolean;
   purpose?: SubmissionPurpose;
   privateCohort?: PrivateCohortMetadata;
+  payment?: JournalPaymentMetadata;
+  validThroughBlock?: bigint;
   deadlineMs?: number;
+  replacement?: ReplacementOptions;
+  publicOnly?: boolean;
 }): void {
   if (
     opts.deadlineMs !== undefined
@@ -609,8 +958,36 @@ function validateSubmissionMetadata(opts: {
     throw new Error("submission deadline must be a non-negative safe-integer timestamp");
   }
   const cohort = opts.privateCohort;
+  if (opts.validThroughBlock !== undefined && opts.validThroughBlock < 0n) {
+    throw new Error("builder-incentive block deadline must be non-negative");
+  }
+  if (opts.payment !== undefined && opts.purpose === "builder-incentive") {
+    throw new Error("builder incentives cannot carry payment recovery metadata");
+  }
+  if (opts.purpose === "nonce-retirement") {
+    if (
+      opts.publicOnly !== true
+      || opts.race !== true
+      || opts.replacement === undefined
+      || opts.privateCohort !== undefined
+      || opts.revertible === true
+      || opts.payment !== undefined
+      || opts.validThroughBlock !== undefined
+      || opts.simTimestamp !== undefined
+      || intent.to.toLowerCase() !== runtime.account?.address.toLowerCase()
+      || intent.data !== "0x"
+      || intent.value !== 0n
+    ) {
+      throw new Error("nonce retirement requires one public-only zero-value same-nonce self-transfer");
+    }
+    return;
+  }
   if (cohort === undefined) {
-    if (opts.revertible === true || opts.purpose !== undefined) {
+    if (
+      opts.revertible === true
+      || opts.purpose !== undefined
+      || opts.validThroughBlock !== undefined
+    ) {
       throw new Error("revertible/purpose submissions require an explicit private cohort");
     }
     return;
@@ -626,7 +1003,11 @@ function validateSubmissionMetadata(opts: {
     throw new Error(`unsupported private cohort role: ${String(cohort.role)}`);
   }
   if (cohort.role === "mandatory") {
-    if (opts.revertible === true || opts.purpose !== undefined) {
+    if (
+      opts.revertible === true
+      || opts.purpose !== undefined
+      || opts.validThroughBlock !== undefined
+    ) {
       throw new Error("mandatory private cohort members cannot be revertible or carry a purpose");
     }
     return;
@@ -641,7 +1022,20 @@ function validateSubmissionMetadata(opts: {
     if (opts.purpose !== "builder-incentive") {
       throw new Error("builder-incentive cohort role requires builder-incentive purpose");
     }
-  } else if (opts.purpose !== undefined) {
+    if (opts.validThroughBlock === undefined) {
+      throw new Error("builder-incentive submissions require an on-chain block deadline");
+    }
+    if (opts.simTimestamp === undefined) {
+      throw new Error("builder-incentive submissions require an on-chain not-before timestamp");
+    }
+    const signedWindow = decodeCoinbasePayment(intent.data);
+    if (
+      signedWindow?.validThroughBlock !== opts.validThroughBlock
+      || signedWindow.notBeforeTimestamp !== opts.simTimestamp
+    ) {
+      throw new Error("builder-incentive calldata does not match its on-chain validity window");
+    }
+  } else if (opts.purpose !== undefined || opts.validThroughBlock !== undefined) {
     throw new Error("allowed-revert cohort members cannot carry builder-incentive purpose");
   }
 }
@@ -739,6 +1133,39 @@ function earliestQueuedDeadline(queue: readonly QueuedTx[]): number | undefined 
   return deadlines.length === 0
     ? undefined
     : deadlines.reduce((earliest, deadline) => deadline < earliest ? deadline : earliest);
+}
+
+function privateTargetBlocksFor(
+  queue: readonly QueuedTx[],
+  firstTargetBlock: bigint,
+): bigint[] {
+  const candidates = [firstTargetBlock, firstTargetBlock + 1n];
+  const signedDeadlines = queue.flatMap((q) =>
+    q.validThroughBlock === undefined ? [] : [q.validThroughBlock]);
+  if (signedDeadlines.length === 0) return candidates;
+  const validThroughBlock = signedDeadlines.reduce((earliest, deadline) =>
+    deadline < earliest ? deadline : earliest);
+  return candidates.filter((block) => block <= validThroughBlock);
+}
+
+/** A builder payment that cannot execute in even the first fresh target block
+ * has not crossed the WAL/delivery barrier. Drop that private-only suffix; the
+ * mandatory/public-authorized prefix remains independently deliverable. */
+function omitBuilderIncentivePastTarget(
+  queue: QueuedTx[],
+  out: Map<number, BundleTxResult>,
+  firstTargetBlock: bigint,
+): void {
+  const cutoff = queue.findIndex((q) =>
+    q.purpose === "builder-incentive"
+    && q.validThroughBlock !== undefined
+    && q.validThroughBlock < firstTargetBlock);
+  if (cutoff === -1) return;
+  failPreparedQueue(
+    queue.splice(cutoff),
+    out,
+    `builder incentive expired before private target block ${firstTargetBlock}`,
+  );
 }
 
 /** Optional cohort roles are a validated nonce suffix. Once any member misses
@@ -859,10 +1286,6 @@ function bundleSimulationIssue(
   return null;
 }
 
-function bundleSimulationFailure(sim: any, expectedResultCount?: number): string | null {
-  return bundleSimulationIssue(sim, new Set(), expectedResultCount)?.failure ?? null;
-}
-
 function bundleHashFromResult(result: any): string | undefined {
   if (typeof result === "string") return result;
   return typeof result?.bundleHash === "string" ? result.bundleHash : undefined;
@@ -888,11 +1311,6 @@ function abortQueuedBeforeDelivery(
 function isAlreadyKnownError(err: unknown): boolean {
   const message = (err as { message?: string })?.message ?? String(err);
   return /already known|known transaction|already imported/i.test(message);
-}
-
-function isExplicitPublicRejection(err: unknown): boolean {
-  const message = (err as { message?: string })?.message ?? String(err);
-  return /insufficient funds|invalid sender|intrinsic gas|exceeds block gas|fee cap less than block base fee|transaction underpriced|replacement transaction underpriced|nonce too (?:low|high)|invalid transaction|gas required exceeds allowance/i.test(message);
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -960,6 +1378,7 @@ function liveMaximumExposure(flights: readonly JournalFlight[]): bigint {
 
 function isRecoveryCandidate(flight: JournalFlight, now: number): boolean {
   return flight.observedConsumedAtBlock === undefined
+    && flight.purpose !== "builder-incentive"
     && flight.recovery.publicAuthorized
     && (flight.state === "prepared"
       || (
@@ -1018,6 +1437,22 @@ function contiguousRecoveryCandidates(
   return candidates.slice(0, prefixLength);
 }
 
+function assertPendingPrefixIsTracked(reconciliation: JournalReconciliation): void {
+  const represented = new Set(reconciliation.retained.map((flight) => flight.nonce));
+  const end = Math.max(reconciliation.confirmedNonce, reconciliation.pendingNonce);
+  for (let nonce = reconciliation.confirmedNonce; nonce < end; nonce++) {
+    if (!represented.has(nonce)) {
+      const wallet = reconciliation.retained[0]?.wallet ?? runtime.account?.address;
+      if (!wallet) {
+        throw new Error(
+          `submission recovery blocked: pending nonce ${nonce} is not represented in the durable journal`,
+        );
+      }
+      throw new UntrackedPendingPrefixError(wallet, nonce);
+    }
+  }
+}
+
 async function rebroadcastJournalFlight(
   flight: JournalFlight,
   signal?: AbortSignal,
@@ -1037,7 +1472,9 @@ async function rebroadcastJournalFlight(
     if (isAlreadyKnownError(error)) return { state: "accepted", channel: "public", endpoint };
     const message = (error as Error).message;
     return {
-      state: isExplicitPublicRejection(error) ? "rejected" : "ambiguous",
+      // Once sendRawTransaction is invoked, even a deterministic-looking RPC
+      // error cannot prove the endpoint discarded the signed bytes.
+      state: "ambiguous",
       channel: "public",
       endpoint,
       error: message,
@@ -1060,6 +1497,7 @@ async function recoverJournalFlights(
     reconciliation.confirmedNonce,
     reconciliation.pendingNonce,
   );
+  if (candidates.length > 0) assertPendingPrefixIsTracked(reconciliation);
   while (candidates.length > 0) {
     const notBefore = candidates.reduce((latest, flight) => {
       const candidate = flight.recovery.notBeforeTimestamp === undefined
@@ -1081,6 +1519,7 @@ async function recoverJournalFlights(
       reconciliation.confirmedNonce,
       reconciliation.pendingNonce,
     );
+    if (candidates.length > 0) assertPendingPrefixIsTracked(reconciliation);
   }
   throwIfRecoveryAborted(signal);
   if (candidates.length === 0) return reconciliation;
@@ -1123,7 +1562,7 @@ async function recoverJournalFlights(
   );
   throwIfRecoveryAborted(signal);
   const maximumExposureWei = liveMaximumExposure(reconciliation.retained);
-  const floorWei = parseEther(String(runtime.strategy.minBalanceEth));
+  const floorWei = configuredEthToWei(runtime.strategy.minBalanceEth);
   if (balanceWei < maximumExposureWei + floorWei) {
     throw new RecoveryFloorError(
       wallet,
@@ -1230,9 +1669,9 @@ async function sendPublic(q: QueuedTx): Promise<DeliveryOutcome> {
   } catch (error) {
     if (isAlreadyKnownError(error)) return { state: "accepted", channel: "public", endpoint };
     const message = (error as Error).message;
-    if (isExplicitPublicRejection(error)) {
-      return { state: "rejected", channel: "public", endpoint, error: message };
-    }
+    // The request crossed the external side-effect boundary. A compromised or
+    // non-conforming RPC can retain the raw transaction even while returning a
+    // deterministic JSON-RPC rejection, so every post-dispatch error is exposed.
     logger.warn(`public broadcast (nonce ${q.nonce}) ambiguous:`, message);
     return { state: "ambiguous", channel: "public", endpoint, error: message };
   }
@@ -1501,9 +1940,9 @@ async function sendPrivateBundle(
   } catch (error) {
     const message = (error as Error).message;
     return {
-      state: error instanceof RpcRejectedError || error instanceof SubmissionDeadlineError
-        ? "rejected"
-        : "ambiguous",
+      // The signed bundle was handed to an external endpoint. JSON-RPC
+      // rejection is not cryptographic deletion and must remain exposed.
+      state: "ambiguous",
       channel: "private",
       endpoint,
       targetBlock,
@@ -1539,16 +1978,25 @@ function publicExposure(outcomes: readonly DeliveryOutcome[]): boolean {
   );
 }
 
+function hasUnboundedPrivateRawExposure(
+  q: Pick<QueuedTx, "validThroughBlock">,
+  outcomes: readonly DeliveryOutcome[],
+): boolean {
+  return q.validThroughBlock === undefined && outcomes.some((outcome) =>
+    outcome.channel === "private"
+      && (outcome.state === "accepted" || outcome.state === "ambiguous"));
+}
+
 function requiresNonceReconciliation(outcomes: readonly DeliveryOutcome[]): boolean {
   return outcomes.some((outcome) =>
     /nonce too (?:low|high)|replacement transaction underpriced|already imported/i.test(outcome.error ?? ""),
   );
 }
 
-/** Evidence that this nonce (or an equivalent replacement) may remain live
- * after private bundle targets expire. `nonce too high` is deliberately absent:
- * it proves a lower gap, not exposure at the submitted nonce, and retaining the
- * higher flight forever would prevent the allocator from going back to fill it. */
+/** Evidence that this nonce (or an equivalent replacement) may remain live.
+ * `nonce too high` is deliberately absent: it proves a lower gap, not another
+ * same-nonce lineage. The dispatched raw is still retained through ordinary
+ * public/private exposure bookkeeping. */
 function hasSameNonceExposureEvidence(outcomes: readonly DeliveryOutcome[]): boolean {
   return outcomes.some((outcome) =>
     /nonce too low|replacement transaction underpriced|already imported/i.test(outcome.error ?? ""),
@@ -1562,7 +2010,6 @@ function reconciledDeliveryState(
   if (
     state === "accepted"
     && hasSameNonceExposureEvidence(outcomes)
-    && !publicExposure(outcomes)
   ) return "ambiguous";
   return state;
 }
@@ -1606,7 +2053,7 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   if (simulationTimestamps.length > 1) {
     return failPreparedQueue(queue, out, "bundle contains conflicting simulation timestamps");
   }
-  const simTimestamp = simulationTimestamps[0] === undefined
+  let simTimestamp = simulationTimestamps[0] === undefined
     ? undefined
     : BigInt(simulationTimestamps[0]);
 
@@ -1628,12 +2075,19 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     }
   }
   if (queue.length === 0) return out;
+  if (privateTargetAvailable) {
+    omitBuilderIncentivePastTarget(queue, out, targetBlock);
+  }
+  if (queue.length === 0) return out;
   if (abortQueuedBeforeDelivery(queue, out)) return out;
   omitExpiredOptionalSuffix(queue, out, "private validation");
   if (queue.length === 0) return out;
 
   let privateQueue: QueuedTx[] = [];
   let privateDisabledReason: string | undefined;
+  let privateSimulationOutcome: DeliveryOutcome | undefined;
+  let privateDeliveryEnabled = false;
+  let suppressDelivery = false;
   if (appConfig.mode === "mainnet" && privateTargetAvailable) {
     let blockGasLimit: bigint | undefined;
     try {
@@ -1660,88 +2114,38 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
       }
     }
 
-    // Simulate only the nonce prefix that can be submitted as a valid private
-    // bundle. A deterministic failure suppresses the dependent sequence; relay
-    // unavailability merely disables private delivery and preserves public safety.
-    if (privateQueue.length > 0) {
-      const privateSigned = privateQueue.map((q) => q.signed);
-      const simParams: Record<string, unknown> = {
-        txs: privateSigned,
-        blockNumber: toHex(targetBlock),
-        stateBlockNumber: "latest",
-      };
-      if (simTimestamp !== undefined) simParams.timestamp = Number(simTimestamp);
-      try {
-        const sim = await flashbotsRpcWithTimeout(
-          "eth_callBundle",
-          [simParams],
-          undefined,
-          BUNDLE_SIM_TIMEOUT_MS,
-          earliestQueuedDeadline(queue),
-        );
-        const allowedRevertIndices = new Set(
-          privateQueue.flatMap((q, index) => q.revertible ? [index] : []),
-        );
-        const issue = bundleSimulationIssue(
-          sim,
-          allowedRevertIndices,
-          privateQueue.length,
-        );
-        if (issue) {
-          const error = `bundle simulation reverted: ${issue.failure}`;
-          if (issue.index === null || issue.index < 0 || issue.index >= privateQueue.length) {
-            return failPreparedQueue(queue, out, error);
-          }
-
-          const failed = privateQueue[issue.index]!;
-          const failedCohortId = failed.privateCohort?.id;
-          const cutoff = failedCohortId === undefined
-            ? issue.index
-            : queue.findIndex((q) => q.privateCohort?.id === failedCohortId);
-          if (cutoff <= 0) return failPreparedQueue(queue, out, error);
-
-          // The relay simulated this exact ordered sequence and reported clean
-          // results for every lower nonce. Those transactions are independently
-          // executable as a prefix. The failing nonce and every dependent higher
-          // nonce have not crossed the WAL/delivery barrier, so release them as
-          // one fresh top suffix. A failed cohort is cut at its first member so
-          // no partial cohort can cross the private-delivery boundary.
-          const failedSuffix = queue.splice(cutoff);
-          privateQueue = privateQueue.slice(0, cutoff);
-          failPreparedQueue(failedSuffix, out, error);
-          logger.warn(
-            `${error}; delivering validated nonce prefix ${privateQueue.length}/${privateQueue.length + failedSuffix.length}`,
-          );
-        }
-      } catch (err) {
-        privateDisabledReason = `bundle simulation unavailable: ${(err as Error).message}`;
-        privateQueue = [];
-        logger.warn(`${privateDisabledReason}; continuing with individually simulated public delivery`);
-      }
-    }
   }
   if (omitExpiredOptionalSuffix(queue, out, "the prepared-WAL barrier")) {
     const retained = new Set(queue);
     privateQueue = privateQueue.filter((q) => retained.has(q));
   }
   if (queue.length === 0) return out;
+  const plannedPrivateTargets = privateTargetBlocksFor(privateQueue, targetBlock);
+  const plannedPrivateMax = plannedPrivateTargets[plannedPrivateTargets.length - 1];
   for (const q of queue) {
     if (privateQueue.includes(q) || q.purpose === "builder-incentive") {
       // A builder incentive that is excluded by cohort sizing has no delivery
-      // route, but still receives a finite provisional WAL horizon. If the
-      // process crashes after the barrier, recovery expires it instead of ever
-      // replaying it independently or retaining its nonce forever.
-      q.plannedMaxPrivateTargetBlock = targetBlock + 1n;
+      // route, but still receives its signed finite WAL horizon. Recovery never
+      // replays it independently or releases its nonce by height: once the
+      // window is canonically final, the normal same-nonce retirement path
+      // consumes the fence safely.
+      q.plannedMaxPrivateTargetBlock = q.validThroughBlock === undefined
+        ? plannedPrivateMax ?? targetBlock + 1n
+        : q.validThroughBlock < targetBlock + 1n
+          ? q.validThroughBlock
+          : targetBlock + 1n;
     }
+    q.unboundedPrivateExposure = privateQueue.includes(q)
+      && q.validThroughBlock === undefined;
   }
-  // stopEngine may have invalidated this generation while getBlockNumber or the
-  // whole-bundle simulation was in flight. No delivery request has started yet,
-  // so cancellation remains definite and fresh reservations can be released.
+  // stopEngine may have invalidated this generation during local target/gas
+  // validation. No external endpoint has received signed bytes yet, so this
+  // cancellation remains definite and fresh reservations can be released.
   if (abortQueuedBeforeDelivery(queue, out)) return out;
 
   try {
-    // No transaction is live before this point, so one wallet-scoped atomic
-    // barrier covers the whole prepared campaign without O(n²) fsync churn.
+    // Establish one wallet-scoped barrier before any external endpoint receives
+    // signed raw bytes, including relay simulation.
     persistPreparedBatch(queue);
     for (const q of queue) q.journaled = true;
   } catch (error) {
@@ -1759,11 +2163,73 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     return failPreparedQueue(queue, out, `submission journal write failed: ${(error as Error).message}`);
   }
 
-  if (omitExpiredOptionalSuffix(queue, out, "replacement cancellation")) {
+  // This is the last definite-abort point. Once eth_callBundle starts, the relay
+  // can retain every raw transaction regardless of its simulation response.
+  if (abortQueuedBeforeDelivery(queue, out)) return out;
+  if (omitExpiredOptionalSuffix(queue, out, "the prepared-WAL barrier")) {
     const retained = new Set(queue);
     privateQueue = privateQueue.filter((q) => retained.has(q));
+    const remainingTimestamps = [
+      ...new Set(queue.flatMap((q) =>
+        q.simTimestamp === undefined ? [] : [q.simTimestamp.toString()])),
+    ];
+    simTimestamp = remainingTimestamps[0] === undefined
+      ? undefined
+      : BigInt(remainingTimestamps[0]);
   }
   if (queue.length === 0) return out;
+
+  // Simulate only the nonce prefix that can be submitted as a valid private
+  // bundle. The prepared WAL above already covers the disclosure. A deterministic
+  // failure suppresses further delivery but cannot release the disclosed raws;
+  // relay unavailability disables private sends and preserves public fallback.
+  if (appConfig.mode === "mainnet" && privateTargetAvailable && privateQueue.length > 0) {
+    const simulationTargetBlock = privateTargetBlocksFor(privateQueue, targetBlock)[0];
+    if (simulationTargetBlock === undefined) {
+      throw new Error("private queue has no target within its signed block deadline");
+    }
+    const simParams: Record<string, unknown> = {
+      txs: privateQueue.map((q) => q.signed),
+      blockNumber: toHex(simulationTargetBlock),
+      stateBlockNumber: "latest",
+    };
+    if (simTimestamp !== undefined) simParams.timestamp = Number(simTimestamp);
+    privateSimulationOutcome = {
+      state: "ambiguous",
+      channel: "private",
+      endpoint: appConfig.flashbotsRelayUrl,
+      targetBlock: simulationTargetBlock,
+    };
+    try {
+      const sim = await flashbotsRpcWithTimeout(
+        "eth_callBundle",
+        [simParams],
+        undefined,
+        BUNDLE_SIM_TIMEOUT_MS,
+        earliestQueuedDeadline(queue),
+      );
+      const allowedRevertIndices = new Set(
+        privateQueue.flatMap((q, index) => q.revertible ? [index] : []),
+      );
+      const issue = bundleSimulationIssue(
+        sim,
+        allowedRevertIndices,
+        privateQueue.length,
+      );
+      if (issue) {
+        privateDisabledReason = `bundle simulation reverted: ${issue.failure}`;
+        privateSimulationOutcome.error = privateDisabledReason;
+        suppressDelivery = true;
+        logger.warn(`${privateDisabledReason}; retaining every disclosed nonce under the WAL`);
+      } else {
+        privateDeliveryEnabled = true;
+      }
+    } catch (err) {
+      privateDisabledReason = `bundle simulation unavailable: ${(err as Error).message}`;
+      privateSimulationOutcome.error = privateDisabledReason;
+      logger.warn(`${privateDisabledReason}; continuing with individually simulated public delivery`);
+    }
+  }
 
   const priorReplacementUuids = [...new Set(queue.flatMap((q) => [
     ...(q.replacement?.replacementUuids ?? []),
@@ -1773,15 +2239,6 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     sameEndpoint(endpoint, appConfig.flashbotsRelayUrl),
   );
   const currentReplacementUuids = new Map<bigint, string>();
-  if (
-    appConfig.mode === "mainnet"
-    && privateTargetAvailable
-    && privateQueue.length > 0
-    && hasFlashbotsTarget
-  ) {
-    currentReplacementUuids.set(targetBlock, globalThis.crypto.randomUUID());
-    currentReplacementUuids.set(targetBlock + 1n, globalThis.crypto.randomUUID());
-  }
   if (privateTargetAvailable && priorReplacementUuids.length > 0) {
     const cancellationDeadlineMs = earliestQueuedDeadline(queue);
     const cancellations = priorReplacementUuids.map(async (priorUuid) => {
@@ -1798,33 +2255,56 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
           cancellationDeadlineMs,
         );
       } catch (error) {
-        // Cancellation is capability-specific and best-effort. Old builder
-        // lineages remain journaled until confirmation or their target expiry.
+        // Cancellation is capability-specific and best-effort. Every disclosed
+        // lineage remains journaled until canonical nonce consumption is confirmed.
         logger.warn(`Flashbots cancellation for ${priorUuid} ambiguous:`, (error as Error).message);
       }
     });
     await Promise.all(cancellations);
   }
-  if (omitExpiredOptionalSuffix(queue, out, "delivery")) {
-    const retained = new Set(queue);
-    privateQueue = privateQueue.filter((q) => retained.has(q));
+  if (queue.some((q) => q.signal?.aborted) && privateSimulationOutcome !== undefined) {
+    // The relay already received the signed private prefix for simulation. Stop
+    // prevents any additional send request, but cannot turn that disclosure into
+    // a definite abort or release its nonce/WAL fence.
+    suppressDelivery = true;
+    privateDisabledReason ??= "bundle submission stopped after signed relay disclosure";
+    privateSimulationOutcome.error ??= privateDisabledReason;
   }
-  if (queue.length === 0) return out;
-  // The engine can stop immediately after the WAL barrier or while a prior
-  // Flashbots lineage is being cancelled. In both cases no new delivery has
-  // started, so remove the prepared WAL before releasing its reservations.
-  if (abortQueuedBeforeDelivery(queue, out)) return out;
+  const livePrivateTargetBlocks = privateTargetBlocksFor(privateQueue, targetBlock);
+  if (
+    appConfig.mode === "mainnet"
+    && privateTargetAvailable
+    && privateQueue.length > 0
+    && privateDeliveryEnabled
+    && !suppressDelivery
+    && !queue.some((q) => q.signal?.aborted)
+    && hasFlashbotsTarget
+  ) {
+    for (const block of livePrivateTargetBlocks) {
+      currentReplacementUuids.set(block, globalThis.crypto.randomUUID());
+    }
+  }
   const revertingTxHashes = privateQueue.flatMap((q) => q.revertible ? [q.txHash] : []);
   const privateDeadlineMs = earliestQueuedDeadline(queue);
   // Start the authorized public fallback while still inside the checked
   // delivery-start window. Its future-timestamp wait may intentionally finish
   // at the boundary; the private builder transfer itself may not start late.
-  const publicPromise = sendPublicBatch(queue, simTimestamp);
+  const publicPromise = suppressDelivery
+    ? Promise.resolve(new Map(queue.map((q) => [q.nonce, {
+        state: "rejected" as const,
+        channel: "public" as const,
+        endpoint: "public-rpc",
+        error: privateDisabledReason,
+      }])))
+    : sendPublicBatch(queue, simTimestamp);
   const privatePromise: Promise<DeliveryOutcome[]> = appConfig.mode === "mainnet"
     && privateTargetAvailable
     && privateQueue.length > 0
+    && privateDeliveryEnabled
+    && !suppressDelivery
+    && !queue.some((q) => q.signal?.aborted)
     ? Promise.all(appConfig.builderUrls.flatMap((endpoint) =>
-      [targetBlock, targetBlock + 1n].map((block) =>
+      livePrivateTargetBlocks.map((block) =>
         sendPrivateBundle(
           endpoint,
           privateQueue.map((q) => q.signed),
@@ -1837,8 +2317,10 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
           privateDeadlineMs,
         ),
       ),
-    ))
-    : Promise.resolve([]);
+    )).then((outcomes) => privateSimulationOutcome === undefined
+      ? outcomes
+      : [privateSimulationOutcome, ...outcomes])
+    : Promise.resolve(privateSimulationOutcome === undefined ? [] : [privateSimulationOutcome]);
   const deliveryJob = Promise.all([privatePromise, publicPromise]);
   lifecycleJobs.add(deliveryJob);
   let privateOutcomes: DeliveryOutcome[];
@@ -1871,7 +2353,8 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
       q,
       outcomes,
       state: reconciledDeliveryState(outcomes),
-      retainFence: requiresNonceReconciliation(outcomes),
+      retainFence: requiresNonceReconciliation(outcomes)
+        || hasUnboundedPrivateRawExposure(q, outcomes),
       retryImmediately: false,
       retryReason: undefined as string | undefined,
       journalError: undefined as string | undefined,
@@ -1908,7 +2391,8 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
         update: {
           state,
           publicExposure: publicExposure(outcomes),
-          nonceConflict: hasSameNonceExposureEvidence(outcomes),
+          nonceConflict: hasSameNonceExposureEvidence(outcomes)
+            || hasUnboundedPrivateRawExposure(q, outcomes),
           attempts: outcomes.map(journalAttempt).filter(
             (attempt): attempt is JournalDeliveryAttempt => attempt !== null,
           ),
@@ -1966,7 +2450,10 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
         txHash: q.txHash,
         publicExposure: publicExposure(outcomes),
         maxPrivateTargetBlock: maxPrivateTarget(outcomes),
-        retainBeyondPrivateTarget: hasSameNonceExposureEvidence(outcomes),
+        retainBeyondPrivateTarget: hasSameNonceExposureEvidence(outcomes)
+          || hasUnboundedPrivateRawExposure(q, outcomes)
+          || maxPrivateTarget(outcomes) !== undefined
+          || q.validThroughBlock !== undefined,
         retainRejectedFence: state === "rejected",
       });
     }
@@ -2022,10 +2509,14 @@ function preparedFlight(q: QueuedTx): JournalFlight {
     recovery: {
       publicAuthorized: q.race,
       notBeforeTimestamp: q.simTimestamp?.toString(),
+      ...(q.payment === undefined ? {} : { payment: { ...q.payment } }),
+      ...(q.validThroughBlock === undefined
+        ? {}
+        : { validThroughBlock: q.validThroughBlock.toString() }),
     },
     state: "prepared",
     publicExposure: false,
-    nonceConflict: false,
+    nonceConflict: q.unboundedPrivateExposure === true,
     attempts: [],
     maxPrivateTargetBlock: q.plannedMaxPrivateTargetBlock?.toString(),
     createdAtMs: now,
@@ -2054,18 +2545,24 @@ export async function submitTx(
     /** Allow this private-bundle member to revert without invalidating mandatory
      * cohort members. Ignored for public delivery. */
     revertible?: boolean;
-    /** Private-only semantic. Builder incentives are never public-authorized or
-     * independently replayed by recovery. */
-    purpose?: "builder-incentive";
+    /** Durable special-purpose delivery semantics. */
+    purpose?: SubmissionPurpose;
     /** Declares the all-or-none private-delivery cohort and member role. */
     privateCohort?: {
       id: string;
       role: "mandatory" | "allowed-revert" | "builder-incentive";
     };
+    /** Strategy identity for crash-safe one-shot payment deduplication. */
+    payment?: JournalPaymentMetadata;
+    /** Last block encoded into a private-only CoinbasePayer call. */
+    validThroughBlock?: bigint;
     /** Absolute wall-clock cutoff for optional work riding a mandatory bundle. */
     deadlineMs?: number;
     /** Replace a previously signed transaction without consuming a new nonce. */
     replacement?: ReplacementOptions;
+    /** Internal recovery path: deliver an inert same-nonce retirement only to
+     * the public RPC, never back to a builder that retained the old raw. */
+    publicOnly?: boolean;
     /** Cancel a delayed public broadcast when this engine generation stops. */
     signal?: AbortSignal;
     /** Last-moment exact affordability/revision gate. */
@@ -2083,9 +2580,12 @@ export async function submitTx(
 ): Promise<SubmitResult> {
   const account = runtime.account;
   if (!account) throw new Error("Wallet locked");
-  validateSubmissionMetadata(opts);
+  validateSubmissionMetadata(intent, opts);
   if (opts.privateCohort !== undefined && bundleQueue === null) {
     throw new Error("private cohort submissions require an open batch");
+  }
+  if (opts.publicOnly && bundleQueue !== null && bundleQueue.length > 0) {
+    throw new Error("public-only nonce retirement cannot interleave a non-empty preparation batch");
   }
   if (opts.purpose === "builder-incentive" && appConfig.mode !== "mainnet") {
     throw new Error("builder incentives require mainnet private-bundle mode");
@@ -2093,9 +2593,7 @@ export async function submitTx(
   // Authentication identity corruption is local fatal state, not relay
   // unavailability. Validate/create it before simulation fallbacks can
   // accidentally reinterpret the error as a tolerable network failure.
-  if (appConfig.mode === "mainnet") getAuthSigner();
-  const batching = bundleQueue !== null;
-
+  if (appConfig.mode === "mainnet" && !opts.publicOnly) getAuthSigner();
   // Independent pre-submission reads — run together (viem batches them, and the
   // block is usually already cached from the pass's canSpend), instead of three
   // serial round-trips per tx. Pre-boundary races pass explicit gas, so estimateGas
@@ -2171,9 +2669,24 @@ export async function submitTx(
   if (replacementFeeError) {
     return { ...base, error: replacementFeeError, targetBlock };
   }
+  if (opts.validThroughBlock !== undefined) {
+    if (opts.validThroughBlock < targetBlock) {
+      return {
+        ...base,
+        error: `builder-incentive block deadline ${opts.validThroughBlock} is before first target ${targetBlock}`,
+        targetBlock,
+      };
+    }
+    if (opts.validThroughBlock > targetBlock + 1n) {
+      return {
+        ...base,
+        error: `builder-incentive block deadline ${opts.validThroughBlock} exceeds the two-block private horizon`,
+        targetBlock,
+      };
+    }
+  }
 
   // --- Simulation ---
-  let directPrivateSimulationAvailable = true;
   if (opts.simTimestamp !== undefined) {
     // Future-timestamp race (pre-boundary pay/audit/kill): validate at the instant
     // the tx will actually execute. Always uses eth_call block overrides against
@@ -2198,45 +2711,11 @@ export async function submitTx(
         targetBlock,
       };
     }
-  } else if (appConfig.mode === "mainnet" && !batching) {
-    // Flashbots bundle simulation needs a signed tx — use peeked nonce (not consumed yet).
-    const simSigned = await signTx(account, intent, candidateNonce, gas, maxFeePerGas, maxPriorityFeePerGas);
-    try {
-      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [
-        { txs: [simSigned], blockNumber: toHex(targetBlock), stateBlockNumber: "latest" },
-      ]);
-      const failure = bundleSimulationFailure(sim, 1);
-      if (failure) {
-        return { ...base, simulated: true, error: `sim revert: ${failure}`, targetBlock };
-      }
-      base.simulated = true;
-    } catch (err) {
-      // The relay being slow/down must NOT block a payment — that can cost a
-      // citizen, and mainnet is the default mode. Fall back to a plain eth_call
-      // against our own RPC for the authorized public route, but do not privately
-      // deliver a sequence the relay never coherently simulated.
-      directPrivateSimulationAvailable = false;
-      logger.warn(`relay sim unavailable (${(err as Error).message}); falling back to eth_call`);
-      try {
-        await publicClient.call({
-          account: account.address,
-          to: intent.to,
-          data: intent.data,
-          value: intent.value,
-          gas,
-          maxFeePerGas,
-          maxPriorityFeePerGas,
-        });
-        base.simulated = true;
-      } catch (e2) {
-        return { ...base, simulated: true, error: `sim revert: ${(e2 as Error).message}`, targetBlock };
-      }
-    }
   } else {
-    // Plain eth_call — no nonce needed, no relay round-trip.
-    // Batched transactions use this individual semantic check while they
-    // are being assembled; flushBundle later simulates their signed nonce sequence
-    // as one ordered eth_callBundle before private/public submission.
+    // Plain eth_call — no nonce or signed raw bytes leave this process. Batched
+    // transactions later get ordered relay simulation only after the WAL; a
+    // direct mainnet transaction relies on this local semantic check before its
+    // own WAL and delivery barrier.
     try {
       await beforeSubmissionDeadline(
         publicClient.call({
@@ -2354,11 +2833,13 @@ export async function submitTx(
     revertible: opts.revertible === true,
     purpose: opts.purpose,
     privateCohort: opts.privateCohort === undefined ? undefined : { ...opts.privateCohort },
+    payment: opts.payment === undefined ? undefined : { ...opts.payment },
+    validThroughBlock: opts.validThroughBlock,
     deadlineMs: opts.deadlineMs,
   };
   // Every mode uses the same preparation batch. This guarantees all due nonces
   // are reserved and signed before the shared boundary wait starts.
-  if (bundleQueue !== null) {
+  if (bundleQueue !== null && !opts.publicOnly) {
     bundleQueue.push(queued);
     return {
       ...base,
@@ -2370,10 +2851,11 @@ export async function submitTx(
     };
   }
 
-  const privateEligible = directPrivateSimulationAvailable
+  const privateEligible = !opts.publicOnly
     && privateBundlePrefixLength([queued], latest.gasLimit) === 1;
   if (appConfig.mode === "mainnet" && privateEligible) {
     queued.plannedMaxPrivateTargetBlock = targetBlock + 1n;
+    queued.unboundedPrivateExposure = queued.validThroughBlock === undefined;
   }
 
   try {
@@ -2451,7 +2933,8 @@ export async function submitTx(
   ]);
   const outcomes = [...privateOutcomes, publicResults.get(nonce)!];
   let state = reconciledDeliveryState(outcomes);
-  const retainRejectedFence = requiresNonceReconciliation(outcomes);
+  const retainRejectedFence = requiresNonceReconciliation(outcomes)
+    || hasUnboundedPrivateRawExposure(queued, outcomes);
   const terminal = state === "rejected";
   let journalError: string | undefined;
   let journalCommitted = false;
@@ -2464,7 +2947,8 @@ export async function submitTx(
         update: {
           state,
           publicExposure: publicExposure(outcomes),
-          nonceConflict: hasSameNonceExposureEvidence(outcomes),
+          nonceConflict: hasSameNonceExposureEvidence(outcomes)
+            || hasUnboundedPrivateRawExposure(queued, outcomes),
           attempts: outcomes.map(journalAttempt).filter(
             (attempt): attempt is JournalDeliveryAttempt => attempt !== null,
           ),
@@ -2505,7 +2989,10 @@ export async function submitTx(
       txHash: signedTxHash,
       publicExposure: publicExposure(outcomes),
       maxPrivateTargetBlock: maxPrivateTarget(outcomes),
-      retainBeyondPrivateTarget: hasSameNonceExposureEvidence(outcomes),
+      retainBeyondPrivateTarget: hasSameNonceExposureEvidence(outcomes)
+        || hasUnboundedPrivateRawExposure(queued, outcomes)
+        || maxPrivateTarget(outcomes) !== undefined
+        || opts.validThroughBlock !== undefined,
       retainRejectedFence: state === "rejected",
     });
   }

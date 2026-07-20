@@ -20,16 +20,21 @@ cohort, in nonce order:
 
 1. one or more mandatory pre-boundary tax payments;
 2. zero or more optional audits, each explicitly allowed to revert; and
-3. exactly one final owner-signed transfer to the verified `CoinbasePayer`, also
-   explicitly allowed to revert.
+3. exactly one final owner-signed
+   `payCoinbase(notBeforeTimestamp, validThroughBlock)` call to the
+   verified `CoinbasePayer`, also explicitly allowed to revert.
 
 The feature never creates an audit-only or bid-only cohort. It is considered
 only when a mandatory pre-boundary payment was prepared. The payer is a
-stateless forwarder whose checked `receive()` call sends all `msg.value` to
-`block.coinbase`; it has no owner, storage, withdrawal path, fallback, or
-arbitrary-call surface. If audit or incentive preparation is skipped or fails,
-already prepared mandatory work still follows its hardened delivery path; the
-bot does not manufacture a standalone bid to complete the cohort.
+stateless forwarder whose checked `payCoinbase(uint256,uint256)` call sends all
+`msg.value` to `block.coinbase` only while
+`block.timestamp >= notBeforeTimestamp` and
+`block.number <= validThroughBlock`;
+it has no owner, storage, withdrawal path, receive function, fallback, or
+arbitrary-call surface. Legacy empty-calldata transfers therefore revert. If
+audit or incentive preparation is skipped or fails, already prepared mandatory
+work still follows its hardened delivery path; the bot does not manufacture a
+standalone bid to complete the cohort.
 
 The three roles deliberately have different delivery semantics:
 
@@ -50,12 +55,25 @@ encoded-byte, and aggregate-gas limits; if a limit would split it, no member of
 that cohort is privately sent. Public-authorized payments and audits keep their
 ordinary public delivery, while the private-only incentive is not sent.
 
-Private delivery targets the next two blocks. Prepared journal entries carry a
-finite private target horizon and durable cohort/purpose metadata. A restart may
-recover public-authorized payments and audits, but cannot reinterpret the bid as
-public work. Flashbots replacement UUIDs are scoped to each whole submitted
-bundle and target; cancellation is relay-specific and best-effort, not a
-cross-builder guarantee.
+That atomicity is a rule of the submitted bundle, not a cryptographic
+postcondition enforced by the payer. Configured relays/builders receive each raw
+signed cohort transaction. A malicious or compromised builder could ignore the
+bundle rules and include the payer transaction during its signed window even if
+a preceding game payment reverted or was omitted. The feature therefore requires
+an operator-reviewed builder set and never represents the incentive as proof that
+payment-first ordering occurred.
+
+Private delivery targets the next two blocks. The signed payer calldata binds the
+bid to both the payment boundary timestamp and that block horizon, and transport
+never targets a block later than the signed `validThroughBlock`. If preparation
+advances, transport narrows the target set or drops the bid instead of extending
+its authorization. Prepared journal
+entries carry that exact signed bound, a no-later private target horizon, and
+durable cohort/purpose metadata. A restart may recover public-authorized payments
+and audits, but cannot reinterpret the bid as public work; transport also rejects
+builder-purpose recovery even if that policy metadata is corrupted. Flashbots
+replacement UUIDs are scoped to each whole submitted bundle and target;
+cancellation is relay-specific and best-effort, not a cross-builder guarantee.
 
 ## Capability and execution gates
 
@@ -67,9 +85,9 @@ the persistent configuration and backend environment satisfy all of the followin
 - `MODE=mainnet`, verified Ethereum chain ID 1, and a healthy submission journal;
 - a positive canonical `coinbaseBidEth` value and a nonzero
   `coinbasePayerAddress`;
-- deployed runtime bytecode exactly matching
+- finalized deployed runtime bytecode exactly matching
   `contracts/CoinbasePayer.build.json`, whose pinned Keccak-256 hash is
-  `0x8ca126cf92be3a9978ed8f20db5c0851bc006f0354b9e73a597ed94d80f851e9`;
+  `0x00ead4184eaf62003aa381e9902e3c33b6a7b455e455c94c86f9a4f916f8f44f`;
 - both the direct-incentive and combined-cohort switches enabled.
 
 Risk-increasing configuration mutations require explicit acknowledgement before
@@ -82,14 +100,41 @@ That capability result is not an executable-now signal. Actual preparation and
 submission additionally require pre-boundary payments to be enabled, a running
 engine, an unlocked wallet, Dry Run to be off, a due mandatory boundary payment,
 and final immediate re-authorization of the configured amount, payer, engine
-generation, deadline, ownership, spend cap, pending exposure, and minimum-balance
-floor before signing.
+generation, deadline, ownership, spend cap, pending exposure, minimum-balance
+floor, and exact payer code at the finalized chain tag before signing. A payer
+deployment is unusable until it is finalized.
 
-The bid amount plus its maximum gas is included in pending exposure. Dry-run
-models the intents and authorization but does not reserve a nonce, sign, write
-the submission journal, or send a transaction or bundle. The capability endpoint
-may still report `active: true` during Dry Run because it verifies configuration,
-mode, chain, journal, amount, address, and code—not current executability.
+The bid amount plus its maximum gas remains in pending exposure while its nonce
+lineage is unresolved. Dry-run models the intents and authorization but does not
+reserve a nonce, sign, write the submission journal, or send a transaction or
+bundle. The capability endpoint may still report `active: true` during Dry Run
+because it verifies configuration, mode, chain, journal, amount, address, and
+code—not current executability.
+
+### Expiry and residual raw-transaction risk
+
+The on-chain block check makes the bid value unavailable after the signed bound,
+even to a builder that retained the raw transaction. It does not give the
+Ethereum transaction itself protocol-level expiry. A builder can still include
+that raw transaction later; it will revert before forwarding value, but can
+consume the sender nonce and actual revert gas. The fixed 100,000 gas limit and
+signed maximum fee cap bound that gas loss, while the bid value remains safe.
+
+The bot never releases a disclosed signed raw merely because its relay target or
+value window ended. Once the signed deadline is canonically deep enough, an
+operator-authorized running live engine signs and publicly submits a zero-value,
+21,000-gas self-transfer at the same nonce. That retirement is journaled before
+dispatch, remains public-only, and is fee-bumped within the configured caps when
+an accepted/ambiguous attempt appears dropped. The original payer raw and every
+retirement alternative stay fenced and counted as one maximum same-nonce
+liability until account-nonce consumption is canonically confirmed.
+
+If Dry Run is on, the wallet is locked, an unknown pending nonce exists, the
+balance floor cannot be met, the fee ceiling cannot produce a valid replacement,
+or the public RPC cannot make progress, retirement fails closed and the nonce is
+not reused. Stop/Lock revokes active recovery delivery; a later explicit Start is
+required to resume it. Do not use another signer to repair the nonce: manual
+same-wallet traffic can invalidate the journal's semantic recovery assumptions.
 
 ## Operator deployment and verification
 
@@ -110,17 +155,18 @@ and chosen financial limits before any mainnet use.
    deployment process. The project does not prescribe a universal deployment
    mechanism or address. Record the deployment transaction, chain ID, creation
    bytecode, and resulting address.
-4. Compare the deployed runtime byte-for-byte and by hash before configuring it.
+4. Wait for the deployment to reach Ethereum's `finalized` tag, then compare the
+   finalized runtime byte-for-byte and by hash before configuring it.
    One possible read-only check is:
 
    ```bash
    export RPC_HTTP_URL=<ETHEREUM_MAINNET_RPC>
    export COINBASE_PAYER=<DEPLOYED_ADDRESS>
-   ONCHAIN_CODE=$(cast code --rpc-url "$RPC_HTTP_URL" "$COINBASE_PAYER")
+   ONCHAIN_CODE=$(cast code --rpc-url "$RPC_HTTP_URL" --block finalized "$COINBASE_PAYER")
    EXPECTED_CODE=$(jq -r .runtimeBytecode contracts/CoinbasePayer.build.json)
    test "$ONCHAIN_CODE" = "$EXPECTED_CODE"
    test "$(cast keccak "$ONCHAIN_CODE")" = \
-     "0x8ca126cf92be3a9978ed8f20db5c0851bc006f0354b9e73a597ed94d80f851e9"
+     "0x00ead4184eaf62003aa381e9902e3c33b6a7b455e455c94c86f9a4f916f8f44f"
    ```
 
 5. With Dry Run still enabled, enter the reviewed fixed bid and verified payer
@@ -142,9 +188,13 @@ and chosen financial limits before any mainnet use.
 
 ## Disable / rollback
 
-Disabling the feature does not retract a bundle already submitted to a relay.
-Stop new work first, then atomically turn off both persistent switches and
-reconcile any already journaled or pending transaction separately:
+Disabling the feature does not retract a bundle or raw transaction already
+submitted to a relay. The signed deadline prevents a later value transfer, but
+does not prevent a later reverted inclusion and its nonce/gas cost. Stop new work
+first, then atomically turn off both persistent switches. Previously disclosed
+lineages remain in the journal; explicitly Start again when prepared to let the
+bot complete any required public nonce retirement, and keep the wallet exclusive
+until the lineage clears:
 
 ```bash
 export BOT_API=http://127.0.0.1:8787
@@ -180,8 +230,11 @@ The automated gate covers exact compiler comparison of the pinned payer creation
 and runtime bytecode, default-off migration, explicit risk acknowledgement,
 chain/mode/journal/runtime-hash capability checks, spend accounting, dry-run
 side-effect freedom, role ordering, exact revert-hash allowlisting, cohort-atomic
-private limits, public fallback, finite journal expiry, and the payer's EOA,
-accepting-contract, and rejecting-contract behavior on disposable Anvil.
+private limits, public fallback, signed-window enforcement, indefinite raw
+retention, confirmed same-nonce retirement, and the payer's success-at-deadline,
+revert-before/after-window, legacy
+empty-calldata rejection, EOA, accepting-contract, and rejecting-contract
+behavior on disposable Anvil and Foundry.
 
 That evidence does not constitute a contract audit, a live relay test, a funded
 mainnet test, or proof of economic advantage. No release or owner-QA checklist

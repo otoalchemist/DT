@@ -3,6 +3,7 @@ import fc from "fast-check";
 import { join } from "node:path";
 import { parseEther, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { encodeCoinbasePayment } from "./coinbase-payer.js";
 
 const h = vi.hoisted(() => {
   const publicClient = {
@@ -23,6 +24,8 @@ const h = vi.hoisted(() => {
     reset: vi.fn(),
     markDelivery: vi.fn(),
     restoreFlight: vi.fn(),
+    initializeFromJournal: vi.fn(),
+    releaseJournalExpired: vi.fn(),
     setRecoveryHook: vi.fn(),
   };
   const journal = {
@@ -51,6 +54,7 @@ const h = vi.hoisted(() => {
     },
     runtime: {
       account: null as ReturnType<typeof privateKeyToAccount> | null,
+      unlocked: true,
       chainId: 1 as number | null,
       strategy: {
         maxBaseFeeGwei: 100,
@@ -121,11 +125,11 @@ vi.mock("./logic.js", async () => {
   return {
     ...actual,
     resolveGas: () => ({
-      maxBaseFeeGwei: 100,
-      priorityFeeGwei: 2,
-      replacementPriorityFeeCapGwei: 10,
-      dynamicTipEnabled: false,
-      dynamicTipMaxGwei: 50,
+      maxBaseFeeGwei: h.runtime.strategy.maxBaseFeeGwei,
+      priorityFeeGwei: h.runtime.strategy.priorityFeeGwei,
+      replacementPriorityFeeCapGwei: h.runtime.strategy.replacementPriorityFeeCapGwei,
+      dynamicTipEnabled: h.runtime.strategy.dynamicTipEnabled,
+      dynamicTipMaxGwei: h.runtime.strategy.dynamicTipMaxGwei,
     }),
     effectiveTipGwei: () => 2,
   };
@@ -141,17 +145,26 @@ const {
   MAX_BUNDLE_BYTES,
   MAX_BUNDLE_TXS,
   beginBundle,
+  discardBundle,
   flushBundle,
   privateBundlePrefixLength,
   reconcileSubmissionJournal,
+  BuilderNonceRetirementError,
   RecoveryFloorError,
   recoverPreparedSubmissions,
   submitTx,
+  UntrackedPendingPrefixError,
 } = await import("./flashbots.js");
 const { AtomicWriteCommittedError } = await import("./durability.js");
 
 const ACCOUNT = privateKeyToAccount(`0x${"11".repeat(32)}`);
 const TO = "0x00000000000000000000000000000000000000aa" as const;
+const BUILDER_NOT_BEFORE_TIMESTAMP = 2_000n;
+const BUILDER_VALID_THROUGH_BLOCK = 102n;
+const BUILDER_CALL = encodeCoinbasePayment(
+  BUILDER_NOT_BEFORE_TIMESTAMP,
+  BUILDER_VALID_THROUGH_BLOCK,
+);
 const BLOCK_100_HASH = `0x${"64".repeat(32)}` as Hex;
 const BLOCK_99_HASH = `0x${"63".repeat(32)}` as Hex;
 const BLOCK_98_HASH = `0x${"62".repeat(32)}` as Hex;
@@ -249,13 +262,116 @@ async function recoveredFlight(
   };
 }
 
+async function recoveredBuilderFlight(options: {
+  nonce?: number;
+  valueWei?: bigint;
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
+  notBeforeTimestamp?: bigint;
+  validThroughBlock?: bigint;
+  updatedAtMs?: number;
+} = {}) {
+  const notBeforeTimestamp = options.notBeforeTimestamp ?? BUILDER_NOT_BEFORE_TIMESTAMP;
+  const validThroughBlock = options.validThroughBlock ?? BUILDER_VALID_THROUGH_BLOCK;
+  const base = await recoveredFlight(false, undefined, {
+    nonce: options.nonce,
+    valueWei: options.valueWei ?? 15_000_000_000_000_000n,
+    maxFeePerGas: options.maxFeePerGas,
+    maxPriorityFeePerGas: options.maxPriorityFeePerGas,
+    data: encodeCoinbasePayment(notBeforeTimestamp, validThroughBlock),
+    updatedAtMs: options.updatedAtMs,
+  });
+  return {
+    ...base,
+    purpose: "builder-incentive" as const,
+    privateCohort: { id: "boundary-retirement", role: "builder-incentive" as const },
+    recovery: {
+      publicAuthorized: false,
+      notBeforeTimestamp: notBeforeTimestamp.toString(),
+      validThroughBlock: validThroughBlock.toString(),
+    },
+    maxPrivateTargetBlock: validThroughBlock.toString(),
+  };
+}
+
+async function recoveredRetirementFlight(
+  builder: Awaited<ReturnType<typeof recoveredBuilderFlight>>,
+  state: "prepared" | "accepted" | "ambiguous" = "prepared",
+  updatedAtMs = 2,
+) {
+  const maxFeePerGas = 5_000_000_000n;
+  const maxPriorityFeePerGas = 3_000_000_000n;
+  const rawSignedTx = await ACCOUNT.signTransaction({
+    chainId: 1,
+    type: "eip1559",
+    nonce: builder.nonce,
+    to: ACCOUNT.address,
+    data: "0x",
+    value: 0n,
+    gas: 21_000n,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+  });
+  return {
+    wallet: ACCOUNT.address,
+    nonce: builder.nonce,
+    rawSignedTx,
+    txHash: (await import("viem")).keccak256(rawSignedTx),
+    purpose: "nonce-retirement" as const,
+    obligation: {
+      to: ACCOUNT.address,
+      data: "0x" as Hex,
+      valueWei: "0",
+      gasLimit: "21000",
+      maxFeePerGas: maxFeePerGas.toString(),
+      maxPriorityFeePerGas: maxPriorityFeePerGas.toString(),
+    },
+    lineage: { id: builder.lineage.id, replacesTxHash: builder.txHash },
+    recovery: { publicAuthorized: true },
+    state,
+    publicExposure: state !== "prepared",
+    nonceConflict: false,
+    attempts: state === "prepared" ? [] : [{
+      channel: "public" as const,
+      endpoint: "public-rpc",
+      state,
+    }],
+    createdAtMs: 2,
+    updatedAtMs,
+  };
+}
+
+function mockReconciliation(
+  retained: readonly any[],
+  options: { confirmedNonce?: number; pendingNonce?: number; currentBlock?: bigint } = {},
+) {
+  h.journal.load.mockReturnValue([...retained]);
+  h.journal.reconcile.mockReturnValue({
+    confirmedNonce: options.confirmedNonce ?? 7,
+    pendingNonce: options.pendingNonce ?? 7,
+    currentBlock: options.currentBlock ?? 104n,
+    retained: [...retained],
+    consumed: [],
+    expired: [],
+  });
+}
+
 beforeEach(() => {
-  vi.clearAllMocks();
+  // Reset implementations as well as call history. Several crash-window tests
+  // install one-shot durability failures; an intentionally uncalled mock must
+  // never leak that queued behavior into a shuffled successor.
+  vi.resetAllMocks();
   h.appConfig.mode = "mainnet";
   h.appConfig.dataDir = "/tmp/unused-flashbots-test";
   h.appConfig.builderUrls = ["https://relay.test", "https://builder.test"];
   h.runtime.account = ACCOUNT;
+  h.runtime.unlocked = true;
   h.runtime.chainId = 1;
+  h.runtime.strategy.maxBaseFeeGwei = 100;
+  h.runtime.strategy.priorityFeeGwei = 2;
+  h.runtime.strategy.replacementPriorityFeeCapGwei = 10;
+  h.runtime.strategy.dynamicTipEnabled = false;
+  h.runtime.strategy.dynamicTipMaxGwei = 50;
   h.runtime.strategy.minBalanceEth = 0;
   h.reputationKey = `0x${"22".repeat(32)}`;
   h.reputationKeyExists = true;
@@ -363,6 +479,48 @@ describe("prepared delivery campaigns", () => {
     expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(2);
     expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(2);
     expect([...result.values()].every((item) => item.ok && !item.uncertain)).toBe(true);
+  });
+
+  it("writes payment baseline and one-shot identity under the prepared WAL barrier", async () => {
+    h.appConfig.mode = "public";
+    beginBundle();
+    await submitTx(
+      { to: TO, data: "0x01", value: 7n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        payment: {
+          tokenId: "1",
+          startingLastEpochPaid: "1",
+          expectedLastEpochPaid: "2",
+          source: "jit",
+          epochs: "1",
+          pricedEpoch: "20",
+          jitTargetEpoch: 20,
+          jitCampaignRevision: 7,
+          proactiveEpoch: "20",
+          proactiveMarkerReserved: true,
+        },
+      },
+    );
+    await flushBundle();
+
+    expect(h.journal.upsertMany.mock.calls[0]![1][0]).toMatchObject({
+      recovery: {
+        payment: {
+          tokenId: "1",
+          startingLastEpochPaid: "1",
+          expectedLastEpochPaid: "2",
+          source: "jit",
+          epochs: "1",
+          pricedEpoch: "20",
+          jitTargetEpoch: 20,
+          jitCampaignRevision: 7,
+          proactiveEpoch: "20",
+          proactiveMarkerReserved: true,
+        },
+      },
+    });
   });
 
   it("signs local-mode transactions for the validated local chain", async () => {
@@ -547,7 +705,7 @@ describe("prepared delivery campaigns", () => {
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
-  it("honors a stop during prior-bundle cancellation before starting new delivery", async () => {
+  it("stops new delivery but retains raws disclosed before prior-bundle cancellation", async () => {
     h.appConfig.mode = "mainnet";
     const controller = new AbortController();
     beginBundle();
@@ -573,12 +731,6 @@ describe("prepared delivery campaigns", () => {
       { to: TO, data: "0x07", value: 0n, gas: 50_000n },
       { dryRun: false, race: true, signal: controller.signal },
     );
-    const events: string[] = [];
-    h.journal.removeMany.mockImplementationOnce(() => { events.push("remove"); });
-    h.nonceManager.releaseContiguous.mockImplementationOnce(() => {
-      events.push("release");
-      return true;
-    });
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
       if (call.method === "eth_callBundle") {
@@ -593,11 +745,15 @@ describe("prepared delivery campaigns", () => {
 
     const result = await flushBundle();
 
-    expect(result.get(fresh.nonce)?.ok).toBe(false);
-    expect(events).toEqual(["remove", "release"]);
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([8]);
+    expect(result.get(7)).toMatchObject({ ok: true, uncertain: true });
+    expect(result.get(fresh.nonce)).toMatchObject({ ok: true, uncertain: true });
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
     expect(fetchMock.mock.calls.map(([url, init]) => rpcCall(url, init).method)).not.toContain("eth_sendBundle");
+    expect(h.journal.mutate).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      expect.objectContaining({ remove: [] }),
+    );
   });
 
   it("uses distinct Flashbots UUIDs for direct target-block submissions", async () => {
@@ -776,12 +932,14 @@ describe("prepared delivery campaigns", () => {
   it("keeps builder-incentive dry runs free of signing, reservation, WAL, and delivery", async () => {
     beginBundle();
     const result = await submitTx(
-      { to: TO, data: "0x14", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: true,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         privateCohort: { id: "dry-run-cohort", role: "builder-incentive" },
       },
     );
@@ -799,18 +957,52 @@ describe("prepared delivery campaigns", () => {
   it("rejects public authorization for builder incentives", async () => {
     beginBundle();
     await expect(submitTx(
-      { to: TO, data: "0x1414", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: true,
         race: true,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         privateCohort: { id: "public-bid", role: "builder-incentive" },
       },
     )).rejects.toThrow("cannot authorize public delivery");
 
     expect(h.nonceManager.reserve).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(await flushBundle()).toEqual(new Map());
+  });
+
+  it("rejects missing, mismatched, or overbroad builder block authorization before signing", async () => {
+    beginBundle();
+    const base = {
+      dryRun: false,
+      race: false,
+      revertible: true,
+      purpose: "builder-incentive" as const,
+      simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+      privateCohort: { id: "expiry-validation", role: "builder-incentive" as const },
+    };
+
+    await expect(submitTx(
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
+      base,
+    )).rejects.toThrow("require an on-chain block deadline");
+    await expect(submitTx(
+      { to: TO, data: encodeCoinbasePayment(BUILDER_NOT_BEFORE_TIMESTAMP, 101n), value: 1n, gas: 50_000n },
+      { ...base, validThroughBlock: BUILDER_VALID_THROUGH_BLOCK },
+    )).rejects.toThrow("calldata does not match");
+    await expect(submitTx(
+      { to: TO, data: encodeCoinbasePayment(BUILDER_NOT_BEFORE_TIMESTAMP, 103n), value: 1n, gas: 50_000n },
+      { ...base, validThroughBlock: 103n },
+    )).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining("exceeds the two-block private horizon"),
+    });
+
+    expect(h.nonceManager.reserve).not.toHaveBeenCalled();
+    expect(h.journal.upsertMany).not.toHaveBeenCalled();
     expect(await flushBundle()).toEqual(new Map());
   });
 
@@ -844,12 +1036,14 @@ describe("prepared delivery campaigns", () => {
       },
     );
     const incentive = await submitTx(
-      { to: TO, data: "0x17", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: false,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         privateCohort: { id: "combined-1", role: "builder-incentive" },
       },
     );
@@ -877,9 +1071,106 @@ describe("prepared delivery campaigns", () => {
     expect(prepared.find((flight: any) => flight.nonce === incentive.nonce)).toMatchObject({
       purpose: "builder-incentive",
       privateCohort: { id: "combined-1", role: "builder-incentive" },
-      recovery: { publicAuthorized: false },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+      },
       maxPrivateTargetBlock: "102",
     });
+    const signedIncentive = parseTransaction(
+      privateSends[0]!.params[0].txs[2] as Hex,
+    );
+    expect(signedIncentive.data).toBe(BUILDER_CALL);
+  });
+
+  it("never extends a signed builder payment beyond its last authorized target block", async () => {
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: call.params[0].txs.map(() => ({})) }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xbounded" }));
+    });
+
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x1701", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        privateCohort: { id: "bounded-bid", role: "mandatory" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
+        privateCohort: { id: "bounded-bid", role: "builder-incentive" },
+      },
+    );
+    // Preparation authorized blocks 101-102. By flush time 102 is the first
+    // fresh target, so transport may submit exactly that block and no later one.
+    h.publicClient.getBlockNumber.mockResolvedValueOnce(101n);
+
+    const result = await flushBundle();
+
+    expect(result.get(payment.nonce)?.ok).toBe(true);
+    expect(result.get(incentive.nonce)?.ok).toBe(true);
+    const privateSends = calls.filter((call) => call.method === "eth_sendBundle");
+    expect(privateSends).toHaveLength(2);
+    expect(privateSends.every((call) => call.params[0].blockNumber === "0x66")).toBe(true);
+    expect(h.journal.upsertMany.mock.calls[0]![1].find(
+      (flight: any) => flight.nonce === incentive.nonce,
+    )).toMatchObject({
+      recovery: {
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: "102",
+      },
+      maxPrivateTargetBlock: "102",
+    });
+  });
+
+  it("drops a builder payment that is stale before the first fresh private target", async () => {
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x1702", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        privateCohort: { id: "stale-bid", role: "mandatory" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
+        privateCohort: { id: "stale-bid", role: "builder-incentive" },
+      },
+    );
+    h.publicClient.getBlockNumber.mockResolvedValueOnce(102n);
+
+    const result = await flushBundle();
+
+    expect(result.get(payment.nonce)?.ok).toBe(true);
+    expect(result.get(incentive.nonce)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("expired before private target block 103"),
+    });
+    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
   });
 
   it("drops an expired optional cohort suffix without suppressing the mandatory public fallback", async () => {
@@ -916,12 +1207,14 @@ describe("prepared delivery campaigns", () => {
       },
     );
     const incentive = await submitTx(
-      { to: TO, data: "0x1712", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: false,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         deadlineMs: 2_000,
         privateCohort: { id: "expired-cohort", role: "builder-incentive" },
       },
@@ -1011,12 +1304,14 @@ describe("prepared delivery campaigns", () => {
       },
     );
     const incentive = await submitTx(
-      { to: TO, data: "0x1721", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: false,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         deadlineMs: 2_000,
         privateCohort: { id: "wal-deadline", role: "builder-incentive" },
       },
@@ -1056,12 +1351,14 @@ describe("prepared delivery campaigns", () => {
       },
     );
     const incentive = await submitTx(
-      { to: TO, data: "0x1731", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: false,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         deadlineMs: 2_000,
         privateCohort: { id: "wal-cleanup-failure", role: "builder-incentive" },
       },
@@ -1090,7 +1387,7 @@ describe("prepared delivery campaigns", () => {
     expect(privateSends).toEqual([]);
   });
 
-  it("cuts before a cohort when one of its mandatory members fails simulation", async () => {
+  it("retains every disclosed raw when one cohort member fails relay simulation", async () => {
     const calls: RpcCall[] = [];
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
@@ -1115,29 +1412,35 @@ describe("prepared delivery campaigns", () => {
       },
     );
     const incentive = await submitTx(
-      { to: TO, data: "0x1a", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: false,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         privateCohort: { id: "failed-cohort", role: "builder-incentive" },
       },
     );
 
     const result = await flushBundle();
 
-    expect(result.get(ordinary.nonce)?.ok).toBe(true);
-    expect(result.get(mandatory.nonce)?.error).toContain("payment failed");
-    expect(result.get(incentive.nonce)?.error).toContain("payment failed");
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([mandatory.nonce, incentive.nonce]);
-    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(result.get(ordinary.nonce)).toMatchObject({ ok: true, uncertain: true });
+    expect(result.get(mandatory.nonce)).toMatchObject({
+      ok: true,
+      uncertain: true,
+      error: expect.stringContaining("payment failed"),
+    });
+    expect(result.get(incentive.nonce)).toMatchObject({
+      ok: true,
+      uncertain: true,
+      error: expect.stringContaining("payment failed"),
+    });
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
     const privateSends = calls.filter((call) => call.method === "eth_sendBundle");
-    expect(privateSends).toHaveLength(4);
-    expect(privateSends.every((call) => {
-      const txs = call.params[0].txs as Hex[];
-      return txs.length === 1 && parseTransaction(txs[0]!).nonce === ordinary.nonce;
-    })).toBe(true);
+    expect(privateSends).toHaveLength(0);
   });
 
   it("excludes an entire cohort when private gas limits would split it", async () => {
@@ -1171,12 +1474,14 @@ describe("prepared delivery campaigns", () => {
       },
     );
     const incentive = await submitTx(
-      { to: TO, data: "0x1d", value: 1n, gas: 50_000n },
+      { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
       {
         dryRun: false,
         race: false,
         revertible: true,
         purpose: "builder-incentive",
+        simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
         privateCohort: { id: "oversize-cohort", role: "builder-incentive" },
       },
     );
@@ -1201,12 +1506,16 @@ describe("prepared delivery campaigns", () => {
       (flight: any) => flight.nonce === incentive.nonce,
     )).toMatchObject({
       purpose: "builder-incentive",
-      recovery: { publicAuthorized: false },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+      },
       maxPrivateTargetBlock: "102",
     });
   });
 
-  it("releases the complete fresh sequence when every route explicitly rejects", async () => {
+  it("retains the complete sequence when every remote route reports rejection", async () => {
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
       if (call.method === "eth_callBundle") {
@@ -1218,12 +1527,14 @@ describe("prepared delivery campaigns", () => {
     await queue(2);
 
     const result = await flushBundle();
-    expect([...result.values()].every((item) => !item.ok && !item.uncertain)).toBe(true);
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([7, 8]);
+    expect([...result.values()].every((item) => item.ok && item.uncertain)).toBe(true);
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
     expect(h.journal.mutate).toHaveBeenCalledWith(
       ACCOUNT.address,
       expect.objectContaining({
-        remove: expect.arrayContaining([...result.values()].map((item) => item.txHash)),
+        remove: [],
+        updates: expect.arrayContaining([...result.values()].map((item) =>
+          expect.objectContaining({ txHash: item.txHash }))),
       }),
     );
   });
@@ -1247,7 +1558,7 @@ describe("prepared delivery campaigns", () => {
     expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
 
-  it("fences a definitively rejected lower nonce when a higher nonce was accepted", async () => {
+  it("fences a remotely rejected lower nonce when a higher nonce was accepted", async () => {
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
       if (call.method === "eth_callBundle") {
@@ -1262,7 +1573,7 @@ describe("prepared delivery campaigns", () => {
 
     const result = await flushBundle();
     expect(result.get(7)).toMatchObject({ ok: true, uncertain: true });
-    expect(result.get(7)?.error).toContain("higher-nonce gap");
+    expect(result.get(7)?.error).toContain("bundle rejected");
     expect(result.get(8)?.ok).toBe(true);
     expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
     expect(h.nonceManager.markDelivery).toHaveBeenCalledWith(
@@ -1272,7 +1583,7 @@ describe("prepared delivery campaigns", () => {
     );
   });
 
-  it("releases a definitively rejected fresh top suffix", async () => {
+  it("retains a remotely rejected fresh top suffix", async () => {
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
       if (call.method === "eth_callBundle") {
@@ -1287,11 +1598,11 @@ describe("prepared delivery campaigns", () => {
 
     const result = await flushBundle();
     expect(result.get(7)?.ok).toBe(true);
-    expect(result.get(8)?.ok).toBe(false);
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([8]);
+    expect(result.get(8)).toMatchObject({ ok: true, uncertain: true });
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
 
-  it("releases a fresh nonce-conflict rejection but forces a pending resync", async () => {
+  it("retains a fresh nonce-conflict response after public/private dispatch", async () => {
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
       if (call.method === "eth_callBundle") return Promise.resolve(response({ results: [{}] }));
@@ -1301,9 +1612,9 @@ describe("prepared delivery campaigns", () => {
     await queue(1);
 
     const result = await flushBundle();
-    expect(result.get(7)?.ok).toBe(false);
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([7]);
-    expect(h.nonceManager.reset).toHaveBeenCalledTimes(1);
+    expect(result.get(7)).toMatchObject({ ok: true, uncertain: true });
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+    expect(h.nonceManager.reset).not.toHaveBeenCalled();
   });
 
   it("keeps private acceptance ambiguous when public nonce conflict proves another lineage", async () => {
@@ -1323,7 +1634,7 @@ describe("prepared delivery campaigns", () => {
     );
   });
 
-  it("lets a nonce-too-high private flight expire instead of fencing the missing lower nonce forever", async () => {
+  it("retains a nonce-too-high dispatched raw despite finite relay target metadata", async () => {
     h.publicClient.sendRawTransaction.mockRejectedValue(new Error("nonce too high"));
     await queue(1);
 
@@ -1334,14 +1645,18 @@ describe("prepared delivery campaigns", () => {
       ACCOUNT.address,
       expect.objectContaining({
         updates: [expect.objectContaining({
-          update: expect.objectContaining({ state: "accepted", nonceConflict: false }),
+          update: expect.objectContaining({
+            state: "accepted",
+            nonceConflict: true,
+            publicExposure: true,
+          }),
         })],
       }),
     );
     expect(h.nonceManager.markDelivery).toHaveBeenCalledWith(
       7,
       "accepted",
-      expect.objectContaining({ retainBeyondPrivateTarget: false }),
+      expect.objectContaining({ retainBeyondPrivateTarget: true, publicExposure: true }),
     );
   });
 
@@ -1352,7 +1667,7 @@ describe("prepared delivery campaigns", () => {
     const result = await flushBundle();
     expect([...result.values()].every((item) => !item.ok)).toBe(true);
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
-    expect(fetchMock.mock.calls.map(([url, init]) => rpcCall(url, init).method)).toEqual(["eth_callBundle"]);
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([7, 8]);
   });
 
@@ -1390,7 +1705,7 @@ describe("prepared delivery campaigns", () => {
     expect(h.runtime.setJournalHealth).toHaveBeenCalledWith(false, expect.any(String));
   });
 
-  it("releases a direct rejection whose terminal WAL removal visibly committed", async () => {
+  it("retains a direct raw after remote rejection and a committed outcome update", async () => {
     h.appConfig.mode = "public";
     h.publicClient.sendRawTransaction.mockRejectedValueOnce(new Error("insufficient funds"));
     h.journal.mutate.mockImplementationOnce(() => {
@@ -1404,9 +1719,13 @@ describe("prepared delivery campaigns", () => {
       { dryRun: false, race: true },
     );
 
-    expect(result).toMatchObject({ ok: false, uncertain: undefined });
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([7]);
-    expect(h.nonceManager.markDelivery).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: true, uncertain: true });
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+    expect(h.nonceManager.markDelivery).toHaveBeenCalledWith(
+      7,
+      "ambiguous",
+      expect.objectContaining({ publicExposure: true }),
+    );
     expect(h.runtime.setJournalHealth).toHaveBeenCalledWith(false, expect.any(String));
   });
 
@@ -1459,7 +1778,7 @@ describe("prepared delivery campaigns", () => {
     expect(await flushBundle()).toEqual(new Map());
   });
 
-  it("delivers a clean lower-nonce prefix and releases the failing dependent suffix", async () => {
+  it("retains the whole WAL-fenced batch when relay simulation reports a failure", async () => {
     const calls: RpcCall[] = [];
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
@@ -1472,31 +1791,25 @@ describe("prepared delivery campaigns", () => {
     await queue(3);
 
     const result = await flushBundle();
-    expect(result.get(7)).toMatchObject({ ok: true, txHash: expect.any(String) });
-    expect(result.get(8)).toMatchObject({ ok: false, error: expect.stringContaining("second obligation failed") });
-    expect(result.get(9)).toMatchObject({ ok: false, error: expect.stringContaining("second obligation failed") });
-    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
-    expect(parseTransaction(
-      h.publicClient.sendRawTransaction.mock.calls[0]![0].serializedTransaction,
-    ).nonce).toBe(7);
-    expect(calls.filter((call) => call.method === "eth_sendBundle")).toHaveLength(4);
-    expect(calls.filter((call) => call.method === "eth_sendBundle").every(
-      (call) => call.params[0].txs.length === 1,
-    )).toBe(true);
+    expect([...result.values()].every((item) => item.ok && item.uncertain)).toBe(true);
+    expect([...result.values()].every((item) =>
+      item.error?.includes("second obligation failed"))).toBe(true);
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(calls.filter((call) => call.method === "eth_sendBundle")).toHaveLength(0);
     expect(h.journal.upsertMany).toHaveBeenCalledTimes(1);
-    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(1);
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([8, 9]);
+    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(3);
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
 
-  it("fails the whole queue when the first simulated transaction reverts", async () => {
+  it("retains the whole queue when the first post-WAL relay simulation result reverts", async () => {
     fetchMock.mockResolvedValue(response({ results: [{ revert: "first obligation failed" }, {}] }));
     await queue(2);
 
     const result = await flushBundle();
-    expect([...result.values()].every((item) => !item.ok)).toBe(true);
+    expect([...result.values()].every((item) => item.ok && item.uncertain)).toBe(true);
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
-    expect(h.journal.upsertMany).not.toHaveBeenCalled();
-    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([7, 8]);
+    expect(h.journal.upsertMany).toHaveBeenCalledTimes(1);
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
 
   it("preserves public delivery when relay simulation times out", async () => {
@@ -1557,12 +1870,14 @@ describe("prepared delivery campaigns", () => {
         },
       );
       const incentive = await submitTx(
-        { to: TO, data: "0x7812", value: 1n, gas: 50_000n },
+        { to: TO, data: BUILDER_CALL, value: 1n, gas: 50_000n },
         {
           dryRun: false,
           race: false,
           revertible: true,
           purpose: "builder-incentive",
+          simTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP,
+          validThroughBlock: BUILDER_VALID_THROUGH_BLOCK,
           privateCohort: { id: "malformed-sim", role: "builder-incentive" },
         },
       );
@@ -1571,23 +1886,25 @@ describe("prepared delivery campaigns", () => {
 
       expect(result.get(payment.nonce)?.ok).toBe(true);
       expect(result.get(audit.nonce)?.ok).toBe(true);
-      expect(result.get(incentive.nonce)?.ok).toBe(false);
+      expect(result.get(incentive.nonce)).toMatchObject({ ok: true, uncertain: true });
       expect(h.publicClient.sendRawTransaction.mock.calls.map(([arg]) =>
         parseTransaction(arg.serializedTransaction).nonce,
       )).toEqual([payment.nonce, audit.nonce]);
       expect(calls.filter((call) => call.method === "eth_callBundle")).toHaveLength(1);
       expect(calls.filter((call) => call.method === "eth_sendBundle")).toHaveLength(0);
-      expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([incentive.nonce]);
+      expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
     },
   );
 
-  it("disables direct private delivery when the relay returns a malformed simulation", async () => {
+  it("uses only local simulation before direct private delivery", async () => {
     const calls: RpcCall[] = [];
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
       calls.push(call);
-      if (call.method === "eth_callBundle") return Promise.resolve(response({}));
-      throw new Error("malformed simulation must disable direct private delivery");
+      if (call.method === "eth_callBundle") {
+        throw new Error("signed raw must never be sent for direct relay simulation");
+      }
+      throw new Error("private delivery is conservatively ambiguous");
     });
 
     const result = await submitTx(
@@ -1598,7 +1915,8 @@ describe("prepared delivery campaigns", () => {
     expect(result.ok).toBe(true);
     expect(h.publicClient.call).toHaveBeenCalledTimes(1);
     expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
-    expect(calls.map((call) => call.method)).toEqual(["eth_callBundle"]);
+    expect(calls.filter((call) => call.method === "eth_callBundle")).toHaveLength(0);
+    expect(calls.filter((call) => call.method === "eth_sendBundle")).toHaveLength(4);
   });
 
   it("submits a 100-tx private prefix and all 101 prepared payments publicly", async () => {
@@ -1723,7 +2041,7 @@ describe("prepared delivery campaigns", () => {
     expect(mutation?.remove ?? []).not.toContain(priorHash);
   });
 
-  it("returns a definitive failure for a rejected replacement while fencing the prior flight", async () => {
+  it("retains a remotely rejected replacement as ambiguous alongside its prior flight", async () => {
     const priorHash = `0x${"55".repeat(32)}` as Hex;
     fetchMock.mockImplementation((url, init) => {
       const call = rpcCall(url, init);
@@ -1753,14 +2071,17 @@ describe("prepared delivery campaigns", () => {
     const result = await flushBundle();
 
     expect(result.get(7)).toMatchObject({
-      ok: false,
-      uncertain: undefined,
+      ok: true,
+      uncertain: true,
       txHash: prepared.txHash,
       lineageId: "payment:1",
     });
     expect(h.nonceManager.markDelivery).toHaveBeenCalledWith(7, "ambiguous", {
-      txHash: priorHash,
-      retainRejectedFence: true,
+      maxPrivateTargetBlock: 102n,
+      txHash: prepared.txHash,
+      publicExposure: true,
+      retainBeyondPrivateTarget: true,
+      retainRejectedFence: false,
     });
     expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
@@ -1819,6 +2140,305 @@ describe("durable prepared-flight recovery", () => {
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
     expect(h.journal.updateMany).not.toHaveBeenCalled();
     expect(h.nonceManager.restoreFlight).not.toHaveBeenCalled();
+  });
+
+  it("cold-initializes canonical nonce state and retires a mature builder through the public path", async () => {
+    const builder = await recoveredBuilderFlight();
+    mockReconciliation([builder]);
+    beginBundle(); // Live strategy ticks open an empty preparation window first.
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.nonceManager.initializeFromJournal).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      7,
+      7,
+      [expect.objectContaining({ nonce: 7, retainBeyondPrivateTarget: true })],
+    );
+    expect(h.nonceManager.initializeFromJournal.mock.invocationCallOrder[0])
+      .toBeLessThan(h.nonceManager.ensureNextAbove.mock.invocationCallOrder[0]!);
+    expect(h.journal.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      nonce: 7,
+      purpose: "nonce-retirement",
+      recovery: expect.objectContaining({ publicAuthorized: true }),
+      lineage: expect.objectContaining({ replacesTxHash: builder.txHash }),
+    }));
+    const serialized = h.publicClient.sendRawTransaction.mock.calls[0]![0].serializedTransaction;
+    const parsed = parseTransaction(serialized);
+    expect(parsed.nonce).toBe(7);
+    expect(parsed.to?.toLowerCase()).toBe(ACCOUNT.address.toLowerCase());
+    expect(parsed.value ?? 0n).toBe(0n);
+    expect(parsed.data ?? "0x").toBe("0x");
+    expect(h.journal.upsert.mock.invocationCallOrder[0])
+      .toBeLessThan(h.publicClient.sendRawTransaction.mock.invocationCallOrder[0]!);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(discardBundle()).toEqual(new Map());
+  });
+
+  it("keeps a remotely rejected retirement ambiguous and WAL-fenced", async () => {
+    const builder = await recoveredBuilderFlight();
+    mockReconciliation([builder]);
+    h.publicClient.sendRawTransaction.mockRejectedValueOnce(
+      new Error("replacement transaction underpriced"),
+    );
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.journal.mutate).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      expect.objectContaining({
+        updates: [expect.objectContaining({
+          update: expect.objectContaining({
+            state: "ambiguous",
+            publicExposure: true,
+          }),
+        })],
+      }),
+    );
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+    expect(h.journal.removeMany).not.toHaveBeenCalled();
+  });
+
+  it("waits until every same-nonce builder deadline is canonically final", async () => {
+    const early = await recoveredBuilderFlight({ updatedAtMs: 1 });
+    const later = await recoveredBuilderFlight({
+      notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP + 1n,
+      validThroughBlock: 105n,
+      updatedAtMs: 2,
+    });
+    mockReconciliation([early, later], { currentBlock: 104n });
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+
+    mockReconciliation([early, later], { currentBlock: 107n });
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.journal.upsert).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects recovery before any mutation when a live batch is non-empty", async () => {
+    beginBundle();
+    await submitTx(
+      { to: TO, data: "0x79", value: 0n, gas: 50_000n },
+      { dryRun: false, race: true },
+    );
+    const builder = await recoveredBuilderFlight();
+    mockReconciliation([builder]);
+
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toThrow(
+      "submission recovery cannot interleave a non-empty transaction batch",
+    );
+
+    expect(h.journal.reconcile).not.toHaveBeenCalled();
+    expect(h.nonceManager.initializeFromJournal).not.toHaveBeenCalled();
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    discardBundle();
+  });
+
+  it("exact-replays a crash-window prepared retirement before considering another bump", async () => {
+    const builder = await recoveredBuilderFlight();
+    const retirement = await recoveredRetirementFlight(builder, "prepared");
+    mockReconciliation([builder, retirement]);
+    const genericStrategyAuthorizer = vi.fn(async () => false);
+
+    await recoverPreparedSubmissions(
+      ACCOUNT.address,
+      undefined,
+      genericStrategyAuthorizer,
+    );
+
+    expect(genericStrategyAuthorizer).not.toHaveBeenCalled();
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
+      serializedTransaction: retirement.rawSignedTx,
+    });
+    expect(h.journal.updateMany).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      [expect.objectContaining({
+        txHash: retirement.txHash,
+        update: expect.objectContaining({ state: "accepted", publicExposure: true }),
+      })],
+    );
+  });
+
+  it("rejects prepared retirement replay above the explicit replacement cap", async () => {
+    const builder = await recoveredBuilderFlight();
+    const retirement = await recoveredRetirementFlight(builder, "prepared");
+    mockReconciliation([builder, retirement]);
+    h.runtime.strategy.dynamicTipEnabled = true;
+    h.runtime.strategy.dynamicTipMaxGwei = 50;
+    h.runtime.strategy.replacementPriorityFeeCapGwei = 2;
+
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toThrow(
+      "prepared retirement fees exceed current general cleanup caps",
+    );
+
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("fee-bumps an aged ambiguous retirement while retaining every prior lineage", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    const builder = await recoveredBuilderFlight();
+    const retirement = await recoveredRetirementFlight(builder, "ambiguous", 1);
+    mockReconciliation([builder, retirement]);
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    const prepared = h.journal.upsert.mock.calls[0]![0];
+    expect(prepared).toMatchObject({
+      nonce: builder.nonce,
+      purpose: "nonce-retirement",
+      lineage: { id: builder.lineage.id, replacesTxHash: retirement.txHash },
+    });
+    expect(BigInt(prepared.obligation.maxFeePerGas))
+      .toBeGreaterThan(BigInt(retirement.obligation.maxFeePerGas));
+    expect(BigInt(prepared.obligation.maxPriorityFeePerGas))
+      .toBeGreaterThan(BigInt(retirement.obligation.maxPriorityFeePerGas));
+    expect(h.journal.removeMany).not.toHaveBeenCalled();
+  });
+
+  it("fails closed at replacement caps or the spend floor without exposing a new raw", async () => {
+    const capBuilder = await recoveredBuilderFlight({
+      maxFeePerGas: 210_000_000_000n,
+      maxPriorityFeePerGas: 10_000_000_000n,
+    });
+    mockReconciliation([capBuilder]);
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toBeInstanceOf(
+      BuilderNonceRetirementError,
+    );
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    h.runtime.account = ACCOUNT;
+    const floorBuilder = await recoveredBuilderFlight({ valueWei: parseEther("100") });
+    mockReconciliation([floorBuilder]);
+    h.publicClient.getBalance.mockResolvedValue(1n);
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toThrow(
+      "cannot cover",
+    );
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("removes only a pre-dispatch retirement WAL when Stop lands after its barrier", async () => {
+    const builder = await recoveredBuilderFlight();
+    mockReconciliation([builder]);
+    const controller = new AbortController();
+    h.journal.upsert.mockImplementationOnce(() => controller.abort());
+
+    await expect(recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    )).rejects.toBeInstanceOf(BuilderNonceRetirementError);
+
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(h.journal.removeMany).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      [expect.any(String)],
+    );
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+  });
+
+  it("keeps retirement WAL exposure when Stop lands after public dispatch starts", async () => {
+    const builder = await recoveredBuilderFlight();
+    mockReconciliation([builder]);
+    const controller = new AbortController();
+    const send = deferred<Hex>();
+    h.publicClient.sendRawTransaction.mockImplementationOnce(() => send.promise);
+
+    const recovering = recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    ).catch((error) => error as Error);
+    await vi.waitFor(() => expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1));
+    controller.abort();
+    send.reject(new Error("transport dropped after dispatch"));
+    await recovering;
+
+    expect(h.journal.mutate).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      expect.objectContaining({
+        updates: [expect.objectContaining({
+          update: expect.objectContaining({ state: "ambiguous", publicExposure: true }),
+        })],
+      }),
+    );
+    expect(h.journal.removeMany).not.toHaveBeenCalled();
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+  });
+
+  it("retains the old builder fence when retirement WAL preparation fails", async () => {
+    const builder = await recoveredBuilderFlight();
+    mockReconciliation([builder]);
+    h.journal.upsert.mockImplementationOnce(() => {
+      throw new Error("retirement WAL unavailable");
+    });
+
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toThrow(
+      "retirement WAL unavailable",
+    );
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(h.journal.removeMany).not.toHaveBeenCalled();
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+  });
+
+  it("blocks retirement above an untracked pending prefix", async () => {
+    const builder = await recoveredBuilderFlight({ nonce: 8 });
+    mockReconciliation([builder], { confirmedNonce: 7, pendingNonce: 8 });
+
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toBeInstanceOf(
+      UntrackedPendingPrefixError,
+    );
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("releases a nonce only after the canonical journal returns final expiry", async () => {
+    const expired = {
+      ...await recoveredFlight(false),
+      // Only undisclosed prepared work with no viable route can expire safely.
+      maxPrivateTargetBlock: undefined,
+    };
+    h.journal.load.mockReturnValue([expired]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 104n,
+      retained: [],
+      consumed: [],
+      expired: [{ ...expired, state: "expired" }],
+    });
+
+    await reconcileSubmissionJournal(ACCOUNT.address);
+
+    expect(h.nonceManager.releaseJournalExpired).toHaveBeenCalledWith([expired.nonce]);
+  });
+
+  it("does not release an expired alternative while the nonce has a retained lineage", async () => {
+    const expired = await recoveredFlight(false);
+    const retained = await recoveredFlight(true, undefined, { data: "0x02" });
+    h.journal.load.mockReturnValue([expired, retained]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 104n,
+      retained: [retained],
+      consumed: [],
+      expired: [{ ...expired, state: "expired" }],
+    });
+
+    await reconcileSubmissionJournal(ACCOUNT.address);
+
+    expect(h.nonceManager.releaseJournalExpired).toHaveBeenCalledWith([]);
   });
 
   it("fails closed when the provider rejects the canonical hash-bound nonce read", async () => {
@@ -1885,6 +2505,36 @@ describe("durable prepared-flight recovery", () => {
         update: expect.objectContaining({ state: "accepted", publicExposure: true }),
       })],
     );
+  });
+
+  it("cancels a future not-before recovery without broadcasting", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const flight = await recoveredFlight(true, 1_060n);
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+    const controller = new AbortController();
+    const recovering = recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    ).catch((error) => error as Error);
+
+    await vi.advanceTimersByTimeAsync(1);
+    controller.abort();
+    const error = await recovering;
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("aborted");
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(h.journal.updateMany).not.toHaveBeenCalled();
   });
 
   it("does not start journal reconciliation with already-revoked recovery authority", async () => {
@@ -2050,6 +2700,39 @@ describe("durable prepared-flight recovery", () => {
     expect(h.journal.updateMany).not.toHaveBeenCalled();
   });
 
+  it("never public-replays a builder incentive even if recovery policy is tampered", async () => {
+    const flight = {
+      ...await recoveredFlight(true, undefined, {
+        data: BUILDER_CALL,
+        valueWei: 1n,
+      }),
+      purpose: "builder-incentive" as const,
+      privateCohort: { id: "tampered-builder", role: "builder-incentive" as const },
+      recovery: {
+        publicAuthorized: true,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+      },
+      maxPrivateTargetBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+    };
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+
+    await recoverPreparedSubmissions(ACCOUNT.address);
+
+    expect(h.publicClient.getBalance).not.toHaveBeenCalled();
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(h.journal.updateMany).not.toHaveBeenCalled();
+  });
+
   it("never replays a tip-included flight while confirmation is provisional", async () => {
     const flight = {
       ...await recoveredFlight(true),
@@ -2130,7 +2813,7 @@ describe("durable prepared-flight recovery", () => {
     );
   });
 
-  it("extends the pending frontier even when confirmed nonce is lower", async () => {
+  it("blocks recovery above a pending nonce absent from durable journal state", async () => {
     const flight = await recoveredFlight(true, undefined, { nonce: 8, data: "0x78" });
     h.journal.load.mockReturnValue([flight]);
     h.journal.reconcile.mockReturnValue({
@@ -2142,11 +2825,36 @@ describe("durable prepared-flight recovery", () => {
       expired: [],
     });
 
+    await expect(recoverPreparedSubmissions(ACCOUNT.address)).rejects.toBeInstanceOf(
+      UntrackedPendingPrefixError,
+    );
+
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("extends a pending prefix only when every lower nonce is durably represented", async () => {
+    const knownPending = {
+      ...await recoveredFlight(true, undefined, { nonce: 7, data: "0x77" }),
+      state: "accepted" as const,
+      publicExposure: true,
+    };
+    const extension = await recoveredFlight(true, undefined, { nonce: 8, data: "0x78" });
+    const retained = [knownPending, extension];
+    h.journal.load.mockReturnValue(retained);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 8,
+      currentBlock: 100n,
+      retained,
+      consumed: [],
+      expired: [],
+    });
+
     await recoverPreparedSubmissions(ACCOUNT.address);
 
-    expect(h.publicClient.call).toHaveBeenCalledTimes(1);
     expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
-      serializedTransaction: flight.rawSignedTx,
+      serializedTransaction: extension.rawSignedTx,
     });
   });
 
@@ -2215,12 +2923,13 @@ describe("durable prepared-flight recovery", () => {
       serializedTransaction: failed.rawSignedTx,
     });
     expect(failed.state).toBe("ambiguous");
-    expect(failed.publicExposure).toBe(false);
+    expect(failed.publicExposure).toBe(true);
     expect(higher.state).toBe("prepared");
     expect(h.journal.updateMany).toHaveBeenCalledWith(
       ACCOUNT.address,
       [expect.objectContaining({ txHash: failed.txHash })],
     );
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
 
   it("durably and monotonically records same-nonce conflict during recovery", async () => {
@@ -2242,7 +2951,7 @@ describe("durable prepared-flight recovery", () => {
 
     expect(flight).toMatchObject({
       state: "ambiguous",
-      publicExposure: false,
+      publicExposure: true,
       nonceConflict: true,
     });
     expect(h.journal.updateMany).toHaveBeenCalledWith(ACCOUNT.address, [
@@ -2251,6 +2960,7 @@ describe("durable prepared-flight recovery", () => {
         update: expect.objectContaining({ nonceConflict: true }),
       }),
     ]);
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
   });
 
   it("fails recovery authorization errors before balance, simulation, or replay", async () => {

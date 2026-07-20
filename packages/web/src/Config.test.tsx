@@ -68,6 +68,12 @@ const config: StrategyConfig = {
   maxPaymentEth: 0,
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -87,7 +93,7 @@ describe("Config revision conflicts", () => {
     });
   });
 
-  it("discards a stale edit and applies the authoritative server snapshot", async () => {
+  it("rebases a stale edit on the authoritative server snapshot after a conflict", async () => {
     const initial: StrategySnapshot = { revision: 1, config };
     const authoritative: StrategySnapshot = {
       revision: 2,
@@ -108,8 +114,64 @@ describe("Config revision conflicts", () => {
       expect(api.getConfig).toHaveBeenCalledOnce();
     });
     expect(await screen.findByText(/Configuration changed elsewhere/)).toBeTruthy();
-    expect(defense.checked).toBe(false);
+    expect(defense.checked).toBe(true);
     expect(onChange).toHaveBeenCalledWith(authoritative);
+  });
+
+  it("preserves an unsaved strategy draft when payment settings advance the revision", async () => {
+    const initial: StrategySnapshot = { revision: 1, config };
+    const paymentSave: StrategySnapshot = {
+      revision: 2,
+      config: { ...config, priorityFeeGwei: 77, auditSafetyBufferSeconds: 43_200 },
+    };
+    const saved: StrategySnapshot = {
+      revision: 3,
+      config: { ...paymentSave.config, defenseEnabled: true },
+    };
+    vi.mocked(api.setConfig).mockResolvedValue(saved);
+    const onChange = vi.fn();
+    const view = render(<Config initial={initial} onChange={onChange} />);
+
+    const defense = screen.getByLabelText("Enable continuous defense") as HTMLInputElement;
+    fireEvent.click(defense);
+    expect(defense.checked).toBe(true);
+
+    view.rerender(<Config initial={paymentSave} onChange={onChange} />);
+
+    expect(await screen.findByText(/unsaved strategy edits were preserved/)).toBeTruthy();
+    expect(defense.checked).toBe(true);
+    expect((screen.getByLabelText(
+      "Clear audits with this many seconds remaining",
+    ) as HTMLInputElement).value).toBe("43200");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save strategy" }));
+    await waitFor(() => {
+      expect(api.setConfig).toHaveBeenCalledWith(2, { defenseEnabled: true });
+      expect(onChange).toHaveBeenCalledWith(saved);
+    });
+  });
+
+  it("preserves edits made while an older strategy save is in flight", async () => {
+    const initial: StrategySnapshot = { revision: 1, config };
+    const firstSave = deferred<StrategySnapshot>();
+    const firstSnapshot: StrategySnapshot = {
+      revision: 2,
+      config: { ...config, defenseEnabled: true },
+    };
+    vi.mocked(api.setConfig).mockReturnValueOnce(firstSave.promise);
+
+    render(<Config initial={initial} onChange={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText("Enable continuous defense"));
+    fireEvent.click(screen.getByRole("button", { name: "Save strategy" }));
+    await waitFor(() => expect(api.setConfig).toHaveBeenCalledWith(1, { defenseEnabled: true }));
+
+    const floor = screen.getByLabelText("Min wallet balance floor (ETH)") as HTMLInputElement;
+    fireEvent.change(floor, { target: { value: "0.25" } });
+    firstSave.resolve(firstSnapshot);
+
+    await waitFor(() => expect(floor.value).toBe("0.25"));
+    expect((screen.getByRole("button", { name: "Save strategy" }) as HTMLButtonElement).disabled)
+      .toBe(false);
   });
 
   it("warns, confirms, and acknowledges a public-to-mainnet bid reactivation", async () => {

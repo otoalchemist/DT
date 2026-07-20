@@ -115,12 +115,14 @@ export function App() {
     );
   }
 
-  // Step 1: Alchemy RPC key must be configured first.
+  // Step 1: RPC and ownership discovery must both be configured first.
   if (!settings?.setupReady) {
     return (
       <div className="app">
         <AlchemySetup
           localMode={settings?.mode === "local"}
+          rpcConfigured={settings?.rpcConfigured ?? false}
+          ownershipConfigured={settings?.ownershipConfigured ?? false}
           onSaved={() => { void api.getSettings().then(setSettings); }}
         />
       </div>

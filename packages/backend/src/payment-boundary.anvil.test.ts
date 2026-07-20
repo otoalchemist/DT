@@ -17,6 +17,7 @@ import {
   type Hex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { encodeCoinbasePayment } from "./coinbase-payer.js";
 
 const ANVIL_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as Hex;
 const MULTICALL3_ADDRESS = "0xca11bde05977b3631167028862be2a173976ca11" as Address;
@@ -575,7 +576,11 @@ describe("epoch-priced payment replacement", () => {
         functionName: "lastEpochPaid",
         args: [3n],
       })).toBe(1n);
-      expect(recoveryJournal.load(account.address)).toEqual([
+      const recoveryFlights = recoveryJournal.load(account.address);
+      // Same-epoch confirmed entries are inert accounting/one-shot tombstones,
+      // not replayable work. Dry-run must add exactly one non-final flight and
+      // must not dispatch it.
+      expect(recoveryFlights.filter((flight) => flight.state !== "confirmed")).toEqual([
         expect.objectContaining({ txHash: dryRunHash, state: "prepared" }),
       ]);
 
@@ -668,9 +673,14 @@ describe("CoinbasePayer production bytecode", () => {
     const eoaBid = parseEther("0.001");
     const contractBid = parseEther("0.002");
     const rejectedBid = parseEther("0.003");
-    const sendBid = async (value: bigint) => {
+    const sendBid = async (
+      value: bigint,
+      validThroughBlock: bigint,
+      notBeforeTimestamp = 0n,
+    ) => {
       const hash = await walletClient.sendTransaction({
         to: payer,
+        data: encodeCoinbasePayment(notBeforeTimestamp, validThroughBlock),
         value,
         gas: 100_000n,
         maxFeePerGas: parseGwei("10"),
@@ -678,6 +688,10 @@ describe("CoinbasePayer production bytecode", () => {
       });
       return publicClient.waitForTransactionReceipt({ hash });
     };
+    // viem caches getBlockNumber by default. Every automined transaction below
+    // needs a fresh height so its signed deadline is exactly its inclusion block.
+    const nextBlockDeadline = async () =>
+      (await publicClient.getBlockNumber({ cacheTime: 0 })) + 1n;
 
     try {
       await publicClient.request({
@@ -685,7 +699,22 @@ describe("CoinbasePayer production bytecode", () => {
         params: [eoaCoinbase] as never,
       });
       const eoaBefore = await publicClient.getBalance({ address: eoaCoinbase });
-      expect((await sendBid(eoaBid)).status).toBe("success");
+      const beforeWindow = await publicClient.getBlock({ blockTag: "latest" });
+      const notBeforeTimestamp = beforeWindow.timestamp + 60n;
+      const eoaDeadline = beforeWindow.number! + 2n;
+      const earlyReceipt = await sendBid(eoaBid, eoaDeadline, notBeforeTimestamp);
+      expect(earlyReceipt.status).toBe("reverted");
+      expect(await publicClient.getBalance({ address: eoaCoinbase })).toBe(eoaBefore);
+
+      await publicClient.request({
+        method: "anvil_setNextBlockTimestamp" as never,
+        params: [Number(notBeforeTimestamp)] as never,
+      });
+      const eoaReceipt = await sendBid(eoaBid, eoaDeadline, notBeforeTimestamp);
+      expect(eoaReceipt.status).toBe("success");
+      expect(eoaReceipt.blockNumber).toBe(eoaDeadline);
+      expect((await publicClient.getBlock({ blockNumber: eoaReceipt.blockNumber })).timestamp)
+        .toBe(notBeforeTimestamp);
       expect(await publicClient.getBalance({ address: eoaCoinbase })).toBe(eoaBefore + eoaBid);
 
       await publicClient.request({
@@ -693,7 +722,10 @@ describe("CoinbasePayer production bytecode", () => {
         params: [acceptingCoinbase] as never,
       });
       const contractBefore = await publicClient.getBalance({ address: acceptingCoinbase });
-      expect((await sendBid(contractBid)).status).toBe("success");
+      expect((await sendBid(
+        contractBid,
+        await nextBlockDeadline(),
+      )).status).toBe("success");
       expect(await publicClient.getBalance({ address: acceptingCoinbase }))
         .toBe(contractBefore + contractBid);
       expect(await publicClient.readContract({
@@ -706,9 +738,32 @@ describe("CoinbasePayer production bytecode", () => {
         method: "anvil_setCoinbase" as never,
         params: [rejectingCoinbase] as never,
       });
-      expect((await sendBid(rejectedBid)).status).toBe("reverted");
+      expect((await sendBid(
+        rejectedBid,
+        await nextBlockDeadline(),
+      )).status).toBe("reverted");
       expect(await publicClient.getBalance({ address: payer })).toBe(0n);
       expect(await publicClient.getBalance({ address: rejectingCoinbase })).toBe(0n);
+
+      await publicClient.request({
+        method: "anvil_setCoinbase" as never,
+        params: [eoaCoinbase] as never,
+      });
+      const expiredCoinbaseBefore = await publicClient.getBalance({ address: eoaCoinbase });
+      const alreadyExpiredAt = await publicClient.getBlockNumber({ cacheTime: 0 });
+      expect((await sendBid(rejectedBid, alreadyExpiredAt)).status).toBe("reverted");
+      expect(await publicClient.getBalance({ address: eoaCoinbase })).toBe(expiredCoinbaseBefore);
+      expect(await publicClient.getBalance({ address: payer })).toBe(0n);
+
+      const legacyHash = await walletClient.sendTransaction({
+        to: payer,
+        value: eoaBid,
+        gas: 100_000n,
+        maxFeePerGas: parseGwei("10"),
+        maxPriorityFeePerGas: 0n,
+      });
+      expect((await publicClient.waitForTransactionReceipt({ hash: legacyHash })).status)
+        .toBe("reverted");
     } finally {
       await publicClient.request({
         method: "anvil_setCoinbase" as never,

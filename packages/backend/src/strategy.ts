@@ -4,6 +4,7 @@ import {
   WINNERS,
   EPOCH_DURATION_SECONDS,
   BASE_TAX_RATE_WEI,
+  MIN_ADVANCED_BOUNDARY_LEAD_MS,
   citizensAbi,
   type StrategyConfig,
 } from "@dat-bot/shared";
@@ -37,6 +38,10 @@ import {
   waitForBundleFallbacks,
   reconcileSubmissionJournal,
   recoverPreparedSubmissions,
+  acknowledgeFinalizedSubmissionFlights,
+  annotateFinalizedSubmissionSpend,
+  type JournalConfirmedSpend,
+  type JournalPaymentMetadata,
   type TxIntent,
   type SubmitResult,
 } from "./flashbots.js";
@@ -46,8 +51,11 @@ import { AtomicWriteCommittedError } from "./durability.js";
 import {
   COINBASE_PAYER_GAS,
   resolveBuilderIncentive,
+  verifyCoinbasePayerRuntime,
   type BuilderIncentiveResolution,
 } from "./builder-incentive.js";
+import { encodeCoinbasePayment } from "./coinbase-payer.js";
+import { configuredEthToWei, configuredGweiToWei } from "./amounts.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
 // Preliminary guard uses at least the largest fixed campaign gas limit. The
@@ -580,6 +588,24 @@ function effectiveLeadMs(): number {
   return appConfig.mode === "mainnet" ? s.preBoundaryLeadMainnetMs : s.preBoundaryLeadMs;
 }
 
+/** Payment-only preparation honors the operator's full configured range. A
+ * combined cohort needs a real discovery interval before its fixed handoff
+ * reserve, so low-but-valid values are raised only while that feature can run. */
+function effectivePaymentLeadMs(): number {
+  const configured = effectiveLeadMs();
+  return appConfig.mode === "mainnet"
+    && runtime.strategy.combinedBoundaryBundle
+    && runtime.strategy.coinbaseBidEnabled
+    ? Math.max(configured, MIN_ADVANCED_BOUNDARY_LEAD_MS)
+    : configured;
+}
+
+/** Standalone audit/kill preparation includes discovery and simulation work; a
+ * 250ms configured payment lead cannot safely be reused as its whole budget. */
+function effectiveOffenseLeadMs(): number {
+  return Math.max(effectiveLeadMs(), MIN_ADVANCED_BOUNDARY_LEAD_MS);
+}
+
 // A precisely-timed boundary tick (JIT / defense / offense) must not be silently
 // dropped just because a routine block/poll tick happens to be running when its
 // timer fires — that would push the payment/kill to the next ordinary tick and
@@ -721,13 +747,20 @@ let journalReconciledGeneration = -1;
 type RetainedJournalFlight = Awaited<ReturnType<typeof reconcileSubmissionJournal>>["retained"][number];
 type JournalReconciliationResult = Awaited<ReturnType<typeof reconcileSubmissionJournal>>;
 
+class PaymentJournalMetadataMismatchError extends Error {
+  constructor(nonce: number) {
+    super(`submission journal payment metadata does not match payTaxes calldata at nonce ${nonce}`);
+    this.name = "PaymentJournalMetadataMismatchError";
+  }
+}
+
 function signedFeesWithinCurrentLimits(
   flight: RetainedJournalFlight,
   offense: boolean,
   baseFeePerGas: bigint,
 ): boolean {
   const gas = resolveGas(runtime.strategy, offense);
-  const maxBaseFeeWei = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
+  const maxBaseFeeWei = configuredGweiToWei(gas.maxBaseFeeGwei);
   if (baseFeePerGas > maxBaseFeeWei) return false;
 
   // A recovered raw may be either the first signed attempt or a same-nonce
@@ -738,7 +771,7 @@ function signedFeesWithinCurrentLimits(
     gas.dynamicTipEnabled ? gas.dynamicTipMaxGwei : 0,
     gas.replacementPriorityFeeCapGwei ?? gas.priorityFeeGwei,
   );
-  const priorityCapWei = BigInt(Math.round(priorityCapGwei * 1e9));
+  const priorityCapWei = configuredGweiToWei(priorityCapGwei);
   const maxFeeCapWei = maxBaseFeeWei * 2n + priorityCapWei;
   return BigInt(flight.obligation.maxPriorityFeePerGas) <= priorityCapWei
     && BigInt(flight.obligation.maxFeePerGas) <= maxFeeCapWei;
@@ -883,7 +916,7 @@ function createRecoveryFlightAuthorizer(address: Address) {
         ? valueWei / divisor
         : undefined;
       const maxPaymentWei = runtime.strategy.maxPaymentEth > 0
-        ? parseEther(String(runtime.strategy.maxPaymentEth))
+        ? configuredEthToWei(runtime.strategy.maxPaymentEth)
         : 0n;
       if (maxPaymentWei > 0n && valueWei > maxPaymentWei) return false;
       const results = await looseMulticall([
@@ -1031,8 +1064,19 @@ function restoreJournalFlights(
   address: Address,
   retained: readonly RetainedJournalFlight[],
   currentBlock?: bigint,
+  restoreExposure = true,
+  detached?: {
+    payments: Map<string, PaymentFlight>;
+    actions: Map<string, ActionFlight>;
+  },
 ): void {
-  refreshProvisionalJournalNonces(address, retained);
+  if (restoreExposure) refreshProvisionalJournalNonces(address, retained);
+  const restoredPayments = detached?.payments ?? paymentFlights;
+  const restoredActions = detached?.actions ?? actionFlights;
+  const paymentKey = (tokenId: string, nonce: number) =>
+    detached === undefined ? tokenId : `${nonce}:${tokenId}`;
+  const actionMapKey = (semanticKey: string, nonce: number) =>
+    detached === undefined ? semanticKey : `${nonce}:${semanticKey}`;
   const normalized = address.toLowerCase();
   const byNonce = new Map<number, RetainedJournalFlight[]>();
   const uuidNonces = new Map<string, Set<number>>();
@@ -1076,20 +1120,22 @@ function restoreJournalFlights(
       return exposure > max ? exposure : max;
     }, 0n);
     const obligation = latest.obligation;
-    const key = liabilityKey(address, nonce);
-    const existing = pendingLiabilities.get(key);
-    pendingLiabilities.set(key, {
-      account: address,
-      nonce,
-      valueWei: BigInt(obligation.valueWei),
-      gasWei: BigInt(obligation.gasLimit) * BigInt(obligation.maxFeePerGas),
-      maxExposureWei: existing && existing.maxExposureWei > maxExposureWei
-        ? existing.maxExposureWei
-        : maxExposureWei,
-      txHash: latest.txHash,
-      submittedAtMs: latest.updatedAtMs,
-      delivery: "submitted",
-    });
+    if (restoreExposure) {
+      const key = liabilityKey(address, nonce);
+      const existing = pendingLiabilities.get(key);
+      pendingLiabilities.set(key, {
+        account: address,
+        nonce,
+        valueWei: BigInt(obligation.valueWei),
+        gasWei: BigInt(obligation.gasLimit) * BigInt(obligation.maxFeePerGas),
+        maxExposureWei: existing && existing.maxExposureWei > maxExposureWei
+          ? existing.maxExposureWei
+          : maxExposureWei,
+        txHash: latest.txHash,
+        submittedAtMs: latest.updatedAtMs,
+        delivery: "submitted",
+      });
+    }
 
     // Recover semantic identity from any alternative in the same-nonce lineage.
     // A zero-value gap filler may be the newest entry, but the older game call is
@@ -1141,7 +1187,18 @@ function restoreJournalFlights(
         const tokenId = args[0] as bigint;
         const epochs = BigInt(args[1] as bigint | number);
         const tokenKey = tokenId.toString();
-        const current = paymentFlights.get(tokenKey);
+        const paymentMetadata = semantic.flight.recovery.payment;
+        if (
+          paymentMetadata !== undefined
+          && (
+            paymentMetadata.tokenId !== tokenKey
+            || BigInt(paymentMetadata.epochs) !== epochs
+          )
+        ) {
+          throw new PaymentJournalMetadataMismatchError(nonce);
+        }
+        const mapKey = paymentKey(tokenKey, nonce);
+        const current = restoredPayments.get(mapKey);
         const divisor = epochs > 0n ? epochs * BASE_TAX_RATE_WEI : 0n;
         const semanticValueWei = BigInt(semantic.obligation.valueWei);
         const inferredPricedEpoch = divisor > 0n && semanticValueWei % divisor === 0n
@@ -1171,27 +1228,37 @@ function restoreJournalFlights(
           }
           continue;
         }
-        paymentFlights.set(tokenKey, {
+        restoredPayments.set(mapKey, {
           attemptId: ++nextPaymentAttemptId,
           tokenId: tokenKey,
-          startingLastEpochPaid: null,
-          // Exact pre-submission progress is not durable. A conservative sentinel
-          // prevents false confirmation; recovered gap coverage is inferred only
-          // when chain progress reaches the value-derived priced epoch below.
-          expectedLastEpochPaid: (1n << 256n) - 1n,
+          startingLastEpochPaid: paymentMetadata?.startingLastEpochPaid === null
+            || paymentMetadata === undefined
+            ? null
+            : BigInt(paymentMetadata.startingLastEpochPaid),
+          // Legacy WALs did not persist their signing-time progress baseline.
+          // Keep their conservative sentinel; new flights restore the exact
+          // expected progress needed to prove a deeply-behind one-shot payment.
+          expectedLastEpochPaid: paymentMetadata === undefined
+            ? (1n << 256n) - 1n
+            : BigInt(paymentMetadata.expectedLastEpochPaid),
           ...common,
           obligationCovered: false,
           cancelRequired: durableGapFiller,
           inertFiller: durableGapFiller,
           recoveredGap: retryImmediately || durableGapFiller,
-          recoveredFromJournal: true,
-          source: "defense",
+          recoveredFromJournal:
+            paymentMetadata === undefined || paymentMetadata.startingLastEpochPaid === null,
+          source: paymentMetadata?.source ?? "defense",
           epochs,
-          pricedEpoch: inferredPricedEpoch,
-          jitTargetEpoch: null,
-          jitCampaignRevision: null,
-          proactiveEpoch: null,
-          proactiveMarkerReserved: false,
+          pricedEpoch: paymentMetadata === undefined
+            ? inferredPricedEpoch
+            : BigInt(paymentMetadata.pricedEpoch),
+          jitTargetEpoch: paymentMetadata?.jitTargetEpoch ?? null,
+          jitCampaignRevision: paymentMetadata?.jitCampaignRevision ?? null,
+          proactiveEpoch: paymentMetadata?.proactiveEpoch === undefined
+            ? null
+            : BigInt(paymentMetadata.proactiveEpoch),
+          proactiveMarkerReserved: paymentMetadata?.proactiveMarkerReserved ?? false,
         });
         continue;
       }
@@ -1216,7 +1283,8 @@ function restoreJournalFlights(
       }
       const actionKey = semanticActionKey(kind, tokenId, targetTokenId);
       if (actionKey === null) continue;
-      const currentAction = actionFlights.get(actionKey);
+      const mapKey = actionMapKey(actionKey, nonce);
+      const currentAction = restoredActions.get(mapKey);
       const notBeforeTimestamp = semantic.flight.recovery.notBeforeTimestamp === undefined
         ? null
         : BigInt(semantic.flight.recovery.notBeforeTimestamp);
@@ -1251,7 +1319,7 @@ function restoreJournalFlights(
         }
         continue;
       }
-      actionFlights.set(actionKey, {
+      restoredActions.set(mapKey, {
         attemptId: ++nextActionAttemptId,
         key: actionKey,
         kind,
@@ -1267,17 +1335,75 @@ function restoreJournalFlights(
         ...common,
       });
     } catch (err) {
+      if (err instanceof PaymentJournalMetadataMismatchError) throw err;
       logger.warn(`could not reconstruct journaled nonce ${nonce}:`, (err as Error).message);
     }
   }
-  paymentFlightAccount = address;
-  publishPendingExposure();
+  if (detached === undefined) paymentFlightAccount = address;
+  if (restoreExposure) publishPendingExposure();
+}
+
+type TerminalPaymentCoverage = "covered" | "not-covered" | "unknown";
+
+function oneShotPaymentScopeIsActive(flight: PaymentFlight): boolean {
+  const activeJit = flight.jitTargetEpoch !== null
+    && flight.jitCampaignRevision !== null
+    && runtime.jitCampaign.state === "armed"
+    && runtime.jitCampaign.revision === flight.jitCampaignRevision
+    && runtime.jitCampaign.targetEpoch === flight.jitTargetEpoch
+    && runtime.jitCampaign.tokenIds.includes(flight.tokenId);
+  // Keep a finalized proactive marker through its whole epoch. A null runtime
+  // epoch is startup uncertainty, not permission to discard dedupe evidence.
+  const activeProactive = flight.proactiveEpoch !== null
+    && (runtime.currentEpoch === null || runtime.currentEpoch <= flight.proactiveEpoch);
+  return activeJit || activeProactive;
+}
+
+type ReconciledJournalFlight = JournalReconciliationResult["consumed"][number];
+
+async function journalEpochAtBlock(blockNumber: bigint): Promise<bigint> {
+  const [result] = await publicClient.multicall({
+    allowFailure: true,
+    contracts: [{ ...gameContract, functionName: "currentEpoch" as const }],
+    blockNumber,
+  });
+  if (result?.status !== "success" || typeof result.result !== "bigint" || result.result < 0n) {
+    throw new Error(`could not determine game epoch at block ${blockNumber}`);
+  }
+  return result.result;
+}
+
+function confirmedSpendForNonce(
+  nonce: number,
+  consumed: readonly ReconciledJournalFlight[],
+): JournalConfirmedSpend | null {
+  const annotations = consumed.flatMap((flight) =>
+    flight.confirmedSpend === undefined ? [] : [flight.confirmedSpend]);
+  if (annotations.length > 1) {
+    throw new Error(`multiple confirmed-spend annotations for nonce ${nonce}`);
+  }
+  return annotations[0] ?? null;
 }
 
 async function applyJournalTerminals(
   address: Address,
   reconciliation: JournalReconciliationResult,
 ): Promise<void> {
+  // On a cold restart, consumed entries are no longer in `retained`, but their
+  // inert WAL tombstones still carry the baseline/campaign identity required to
+  // complete one-shot bookkeeping. Rebuild semantics without resurrecting
+  // already-final financial exposure.
+  const terminalSemantics = {
+    payments: new Map<string, PaymentFlight>(),
+    actions: new Map<string, ActionFlight>(),
+  };
+  restoreJournalFlights(
+    address,
+    reconciliation.consumed,
+    reconciliation.currentBlock,
+    false,
+    terminalSemantics,
+  );
   const retainedNonces = new Set(reconciliation.retained.map((flight) => flight.nonce));
   const provisionalFlights = reconciliation.provisional ?? reconciliation.retained.filter(
     (flight) => flight.observedConsumedAtBlock !== undefined,
@@ -1294,20 +1420,45 @@ async function applyJournalTerminals(
   const getReceipt = (publicClient as unknown as {
     getTransactionReceipt?: (args: { hash: Hex }) => Promise<PricedReceipt>;
   }).getTransactionReceipt;
+  const paymentCoverageByNonce = new Map<number, TerminalPaymentCoverage>();
 
-  // Journal finality owns deletion, but semantic bookkeeping still needs the
-  // coherent post-transaction state before that deletion. In particular, a
+  // Journal finality identifies consumed nonces, but strategy acknowledgement
+  // owns deletion after semantic/accounting bookkeeping. In particular, a
   // one-epoch JIT payment can start several epochs behind; merely observing that
   // the Citizen is still behind the current epoch cannot tell a later JIT pass
   // whether this exact one-epoch obligation succeeded. Snapshot the covered
   // marker at the journal's terminal block while the in-memory flight still has
   // its signing-time baseline. A failed/unknown call does not invent coverage.
-  const terminalPaymentFlights = [...paymentFlights.values()].filter((flight) =>
+  const terminalPaymentsByKey = new Map(
+    [...terminalSemantics.payments.values()].map((flight) =>
+      [`${flight.nonce}:${flight.tokenId}`, flight] as const),
+  );
+  // A live process can hold richer receipt-derived state than a legacy or
+  // filler-only consumed WAL lineage. Prefer that state only for the exact same
+  // terminal nonce; never let an older tombstone for the token replace a newer
+  // retained flight at another nonce.
+  for (const flight of paymentFlights.values()) {
+    if (
+      flight.account.toLowerCase() === address.toLowerCase()
+      && consumedNonces.has(flight.nonce)
+      && !retainedNonces.has(flight.nonce)
+      && !provisionalNonces.has(flight.nonce)
+    ) {
+      terminalPaymentsByKey.set(`${flight.nonce}:${flight.tokenId}`, flight);
+    }
+  }
+  const terminalPaymentFlights = [...terminalPaymentsByKey.values()].filter((flight) =>
     flight.account.toLowerCase() === address.toLowerCase()
     && consumedNonces.has(flight.nonce)
     && !retainedNonces.has(flight.nonce)
     && !provisionalNonces.has(flight.nonce)
   );
+  for (const flight of terminalPaymentFlights) {
+    paymentCoverageByNonce.set(
+      flight.nonce,
+      flight.obligationCovered ? "covered" : "unknown",
+    );
+  }
   if (terminalPaymentFlights.length > 0) {
     try {
       const results = await publicClient.multicall({
@@ -1321,23 +1472,30 @@ async function applyJournalTerminals(
       });
       for (let i = 0; i < terminalPaymentFlights.length; i++) {
         const snapshot = terminalPaymentFlights[i]!;
-        const current = paymentFlights.get(snapshot.tokenId);
+        const current = terminalPaymentsByKey.get(`${snapshot.nonce}:${snapshot.tokenId}`);
         const result = results[i];
-        if (
-          !current
-          || current.attemptId !== snapshot.attemptId
-          || result?.status !== "success"
-        ) continue;
+        if (!current || current.attemptId !== snapshot.attemptId) continue;
+        if (result?.status !== "success") {
+          paymentCoverageByNonce.set(current.nonce, "unknown");
+          continue;
+        }
         const observed = result.result as bigint;
-        if (
+        const covered = current.obligationCovered || (
           observed >= current.expectedLastEpochPaid
           || (
             current.recoveredGap
             && current.pricedEpoch > 0n
             && observed >= current.pricedEpoch
           )
-        ) {
+        );
+        if (covered) {
           markPaymentObligationCovered(current);
+          paymentCoverageByNonce.set(current.nonce, "covered");
+        } else if (current.startingLastEpochPaid !== null) {
+          // With the exact signing baseline restored, a coherent terminal-block
+          // value below the expected marker proves this payment did not advance
+          // the Citizen. It is safe to release the tombstone and retry.
+          paymentCoverageByNonce.set(current.nonce, "not-covered");
         }
       }
     } catch (err) {
@@ -1348,42 +1506,209 @@ async function applyJournalTerminals(
     }
   }
 
+  const acknowledgedHashes: Hex[] = [];
+  const unknownTerminalPayments: PaymentFlight[] = [];
+  const epochByBlock = new Map<string, Promise<bigint>>();
+  const exactEpochAtBlock = (blockNumber: bigint): Promise<bigint> => {
+    const key = blockNumber.toString();
+    const cached = epochByBlock.get(key);
+    if (cached) return cached;
+    const pending = journalEpochAtBlock(blockNumber);
+    epochByBlock.set(key, pending);
+    return pending;
+  };
+  let accountingEpoch: bigint | null = null;
+  if (reconciliation.consumed.length > 0) {
+    try {
+      accountingEpoch = await exactEpochAtBlock(reconciliation.currentBlock);
+    } catch (err) {
+      // Without an exact tip epoch, old annotations cannot be pruned and no
+      // reconstructed total is published. Retry from the durable tombstones.
+      logger.warn("journal accounting epoch lookup failed:", (err as Error).message);
+    }
+  }
+  const applyLegacyReceiptEvidence = (
+    nonce: number,
+    minedFlight: ReconciledJournalFlight,
+    receipt: PricedReceipt,
+  ): void => {
+    for (const paymentFlight of terminalPaymentFlights) {
+      if (
+        paymentFlight.nonce !== nonce
+        || paymentFlight.startingLastEpochPaid !== null
+      ) continue;
+      let minedThisPayment = false;
+      if (
+        receipt.status === "success"
+        && minedFlight.obligation.to.toLowerCase() === appConfig.gameAddress.toLowerCase()
+      ) {
+        try {
+          const decoded = decodeFunctionData({
+            abi: gameContract.abi,
+            data: minedFlight.obligation.data,
+          }) as { functionName: string; args?: readonly unknown[] };
+          minedThisPayment = decoded.functionName === "payTaxes"
+            && (decoded.args?.[0] as bigint | undefined)?.toString()
+              === paymentFlight.tokenId;
+        } catch {
+          // A same-nonce filler/action is not the recovered payment.
+        }
+      }
+      if (minedThisPayment) {
+        markPaymentObligationCovered(paymentFlight);
+        paymentCoverageByNonce.set(nonce, "covered");
+      } else if (paymentCoverageByNonce.get(nonce) === "unknown") {
+        paymentCoverageByNonce.set(nonce, "not-covered");
+      }
+    }
+  };
   for (const nonce of terminalNonces) {
     // A replacement lineage may contain an expired private alternative alongside
     // a retained public one. The nonce remains live until every route is terminal.
     if (retainedNonces.has(nonce) || provisionalNonces.has(nonce)) continue;
-    const key = liabilityKey(address, nonce);
-    const liability = pendingLiabilities.get(key);
     const consumed = reconciliation.consumed.filter((flight) => flight.nonce === nonce);
-    let accounted = false;
-    if (liability && getReceipt && consumed.length > 0) {
+    let confirmedSpend = consumed.length === 0
+      ? null
+      : confirmedSpendForNonce(nonce, consumed);
+    if (confirmedSpend === null && getReceipt) {
       for (const flight of consumed) {
+        let receipt: PricedReceipt;
+        let receiptEpoch: bigint;
         try {
-          const receipt = await getReceipt.call(publicClient, { hash: flight.txHash });
-          const obligation = flight.obligation;
-          accountForReceipt({
-            ...liability,
-            valueWei: BigInt(obligation.valueWei),
-            gasWei: BigInt(obligation.gasLimit) * BigInt(obligation.maxFeePerGas),
-          }, receipt);
-          accounted = true;
-          break;
+          receipt = await getReceipt.call(publicClient, { hash: flight.txHash });
+          if (receipt.blockNumber === undefined) {
+            throw new Error(`receipt ${flight.txHash} has no block number`);
+          }
+          receiptEpoch = await exactEpochAtBlock(receipt.blockNumber);
         } catch {
-          // Only the actually mined alternative has a receipt.
+          // Only the actually mined alternative has a receipt. A transient RPC
+          // or historical-state failure is indistinguishable here, so retain
+          // every tombstone and retry instead of under-reporting confirmed spend.
+          continue;
+        }
+        const obligation = flight.obligation;
+        const maximumGasWei = BigInt(obligation.gasLimit)
+          * BigInt(obligation.maxFeePerGas);
+        const actualGasWei = receipt.gasUsed !== undefined
+          && receipt.effectiveGasPrice !== undefined
+          ? receipt.gasUsed * receipt.effectiveGasPrice
+          : maximumGasWei;
+        const transferredValue = receipt.status === "success"
+          ? BigInt(obligation.valueWei)
+          : 0n;
+        confirmedSpend = {
+          epoch: receiptEpoch.toString(),
+          spendWei: (transferredValue + actualGasWei).toString(),
+        };
+        // This synchronous WAL barrier must complete before runtime accounting
+        // changes. A committed-but-not-directory-durable error propagates and
+        // is recovered from the visible annotation on the next reconciliation.
+        annotateFinalizedSubmissionSpend(address, flight.txHash, confirmedSpend);
+        flight.confirmedSpend = confirmedSpend;
+
+        // Legacy WAL entries have no signing-time baseline. The receipt for the
+        // exact semantic hash is nevertheless definitive.
+        applyLegacyReceiptEvidence(nonce, flight, receipt);
+        break;
+      }
+    }
+    if (
+      confirmedSpend !== null
+      && getReceipt
+      && paymentCoverageByNonce.get(nonce) === "unknown"
+      && terminalPaymentFlights.some((flight) =>
+        flight.nonce === nonce && flight.startingLastEpochPaid === null)
+    ) {
+      // The annotation may have committed immediately before a crash, before
+      // legacy semantic bookkeeping ran. Its host flight is the exact mined
+      // alternative; retry only the receipt classification, never the spend.
+      const annotatedFlight = consumed.find((flight) => flight.confirmedSpend !== undefined);
+      if (annotatedFlight) {
+        try {
+          const receipt = await getReceipt.call(publicClient, { hash: annotatedFlight.txHash });
+          applyLegacyReceiptEvidence(nonce, annotatedFlight, receipt);
+        } catch {
+          // Keep the semantic fence and durable annotation until the receipt is
+          // available. Accounting remains exactly reconstructible meanwhile.
         }
       }
     }
-    if (!accounted) settlePendingLiability(address, nonce, reconciliation.currentBlock);
+    settlePendingLiability(address, nonce, reconciliation.currentBlock);
+    // Retain the annotation for its whole mined epoch. Once the coherent tip is
+    // in a later epoch it can be removed; an old receipt is never reattributed.
+    let retainConsumedTombstone = consumed.length > 0 && (
+      confirmedSpend === null
+      || accountingEpoch === null
+      || BigInt(confirmedSpend.epoch) >= accountingEpoch
+    );
+    // Expiration proves that no authorized delivery survived, so it must release
+    // the semantic fence immediately. Only a consumed nonce needs on-chain
+    // coverage evidence before deciding whether the payment obligation landed.
+    const coverage = consumed.length === 0
+      ? "not-covered"
+      : paymentCoverageByNonce.get(nonce) ?? "unknown";
+    const terminalPayments = terminalPaymentFlights.filter((flight) => flight.nonce === nonce);
+    for (const flight of terminalPayments) {
+      if (coverage === "unknown") {
+        // Fail closed on a transient terminal-block state lookup. Keeping the
+        // semantic flight fences fresh payment work; the retained confirmed WAL
+        // marker makes the lookup retryable on the next tick/restart. Detached
+        // terminal reconstruction must not replace a newer retained flight for
+        // this token, but when no such flight exists it still owns the live
+        // semantic fence until coverage becomes knowable.
+        unknownTerminalPayments.push(flight);
+        retainConsumedTombstone = true;
+        continue;
+      }
+      if (coverage === "covered") {
+        retainConsumedTombstone = retainConsumedTombstone || oneShotPaymentScopeIsActive(flight);
+      } else {
+        clearSourceMarker(flight);
+      }
+    }
     for (const [tokenId, flight] of paymentFlights) {
       if (flight.account.toLowerCase() !== address.toLowerCase() || flight.nonce !== nonce) continue;
-      if (!flight.obligationCovered) clearSourceMarker(flight);
+      if (coverage === "unknown") continue;
+      if (coverage === "not-covered") clearSourceMarker(flight);
       paymentFlights.delete(tokenId);
     }
     for (const [actionKey, flight] of actionFlights) {
       if (flight.account.toLowerCase() !== address.toLowerCase() || flight.nonce !== nonce) continue;
       actionFlights.delete(actionKey);
     }
+    if (!retainConsumedTombstone) {
+      acknowledgedHashes.push(...consumed.map((flight) => flight.txHash));
+    }
   }
+  if (accountingEpoch !== null) {
+    let complete = true;
+    let total = 0n;
+    const seenNonces = new Set<number>();
+    for (const flight of reconciliation.consumed) {
+      if (seenNonces.has(flight.nonce)) continue;
+      seenNonces.add(flight.nonce);
+      const sameNonce = reconciliation.consumed.filter((candidate) =>
+        candidate.nonce === flight.nonce);
+      const annotation = confirmedSpendForNonce(flight.nonce, sameNonce);
+      if (annotation === null) {
+        complete = false;
+        continue;
+      }
+      if (BigInt(annotation.epoch) === accountingEpoch) {
+        total += BigInt(annotation.spendWei);
+      }
+    }
+    if (complete) runtime.restoreConfirmedSpend(accountingEpoch, total);
+  }
+  // A newer same-token flight may itself have become terminal and been removed
+  // later in the loop. Install unresolved terminal fences only after all exact-
+  // nonce deletions, newest first, so no ordering of WAL entries can leave the
+  // token briefly unguarded.
+  unknownTerminalPayments.sort((a, b) => b.nonce - a.nonce);
+  for (const flight of unknownTerminalPayments) {
+    if (!paymentFlights.has(flight.tokenId)) paymentFlights.set(flight.tokenId, flight);
+  }
+  acknowledgeFinalizedSubmissionFlights(address, acknowledgedHashes);
 }
 
 async function reconcileSubmissionTerminals(address: Address): Promise<void> {
@@ -1771,7 +2096,7 @@ export function schedulePreBoundaryPay(): void {
   if (!runtime.running || !s.preBoundaryPay || plan === null) return;
   const nowMs = Date.now();
   const nowSec = BigInt(Math.floor(nowMs / 1000));
-  const deltaMs = Number(plan.boundaryTs) * 1000 - nowMs - effectiveLeadMs();
+  const deltaMs = Number(plan.boundaryTs) * 1000 - nowMs - effectivePaymentLeadMs();
   if (deltaMs <= 0) {
     // Starting or waking inside the configured lead is still useful. Fire now
     // while the boundary is in the future; public delivery remains held until
@@ -1923,6 +2248,20 @@ function builderIncentiveAuthorizationError(
     return "CoinbasePayer address changed";
   }
   return undefined;
+}
+
+async function finalBuilderIncentiveAuthorizationError(
+  resolved: ActiveBuilderIncentive,
+  generation: number,
+  deadlineMs: number,
+): Promise<string | undefined> {
+  const beforeRead = builderIncentiveAuthorizationError(resolved, generation, deadlineMs);
+  if (beforeRead) return beforeRead;
+  const runtimeError = await verifyCoinbasePayerRuntime(resolved.payer);
+  if (runtimeError) return `final payer verification failed: ${runtimeError}`;
+  // The bytecode read itself is asynchronous. Recheck every revocable policy
+  // input after it returns so Stop/config changes cannot ride through the check.
+  return builderIncentiveAuthorizationError(resolved, generation, deadlineMs);
 }
 
 function combinedAuditAuthorizationError(
@@ -2095,10 +2434,18 @@ async function submitBoundaryBuilderIncentive(args: {
   resolved: ActiveBuilderIncentive;
   targetEpoch: bigint;
   boundaryTs: bigint;
+  validThroughBlock: bigint;
   generation: number;
   cohortId: string;
 }): Promise<boolean> {
-  const { resolved, targetEpoch, boundaryTs, generation, cohortId } = args;
+  const {
+    resolved,
+    targetEpoch,
+    boundaryTs,
+    validThroughBlock,
+    generation,
+    cohortId,
+  } = args;
   const deadlineMs = Number(boundaryTs) * 1_000;
   const authorizationError = builderIncentiveAuthorizationError(
     resolved,
@@ -2112,7 +2459,7 @@ async function submitBoundaryBuilderIncentive(args: {
   const result = await act(
     {
       to: resolved.payer,
-      data: "0x",
+      data: encodeCoinbasePayment(boundaryTs, validThroughBlock),
       value: resolved.bidWei,
       gas: COINBASE_PAYER_GAS,
     },
@@ -2124,8 +2471,14 @@ async function submitBoundaryBuilderIncentive(args: {
       revertible: true,
       purpose: "builder-incentive",
       privateCohort: { id: cohortId, role: "builder-incentive" },
+      validThroughBlock,
       deadlineMs,
       finalAuthorization: () => builderIncentiveAuthorizationError(
+        resolved,
+        generation,
+        deadlineMs,
+      ),
+      asyncFinalAuthorization: () => finalBuilderIncentiveAuthorizationError(
         resolved,
         generation,
         deadlineMs,
@@ -2157,7 +2510,7 @@ async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineG
 
   const nowMs = Date.now();
   const boundaryMs = Number(plan.boundaryTs) * 1000;
-  if (nowMs < boundaryMs - effectiveLeadMs() - 1_000) {
+  if (nowMs < boundaryMs - effectivePaymentLeadMs() - 1_000) {
     schedulePreBoundaryPay();
     return;
   }
@@ -2366,13 +2719,21 @@ async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineG
       });
       // Exactly one incentive is attempted, always last. Failure leaves every
       // already prepared payment/audit entry intact for the normal batch flush.
-      await submitBoundaryBuilderIncentive({
-        resolved: combined,
-        targetEpoch,
-        boundaryTs,
-        generation,
-        cohortId,
-      });
+      if (latest.number === null) {
+        logger.warn("builder incentive skipped: latest block number is unavailable");
+      } else {
+        // Bind the signed bid to the same two-block horizon used by private
+        // transport. If preparation advances more than one block, transport
+        // narrows or drops the bid rather than extending this authorization.
+        await submitBoundaryBuilderIncentive({
+          resolved: combined,
+          targetEpoch,
+          boundaryTs,
+          validThroughBlock: latest.number + 2n,
+          generation,
+          cohortId,
+        });
+      }
     }
   } catch (err) {
     markPaymentWorkUnsafe();
@@ -2444,7 +2805,7 @@ export function schedulePreBoundaryAudit(): void {
   const nowMs = Date.now();
   // Survival payment gets first use of the wallet nonce. A standalone audit is
   // intentionally offset and never shares the payment's discovery/batch.
-  const deltaMs = Number(plan.boundaryTs) * 1000 - nowMs - effectiveLeadMs()
+  const deltaMs = Number(plan.boundaryTs) * 1000 - nowMs - effectiveOffenseLeadMs()
     + PAYMENT_PRIORITY_OFFSET_MS;
   const generation = engineGeneration;
   if (deltaMs <= 0) {
@@ -2565,7 +2926,7 @@ export function schedulePreBoundaryKill(): void {
   if (nextKillDeadlineSec === null) return;
   const targetDeadline = nextKillDeadlineSec;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const deltaMs = Number(targetDeadline - nowSec) * 1000 - effectiveLeadMs();
+  const deltaMs = Number(targetDeadline - nowSec) * 1000 - effectiveOffenseLeadMs();
   const generation = engineGeneration;
   if (deltaMs <= 0) {
     if (targetDeadline > nowSec) {
@@ -2606,7 +2967,7 @@ async function firePreBoundaryKill(
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   let followingDeadline: bigint | null = null;
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
-  const windowSec = BigInt(Math.ceil(effectiveLeadMs() / 1000) + 12);
+  const windowSec = BigInt(Math.ceil(effectiveOffenseLeadMs() / 1000) + 12);
   try {
     await ensureSubmissionRecovery(address, generation);
     await nonceManager.sync(address, appConfig.mode);
@@ -2737,7 +3098,7 @@ function minBalanceFloorFailure(
   const mutuallyExclusiveExposure = priorLineageExposure > candidateExposure
     ? priorLineageExposure
     : candidateExposure;
-  const floor = parseEther(String(runtime.strategy.minBalanceEth));
+  const floor = configuredEthToWei(runtime.strategy.minBalanceEth);
   return canAffordSpend(
     balanceWei,
     committedThisTickWei + reserved,
@@ -2863,7 +3224,7 @@ async function canSpend(
   const gas = resolveGas(s, offense);
   const block = await getLatestBlockCached();
   const baseFee = block.baseFeePerGas ?? 0n;
-  const maxBase = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
+  const maxBase = configuredGweiToWei(gas.maxBaseFeeGwei);
   if (baseFee > maxBase) {
     return { ok: false, reason: `base fee ${formatEther(baseFee * 1_000_000_000n)} gwei over cap` };
   }
@@ -2871,7 +3232,7 @@ async function canSpend(
   // cap. Guards against a bad tax estimate or a token being many epochs behind
   // draining the wallet in one shot. 0 disables the cap.
   if (s.maxPaymentEth > 0) {
-    const cap = parseEther(String(s.maxPaymentEth));
+    const cap = configuredEthToWei(s.maxPaymentEth);
     if (valueWei > cap) {
       return {
         ok: false,
@@ -2880,7 +3241,9 @@ async function canSpend(
     }
   }
 
-  let priorityFee = BigInt(Math.round(effectiveTipGwei(gas, block.gasUsed, block.gasLimit) * 1e9));
+  let priorityFee = configuredGweiToWei(
+    effectiveTipGwei(gas, block.gasUsed, block.gasLimit),
+  );
   let maxFeePerGas = baseFee * 2n + priorityFee;
   if (replacement) {
     const fees = cappedReplacementFees(
@@ -2922,15 +3285,6 @@ interface PricedReceipt {
   blockNumber?: bigint;
   gasUsed?: bigint;
   effectiveGasPrice?: bigint;
-}
-
-function accountForReceipt(liability: PendingLiability, receipt: PricedReceipt): void {
-  if (!settlePendingLiability(liability.account, liability.nonce, receipt.blockNumber)) return;
-  const actualGasWei = receipt.gasUsed !== undefined && receipt.effectiveGasPrice !== undefined
-    ? receipt.gasUsed * receipt.effectiveGasPrice
-    : liability.gasWei;
-  const transferredValue = receipt.status === "success" ? liability.valueWei : 0n;
-  runtime.recordConfirmedSpend(transferredValue + actualGasWei);
 }
 
 /**
@@ -3010,6 +3364,45 @@ interface PaymentActContext {
   recoveredGap?: boolean;
 }
 
+function durablePaymentMetadata(
+  tokenId: string,
+  payment: PaymentActContext,
+): JournalPaymentMetadata {
+  const previous = payment.replace;
+  const startingLastEpochPaid = payment.inertFiller
+    ? previous?.startingLastEpochPaid ?? payment.startingLastEpochPaid
+    : payment.startingLastEpochPaid;
+  const epochs = payment.epochs
+    ?? previous?.epochs
+    ?? (startingLastEpochPaid === null
+      ? 1n
+      : payment.expectedLastEpochPaid - startingLastEpochPaid);
+  const jitTargetEpoch = payment.jitTargetEpoch ?? previous?.jitTargetEpoch ?? undefined;
+  const jitCampaignRevision = payment.jitCampaignRevision
+    ?? previous?.jitCampaignRevision
+    ?? undefined;
+  if ((jitTargetEpoch === undefined) !== (jitCampaignRevision === undefined)) {
+    throw new Error("payment recovery metadata requires a complete JIT campaign identity");
+  }
+  const proactiveEpoch = payment.proactiveEpoch ?? previous?.proactiveEpoch ?? undefined;
+  const proactiveMarkerReserved = Boolean(payment.reserveProactiveMarker)
+    || Boolean(previous?.proactiveMarkerReserved);
+  if (proactiveMarkerReserved && proactiveEpoch === undefined) {
+    throw new Error("payment recovery metadata requires a proactive epoch for its marker");
+  }
+  return {
+    tokenId,
+    startingLastEpochPaid: startingLastEpochPaid?.toString() ?? null,
+    expectedLastEpochPaid: payment.expectedLastEpochPaid.toString(),
+    source: payment.source,
+    epochs: epochs.toString(),
+    pricedEpoch: payment.pricedEpoch.toString(),
+    ...(jitTargetEpoch === undefined ? {} : { jitTargetEpoch, jitCampaignRevision }),
+    ...(proactiveEpoch === undefined ? {} : { proactiveEpoch: proactiveEpoch.toString() }),
+    proactiveMarkerReserved,
+  };
+}
+
 interface OwnershipAuthorizationScope {
   citizensAddress: Address | null;
   mustOwnTokenIds: string[];
@@ -3028,10 +3421,15 @@ interface ActContext {
     id: string;
     role: "mandatory" | "allowed-revert" | "builder-incentive";
   };
+  /** Signed on-chain expiry for the private-only builder payment. */
+  validThroughBlock?: bigint;
   deadlineMs?: number;
   /** Synchronous final policy check composed with the exact balance/ownership
    * authorization immediately before nonce reservation and signing. */
   finalAuthorization?: () => string | undefined;
+  /** Final asynchronous capability check (for deployed runtime identity) made
+   * after exact spend authorization and immediately before signing. */
+  asyncFinalAuthorization?: () => Promise<string | undefined>;
   payment?: PaymentActContext;
   actionReplacement?: ActionFlight;
   actionUrgency?: ActionUrgency;
@@ -3787,11 +4185,16 @@ async function act(
       revertible: ctx.revertible,
       purpose: ctx.purpose,
       privateCohort: ctx.privateCohort,
+      validThroughBlock: ctx.validThroughBlock,
+      ...(ctx.payment !== undefined && ctx.tokenId !== undefined
+        ? { payment: durablePaymentMetadata(ctx.tokenId, ctx.payment) }
+        : {}),
       deadlineMs: ctx.deadlineMs,
       signal: engineAbortController?.signal,
       authorize: async (quote) => {
         const authorization = await authorizeExactSpend(quote, replacement, ownership);
-        const policyError = ctx.finalAuthorization?.();
+        const policyError = ctx.finalAuthorization?.()
+          ?? await ctx.asyncFinalAuthorization?.();
         const error = authorization.error ?? policyError;
         return {
           ok: authorization.ok && policyError === undefined,

@@ -33,14 +33,53 @@ export function writeJsonAtomic(filePath: string, value: unknown): void {
   writeFileAtomicDurableSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function readSettings(filePath: string): AppSettings | null {
+function secureSettingsOpenFlags(): number {
+  const noFollow = process.platform === "win32"
+    ? 0
+    : (fs.constants as typeof fs.constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+  return fs.constants.O_RDONLY | noFollow;
+}
+
+/** Settings may contain an Alchemy credential. Older releases created these
+ * files without an explicit mode, so tighten every retained copy. Descriptor-
+ * based fstat/fchmod avoids following a swapped path between checking and
+ * securing it; O_NOFOLLOW rejects symlinks on platforms that provide it. */
+function hardenSettingsPermissions(filePath: string): void {
+  let descriptor: number | null = null;
   try {
-    return appSettingsSchema.parse(JSON.parse(fs.readFileSync(filePath, "utf8")));
+    descriptor = fs.openSync(filePath, secureSettingsOpenFlags());
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("settings path is not a regular file");
+    if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o600) {
+      fs.fchmodSync(descriptor, 0o600);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new Error(`Could not secure settings permissions for ${filePath}: ${
+      error instanceof Error ? error.message : String(error)
+    }`, { cause: error });
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+  }
+}
+
+function readSettings(filePath: string): AppSettings | null {
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(filePath, secureSettingsOpenFlags());
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("settings path is not a regular file");
+    if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o600) {
+      fs.fchmodSync(descriptor, 0o600);
+    }
+    return appSettingsSchema.parse(JSON.parse(fs.readFileSync(descriptor, "utf8")));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw new Error(`Could not load settings from ${filePath}: ${
       error instanceof Error ? error.message : String(error)
     }`, { cause: error });
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
   }
 }
 
@@ -48,13 +87,20 @@ export function loadSettingsFromPaths(
   currentPath: string,
   legacyPath: string,
 ): AppSettings {
+  const backupPath = path.join(path.dirname(currentPath), "settings.legacy.json");
+  // Secure all copies even when the current file lets us return immediately.
+  // A prior migration deliberately retains the repository-level source and an
+  // explicit backup for other instances/operator recovery.
+  for (const candidate of new Set([
+    currentPath,
+    ...(currentPath === legacyPath ? [] : [legacyPath, backupPath]),
+  ])) hardenSettingsPermissions(candidate);
   const current = readSettings(currentPath);
   if (current) return current;
   if (currentPath !== legacyPath) {
     const legacy = readSettings(legacyPath);
     if (legacy) {
       // Copy rather than remove: another legacy/default instance may still use it.
-      const backupPath = path.join(path.dirname(currentPath), "settings.legacy.json");
       if (!fs.existsSync(backupPath)) writeJsonAtomic(backupPath, legacy);
       writeJsonAtomic(currentPath, legacy);
       return legacy;

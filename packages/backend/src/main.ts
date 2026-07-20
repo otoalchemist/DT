@@ -36,7 +36,7 @@ async function main(): Promise<void> {
     { appConfig },
     { logger },
     { runtime },
-    { buildServer },
+    { buildServer, revokeAndDrainApiExecution },
     { getChainId },
     { stopEngine, waitForEngineIdle },
   ] = await Promise.all([
@@ -81,9 +81,18 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("Shutting down...");
+    // Revoke WAL replay authority synchronously before Fastify starts draining
+    // active requests. Otherwise a Start/JIT handler waiting for a future-valid
+    // timestamp can both hold close() open and broadcast after SIGINT/SIGTERM.
+    const apiDrain = revokeAndDrainApiExecution(app);
+    stopEngine();
+    const closeServer = app.close();
+    await apiDrain;
+    // A lifecycle mutation already beyond its cancellable RPC step may have
+    // reached a restart finally block. Stop once more after the API queue drains.
     stopEngine();
     await waitForEngineIdle();
-    await app.close();
+    await closeServer;
     releaseDataDirLock();
     process.exit(0);
   };

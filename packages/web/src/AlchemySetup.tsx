@@ -4,9 +4,16 @@ import { api } from "./api.js";
 interface Props {
   onSaved: () => void;
   localMode?: boolean;
+  rpcConfigured?: boolean;
+  ownershipConfigured?: boolean;
 }
 
-export function AlchemySetup({ onSaved, localMode = false }: Props) {
+export function AlchemySetup({
+  onSaved,
+  localMode = false,
+  rpcConfigured = false,
+  ownershipConfigured = false,
+}: Props) {
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,11 +44,22 @@ export function AlchemySetup({ onSaved, localMode = false }: Props) {
       <div className="center panel">
         <h2>Complete local setup</h2>
         <div className="warnbox">
-          Local mode has an RPC endpoint but cannot enumerate owned Citizens.
-          Set <span className="mono">OWNED_TOKENS</span> (recommended for an
-          Anvil fork) or <span className="mono">ALCHEMY_NFT_URL</span> in the
-          environment, then restart the bot. Runtime Alchemy-key changes are
-          disabled in local mode so they cannot swap the Anvil client to mainnet.
+          {!rpcConfigured && (
+            <p>
+              No local RPC endpoint is configured. Set <span className="mono">RPC_HTTP_URL</span>
+              {" "}to your Anvil or other non-mainnet RPC.
+            </p>
+          )}
+          {!ownershipConfigured && (
+            <p>
+              Citizen ownership enumeration is not configured. Set <span className="mono">OWNED_TOKENS</span>
+              {" "}(recommended for an Anvil fork) or <span className="mono">ALCHEMY_NFT_URL</span>.
+            </p>
+          )}
+          <p>
+            Restart the bot after updating the environment. Runtime Alchemy-key changes are disabled in
+            local mode so they cannot swap the local client to mainnet.
+          </p>
         </div>
       </div>
     );

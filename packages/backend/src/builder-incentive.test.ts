@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { keccak256, type Hex } from "viem";
 import type { StrategyConfig } from "@dat-bot/shared";
+import {
+  decodeCoinbasePayment,
+  encodeCoinbasePayment,
+} from "./coinbase-payer.js";
 
 const h = vi.hoisted(() => ({
   appConfig: { mode: "mainnet" as "mainnet" | "public" | "local" },
@@ -89,7 +93,7 @@ describe("builder incentive capability", () => {
       runtimeCodeHash: COINBASE_PAYER_RUNTIME_CODE_HASH,
     });
     expect(COINBASE_PAYER_GAS).toBe(100_000n);
-    expect(h.getBytecode).toHaveBeenCalledWith({ address: PAYER });
+    expect(h.getBytecode).toHaveBeenCalledWith({ address: PAYER, blockTag: "finalized" });
 
     const candidateGetBytecode = vi.fn().mockResolvedValue(manifest.runtimeBytecode);
     h.appConfig.mode = "public";
@@ -99,7 +103,10 @@ describe("builder incentive capability", () => {
       "mainnet",
       { getBytecode: candidateGetBytecode } as Parameters<typeof resolveBuilderIncentiveForMode>[3],
     )).resolves.toMatchObject({ active: true, payer: PAYER });
-    expect(candidateGetBytecode).toHaveBeenCalledWith({ address: PAYER });
+    expect(candidateGetBytecode).toHaveBeenCalledWith({
+      address: PAYER,
+      blockTag: "finalized",
+    });
   });
 
   it("rejects missing, mismatched, and unverifiable bytecode", async () => {
@@ -120,6 +127,20 @@ describe("builder incentive capability", () => {
       active: false,
       reason: expect.stringContaining("RPC unavailable"),
     });
+  });
+});
+
+describe("CoinbasePayer signed calldata", () => {
+  it("round-trips one canonical on-chain block deadline and rejects other shapes", () => {
+    const call = encodeCoinbasePayment(1_234n, 12_345n);
+    expect(decodeCoinbasePayment(call)).toEqual({
+      notBeforeTimestamp: 1_234n,
+      validThroughBlock: 12_345n,
+    });
+    expect(decodeCoinbasePayment("0x")).toBeNull();
+    expect(decodeCoinbasePayment(`${call}00` as Hex)).toBeNull();
+    expect(() => encodeCoinbasePayment(-1n, 1n)).toThrow("non-negative");
+    expect(() => encodeCoinbasePayment(1n, -1n)).toThrow("non-negative");
   });
 });
 
@@ -156,6 +177,10 @@ describe("CoinbasePayer reviewed manifest constants", () => {
     expect(manifest.creationBytecode.endsWith(manifest.runtimeBytecode.slice(2))).toBe(true);
     expect(keccak256(manifest.runtimeBytecode)).toBe(manifest.runtimeCodeHash);
     expect(manifest.runtimeCodeHash).toBe(COINBASE_PAYER_RUNTIME_CODE_HASH);
+    expect(source.toString()).toMatch(
+      /function\s+payCoinbase\s*\(uint256\s+notBeforeTimestamp,\s*uint256\s+validThroughBlock\)/,
+    );
+    expect(source.toString()).not.toMatch(/\breceive\s*\(|\bfallback\s*\(/);
     expect(source.toString()).not.toMatch(/function\s+withdraw|address\s+(public|private|internal)|constructor\s*\(/);
   });
 });

@@ -28,20 +28,43 @@ class ActivityLog {
   }
 
   private load(): void {
+    let descriptor: number | null = null;
+    let contents: string | null = null;
     try {
-      if (fs.existsSync(this.file)) {
-        const parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as unknown;
-        if (!Array.isArray(parsed)) throw new Error("activity log root must be an array");
-        this.entries = parsed.slice(-MAX_ENTRIES).flatMap((value) => {
-          const entry = sanitizeActivityEntry(value);
-          return entry === null ? [] : [entry];
-        });
-        // Rewrite legacy content through redaction and restrictive permissions,
-        // even if no new activity arrives during this process lifetime.
-        this.dirty = true;
+      const noFollow = process.platform === "win32"
+        ? 0
+        : (fs.constants as typeof fs.constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+      descriptor = fs.openSync(this.file, fs.constants.O_RDONLY | noFollow);
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile()) throw new Error("activity log path is not a regular file");
+      // Historic releases could leave provider credentials in 0644 error
+      // messages. Restrict the already-open file before reading any content.
+      if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o600) {
+        fs.fchmodSync(descriptor, 0o600);
       }
+      contents = fs.readFileSync(descriptor, "utf8");
     } catch (err) {
-      logger.warn("Could not load activity log:", (err as Error).message);
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new Error(`Could not securely load activity log: ${(err as Error).message}`, {
+        cause: err,
+      });
+    } finally {
+      if (descriptor !== null) fs.closeSync(descriptor);
+    }
+
+    try {
+      const parsed = JSON.parse(contents!) as unknown;
+      if (!Array.isArray(parsed)) throw new Error("activity log root must be an array");
+      this.entries = parsed.slice(-MAX_ENTRIES).flatMap((value) => {
+        const entry = sanitizeActivityEntry(value);
+        return entry === null ? [] : [entry];
+      });
+      // Rewrite legacy content synchronously. A short-lived process must not
+      // leave the old credential-bearing payload waiting for the periodic timer.
+      this.dirty = true;
+      this.flush();
+    } catch (err) {
+      logger.warn("Could not sanitize activity log:", (err as Error).message);
     }
   }
 

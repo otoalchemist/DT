@@ -104,6 +104,52 @@ describe("NonceManager flight model", () => {
     expect(manager.reserve()).toBe(5);
   });
 
+  it("cannot height-expire a journal-fenced private flight before canonical verdict", async () => {
+    await manager.sync(ADDR, "mainnet");
+    const nonce = manager.reserve();
+    manager.markDelivery(nonce, "accepted", {
+      txHash: HASH,
+      publicExposure: false,
+      maxPrivateTargetBlock: 101n,
+      retainBeyondPrivateTarget: true,
+    });
+
+    // A height-only provider view cannot distinguish the old chain from a
+    // lateral reorg that included the signed transaction in target block 101.
+    manager.reset();
+    getBlockNumber.mockResolvedValue(10_000n);
+    await manager.sync(ADDR, "mainnet");
+    expect(manager.peek()).toBe(6);
+    expect(manager.hasInvisibleReservation()).toBe(true);
+
+    manager.releaseJournalExpired([nonce]);
+    expect(manager.peek()).toBe(5);
+    expect(manager.hasInvisibleReservation()).toBe(false);
+  });
+
+  it("atomically replaces stale same-address flights from hash-bound journal state", () => {
+    manager.initializeFromJournal(ADDR, 5, 6, [{
+      nonce: 5,
+      txHash: HASH,
+      state: "accepted",
+      publicExposure: true,
+    }]);
+    expect(manager.peek()).toBe(6);
+    expect(manager.hasInvisibleReservation()).toBe(false);
+
+    // A later canonical reconciliation no longer contains nonce 5. Keeping the
+    // stale in-memory snapshot would falsely explain the pending prefix and let
+    // a nonce-6 replacement pass.
+    manager.initializeFromJournal(ADDR, 5, 6, [{
+      nonce: 6,
+      txHash: `0x${"ef".repeat(32)}`,
+      state: "prepared",
+      publicExposure: false,
+    }]);
+    expect(manager.hasInvisibleReservation()).toBe(true);
+    expect(() => manager.ensureNextAbove(6)).toThrow("untracked pending wallet nonce prefix");
+  });
+
   it("retains an expired private lower nonce while a higher recovered flight is live", async () => {
     getBlockNumber.mockResolvedValue(102n);
     manager.setRecoveryHook(async () => [{
@@ -180,6 +226,40 @@ describe("NonceManager flight model", () => {
     expect(manager.flightSnapshots()).toHaveLength(1);
     expect(manager.hasInvisibleReservation()).toBe(false);
     expect(manager.reserve()).toBe(6);
+  });
+
+  it("blocks fresh signing above an untracked pending wallet nonce", async () => {
+    getCount.mockImplementation(async ({ blockTag }: { blockTag?: string }) =>
+      blockTag === "pending" ? 6 : 5,
+    );
+    manager.setRecoveryHook(async () => []);
+
+    await manager.sync(ADDR, "public");
+
+    expect(manager.pendingNonce()).toBe(6);
+    expect(manager.peek()).toBe(6);
+    expect(manager.flightSnapshots()).toEqual([]);
+    expect(manager.hasInvisibleReservation()).toBe(true);
+    expect(() => manager.reserve()).toThrow(/untracked pending wallet nonce prefix/);
+    expect(() => manager.ensureNextAbove(6)).toThrow(/untracked pending wallet nonce prefix/);
+  });
+
+  it("blocks a partially known pending prefix with an untracked nonce gap", async () => {
+    getCount.mockImplementation(async ({ blockTag }: { blockTag?: string }) =>
+      blockTag === "pending" ? 7 : 5,
+    );
+    manager.setRecoveryHook(async () => [{
+      nonce: 6,
+      txHash: HASH,
+      state: "accepted",
+      publicExposure: true,
+    }]);
+
+    await manager.sync(ADDR, "public");
+
+    expect(manager.peek()).toBe(7);
+    expect(manager.hasInvisibleReservation()).toBe(true);
+    expect(() => manager.reserve()).toThrow(/untracked pending wallet nonce prefix/);
   });
 
   it("does not re-fence a pending-visible public flight restored after sync", async () => {

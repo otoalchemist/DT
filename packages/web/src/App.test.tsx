@@ -108,6 +108,20 @@ describe("App setup readiness", () => {
     expect(screen.queryByLabelText("Alchemy API key")).toBeNull();
   });
 
+  it("identifies a missing local RPC instead of claiming one exists", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({
+      ...baseSettings,
+      rpcConfigured: false,
+      ownershipConfigured: true,
+      setupReady: false,
+    });
+    render(<App />);
+
+    expect(await screen.findByText(/No local RPC endpoint is configured/)).toBeTruthy();
+    expect(screen.getByText(/RPC_HTTP_URL/)).toBeTruthy();
+    expect(screen.queryByText(/has an RPC endpoint/)).toBeNull();
+  });
+
   it.each(["0.2.9", "0.4.0"])(
     "blocks backend v%s before consuming release-coupled settings",
     async (backendVersion) => {

@@ -18,7 +18,7 @@ export const COINBASE_PAYER_GAS: bigint = 100_000n;
 /** Runtime bytecode hash of contracts/CoinbasePayer.sol, compiled with Solidity
  * 0.8.20. Updated only together with an independently reviewed payer runtime. */
 export const COINBASE_PAYER_RUNTIME_CODE_HASH: Hex =
-  "0x8ca126cf92be3a9978ed8f20db5c0851bc006f0354b9e73a597ed94d80f851e9";
+  "0x00ead4184eaf62003aa381e9902e3c33b6a7b455e455c94c86f9a4f916f8f44f";
 
 export type BuilderIncentiveResolution =
   | {
@@ -31,6 +31,31 @@ export type BuilderIncentiveResolution =
       active: false;
       reason: string;
     };
+
+/** Recheck the exact deployed payer runtime at the financial authorization
+ * boundary. Discovery alone is insufficient because a deployment reorg could
+ * turn the configured address into an EOA before the value-bearing tx is signed. */
+export async function verifyCoinbasePayerRuntime(
+  payer: Address,
+  client: Pick<PublicClient, "getBytecode"> = publicClient,
+): Promise<string | undefined> {
+  let code: Hex | undefined;
+  try {
+    // A latest-block deployment can disappear in a shallow reorg, turning the
+    // same value-bearing call into a successful transfer to an EOA. Finalized
+    // code is the capability boundary; newly deployed payers must wait.
+    code = await client.getBytecode({ address: payer, blockTag: "finalized" });
+  } catch (error) {
+    return `Could not verify CoinbasePayer bytecode: ${(error as Error).message}`;
+  }
+  if (!code || code === "0x") {
+    return "CoinbasePayer address has no deployed bytecode";
+  }
+  if (keccak256(code) !== COINBASE_PAYER_RUNTIME_CODE_HASH) {
+    return "CoinbasePayer bytecode does not match the approved stateless runtime";
+  }
+  return undefined;
+}
 
 /** Resolve the financial configuration against the live chain. No caller may
  * infer activation from a positive amount or syntactically valid address alone. */
@@ -88,21 +113,7 @@ export async function resolveBuilderIncentiveForMode(
     return { active: false, reason: "CoinbasePayer address is invalid" };
   }
 
-  let code: Hex | undefined;
-  try {
-    code = await client.getBytecode({ address: payer });
-  } catch (error) {
-    return {
-      active: false,
-      reason: `Could not verify CoinbasePayer bytecode: ${(error as Error).message}`,
-    };
-  }
-  if (!code || code === "0x") {
-    return { active: false, reason: "CoinbasePayer address has no deployed bytecode" };
-  }
-  const runtimeCodeHash = keccak256(code);
-  if (runtimeCodeHash !== COINBASE_PAYER_RUNTIME_CODE_HASH) {
-    return { active: false, reason: "CoinbasePayer bytecode does not match the approved stateless runtime" };
-  }
-  return { active: true, payer, bidWei, runtimeCodeHash };
+  const runtimeError = await verifyCoinbasePayerRuntime(payer, client);
+  if (runtimeError) return { active: false, reason: runtimeError };
+  return { active: true, payer, bidWei, runtimeCodeHash: COINBASE_PAYER_RUNTIME_CODE_HASH };
 }

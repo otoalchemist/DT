@@ -33,10 +33,26 @@ vi.mock("./api.js", () => {
 });
 
 vi.mock("./Config.js", () => ({
-  Config: ({ initial }: { initial: StrategySnapshot }) => (
-    <div data-testid="strategy-snapshot">
-      revision {initial.revision} / {initial.config.dryRun ? "dry-run" : "live"}
-    </div>
+  Config: ({
+    initial,
+    onChange,
+  }: {
+    initial: StrategySnapshot;
+    onChange: (snapshot: StrategySnapshot) => void;
+  }) => (
+    <>
+      <div data-testid="strategy-snapshot">
+        revision {initial.revision} / {initial.config.dryRun ? "dry-run" : "live"}
+      </div>
+      <button onClick={() => onChange({
+        revision: 5,
+        config: { ...initial.config, dryRun: false },
+      })}>accept revision 5</button>
+      <button onClick={() => onChange({
+        revision: 4,
+        config: { ...initial.config, dryRun: true },
+      })}>accept stale revision 4</button>
+    </>
   ),
 }));
 
@@ -185,5 +201,30 @@ describe("Dashboard dry-run revision conflicts", () => {
     expect(await screen.findByText("delivery-uncertain")).toBeTruthy();
     expect(container.querySelector(".log-row > span:last-child")?.textContent).toContain(message);
     expect(container.querySelector(".pill.delivery-uncertain")?.textContent).toBe("delivery-uncertain");
+  });
+
+  it("never lets a late lower-revision panel response regress the shared snapshot", async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(initialStrategy);
+    render(
+      <Dashboard
+        status={status}
+        activity={[]}
+        connected={false}
+        pushStatus={vi.fn()}
+      />,
+    );
+
+    expect((await screen.findByTestId("strategy-snapshot")).textContent)
+      .toContain("revision 1 / dry-run");
+    fireEvent.click(screen.getByRole("button", { name: "accept revision 5" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("strategy-snapshot").textContent)
+        .toContain("revision 5 / live");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "accept stale revision 4" }));
+    expect(screen.getByTestId("strategy-snapshot").textContent)
+      .toContain("revision 5 / live");
+    expect(screen.getByRole("button", { name: "⚠ LIVE FIRE" })).toBeTruthy();
   });
 });

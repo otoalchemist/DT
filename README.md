@@ -75,7 +75,9 @@ Open the dashboard at **`http://localhost:5173`** and:
    tokens you want defended** — the bot only pays taxes for and defends Citizens
    owned by the wallet it unlocks. A freshly generated burner owns none until you
    transfer Citizens into it, so to protect Citizens you already hold, import that
-   wallet's key.
+   wallet's key. An imported wallet becomes bot-exclusive while automation or any
+   journaled transaction is unresolved: do not also send from it with MetaMask,
+   another script, hardware-wallet software, or another bot instance.
 2. **Unlock** it with your passphrase.
 3. Configure your **strategy** (defense buffers, offense toggles, spend caps).
 4. Leave **Dry-run ON** first to watch what the bot *would* do — toggle it from the **DRY-RUN / LIVE FIRE** badge in the top bar (going live asks for confirmation). Turn it off to go live.
@@ -242,6 +244,12 @@ cp data/config.example.json "$DATA_DIR/config.json"
   restarts. Stop and await the old process before starting its replacement. To
   automate multiple wallets, use separate processes with separate data
   directories, ports, and keystores.
+- **One signer per wallet.** Nonce recovery can prove that each pending nonce has
+  a durable journal entry, but Ethereum does not let it prove that another signer
+  has not replaced that nonce with different calldata. Never submit manual or
+  third-party transactions from the bot wallet while the engine is running or a
+  journaled transaction remains unresolved. Stop and lock the bot, wait for all
+  pending flights to finalize and clear, and only then use the key elsewhere.
 - **Keep the host clock synchronized.** Boundary timers use Unix time. Private
   bundles carry an on-chain timestamp floor and normal ticks recover from a miss,
   but meaningful system-clock skew can still make a first-block attempt late.
@@ -251,7 +259,10 @@ cp data/config.example.json "$DATA_DIR/config.json"
   allocating a fresh nonce or replaying an authorized signed transaction. Recovery
   rechecks the current balance against all live maximum exposure plus the current
   min-balance floor. Public or ambiguous transactions never become reusable merely
-  because a wall-clock timeout elapsed; a corrupt journal fails closed.
+  because a wall-clock timeout elapsed; a corrupt journal fails closed. Confirmed
+  receipt cost is durably tagged with the game epoch at its mined block before the
+  dashboard total changes, so **Confirmed this epoch** rebuilds exactly after
+  Lock/restart and never charges a late receipt to a newer epoch.
 - **Local-only.** The API binds to `127.0.0.1` and validates both HTTP
   `Host` and browser `Origin` headers, blocking DNS-rebinding from a malicious web
   page. Non-loopback `HOST` values are rejected during startup; the API does not
@@ -295,14 +306,23 @@ configurable edges close that gap (configure them in the dashboard):
 - **Direct builder incentive** (advanced, explicit opt-in, `mainnet` only) — an
   owner-signed, private-only transaction can pay a configured amount through the
   bundled `CoinbasePayer`, whose checked call forwards the value to the winning
-  block's `block.coinbase`. The backend enables this only on chain 1 after matching
-  the deployed runtime bytecode to the reproducibly compiled, pinned runtime in
+  block's `block.coinbase` only at or after the signed boundary timestamp and
+  through the last block signed into its calldata.
+  The backend enables this only on chain 1 after matching
+  finalized deployed runtime bytecode to the reproducibly compiled, pinned runtime in
   `contracts/CoinbasePayer.build.json`; no shared third-party payer is trusted by default.
   The incentive is prepared only behind at least one mandatory boundary payment,
   passes the same balance floor, spend cap, durable journal, recovery, and receipt
   accounting as every other transaction, and is never replayed or broadcast on its
-  own. Direct payment improves the bundle's economics for builders, but does **not**
+  own. After its signed block, the bid value cannot transfer; a retained raw
+  transaction can still revert later and consume bounded gas and its nonce. The
+  bot therefore keeps the whole nonce lineage journaled and submits a public
+  zero-value same-nonce retirement before that nonce can be reused.
+  Direct payment improves the bundle's economics for builders, but does **not**
   guarantee inclusion, transaction index zero, or any particular ordering.
+  Configured builders receive the raw signed cohort transactions, and the payer
+  cannot prove that a preceding game payment succeeded if a builder ignores the
+  submitted bundle rules.
 - **Optional combined payment + audit cohort** (`mainnet` only) — a separate opt-in
   can place due boundary payments first, audits second, and one builder incentive
   last in a single nonce-ordered private cohort. Payments remain mandatory and keep
@@ -314,9 +334,11 @@ configurable edges close that gap (configure them in the dashboard):
   multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only
   the first (nonce == chain nonce) is independently executable; the rest carry a
   nonce gap and cannot execute without the preceding nonce. The bot instead
-  collects a cycle's txs and submits them as **one atomic bundle** (txs in nonce order). This
-  gives builders a valid ordered sequence and avoids nonce gaps, but it does not
-  guarantee inclusion or a particular position in the block. All required payments
+  collects a cycle's txs and submits them as **one ordered bundle**. A compliant
+  builder executes every non-allowlisted transaction or none; this is relay/builder
+  policy, not on-chain atomicity against a builder that retains individual raw
+  transactions. It gives builders a valid nonce sequence and avoids nonce gaps,
+  but does not guarantee inclusion or a particular position in the block. All required payments
   are signed before the boundary wait; the public fallback dispatches the prepared
   sequence without serializing one wait per Citizen. Bundles are validated against
   the builder limits (100 transactions, 300,000 encoded bytes, and aggregate gas).
@@ -328,8 +350,10 @@ configurable edges close that gap (configure them in the dashboard):
   they land the instant rivals become delinquent (like a batch-auditor); *race
   kills* pre-submits a `kill` just before a target's audit-expiry so it lands in
   the first eligible block. Both are validated by simulating at the boundary/expiry
-  instant, reuse the shared pre-submit lead, and fall back to the normal
-  post-deadline offense. Off by default; enable under *Offense*. Note: boundary
+  instant, reuse the shared configured pre-submit lead, and fall back to the normal
+  post-deadline offense. Audit/kill discovery uses an effective minimum lead of
+  2,000 ms when a lower payment-only lead is configured. Off by default; enable
+  under *Offense*. Note: boundary
   block position depends on builder profitability, fees, and competing orderflow;
   a defender who pre-pays may still beat your audit, so this is lower-value than
   the payment race.
@@ -356,9 +380,10 @@ npx tsx packages/backend/src/postmortem.ts <yourTx> <rivalTx> [<rivalTx> ...]
 ```
 
 It reports each tx's block, index, effective priority tip, and decoded action;
-empty-data value transfers are flagged as possible builder incentives. That flag
-is only a clue—complete builder-profit attribution requires traces or builder
-data. Needs an RPC (`ALCHEMY_API_KEY` or `RPC_HTTP_URL`).
+canonical `payCoinbase(notBeforeTimestamp, validThroughBlock)` calls and legacy empty-data value
+transfers are flagged as possible builder incentives. That flag is only a clue—
+complete builder-profit attribution requires traces or builder data. Needs an RPC
+(`ALCHEMY_API_KEY` or `RPC_HTTP_URL`).
 
 ---
 

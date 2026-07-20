@@ -46,15 +46,24 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Verify launcher retains its required dev tooling under production omission
+        env:
+          NODE_ENV: production
+          NPM_CONFIG_OMIT: dev
+        run: npm run install:launcher && node -e "require.resolve('concurrently/package.json');if(!require('node:fs').existsSync('node_modules/.bin/concurrently.cmd'))process.exit(1)"
       - run: npm audit --audit-level=high
       - run: npm test
       - run: npm run build

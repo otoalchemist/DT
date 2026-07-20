@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PostMortemTx } from "@dat-bot/shared";
+import { encodeCoinbasePayment } from "./coinbase-payer.js";
 
 vi.mock("./chain.js", () => ({ publicClient: {} }));
 vi.mock("./config.js", () => ({
@@ -58,6 +59,16 @@ describe("race post-mortem builder-economics interpretation", () => {
     expect(describePostMortemTransaction("0x", 15_000_000_000_000_000n)).toEqual({
       action: "value-transfer",
       args: "0.015 ETH; possible builder incentive",
+    });
+  });
+
+  it("decodes the bounded payer call used by current builder incentives", () => {
+    expect(describePostMortemTransaction(
+      encodeCoinbasePayment(1_234n, 12_345n),
+      15_000_000_000_000_000n,
+    )).toEqual({
+      action: "payCoinbase",
+      args: "0.015 ETH; valid from timestamp 1234 through block 12345; possible builder incentive",
     });
   });
 });

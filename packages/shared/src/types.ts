@@ -109,11 +109,13 @@ export interface StrategyConfig {
    *  boundary timestamp. A normal on-chain-estimate tick remains the fallback. */
   preBoundaryPay: boolean;
   /** How many ms before the target boundary to build and simulate the transaction
-   *  in public/local mode (250–8000). Broadcast waits for the boundary timestamp. */
+   *  in public/local mode (250–8000). Broadcast waits for the boundary timestamp.
+   *  Optional audit/kill preparation has a 2000ms effective safety floor. */
   preBoundaryLeadMs: number;
   /** Lead used in `mainnet` (bundle) mode (250–11000). The bundle carries a
    *  boundary minTimestamp and its public fallback waits for that timestamp.
-   *  Keep the lead under one 12s slot. */
+   *  Combined/audit/kill preparation has a 2000ms effective safety floor. Keep
+   *  the configured lead under one 12s slot. */
   preBoundaryLeadMainnetMs: number;
 
   // --- Offense (optional) ---
@@ -126,12 +128,14 @@ export interface StrategyConfig {
   endgameOnlyWithin: number | null;
   /** Specific rival token IDs to target. Empty array = target any delinquent rival. */
   offenseTargetTokenIds: string[];
-  /** ADVANCED: pre-submit audits ~preBoundaryLeadMs before the epoch boundary so
+  /** ADVANCED: pre-submit audits before the epoch boundary using the configured
+   *  lead with a 2000ms effective minimum, so
    *  they land in the FIRST block of the epoch (auditing rivals the instant they
    *  become delinquent, like a batch-auditor) instead of the block after. The
    *  future-timestamp semantic simulation must succeed before submission. */
   preBoundaryAudit: boolean;
-  /** ADVANCED: pre-submit kills ~preBoundaryLeadMs before a target's audit-expiry
+  /** ADVANCED: pre-submit kills before a target's audit-expiry using the configured
+   *  lead with a 2000ms effective minimum,
    *  so the kill lands in the first eligible block. The future-timestamp semantic
    *  simulation must succeed before submission. */
   preBoundaryKill: boolean;

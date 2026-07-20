@@ -9,12 +9,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: npm install is incremental on repeat runs and reconciles upgraded manifests.
+:: The launcher runs the development orchestrator, so explicitly retain its
+:: dev-only dependencies even when NODE_ENV/npm omit settings request production.
+:: npm install remains incremental and reconciles upgraded manifests.
 echo Checking dependencies...
-call npm install
+call npm run install:launcher
 if errorlevel 1 (
     echo.
-    echo ERROR: npm install failed. Use Node.js 20.19+, 22.12+, or 24+.
+    echo ERROR: dependency installation failed. Use Node.js 20.19+, 22.12+, or 24+.
     echo Download it from https://nodejs.org
     pause
     exit /b 1

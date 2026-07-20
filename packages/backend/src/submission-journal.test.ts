@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { keccak256, toHex, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { encodeCoinbasePayment } from "./coinbase-payer.js";
 import {
   JournalCorruptionError,
   JournalChainUnavailableError,
@@ -16,13 +17,13 @@ import {
 const ACCOUNT = privateKeyToAccount(`0x${"11".repeat(32)}`);
 const WALLET = ACCOUNT.address;
 const OTHER = "0x2222222222222222222222222222222222222222" as const;
-async function signed(nonce: number) {
+async function signed(nonce: number, data: Hex = "0x0102") {
   return ACCOUNT.signTransaction({
     chainId: 1,
     type: "eip1559",
     nonce,
     to: OTHER,
-    data: "0x0102",
+    data,
     value: 7n,
     gas: 50_000n,
     maxFeePerGas: 3_000_000_000n,
@@ -31,6 +32,24 @@ async function signed(nonce: number) {
 }
 const RAW_5 = await signed(5);
 const RAW_6 = await signed(6);
+const BUILDER_NOT_BEFORE_TIMESTAMP = 2_000n;
+const BUILDER_VALID_THROUGH_BLOCK = 102n;
+const BUILDER_CALL = encodeCoinbasePayment(
+  BUILDER_NOT_BEFORE_TIMESTAMP,
+  BUILDER_VALID_THROUGH_BLOCK,
+);
+const RAW_BUILDER_5 = await signed(5, BUILDER_CALL);
+const RAW_RETIRE_5 = await ACCOUNT.signTransaction({
+  chainId: 1,
+  type: "eip1559",
+  nonce: 5,
+  to: WALLET,
+  data: "0x",
+  value: 0n,
+  gas: 21_000n,
+  maxFeePerGas: 4_000_000_000n,
+  maxPriorityFeePerGas: 3_000_000_000n,
+});
 
 function blockHash(lineage: string, number: bigint): Hex {
   return keccak256(toHex(`${lineage}:${number}`));
@@ -119,9 +138,16 @@ describe("SubmissionFlightJournal", () => {
 
   it("persists private-cohort semantics and rejects public builder recovery", () => {
     const builder = flight({
+      rawSignedTx: RAW_BUILDER_5,
+      txHash: keccak256(RAW_BUILDER_5),
       purpose: "builder-incentive",
       privateCohort: { id: "combined-1", role: "builder-incentive" },
-      recovery: { publicAuthorized: false },
+      obligation: { ...flight().obligation, data: BUILDER_CALL },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+      },
       maxPrivateTargetBlock: "102",
     });
     journal.upsert(builder);
@@ -134,12 +160,96 @@ describe("SubmissionFlightJournal", () => {
     }))).toThrow("invalid private-delivery metadata");
   });
 
+  it("rejects builder WAL metadata that is not bound to the signed payer deadline", () => {
+    const builder = flight({
+      rawSignedTx: RAW_BUILDER_5,
+      txHash: keccak256(RAW_BUILDER_5),
+      purpose: "builder-incentive",
+      privateCohort: { id: "combined-expiry", role: "builder-incentive" },
+      obligation: { ...flight().obligation, data: BUILDER_CALL },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: "102",
+      },
+      maxPrivateTargetBlock: "102",
+    });
+    expect(() => journal.upsert({
+      ...builder,
+      recovery: { publicAuthorized: false },
+    })).toThrow("invalid private-delivery metadata");
+    expect(() => journal.upsert({
+      ...builder,
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: "101",
+      },
+    })).toThrow("invalid private-delivery metadata");
+    expect(() => journal.upsert({
+      ...builder,
+      maxPrivateTargetBlock: "103",
+    })).toThrow("invalid private-delivery metadata");
+  });
+
+  it("accepts only a public zero-value same-nonce self-transfer as nonce retirement", () => {
+    const retirement = flight({
+      rawSignedTx: RAW_RETIRE_5,
+      txHash: keccak256(RAW_RETIRE_5),
+      purpose: "nonce-retirement",
+      obligation: {
+        to: WALLET,
+        data: "0x",
+        valueWei: "0",
+        gasLimit: "21000",
+        maxFeePerGas: "4000000000",
+        maxPriorityFeePerGas: "3000000000",
+      },
+      lineage: { id: `${WALLET}:5`, replacesTxHash: keccak256(RAW_BUILDER_5) },
+      recovery: { publicAuthorized: true },
+      maxPrivateTargetBlock: undefined,
+    });
+    journal.upsert(retirement);
+    expect(journal.load(WALLET)).toEqual([retirement]);
+    expect(() => journal.upsert({
+      ...retirement,
+      purpose: undefined,
+      recovery: { publicAuthorized: false },
+    })).toThrow("metadata conflict");
+  });
+
   it("refuses to reinterpret an existing signed hash with different cohort metadata", () => {
     journal.upsert(flight());
 
     expect(() => journal.upsert(flight({
       privateCohort: { id: "combined-1", role: "mandatory" },
     }))).toThrow("metadata conflict");
+  });
+
+  it("persists exact payment recovery identity and rejects inconsistent baselines", () => {
+    const payment = {
+      tokenId: "1",
+      startingLastEpochPaid: "1",
+      expectedLastEpochPaid: "2",
+      source: "jit" as const,
+      epochs: "1",
+      pricedEpoch: "20",
+      jitTargetEpoch: 20,
+      jitCampaignRevision: 7,
+      proactiveEpoch: "20",
+      proactiveMarkerReserved: true,
+    };
+    journal.upsert(flight({ recovery: { publicAuthorized: true, payment } }));
+
+    expect(new SubmissionFlightJournal(directory).load(WALLET)[0]?.recovery.payment).toEqual(
+      payment,
+    );
+    expect(() => journal.upsert(flight({
+      recovery: {
+        publicAuthorized: true,
+        payment: { ...payment, expectedLastEpochPaid: "3" },
+      },
+    }))).toThrow("invalid private-delivery metadata");
   });
 
   it("rejects a structurally valid record whose signed hash and obligation disagree", () => {
@@ -220,6 +330,46 @@ describe("SubmissionFlightJournal", () => {
     );
     expect(finalized.retained).toEqual([]);
     expect(finalized.consumed).toHaveLength(1);
+    expect(journal.load(WALLET)).toEqual([
+      expect.objectContaining({ state: "confirmed" }),
+    ]);
+
+    // A semantic tombstone may intentionally survive much longer than the
+    // ancestry window. Its established finality must remain terminal until the
+    // strategy explicitly acknowledges the marker.
+    const restarted = journal.reconcile(WALLET, 6, 6, blockEvidence(2_000n, "later"));
+    expect(restarted.retained).toEqual([]);
+    expect(restarted.consumed).toHaveLength(1);
+    journal.removeMany(WALLET, restarted.consumed.map((item) => item.txHash));
+    expect(journal.load(WALLET)).toEqual([]);
+  });
+
+  it("persists one immutable confirmed-spend annotation across restart and merge", () => {
+    const annotation = { epoch: "22", spendWei: "123456" };
+    journal.upsert(flight({ state: "confirmed" }));
+    journal.update(WALLET, flight().txHash, { confirmedSpend: annotation });
+
+    expect(new SubmissionFlightJournal(directory).load(WALLET)[0]).toMatchObject({
+      state: "confirmed",
+      confirmedSpend: annotation,
+    });
+
+    // A stale same-hash prepared upsert cannot erase finality or accounting.
+    journal.upsert(flight());
+    expect(journal.load(WALLET)[0]).toMatchObject({
+      state: "confirmed",
+      confirmedSpend: annotation,
+    });
+    expect(() => journal.update(WALLET, flight().txHash, {
+      confirmedSpend: { epoch: "22", spendWei: "999" },
+    })).toThrow("confirmed-spend conflict");
+    expect(journal.load(WALLET)[0]?.confirmedSpend).toEqual(annotation);
+  });
+
+  it("rejects confirmed-spend data on a replayable flight", () => {
+    expect(() => journal.upsert(flight({
+      confirmedSpend: { epoch: "22", spendWei: "1" },
+    }))).toThrow("invalid private-delivery metadata");
   });
 
   it("restarts confirmation after a lateral reorg even when the nonce stays advanced", () => {
@@ -324,7 +474,7 @@ describe("SubmissionFlightJournal", () => {
     expect(() => unresolved.upsert(flight())).toThrow(JournalChainUnavailableError);
   });
 
-  it("expires private-only delivery strictly after the final target block", () => {
+  it("never treats a relay target as on-chain expiry for an ordinary private raw", () => {
     journal.upsert(flight({
       state: "accepted",
       maxPrivateTargetBlock: "101",
@@ -337,9 +487,137 @@ describe("SubmissionFlightJournal", () => {
     }));
 
     expect(journal.reconcile(WALLET, 5, 5, blockEvidence(101n)).retained).toHaveLength(1);
-    const expired = journal.reconcile(WALLET, 5, 5, blockEvidence(102n));
-    expect(expired.retained).toEqual([]);
-    expect(expired.expired).toEqual([expect.objectContaining({ state: "expired" })]);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).retained).toHaveLength(1);
+    const farFuture = journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n));
+    expect(farFuture.retained).toHaveLength(1);
+    expect(farFuture.expired).toEqual([]);
+  });
+
+  it("uses the signed builder deadline and survives a lateral reorg before release", () => {
+    const builder = flight({
+      rawSignedTx: RAW_BUILDER_5,
+      txHash: keccak256(RAW_BUILDER_5),
+      purpose: "builder-incentive",
+      privateCohort: { id: "reorg-bid", role: "builder-incentive" },
+      obligation: { ...flight().obligation, data: BUILDER_CALL },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+      },
+      state: "accepted",
+      // The relay accepted only block 101, but the retained signature can still
+      // transfer value through block 102.
+      maxPrivateTargetBlock: "101",
+      attempts: [{
+        channel: "private",
+        endpoint: "builder",
+        state: "accepted",
+        targetBlock: "101",
+      }],
+    });
+    journal.upsert(builder);
+
+    expect(journal.reconcile(
+      WALLET,
+      5,
+      5,
+      blockEvidence(103n, "old-canonical"),
+    ).retained).toHaveLength(1);
+
+    // A same-height replacement can include the raw bid at block 102. The
+    // hash-bound nonce read sees that inclusion and starts consumption finality
+    // instead of treating the old target height as expiry authority.
+    const reorged = journal.reconcile(
+      WALLET,
+      6,
+      6,
+      blockEvidence(103n, "lateral-reorg"),
+    );
+    expect(reorged.expired).toEqual([]);
+    expect(reorged.provisional).toHaveLength(1);
+    expect(reorged.retained).toHaveLength(1);
+  });
+
+  it("retains a builder after its signed value deadline until its nonce is consumed", () => {
+    const builder = flight({
+      rawSignedTx: RAW_BUILDER_5,
+      txHash: keccak256(RAW_BUILDER_5),
+      purpose: "builder-incentive",
+      privateCohort: { id: "bounded-bid", role: "builder-incentive" },
+      obligation: { ...flight().obligation, data: BUILDER_CALL },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: "102",
+      },
+      state: "accepted",
+      maxPrivateTargetBlock: "101",
+      attempts: [{
+        channel: "private",
+        endpoint: "builder",
+        state: "accepted",
+        targetBlock: "101",
+      }],
+    });
+    journal.upsert(builder);
+
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(103n)).retained).toHaveLength(1);
+    const farFuture = journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n));
+    expect(farFuture.retained).toHaveLength(1);
+    expect(farFuture.expired).toEqual([]);
+  });
+
+  it("terminalizes old payer and retirement alternatives only after nonce-consumption depth", () => {
+    const builder = flight({
+      rawSignedTx: RAW_BUILDER_5,
+      txHash: keccak256(RAW_BUILDER_5),
+      purpose: "builder-incentive",
+      privateCohort: { id: "retire-depth", role: "builder-incentive" },
+      obligation: { ...flight().obligation, data: BUILDER_CALL },
+      recovery: {
+        publicAuthorized: false,
+        notBeforeTimestamp: BUILDER_NOT_BEFORE_TIMESTAMP.toString(),
+        validThroughBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+      },
+      state: "ambiguous",
+      maxPrivateTargetBlock: BUILDER_VALID_THROUGH_BLOCK.toString(),
+    });
+    const retirement = flight({
+      rawSignedTx: RAW_RETIRE_5,
+      txHash: keccak256(RAW_RETIRE_5),
+      purpose: "nonce-retirement",
+      obligation: {
+        to: WALLET,
+        data: "0x",
+        valueWei: "0",
+        gasLimit: "21000",
+        maxFeePerGas: "4000000000",
+        maxPriorityFeePerGas: "3000000000",
+      },
+      lineage: { id: builder.lineage.id, replacesTxHash: builder.txHash },
+      recovery: { publicAuthorized: true },
+      state: "accepted",
+      publicExposure: true,
+      maxPrivateTargetBlock: undefined,
+    });
+    journal.upsertMany(WALLET, [builder, retirement]);
+
+    const oldTip = journal.reconcile(WALLET, 6, 6, blockEvidence(105n, "old"));
+    expect(oldTip.provisional).toHaveLength(2);
+    expect(oldTip.expired).toEqual([]);
+
+    // A lateral nonce regression proves neither alternative was final. Both raw
+    // lineages return to the live fence instead of releasing nonce 5.
+    const reorged = journal.reconcile(WALLET, 5, 5, blockEvidence(106n, "replacement"));
+    expect(reorged.retained).toHaveLength(2);
+    expect(reorged.retained.every((item) => item.observedConsumedAtBlock === undefined)).toBe(true);
+
+    expect(journal.reconcile(WALLET, 6, 6, blockEvidence(107n, "replacement")).consumed)
+      .toEqual([]);
+    const finalized = journal.reconcile(WALLET, 6, 6, blockEvidence(109n, "replacement"));
+    expect(finalized.consumed).toHaveLength(2);
+    expect(finalized.expired).toEqual([]);
   });
 
   it("retains expired private lower-nonce evidence while a higher flight remains live", () => {
@@ -381,14 +659,15 @@ describe("SubmissionFlightJournal", () => {
     expect(journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n)).retained).toHaveLength(1);
   });
 
-  it("expires private-only prepared work after its provisional final target", () => {
+  it("retains private-only prepared work without signed on-chain expiry", () => {
     journal.upsert(flight({
       state: "prepared",
       recovery: { publicAuthorized: false },
       maxPrivateTargetBlock: "101",
     }));
     expect(journal.reconcile(WALLET, 5, 5, blockEvidence(101n)).retained).toHaveLength(1);
-    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).expired).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).retained).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n)).retained).toHaveLength(1);
   });
 
   it("terminalizes prepared work when every delivery route was disabled before WAL", () => {
@@ -415,7 +694,7 @@ describe("SubmissionFlightJournal", () => {
     }), { numRuns: 30 });
   });
 
-  it("expires private-only ambiguity but retains nonce-conflict evidence", () => {
+  it("retains private-only ambiguity regardless of relay target metadata", () => {
     const privateAmbiguous = flight({
       state: "ambiguous",
       publicExposure: false,
@@ -429,7 +708,8 @@ describe("SubmissionFlightJournal", () => {
       }],
     });
     journal.upsert(privateAmbiguous);
-    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).expired).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(102n)).retained).toHaveLength(1);
+    expect(journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n)).retained).toHaveLength(1);
 
     journal.upsert({ ...privateAmbiguous, nonceConflict: true });
     expect(journal.reconcile(WALLET, 5, 5, blockEvidence(10_000n)).retained).toHaveLength(1);

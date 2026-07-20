@@ -24,8 +24,10 @@ interface NonceFlight extends NonceFlightSnapshot {
 /**
  * Account-scoped nonce allocator. It deliberately has no time-based expiry:
  * public/ambiguous transactions can remain live in a remote txpool for hours.
- * A private-only flight is released only when the chain has passed its explicit
- * final target block. Definite pre-dispatch failures are released explicitly.
+ * A private-only flight can use target-height expiry only when no durable
+ * canonical-journal fence owns it. Production journaled flights set
+ * retainBeyondPrivateTarget and are released explicitly after hash-bound
+ * reconciliation. Definite pre-dispatch failures are released explicitly.
  */
 export class NonceManager {
   private address: Address | null = null;
@@ -33,6 +35,11 @@ export class NonceManager {
   private lastConfirmed = -1;
   private lastPending = -1;
   private invisibleReservation = false;
+  /** The RPC reports an executable pending prefix that is not fully represented
+   * by this process's durable/in-memory flights. Its unknown calls can change
+   * payment baselines before any higher nonce executes, so fresh signing must
+   * stop until the prefix confirms, disappears, or is recovered explicitly. */
+  private untrackedPendingPrefix = false;
   private readonly flights = new Map<number, NonceFlight>();
   private recoveryHook?: (
     address: Address,
@@ -113,10 +120,7 @@ export class NonceManager {
 
     const ceiling = this.reservationCeiling();
     this.next = Math.max(effectivePendingNonce, ceiling);
-    this.invisibleReservation = [...this.flights.values()].some(
-      (flight) => flight.nonce >= confirmedNonce
-        && (!flight.publicExposure || flight.nonce >= effectivePendingNonce),
-    );
+    this.refreshReservationFence();
   }
 
   peek(): number {
@@ -127,6 +131,9 @@ export class NonceManager {
   reserve(): number {
     if (this.next === null) throw new Error("NonceManager.reserve called before sync");
     if (this.invisibleReservation) {
+      if (this.untrackedPendingPrefix) {
+        throw new Error("NonceManager.reserve blocked by an untracked pending wallet nonce prefix");
+      }
       throw new Error("NonceManager.reserve blocked by an unresolved nonce flight");
     }
     const nonce = this.next++;
@@ -141,6 +148,9 @@ export class NonceManager {
 
   ensureNextAbove(nonce: number): void {
     if (this.next === null) throw new Error("NonceManager.ensureNextAbove called before sync");
+    if (this.untrackedPendingPrefix) {
+      throw new Error("NonceManager replacement blocked by an untracked pending wallet nonce prefix");
+    }
     if (this.next <= nonce) this.next = nonce + 1;
     const existing = this.flights.get(nonce);
     if (!existing) {
@@ -185,31 +195,54 @@ export class NonceManager {
     } else {
       this.flights.set(nonce, flight);
     }
-    if (
-      state === "ambiguous"
-      || options.retainRejectedFence
-      || (state === "accepted" && !flight.publicExposure)
-    ) {
-      this.invisibleReservation = true;
-    } else {
-      this.invisibleReservation = [...this.flights.values()].some(
-        (item) => item.state === "ambiguous"
-          || (item.state === "accepted" && !item.publicExposure),
-      );
-    }
+    this.refreshReservationFence();
   }
 
   /** Restore a durable flight before fresh allocation on process startup. */
   restoreFlight(snapshot: NonceFlightSnapshot): void {
     this.flights.set(snapshot.nonce, { ...snapshot, replacement: false });
-    this.invisibleReservation = this.lastConfirmed < 0 || [...this.flights.values()].some(
-      (flight) => flight.nonce >= this.lastConfirmed
-        && (!flight.publicExposure || flight.nonce >= this.lastPending),
-    );
+    this.refreshReservationFence();
+  }
+
+  /** Initialize replacement/allocation state from one hash-bound journal
+   * reconciliation. This avoids a second loose nonce read between canonical
+   * retirement authorization and same-nonce signing. */
+  initializeFromJournal(
+    address: Address,
+    confirmedNonce: number,
+    pendingNonce: number,
+    snapshots: readonly NonceFlightSnapshot[],
+  ): void {
+    if (this.address !== null && this.address.toLowerCase() !== address.toLowerCase()) {
+      this.clearAccountState();
+    }
+    this.address = address;
+    this.lastConfirmed = confirmedNonce;
+    this.lastPending = Math.max(confirmedNonce, pendingNonce);
+    // This entry point is used only at serialized recovery gates, before new
+    // work is prepared. The hash-bound journal is authoritative here; retaining
+    // an absent in-memory flight could falsely make an unknown pending gap look
+    // tracked.
+    this.flights.clear();
+    for (const snapshot of snapshots) {
+      this.flights.set(snapshot.nonce, { ...snapshot, replacement: false });
+    }
+    this.recoveredAddress = address.toLowerCase();
+    this.next = Math.max(this.lastPending, this.reservationCeiling());
+    this.refreshReservationFence();
   }
 
   flightSnapshots(): NonceFlightSnapshot[] {
     return [...this.flights.values()].map(({ replacement: _replacement, ...flight }) => ({ ...flight }));
+  }
+
+  /** Release only the nonces whose durable journal has established canonical
+   * private-expiry finality. The caller must exclude any nonce with another
+   * retained lineage; height-only sync is deliberately not equivalent. */
+  releaseJournalExpired(nonces: readonly number[]): void {
+    for (const nonce of new Set(nonces)) this.flights.delete(nonce);
+    if (this.next !== null) this.next = this.reservationCeiling();
+    this.refreshReservationFence();
   }
 
   hasInvisibleReservation(): boolean {
@@ -233,10 +266,7 @@ export class NonceManager {
     if (this.next !== end || this.reservationCeiling() !== end) return false;
     for (const nonce of sorted) this.flights.delete(nonce);
     this.next = start;
-    this.invisibleReservation = [...this.flights.values()].some(
-      (flight) => flight.nonce >= this.lastConfirmed
-        && (!flight.publicExposure || flight.nonce >= this.lastPending),
-    );
+    this.refreshReservationFence();
     return true;
   }
 
@@ -250,11 +280,32 @@ export class NonceManager {
     return ceiling;
   }
 
+  private refreshReservationFence(): void {
+    if (this.lastConfirmed < 0 || this.lastPending < 0) {
+      this.untrackedPendingPrefix = false;
+      this.invisibleReservation = this.flights.size > 0;
+      return;
+    }
+    const expectedKnownPrefix = this.lastPending - this.lastConfirmed;
+    const knownPrefixNonces = new Set(
+      [...this.flights.keys()].filter(
+        (nonce) => nonce >= this.lastConfirmed && nonce < this.lastPending,
+      ),
+    );
+    this.untrackedPendingPrefix = knownPrefixNonces.size < expectedKnownPrefix;
+    this.invisibleReservation = this.untrackedPendingPrefix
+      || [...this.flights.values()].some(
+        (flight) => flight.nonce >= this.lastConfirmed
+          && (!flight.publicExposure || flight.nonce >= this.lastPending),
+      );
+  }
+
   private clearAccountState(): void {
     this.next = null;
     this.lastConfirmed = -1;
     this.lastPending = -1;
     this.invisibleReservation = false;
+    this.untrackedPendingPrefix = false;
     this.flights.clear();
     this.recoveredAddress = null;
   }

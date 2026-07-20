@@ -11,7 +11,7 @@
     "postmortem": "tsx src/postmortem.ts",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run --exclude \"dist/**\" --exclude \"**/*.anvil.test.ts\"",
-    "test:integration": "forge build --root test/foundry && forge build --root ../.. --contracts contracts --out packages/backend/test/foundry/out/payer-compiled --cache-path packages/backend/test/foundry/cache/payer-compiled --use 0.8.20 --evm-version shanghai --optimize --optimizer-runs 200 --no-metadata && vitest run anvil --exclude \"dist/**\"",
+    "test:integration": "forge build --root test/foundry && forge test --root test/foundry --offline && forge build --root ../.. --contracts contracts --out packages/backend/test/foundry/out/payer-compiled --cache-path packages/backend/test/foundry/cache/payer-compiled --use 0.8.20 --evm-version shanghai --optimize --optimizer-runs 200 --no-metadata && vitest run anvil --exclude \"dist/**\"",
     "test:watch": "vitest"
   },
   "dependencies": {

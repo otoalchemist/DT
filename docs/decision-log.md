@@ -10,11 +10,19 @@ Rename the persistent payment control to `defenseEnabled`. Persist JIT as an ind
 
 ## 2026-07-18 — Transaction certainty
 
-Release a nonce only on positive terminal evidence. Public and transport-ambiguous flights have no age-based expiry; private-only flights expire after their final target block. Persist enough signed-flight data to reconcile after restart.
+Release a nonce only on positive terminal evidence. Any signed raw disclosed to a
+public RPC, relay, or builder has no age-based expiry, even after a private target
+or on-chain value window ends. Only a preparation proven never to have crossed an
+external-dispatch boundary may expire. Persist enough signed-flight data and
+same-nonce lineage to reconcile after restart.
 
 Before replaying an authorized signed flight after a restart, reconcile at a coherent block and require the current balance to cover the configured floor plus maximum exposure across every live nonce. Keep blocked flights in the journal for a later funded retry.
 
-Deduplicate pending game actions by their contract semantics, not only by transaction hash. A zero-value self-transfer replacement is permitted solely to retire a lower rejected nonce whose payment obligation is already covered while higher accepted work remains fenced.
+Deduplicate pending game actions by their contract semantics, not only by
+transaction hash. A zero-value self-transfer replacement is permitted only for a
+durable cleanup purpose: retiring a covered lower game-action gap ahead of accepted
+work, or consuming an expired builder-incentive nonce before reuse. It is WAL-first,
+floor/fee-capped, and never private builder work.
 
 ## 2026-07-18 — Upgrade defaults
 
@@ -51,13 +59,17 @@ boundary payments. Mandatory payments remain fail-closed in whole-bundle
 simulation and retain public fallback. Optional audits may be explicitly
 allowlisted to revert privately and retain their authorized public fallback. The
 single final bid is also revertible so it cannot invalidate a payment, but is
-strictly private, has finite target/journal lifetime, and is never independently
-replayed. Private size limits include the complete cohort or none of it.
+strictly private, has a finite value/target window, and is never independently
+replayed. Its signed `payCoinbase(notBeforeTimestamp, validThroughBlock)` calldata
+enforces the payment boundary and last target on-chain; transport narrows or
+omits a stale bid rather than extending the authorization. Private size limits
+include the complete cohort or none of it.
 
 Capability verification requires both default-off switches, explicit
 acknowledgement of any risk increase, private mainnet mode on verified chain ID 1,
 a healthy journal, a positive fixed amount, and exact deployed-runtime equality
-with the reproducibly compiled, pinned `CoinbasePayer` artifact. A public-to-mainnet
+at the finalized chain tag with the reproducibly compiled, pinned `CoinbasePayer`
+artifact. A public-to-mainnet
 mode change that can reactivate persisted switches requires the same explicit
 acknowledgement and revalidates the candidate chain and payer before saving.
 Capability does not imply current execution: the engine must also be running and
@@ -66,4 +78,21 @@ payment must be due. Migrations force the activation switches off even when
 they preserve a staged legacy amount/address. Automated and disposable-Anvil QA
 do not constitute live financial QA. No direct payment is represented as
 guaranteeing inclusion, block position, transaction ordering, or audit success.
+The block check expires value transfer, not the Ethereum transaction itself: a
+retained expired raw transaction can still revert later and consume its nonce and
+bounded gas. The bot keeps that lineage and its maximum same-nonce exposure fenced,
+then publicly retires it with a WAL-first zero-value same-nonce transaction before
+reuse. The payer cannot enforce success of preceding game calls against a builder
+that ignores bundle semantics; configured builders are therefore an explicit trust
+boundary.
 See `docs/builder-incentives.md`.
+
+## 2026-07-20 — Durable confirmed-spend attribution
+
+Price a finalized transaction from its actual receipt and resolve the game epoch
+at the receipt's block. Write one immutable `{epoch, spendWei}` annotation into
+the confirmed WAL tombstone before changing runtime/UI accounting. Retain those
+annotations through their mined epoch, rebuild the exact deduplicated total after
+Lock/restart, and remove them only after a coherent chain view advances past that
+epoch. A delayed receipt is never attributed to the epoch in which it was
+discovered.

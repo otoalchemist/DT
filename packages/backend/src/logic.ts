@@ -1,4 +1,5 @@
 import type { StrategyConfig, TokenRisk } from "@dat-bot/shared";
+import { configuredGweiToWei } from "./amounts.js";
 
 // Pure game/strategy logic — no I/O, so it can be unit-tested directly.
 
@@ -62,8 +63,8 @@ export function cappedReplacementFees(
     gas.priorityFeeGwei,
     gas.replacementPriorityFeeCapGwei ?? gas.priorityFeeGwei,
   );
-  const priorityCap = BigInt(Math.round(priorityCapGwei * 1e9));
-  const maxFeeCap = BigInt(Math.round(2 * gas.maxBaseFeeGwei * 1e9)) + priorityCap;
+  const priorityCap = configuredGweiToWei(priorityCapGwei);
+  const maxFeeCap = 2n * configuredGweiToWei(gas.maxBaseFeeGwei) + priorityCap;
   const bumpedMax = nextReplacementFee(priorMaxFeePerGas);
   const bumpedPriority = nextReplacementFee(priorMaxPriorityFeePerGas);
   const maxFeePerGas = currentMaxFeePerGas > bumpedMax ? currentMaxFeePerGas : bumpedMax;

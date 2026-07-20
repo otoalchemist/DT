@@ -11,8 +11,13 @@ Version 0.3.0 must protect an unlocked wallet's selected citizens at epoch bound
 - Required payments are prepared as one nonce-ordered campaign and delivered at the boundary without per-token waiting.
 - A payment priced for an old epoch is replaced immediately at the same nonce.
 - Public or ambiguous delivery remains reserved until positive terminal evidence exists.
-- Private-only delivery expires only after every target block is past.
+- A signed raw disclosed to any external transport never expires by height alone;
+  only preparation proven never dispatched may be released without nonce
+  consumption.
 - Pending value and worst-case gas remain reserved against the balance floor across ticks and restarts.
+- Final receipt value/gas is durably attributed to the game epoch at its mined
+  block before display, rebuilt idempotently after Lock/restart, and never moved
+  into a later epoch merely because receipt lookup was delayed.
 - Crash recovery rechecks the current balance and configured floor against all live nonce liabilities before any signed transaction is replayed.
 - Unresolved bribe, audit, and kill actions are semantically deduplicated across ticks and restarts; pending audits continue to reserve their auditor's capacity.
 - If an externally covered payment leaves a rejected lower nonce ahead of accepted work, a floor-checked same-nonce filler may retire only that gap.
@@ -24,7 +29,14 @@ Version 0.3.0 must protect an unlocked wallet's selected citizens at epoch bound
   Mandatory payments fail closed in private simulation and keep public fallback;
   optional audits are explicitly revertible privately and keep public fallback
   when authorized; the single final builder incentive is revertible,
-  private-only, finite-target, and never independently replayed.
+  private-only, on-chain bounded to its signed timestamp/block window, and never
+  independently replayed.
+- After that value window, every disclosed builder raw remains journaled until a
+  WAL-first public zero-value same-nonce retirement (or another lineage member)
+  is canonically consumed. Fee/floor/RPC failure keeps the wallet fenced.
+- Configured builders receive the signed cohort members. Bundle atomicity is a
+  builder-policy assumption; the payer cannot prove a preceding game payment
+  succeeded if a builder violates the submitted bundle rules.
 - A declared cohort is privately delivered only when every member fits the
   private transaction-count, encoded-byte, and aggregate-gas limits. Otherwise
   no cohort member is privately sent, public-authorized work keeps its ordinary
@@ -32,7 +44,7 @@ Version 0.3.0 must protect an unlocked wallet's selected citizens at epoch bound
 - Builder-incentive activation requires private mainnet mode, verified chain ID
   1, a healthy journal, explicit risk acknowledgement, positive fixed amount,
   balance/spend authorization, and exact equality with the pinned stateless
-  `CoinbasePayer` runtime.
+  `CoinbasePayer` runtime at the finalized chain tag.
 - Configuration, campaign state, and transaction flights are versioned and written atomically under `DATA_DIR`.
 - No implicit public RPC is permitted. Local direct-broadcast mode refuses chain
   ID 1, and environment-owned endpoints/mode/key cannot be replaced at runtime.
@@ -54,5 +66,7 @@ committed-range whitespace checks pass; restart recovery cannot allocate or repl
 over an unresolved unaffordable flight or a withdrawn payment cap; JIT cannot
 activate defense or unselected payments; the reproducible builder-incentive bytecode,
 default-off migration, capability gates, spend accounting, cohort/revert routing,
-private-limit atomicity, and no-public-bid recovery policy pass their automated
-and disposable-Anvil checks; and owner QA passes or is explicitly deferred.
+private-limit atomicity, signed payer-window enforcement, builder-nonce retirement,
+and no-public-bid
+recovery policy pass their automated, Foundry, and disposable-Anvil checks; and
+owner QA passes or is explicitly deferred.

@@ -20,13 +20,14 @@ import {
   type PostMortemResult,
 } from "@dat-bot/shared";
 import { publicClient } from "./chain.js";
+import { decodeCoinbasePayment } from "./coinbase-payer.js";
 import { appConfig } from "./config.js";
 import { redactSensitiveText } from "./redaction.js";
 
 /** Decode the contract call into a human label; falls back to the raw selector.
- * Empty-data value transfers are called out because they can be the outer
- * transaction that funds a direct block.coinbase forwarder. This is a clue, not
- * proof: a complete bundle-profit analysis still needs traces/builder data. */
+ * Canonical payer calldata and legacy empty-data value transfers are called out
+ * because they can be direct block.coinbase payments. This is a clue, not proof:
+ * a complete bundle-profit analysis still needs traces/builder data. */
 export function describePostMortemTransaction(
   input: Hex,
   value: bigint,
@@ -35,6 +36,13 @@ export function describePostMortemTransaction(
     return value > 0n
       ? { action: "value-transfer", args: `${formatEther(value)} ETH; possible builder incentive` }
       : { action: "empty-call", args: "" };
+  }
+  const paymentWindow = decodeCoinbasePayment(input);
+  if (paymentWindow !== null) {
+    return {
+      action: "payCoinbase",
+      args: `${formatEther(value)} ETH; valid from timestamp ${paymentWindow.notBeforeTimestamp} through block ${paymentWindow.validThroughBlock}; possible builder incentive`,
+    };
   }
   try {
     const { functionName, args } = decodeFunctionData({ abi: deathAndTaxesAbi, data: input });

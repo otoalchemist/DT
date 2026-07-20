@@ -1,8 +1,23 @@
-import { useEffect, useState } from "react";
-import type { StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
+import { useEffect, useRef, useState } from "react";
+import {
+  MIN_ADVANCED_BOUNDARY_LEAD_MS,
+  type StrategyConfig,
+  type StrategySnapshot,
+} from "@dat-bot/shared";
 import { ApiError, api } from "./api.js";
 
 type SubmissionMode = "public" | "mainnet" | "local";
+
+function remainingStrategyDraft(
+  current: Partial<StrategyConfig>,
+  submitted: Partial<StrategyConfig>,
+): Partial<StrategyConfig> {
+  const remaining = { ...current };
+  for (const key of Object.keys(submitted) as Array<keyof StrategyConfig>) {
+    if (Object.is(current[key], submitted[key])) delete remaining[key];
+  }
+  return remaining;
+}
 
 const MODE_TIPS: Record<SubmissionMode, string> = {
   public:
@@ -66,7 +81,8 @@ function AlchemyKeySection({
       + "The persisted direct-incentive and combined-cohort switches are enabled. "
       + "Switching to mainnet will revalidate the configured CoinbasePayer and can reactivate "
       + "a non-refundable payment of the configured bid plus gas when a mandatory boundary payment is due. "
-      + "It does not guarantee inclusion, placement, or transaction ordering.",
+      + "Configured builders receive the raw signed cohort transactions, and payment-first ordering relies on "
+      + "them honoring bundle rules. It does not guarantee inclusion, placement, or transaction ordering.",
     )) return;
     setBusyMode(true);
     setMsg(null);
@@ -165,9 +181,11 @@ export function Config({
   const [cfg, setCfg] = useState<StrategyConfig>(initial.config);
   const [revision, setRevision] = useState(initial.revision);
   const [dirty, setDirty] = useState<Partial<StrategyConfig>>({});
+  const dirtyRef = useRef<Partial<StrategyConfig>>({});
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [draftNotice, setDraftNotice] = useState<string | null>(null);
   // Seed with the actual shipped default (mainnet) so the panel doesn't briefly
   // misreport before GET /api/settings resolves; corrected on load if it differs.
   const [currentMode, setCurrentMode] = useState<SubmissionMode>("mainnet");
@@ -175,11 +193,15 @@ export function Config({
   const [keyConfiguredByEnvironment, setKeyConfiguredByEnvironment] = useState(false);
 
   useEffect(() => {
-    if (initial.revision === revision) return;
-    setCfg(initial.config);
+    if (initial.revision <= revision) return;
+    const hasDraft = Object.keys(dirty).length > 0;
+    setCfg({ ...initial.config, ...dirty });
     setRevision(initial.revision);
-    setDirty({});
-  }, [initial, revision]);
+    setSaved(false);
+    setDraftNotice(hasDraft
+      ? "Configuration changed elsewhere; your unsaved strategy edits were preserved on the latest revision."
+      : null);
+  }, [initial, revision, dirty]);
 
   useEffect(() => {
     api.getSettings().then((s) => {
@@ -191,8 +213,13 @@ export function Config({
 
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
     setCfg((c) => ({ ...c, [k]: v }));
-    setDirty((patch) => ({ ...patch, [k]: v }));
+    setDirty((patch) => {
+      const next = { ...patch, [k]: v };
+      dirtyRef.current = next;
+      return next;
+    });
     setSaved(false);
+    setDraftNotice(null);
   };
 
   const save = async () => {
@@ -200,23 +227,30 @@ export function Config({
     setSaveErr(null);
     try {
       if (Object.keys(dirty).length === 0) return;
-      const snapshot = await api.setConfig(revision, dirty);
-      setCfg(snapshot.config);
+      const submitted = { ...dirty };
+      // A newer authoritative prop can render before the synchronization
+      // effect runs. Use it immediately so a fast click does not submit the
+      // draft against a revision we already know is stale.
+      const baseRevision = Math.max(revision, initial.revision);
+      const snapshot = await api.setConfig(baseRevision, submitted);
+      const remaining = remainingStrategyDraft(dirtyRef.current, submitted);
+      dirtyRef.current = remaining;
+      setCfg({ ...snapshot.config, ...remaining });
       setRevision(snapshot.revision);
-      setDirty({});
+      setDirty(remaining);
+      setDraftNotice(null);
       onChange(snapshot);
-      setSaved(true);
+      setSaved(Object.keys(remaining).length === 0);
     } catch (e) {
       if (e instanceof ApiError && (e.status === 409 || e.status === 503)) {
         try {
           const authoritative = await api.getConfig();
-          setCfg(authoritative.config);
+          setCfg({ ...authoritative.config, ...dirtyRef.current });
           setRevision(authoritative.revision);
-          setDirty({});
           onChange(authoritative);
           setSaveErr(e.status === 409
-            ? "Configuration changed elsewhere; refreshed the authoritative values. Review and try again."
-            : "The save may have committed but durability was not confirmed; refreshed authoritative values. The engine remains paused.");
+            ? "Configuration changed elsewhere; refreshed the authoritative values and preserved your unsaved edits. Review and try again."
+            : "The save may have committed but durability was not confirmed; refreshed authoritative values and preserved your unsaved edits. The engine remains paused.");
           return;
         } catch {
           // Fall through to the original mutation error.
@@ -291,7 +325,8 @@ export function Config({
         Pre-submit audits/kills ~{cfg.preBoundaryLeadMs}ms before the deadline so they land in the first
         eligible block ahead of rivals, instead of the block after. Each is validated by simulating at the
         boundary/expiry instant, so an invalid one is skipped before spending gas. Lead is shared with the
-        JIT boundary race. Note: builders choose block position from profitability, fees, and competing
+        JIT boundary race, but optional audit/kill preparation uses at least {MIN_ADVANCED_BOUNDARY_LEAD_MS}ms
+        even when a lower payment-only lead is configured. Note: builders choose block position from profitability, fees, and competing
         orderflow — a defender who pre-pays can still beat your audit.
       </p>
       <label className="field">
@@ -427,6 +462,7 @@ export function Config({
       <button className="primary" onClick={save} disabled={busy || Object.keys(dirty).length === 0}>
         {busy ? "Saving…" : saved ? "Saved ✓" : "Save strategy"}
       </button>
+      {draftNotice && <p className="hint" style={{ marginTop: 6 }}>{draftNotice}</p>}
       {saveErr && <p className="err" style={{ marginTop: 6 }}>{saveErr}</p>}
 
       <AlchemyKeySection
