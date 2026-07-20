@@ -27,13 +27,25 @@ contract CoinbasePayer {
 
     /// Forward all received ETH to the block builder. Never reverts.
     receive() external payable {
-        // Deliberately ignore the result: a failed forward must not revert the tx.
-        block.coinbase.call{value: msg.value}("");
+        _forward();
     }
 
     /// Same as receive(), for callers that send calldata.
     fallback() external payable {
-        block.coinbase.call{value: msg.value}("");
+        _forward();
+    }
+
+    /// Send this call's ETH to `block.coinbase`, discarding the result so it can
+    /// NEVER revert (a failed forward must not drag down the payment bundle).
+    /// Inline assembly is used purely to drop the call's success flag without a
+    /// compiler warning — the high-level `.call` leaves the return value unused,
+    /// which is intentional but warns. Equivalent to:
+    ///   (bool ok, ) = block.coinbase.call{value: msg.value}("");  // ok ignored
+    function _forward() private {
+        assembly {
+            // call(gas, addr, value, inOffset, inSize, outOffset, outSize)
+            pop(call(gas(), coinbase(), callvalue(), 0, 0, 0, 0))
+        }
     }
 
     /// Recover ETH stuck here (only if a forward ever failed). Deployer only.
