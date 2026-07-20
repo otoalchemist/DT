@@ -81,6 +81,6 @@
   "dynamicTipEnabled": true,
   "dynamicTipMaxGwei": 50.1,
   "coinbaseBidEth": 0,
-  "coinbasePayerAddress": "",
+  "coinbasePayerAddress": "0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815",
   "maxPaymentEth": 0
 }

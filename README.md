@@ -238,11 +238,13 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   priority tip, which scales with it), so it's the capital-efficient way to buy the
   top slot. It rides the bundle **allowed-to-revert** and is **never mirrored** to the
   mempool, so it only ever spends when the bundle wins the slot, and a misconfigured
-  payer can't drop your payment. Set `coinbaseBidEth` (0 = off) and
-  `coinbasePayerAddress` under *Just-in-time epoch payment → Coinbase bid*. Requires a
-  one-time deploy of **`contracts/CoinbasePayer.sol`** (a tiny forwarder whose
-  `receive()` sends to `block.coinbase`) — deploy it once (e.g. in Remix), then paste
-  its address into the config. **Off by default.**
+  payer can't drop your payment. Just set `coinbaseBidEth` (0 = off) under
+  *Just-in-time epoch payment → Coinbase bid*. A shared `coinbasePayerAddress` ships
+  as the default (`0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815` — a deployed
+  **`contracts/CoinbasePayer.sol`**, verified on-chain to forward 100% of what it
+  receives to `block.coinbase`), so you only need the bid amount. Prefer your own?
+  Deploy `CoinbasePayer.sol` once (e.g. in Remix) and paste that address instead.
+  **Off by default.**
 - **Atomic multi-tx bundles (`mainnet` mode, automatic)** — every Citizen you hold
   is owned by the same wallet, so paying/auditing several in one cycle produces
   multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only

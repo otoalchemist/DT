@@ -69,7 +69,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,
   coinbaseBidEth: 0, // off; flat builder payment for top-of-block, opt-in
-  coinbasePayerAddress: "",
+  // Shared CoinbasePayer forwarder (verified on-chain to forward 100% to
+  // block.coinbase). Only used when coinbaseBidEth > 0; deploy your own if you'd
+  // rather not share (see contracts/CoinbasePayer.sol).
+  coinbasePayerAddress: "0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815",
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 
