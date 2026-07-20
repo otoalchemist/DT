@@ -28,11 +28,29 @@ including exclusive `DATA_DIR` operation, armed-JIT authority display, and the
 mixed-release bootstrap checks, without a funded wallet; otherwise explicitly
 record a deferral. This milestone remains awaiting that evidence.
 
-Excluded: merging the PR, sending live transactions, and reintroducing payment-plus-audit bundle coupling.
+Excluded from the owner gate: merging the PR, deploying a mainnet payer, enabling
+the direct incentive, or sending live/funded transactions. Combined boundary
+cohorts are tested with models and disposable Anvil only.
 
-## Future milestone — Capped builder incentives
+## Milestone 0.3.0 — Opt-in builder incentives
 
-Status: design/research only. Validate the reported competing transaction, then
-implement the private-only, cohort-journaled `CoinbasePayer` design and safety
-gates in `docs/builder-incentives.md`. Direct payments improve bundle economics;
-they are not represented as guaranteeing top-of-block ordering.
+Status: implemented, disabled by default, and awaiting the exact-head automated
+and owner QA gates. No mainnet deployment or live financial QA is claimed.
+
+The implemented combined path starts only from one or more mandatory boundary
+payments. Payments keep their ordinary public fallback. Optional audits follow,
+are explicitly revertible in the private bundle, and keep public fallback when
+the offense/race policy authorizes it. A single final `builder-incentive` is
+private-only, finite-target, cohort-journaled, and never independently replayed.
+If the complete cohort would exceed private count, byte, or gas limits, none of
+that cohort is sent privately; public-authorized work retains its normal route
+and the bid is omitted.
+
+Release gates cover exact compiler comparison of the pinned stateless
+`CoinbasePayer` creation/runtime bytecode, mainnet chain and deployed-runtime
+verification, healthy journal, explicit risk acknowledgement,
+balance/spend accounting, dry-run side-effect freedom, simulation allowlisting,
+replacement/expiry behavior, and disposable-Anvil payer behavior. An operator
+may consider a separately reviewed deployment only after following
+`docs/builder-incentives.md`. A bid can affect builder economics but never
+guarantees inclusion, placement, or ordering.

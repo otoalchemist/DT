@@ -14,7 +14,7 @@ const outcomeBadge: Record<PostMortemVerdict["outcome"], string> = {
 const outcomeLabel: Record<PostMortemVerdict["outcome"], string> = {
   won: "WON",
   "lost-timing": "LOST · timing",
-  "lost-fee": "LOST · fee",
+  "lost-fee": "LOST · ordering",
   unknown: "unknown",
 };
 
@@ -56,7 +56,8 @@ export function PostMortem() {
       <h2>Race post-mortem</h2>
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
         Compare your transaction(s) against rivals to see whether a loss was timing (later block) or
-        fee (same block, out-priced). Paste tx hashes — one per line or comma-separated.
+        same-block ordering/builder economics. Visible tips are evidence, not proof: direct coinbase
+        transfers or other bundle revenue may decide ordering. Paste tx hashes — one per line or comma-separated.
       </p>
 
       <label className="field">

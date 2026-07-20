@@ -81,6 +81,7 @@ export function Dashboard({
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [capabilityRefreshToken, setCapabilityRefreshToken] = useState(0);
 
   useEffect(() => {
     api.getConfig().then(setStrategy).catch(() => {});
@@ -248,6 +249,7 @@ export function Dashboard({
           strategy={strategy}
           onStrategyChange={setStrategy}
           onStatusChange={pushStatus}
+          capabilityRefreshToken={capabilityRefreshToken}
         />
 
         <div className="spacer" />
@@ -287,7 +289,13 @@ export function Dashboard({
 
         <div className="spacer" />
         <div className="grid cols-2">
-          {strategy && <Config initial={strategy} onChange={setStrategy} />}
+          {strategy && (
+            <Config
+              initial={strategy}
+              onChange={setStrategy}
+              onSettingsChange={() => setCapabilityRefreshToken((token) => token + 1)}
+            />
+          )}
 
           <div className="panel">
             <h2>Activity</h2>

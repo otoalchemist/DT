@@ -71,10 +71,13 @@ const config: StrategyConfig = {
   offenseDynamicTipEnabled: true,
   offenseDynamicTipMaxGwei: 20.1,
   offenseReplacementPriorityFeeCapGwei: 20.1,
-  offenseBoundaryScheduling: false,
   racePublicMempool: true,
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,
+  combinedBoundaryBundle: false,
+  coinbaseBidEnabled: false,
+  coinbaseBidEth: "0",
+  coinbasePayerAddress: "",
   maxPaymentEth: 0,
 };
 
@@ -82,6 +85,7 @@ const initialStrategy: StrategySnapshot = { revision: 1, config };
 
 const status: BotStatus = {
   version: "0.3.0",
+  mode: "mainnet",
   running: false,
   unlocked: true,
   dryRun: true,

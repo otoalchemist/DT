@@ -45,6 +45,7 @@ const baseSettings = {
 
 const bootstrapStatus: BotStatus = {
   version: VERSION,
+  mode: "local",
   running: false,
   unlocked: false,
   dryRun: true,

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_STRATEGY, Runtime } from "./runtime.js";
+import { appConfig } from "./config.js";
 import { AtomicWriteCommittedError } from "./durability.js";
 
 const tempDirs: string[] = [];
@@ -13,12 +14,33 @@ function tempDir(): string {
   return dir;
 }
 
+function v2Config() {
+  const {
+    combinedBoundaryBundle: _combined,
+    coinbaseBidEnabled: _bidEnabled,
+    coinbaseBidEth: _bidEth,
+    coinbasePayerAddress: _payer,
+    ...prior
+  } = DEFAULT_STRATEGY;
+  return { ...prior, offenseBoundaryScheduling: true };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe("versioned strategy persistence", () => {
+  it("reports the backend's authoritative submission mode", () => {
+    const previousMode = appConfig.mode;
+    appConfig.mode = "public";
+    try {
+      expect(new Runtime(tempDir()).status().mode).toBe("public");
+    } finally {
+      appConfig.mode = previousMode;
+    }
+  });
+
   it("emits the updated confirmed-spend value immediately", () => {
     const runtime = new Runtime(tempDir());
     runtime.currentEpoch = 7n;
@@ -61,9 +83,24 @@ describe("versioned strategy persistence", () => {
       autoStopOnCompletion: false,
     });
     const persisted = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
-    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted.schemaVersion).toBe(3);
     expect(persisted.strategy.config.enabled).toBeUndefined();
     expect(persisted.strategy.config.auditSafetyBufferSeconds).toBe(86_400);
+  });
+
+  it("does not grant kill authority when a partial legacy offense config omitted it", () => {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
+      offenseEnabled: true,
+    }));
+
+    const runtime = new Runtime(dir);
+
+    expect(runtime.strategy.offenseEnabled).toBe(true);
+    expect(runtime.strategy.autoAudit).toBe(true);
+    expect(runtime.strategy.autoKill).toBe(false);
+    const persisted = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+    expect(persisted.strategy.config.autoKill).toBe(false);
   });
 
   it.each([
@@ -165,6 +202,84 @@ describe("versioned strategy persistence", () => {
     });
   });
 
+  it("migrates a strict v2 envelope without changing strategy or JIT revisions", () => {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
+      schemaVersion: 2,
+      strategy: { revision: 7, config: v2Config() },
+      jitCampaign: {
+        revision: 4,
+        state: "armed",
+        targetEpoch: 22,
+        tokenIds: ["7"],
+        autoStopOnCompletion: true,
+      },
+    }));
+
+    const runtime = new Runtime(dir);
+
+    expect(runtime.strategyRevision).toBe(7);
+    expect(runtime.jitCampaign).toMatchObject({ revision: 4, state: "armed", tokenIds: ["7"] });
+    expect(runtime.strategy).toMatchObject({
+      combinedBoundaryBundle: false,
+      coinbaseBidEnabled: false,
+      coinbaseBidEth: "0",
+      coinbasePayerAddress: "",
+    });
+    expect("offenseBoundaryScheduling" in runtime.strategy).toBe(false);
+    const persisted = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+    expect(persisted.schemaVersion).toBe(3);
+    expect(persisted.strategy.revision).toBe(7);
+    expect(persisted.jitCampaign.revision).toBe(4);
+    expect(persisted.strategy.config.offenseBoundaryScheduling).toBeUndefined();
+  });
+
+  it("stages a flat upstream bid but revokes implicit financial and combined authority", () => {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
+      coinbaseBidEth: 0.015,
+      coinbasePayerAddress: "0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815",
+      combinedBoundaryBundle: true,
+      offenseBoundaryScheduling: true,
+    }));
+
+    const runtime = new Runtime(dir);
+
+    expect(runtime.strategy.coinbaseBidEth).toBe("0.015");
+    expect(runtime.strategy.coinbasePayerAddress).toBe("0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815");
+    expect(runtime.strategy.coinbaseBidEnabled).toBe(false);
+    expect(runtime.strategy.combinedBoundaryBundle).toBe(false);
+    expect("offenseBoundaryScheduling" in runtime.strategy).toBe(false);
+  });
+
+  it("refuses to silently round a nonzero legacy bid below one wei to zero", () => {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
+      coinbaseBidEth: 1e-19,
+    }));
+
+    expect(() => new Runtime(dir)).toThrow(/smaller than one wei/);
+  });
+
+  it("canonicalizes builder amounts and requires a positive bid and payer before enabling", () => {
+    const blank = new Runtime(tempDir());
+    expect(() => blank.saveStrategy({ coinbaseBidEnabled: true }, 0))
+      .toThrow(/coinbaseBidEth/);
+
+    const runtime = new Runtime(tempDir());
+    const staged = runtime.saveStrategy({ coinbaseBidEth: "0.010000000000000000" }, 0);
+    expect(staged.config.coinbaseBidEth).toBe("0.01");
+
+    expect(() => runtime.saveStrategy({ coinbaseBidEnabled: true }, 1))
+      .toThrow(/coinbasePayerAddress/);
+    expect(() => runtime.saveStrategy({
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+    }, 1)).toThrow(/coinbasePayerAddress/);
+    expect(() => runtime.saveStrategy({ coinbaseBidEth: "0.0000000000000000001" }, 1))
+      .toThrow(/at most 18 decimal places/);
+  });
+
   it("fails closed for an unsupported or corrupt versioned envelope", () => {
     const unsupported = tempDir();
     fs.writeFileSync(path.join(unsupported, "config.json"), JSON.stringify({ schemaVersion: 999 }));
@@ -172,7 +287,7 @@ describe("versioned strategy persistence", () => {
 
     const corrupt = tempDir();
     fs.writeFileSync(path.join(corrupt, "config.json"), JSON.stringify({ schemaVersion: 2, strategy: {} }));
-    expect(() => new Runtime(corrupt)).toThrow(/Invalid strategy envelope/);
+    expect(() => new Runtime(corrupt)).toThrow(/Invalid strategy v2 envelope/);
   });
 
   it("does not mutate in-memory state when an atomic persistence write fails", () => {

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BotStatus,
@@ -29,6 +30,7 @@ vi.mock("./api.js", () => {
       status: vi.fn(),
       getConfig: vi.fn(),
       setConfig: vi.fn(),
+      builderIncentive: vi.fn(),
       jit: vi.fn(),
     },
   };
@@ -62,10 +64,13 @@ const config: StrategyConfig = {
   offenseDynamicTipEnabled: true,
   offenseDynamicTipMaxGwei: 20.1,
   offenseReplacementPriorityFeeCapGwei: 20.1,
-  offenseBoundaryScheduling: false,
   racePublicMempool: true,
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,
+  combinedBoundaryBundle: false,
+  coinbaseBidEnabled: false,
+  coinbaseBidEth: "0",
+  coinbasePayerAddress: "",
   maxPaymentEth: 0,
 };
 
@@ -74,6 +79,7 @@ const strategy: StrategySnapshot = { revision: 1, config };
 function status(overrides: Partial<BotStatus> = {}): BotStatus {
   return {
     version: "0.3.0",
+    mode: "mainnet",
     running: false,
     unlocked: true,
     dryRun: true,
@@ -120,8 +126,27 @@ function token(tokenId: string): OwnedTokenStatus {
 
 afterEach(cleanup);
 
+function Harness({ initial }: { initial: StrategySnapshot }) {
+  const [current, setCurrent] = useState(initial);
+  return (
+    <JitPanel
+      status={status()}
+      tokens={[token("7")]}
+      strategy={current}
+      onStatusChange={vi.fn()}
+      onStrategyChange={setCurrent}
+    />
+  );
+}
+
 describe("JitPanel campaign scope", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.builderIncentive).mockResolvedValue({
+      active: false,
+      reason: "Direct builder incentives are disabled",
+    });
+  });
 
   it("arms the displayed epoch and exact selected IDs, then applies the mutation response", async () => {
     const initialStatus = status();
@@ -272,5 +297,199 @@ describe("JitPanel campaign scope", () => {
       expect(onStrategyChange).toHaveBeenCalledWith(freshStrategy);
     });
     expect(await screen.findByText(/Campaign changed elsewhere/)).toBeTruthy();
+  });
+
+  it("shows irreversible-cost and no-guarantee warnings separately from backend state", async () => {
+    render(
+      <JitPanel
+        status={status()}
+        tokens={[token("7")]}
+        strategy={{
+          revision: 1,
+          config: {
+            ...config,
+            coinbaseBidEnabled: true,
+            coinbaseBidEth: "0.01",
+            coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+            combinedBoundaryBundle: true,
+          },
+        }}
+        onStatusChange={vi.fn()}
+        onStrategyChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("Non-refundable ETH");
+    expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("does not guarantee");
+    expect(screen.getByLabelText("Builder incentive risk warning").textContent).toContain("No bid-only submission");
+    expect(await screen.findByText("Backend state: Direct builder incentives are disabled")).toBeTruthy();
+    expect(screen.queryByText(/CONFIG \/ CHAIN \/ CODE VERIFIED/)).toBeNull();
+  });
+
+  it("labels only config, chain, and code capability after backend verification", async () => {
+    vi.mocked(api.builderIncentive).mockResolvedValue({
+      active: true,
+      payer: "0x3333333333333333333333333333333333333333",
+      bidWei: "10000000000000000",
+      runtimeCodeHash: `0x${"44".repeat(32)}`,
+    });
+    render(
+      <JitPanel
+        status={status()}
+        tokens={[token("7")]}
+        strategy={{
+          revision: 1,
+          config: {
+            ...config,
+            coinbaseBidEnabled: true,
+            coinbaseBidEth: "0.01",
+            coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+            combinedBoundaryBundle: true,
+          },
+        }}
+        onStatusChange={vi.fn()}
+        onStrategyChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("CONFIG / CHAIN / CODE VERIFIED")).toBeTruthy();
+    expect(screen.getByLabelText("Builder incentive backend state").textContent).toContain(
+      "This is not an executable-now signal",
+    );
+    const requirements = screen.getByLabelText("Builder incentive execution requirements").textContent ?? "";
+    expect(requirements).toContain("currently mainnet");
+    expect(requirements).toContain("stopped");
+    expect(requirements).toContain("unlocked");
+    expect(requirements).toContain("healthy");
+    expect(requirements).toContain("Dry Run is on");
+    expect(requirements).toContain("due mandatory boundary payment");
+  });
+
+  it("refreshes builder capability when authoritative submission mode changes", async () => {
+    vi.mocked(api.builderIncentive)
+      .mockResolvedValueOnce({
+        active: true,
+        payer: "0x3333333333333333333333333333333333333333",
+        bidWei: "10000000000000000",
+        runtimeCodeHash: `0x${"44".repeat(32)}`,
+      })
+      .mockResolvedValueOnce({
+        active: false,
+        reason: "Direct builder incentives require mainnet private-bundle mode",
+      });
+    const enabledStrategy: StrategySnapshot = {
+      revision: 1,
+      config: {
+        ...config,
+        coinbaseBidEnabled: true,
+        coinbaseBidEth: "0.01",
+        coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+        combinedBoundaryBundle: true,
+      },
+    };
+    const view = render(
+      <JitPanel
+        status={status({ mode: "mainnet" })}
+        tokens={[token("7")]}
+        strategy={enabledStrategy}
+        onStatusChange={vi.fn()}
+        onStrategyChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("CONFIG / CHAIN / CODE VERIFIED")).toBeTruthy();
+    view.rerender(
+      <JitPanel
+        status={status({ mode: "public" })}
+        tokens={[token("7")]}
+        strategy={enabledStrategy}
+        onStatusChange={vi.fn()}
+        onStrategyChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText(
+      "Backend state: Direct builder incentives require mainnet private-bundle mode",
+    )).toBeTruthy();
+    expect(api.builderIncentive).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes builder capability after RPC settings are replaced", async () => {
+    vi.mocked(api.builderIncentive)
+      .mockResolvedValueOnce({
+        active: true,
+        payer: "0x3333333333333333333333333333333333333333",
+        bidWei: "10000000000000000",
+        runtimeCodeHash: `0x${"44".repeat(32)}`,
+      })
+      .mockResolvedValueOnce({
+        active: false,
+        reason: "Builder capability must be revalidated against the replacement RPC",
+      });
+    const enabledStrategy: StrategySnapshot = {
+      revision: 1,
+      config: {
+        ...config,
+        coinbaseBidEnabled: true,
+        coinbaseBidEth: "0.01",
+        coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+        combinedBoundaryBundle: true,
+      },
+    };
+    const sharedProps = {
+      status: status({ mode: "mainnet" as const }),
+      tokens: [token("7")],
+      strategy: enabledStrategy,
+      onStatusChange: vi.fn(),
+      onStrategyChange: vi.fn(),
+    };
+    const view = render(<JitPanel {...sharedProps} capabilityRefreshToken={0} />);
+
+    expect(await screen.findByText("CONFIG / CHAIN / CODE VERIFIED")).toBeTruthy();
+    view.rerender(<JitPanel {...sharedProps} capabilityRefreshToken={1} />);
+
+    expect(await screen.findByText(
+      "Backend state: Builder capability must be revalidated against the replacement RPC",
+    )).toBeTruthy();
+    expect(api.builderIncentive).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires an explicit confirmation and sends the API risk acknowledgement", async () => {
+    const initial: StrategySnapshot = {
+      revision: 1,
+      config: {
+        ...config,
+        coinbaseBidEth: "0.01",
+        coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+      },
+    };
+    vi.mocked(api.setConfig).mockImplementation(async (_revision, patch) => ({
+      revision: 2,
+      config: { ...initial.config, ...patch },
+    }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<Harness initial={initial} />);
+
+    fireEvent.click(screen.getByLabelText(
+      "Enable a direct builder incentive for eligible combined boundary cohorts",
+    ));
+    fireEvent.click(screen.getByLabelText(
+      "Allow a combined boundary payment / audit private cohort",
+    ));
+    fireEvent.click(screen.getByRole("button", { name: "Save payment settings" }));
+
+    await waitFor(() => {
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(api.setConfig).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({
+          coinbaseBidEnabled: true,
+          coinbaseBidEth: "0.01",
+          coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+          combinedBoundaryBundle: true,
+        }),
+        true,
+      );
+    });
   });
 });

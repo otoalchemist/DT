@@ -208,10 +208,10 @@ export async function validateMainnetRpcCandidate(
 // header. A bundle can only be included by the builder that WINS the slot, so we
 // fan out to all of them. Endpoints do change — override with BUILDER_URLS.
 // Unreachable entries are tolerated: submission succeeds if ANY builder accepts.
-// NOTE: rpc.buildernet.org documents a ~3 req/IP/s limit. Each private batch sends
-// two requests there (one per target block), so back-to-back payment and offense
-// batches may be throttled; other builders and the public payment route continue
-// independently.
+// NOTE: rpc.buildernet.org currently documents a 3-connection/10s limit and a
+// 100-request/10s HTTP limit per client. Each private batch sends two requests
+// there (one per target block), so back-to-back cohorts can still contend for
+// connection slots; other builders and the public payment route continue independently.
 // (rsync-builder.xyz was dropped — verified unreachable as of 2026-07; add it back
 // via BUILDER_URLS if it returns.)
 const DEFAULT_BUILDER_URLS = [

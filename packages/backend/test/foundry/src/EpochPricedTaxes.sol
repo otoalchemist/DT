@@ -123,3 +123,21 @@ contract MockMulticall3 {
         }
     }
 }
+
+/// Contract-valued fee recipient used to prove the production CoinbasePayer
+/// does not rely on transfer's 2,300-gas stipend.
+contract AcceptingCoinbase {
+    uint256 public totalReceived;
+
+    receive() external payable {
+        totalReceived += msg.value;
+    }
+}
+
+/// Adversarial fee recipient used to prove a failed forwarding call reverts the
+/// payer transaction and cannot strand its value in the stateless payer.
+contract RejectingCoinbase {
+    receive() external payable {
+        revert("reject payment");
+    }
+}

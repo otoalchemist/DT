@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import type { StrategyConfig } from "@dat-bot/shared";
 
 const h = vi.hoisted(() => {
   class RevisionConflictError extends Error {
@@ -7,7 +8,15 @@ const h = vi.hoisted(() => {
       super(`Revision conflict; current revision is ${currentRevision}`);
     }
   }
-  const strategy = { defenseEnabled: false, offenseEnabled: false, dryRun: true };
+  const strategy = {
+    defenseEnabled: false,
+    offenseEnabled: false,
+    dryRun: true,
+    combinedBoundaryBundle: false,
+    coinbaseBidEnabled: false,
+    coinbaseBidEth: "0",
+    coinbasePayerAddress: "",
+  };
   const campaign = {
     revision: 0,
     state: "cancelled",
@@ -21,6 +30,7 @@ const h = vi.hoisted(() => {
     jitCampaign: campaign,
     unlocked: true,
     running: false,
+    journalHealthy: true,
     account: null as { address: `0x${string}` } | null,
     walletClient: null as unknown,
     chainId: null as number | null,
@@ -48,11 +58,13 @@ const h = vi.hoisted(() => {
     }),
     emitStatus: vi.fn(),
     status: vi.fn(() => ({
+      mode: appConfig.mode,
       running: runtime.running,
       jitRevision: runtime.jitCampaign.revision,
       jitEnabled: runtime.jitCampaign.state === "armed",
       jitTargetEpoch: runtime.jitCampaign.targetEpoch,
       jitTokenIds: runtime.jitCampaign.tokenIds,
+      journalHealthy: runtime.journalHealthy,
     })),
     lock: vi.fn(() => { runtime.unlocked = false; runtime.account = null; }),
     onStatus: vi.fn(() => () => {}),
@@ -84,17 +96,44 @@ const h = vi.hoisted(() => {
     schedulePreBoundaryAudit: vi.fn(),
     resetJitState: vi.fn(),
     preflightSubmissionRecovery: vi.fn(async () => {}),
-    recoverAuthorizedSubmissions: vi.fn(async () => {}),
+    recoverAuthorizedSubmissions: vi.fn(async (
+      _address: `0x${string}`,
+      _signal?: AbortSignal,
+    ) => {}),
     hasUnresolvedJitCampaignWork: vi.fn(() => false),
     saveSettings: vi.fn(),
     validateRpc: vi.fn(async () => {}),
     reinitClients: vi.fn(),
+    publicClient: { getBalance: vi.fn(async () => 0n) },
     loadKeystore: vi.fn((): Record<string, unknown> | null => null),
     keystoreExists: vi.fn(() => false),
     saveKeystore: vi.fn(),
     decryptPrivateKey: vi.fn(() => `0x${"11".repeat(32)}` as `0x${string}`),
     accountFromPrivateKey: vi.fn(() => ({ address: "0x2222222222222222222222222222222222222222" as const })),
     getChainId: vi.fn(async () => 1),
+    resolveBuilderIncentive: vi.fn(async (): Promise<
+      | { active: true; payer: `0x${string}`; bidWei: bigint; runtimeCodeHash: `0x${string}` }
+      | { active: false; reason: string }
+    > => ({
+      active: true,
+      payer: "0x3333333333333333333333333333333333333333",
+      bidWei: 10_000_000_000_000_000n,
+      runtimeCodeHash: `0x${"44".repeat(32)}`,
+    })),
+    resolveBuilderIncentiveForMode: vi.fn(async (
+      _config: unknown,
+      _chainId: number | null,
+      _mode: "mainnet" | "public" | "local",
+      _client: unknown,
+    ): Promise<
+      | { active: true; payer: `0x${string}`; bidWei: bigint; runtimeCodeHash: `0x${string}` }
+      | { active: false; reason: string }
+    > => ({
+      active: true,
+      payer: "0x3333333333333333333333333333333333333333",
+      bidWei: 10_000_000_000_000_000n,
+      runtimeCodeHash: `0x${"44".repeat(32)}`,
+    })),
     readOwnedStatuses: vi.fn(async () => [{ tokenId: "7" }, { tokenId: "8" }]),
     filterOwnedTokenIds: vi.fn(async (
       _citizens: unknown,
@@ -114,7 +153,12 @@ vi.mock("./config.js", () => ({
 vi.mock("./runtime.js", () => ({
   runtime: h.runtime,
   RevisionConflictError: h.RevisionConflictError,
+  strategyConfigSchema: z.record(z.unknown()),
   strategyPatchSchema: z.record(z.unknown()),
+}));
+vi.mock("./builder-incentive.js", () => ({
+  resolveBuilderIncentive: h.resolveBuilderIncentive,
+  resolveBuilderIncentiveForMode: h.resolveBuilderIncentiveForMode,
 }));
 vi.mock("./strategy.js", () => ({
   startEngine: h.startEngine,
@@ -129,7 +173,7 @@ vi.mock("./strategy.js", () => ({
   hasUnresolvedJitCampaignWork: h.hasUnresolvedJitCampaignWork,
 }));
 vi.mock("./chain.js", () => ({
-  publicClient: { getBalance: vi.fn(async () => 0n) },
+  publicClient: h.publicClient,
   reinitClients: h.reinitClients,
   accountFromPrivateKey: h.accountFromPrivateKey,
   makeWalletClient: vi.fn(),
@@ -158,13 +202,21 @@ vi.mock("./index-tokens.js", () => ({ filterOwnedTokenIds: h.filterOwnedTokenIds
 vi.mock("./postmortem.js", () => ({ runPostMortem: vi.fn() }));
 vi.mock("./logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
-const { buildServer } = await import("./api.js");
+const { buildServer, builderIncentiveRiskIncreases } = await import("./api.js");
 const { AtomicWriteCommittedError } = await import("./durability.js");
 
 describe("revisioned API lifecycle", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    Object.assign(h.strategy, { defenseEnabled: false, offenseEnabled: false, dryRun: true });
+    Object.assign(h.strategy, {
+      defenseEnabled: false,
+      offenseEnabled: false,
+      dryRun: true,
+      combinedBoundaryBundle: false,
+      coinbaseBidEnabled: false,
+      coinbaseBidEth: "0",
+      coinbasePayerAddress: "",
+    });
     h.runtime.strategy = h.strategy;
     h.runtime.strategyRevision = 0;
     Object.assign(h.campaign, {
@@ -177,6 +229,8 @@ describe("revisioned API lifecycle", () => {
     h.runtime.jitCampaign = h.campaign;
     h.runtime.unlocked = true;
     h.runtime.running = false;
+    h.runtime.journalHealthy = true;
+    h.runtime.chainId = null;
     h.runtime.currentEpoch = 9n;
     h.runtime.account = { address: "0x2222222222222222222222222222222222222222" as const };
     h.appConfig.host = "127.0.0.1";
@@ -196,6 +250,18 @@ describe("revisioned API lifecycle", () => {
     h.hasUnresolvedJitCampaignWork.mockReturnValue(false);
     h.validateRpc.mockResolvedValue(undefined);
     h.getChainId.mockResolvedValue(1);
+    h.resolveBuilderIncentive.mockResolvedValue({
+      active: true,
+      payer: "0x3333333333333333333333333333333333333333",
+      bidWei: 10_000_000_000_000_000n,
+      runtimeCodeHash: `0x${"44".repeat(32)}`,
+    });
+    h.resolveBuilderIncentiveForMode.mockResolvedValue({
+      active: true,
+      payer: "0x3333333333333333333333333333333333333333",
+      bidWei: 10_000_000_000_000_000n,
+      runtimeCodeHash: `0x${"44".repeat(32)}`,
+    });
     h.filterOwnedTokenIds.mockImplementation(async (_citizens: unknown, tokenIds: bigint[]) =>
       tokenIds.filter((tokenId) => tokenId === 7n || tokenId === 8n));
   });
@@ -207,10 +273,60 @@ describe("revisioned API lifecycle", () => {
     const response = await app.inject({ method: "POST", url: "/api/start", headers: { host: "localhost" } });
 
     expect(response.statusCode).toBe(200);
-    expect(h.recoverAuthorizedSubmissions).toHaveBeenCalledWith(account.address);
+    expect(h.recoverAuthorizedSubmissions).toHaveBeenCalledWith(
+      account.address,
+      expect.any(AbortSignal),
+    );
     expect(h.recoverAuthorizedSubmissions.mock.invocationCallOrder[0]).toBeLessThan(
       h.startEngine.mock.invocationCallOrder[0]!,
     );
+    await app.close();
+  });
+
+  it("revokes an in-flight Start recovery when Stop arrives", async () => {
+    const account = { address: "0x2222222222222222222222222222222222222222" as const };
+    h.runtime.account = account;
+    let observedSignal: AbortSignal | undefined;
+    let markRecoveryStarted!: () => void;
+    const recoveryStarted = new Promise<void>((resolve) => {
+      markRecoveryStarted = resolve;
+    });
+    h.recoverAuthorizedSubmissions.mockImplementationOnce(async (_address, signal) => {
+      observedSignal = signal;
+      markRecoveryStarted();
+      await new Promise<void>((_resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error("recovery aborted"));
+          return;
+        }
+        signal?.addEventListener(
+          "abort",
+          () => reject(new Error("recovery aborted")),
+          { once: true },
+        );
+      });
+    });
+    const app = await buildServer();
+    const startResponse = app.inject({
+      method: "POST",
+      url: "/api/start",
+      headers: { host: "localhost" },
+    });
+
+    await recoveryStarted;
+    const stopResponse = app.inject({
+      method: "POST",
+      url: "/api/stop",
+      headers: { host: "localhost" },
+    });
+
+    await vi.waitFor(() => expect(observedSignal?.aborted).toBe(true));
+    const [start, stop] = await Promise.all([startResponse, stopResponse]);
+    expect(start.statusCode).toBe(503);
+    expect(start.json().error).toContain("recovery aborted");
+    expect(stop.statusCode).toBe(200);
+    expect(h.startEngine).not.toHaveBeenCalled();
+    expect(h.runtime.running).toBe(false);
     await app.close();
   });
 
@@ -470,6 +586,167 @@ describe("revisioned API lifecycle", () => {
     expect(h.stopEngine).not.toHaveBeenCalled();
     expect(h.runtime.saveJitCampaign).not.toHaveBeenCalled();
     expect(h.runtime.jitCampaign.state).toBe("cancelled");
+    await app.close();
+  });
+
+  it("classifies every direct builder-incentive risk increase", () => {
+    const current = {
+      ...h.strategy,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    } as unknown as StrategyConfig;
+
+    expect(builderIncentiveRiskIncreases(
+      { ...current, coinbaseBidEnabled: false },
+      current,
+    )).toBe(true);
+    expect(builderIncentiveRiskIncreases(
+      current,
+      { ...current, coinbaseBidEth: "0.02" },
+    )).toBe(true);
+    expect(builderIncentiveRiskIncreases(
+      current,
+      { ...current, coinbasePayerAddress: "0x4444444444444444444444444444444444444444" },
+    )).toBe(true);
+    expect(builderIncentiveRiskIncreases(
+      current,
+      { ...current, combinedBoundaryBundle: true },
+    )).toBe(true);
+    expect(builderIncentiveRiskIncreases(
+      current,
+      { ...current, coinbaseBidEth: "0.005" },
+    )).toBe(false);
+    expect(builderIncentiveRiskIncreases(
+      current,
+      { ...current, coinbaseBidEnabled: false, combinedBoundaryBundle: true },
+    )).toBe(false);
+  });
+
+  it("requires explicit acknowledgement before enabling a builder incentive", async () => {
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/config",
+      headers: { host: "localhost" },
+      payload: {
+        expectedRevision: 0,
+        patch: {
+          coinbaseBidEnabled: true,
+          coinbaseBidEth: "0.01",
+          coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toContain("explicit acknowledgement");
+    expect(h.resolveBuilderIncentive).not.toHaveBeenCalled();
+    expect(h.runtime.saveStrategy).not.toHaveBeenCalled();
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("validates the deployed payer bytecode before persisting an acknowledged bid", async () => {
+    const app = await buildServer();
+    const patch = {
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+      combinedBoundaryBundle: true,
+    };
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/config",
+      headers: { host: "localhost" },
+      payload: { expectedRevision: 0, patch, acknowledgeCoinbaseBidRisk: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.resolveBuilderIncentive).toHaveBeenCalledWith(
+      expect.objectContaining(patch),
+      1,
+    );
+    expect(h.resolveBuilderIncentive.mock.invocationCallOrder[0]).toBeLessThan(
+      h.runtime.saveStrategy.mock.invocationCallOrder[0]!,
+    );
+    expect(h.runtime.saveStrategy).toHaveBeenCalledWith(patch, 0);
+    await app.close();
+  });
+
+  it("rejects an acknowledged bid when the payer capability is inactive", async () => {
+    h.resolveBuilderIncentive.mockResolvedValueOnce({
+      active: false,
+      reason: "CoinbasePayer runtime bytecode hash does not match the pinned artifact",
+    });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/config",
+      headers: { host: "localhost" },
+      payload: {
+        expectedRevision: 0,
+        acknowledgeCoinbaseBidRisk: true,
+        patch: {
+          coinbaseBidEnabled: true,
+          coinbaseBidEth: "0.01",
+          coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toContain("bytecode hash");
+    expect(h.runtime.saveStrategy).not.toHaveBeenCalled();
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("reports only backend-verified builder-incentive capability as active", async () => {
+    Object.assign(h.strategy, {
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+      combinedBoundaryBundle: false,
+    });
+    const app = await buildServer();
+    const notCombined = await app.inject({
+      method: "GET",
+      url: "/api/builder-incentive",
+      headers: { host: "localhost" },
+    });
+    expect(notCombined.json()).toEqual({
+      active: false,
+      reason: "Combined boundary bundles are disabled",
+    });
+    expect(h.resolveBuilderIncentive).not.toHaveBeenCalled();
+
+    h.strategy.combinedBoundaryBundle = true;
+    const active = await app.inject({
+      method: "GET",
+      url: "/api/builder-incentive",
+      headers: { host: "localhost" },
+    });
+
+    expect(active.statusCode).toBe(200);
+    expect(active.json()).toEqual({
+      active: true,
+      payer: "0x3333333333333333333333333333333333333333",
+      bidWei: "10000000000000000",
+      runtimeCodeHash: `0x${"44".repeat(32)}`,
+    });
+
+    h.runtime.journalHealthy = false;
+    const unhealthy = await app.inject({
+      method: "GET",
+      url: "/api/builder-incentive",
+      headers: { host: "localhost" },
+    });
+    expect(unhealthy.json()).toEqual({
+      active: false,
+      reason: "Submission journal is unhealthy",
+    });
+    expect(h.resolveBuilderIncentive).toHaveBeenCalledTimes(1);
     await app.close();
   });
 
@@ -803,7 +1080,9 @@ describe("revisioned API lifecycle", () => {
 
   it("validates a candidate RPC before stopping and swapping clients", async () => {
     h.runtime.running = true;
-    h.validateRpc.mockRejectedValueOnce(new Error("wrong chain"));
+    h.validateRpc.mockRejectedValueOnce(new Error(
+      "wrong chain for invalid-key-value at https://tenant-secret.rpc.example/v2/invalid-key-value",
+    ));
     const previous = {
       httpUrl: h.appConfig.httpUrl,
       wsUrl: h.appConfig.wsUrl,
@@ -816,6 +1095,10 @@ describe("revisioned API lifecycle", () => {
       payload: { alchemyApiKey: "invalid-key-value" },
     });
     expect(failed.statusCode).toBe(400);
+    expect(failed.body).toContain("REDACTED_CANDIDATE_KEY");
+    expect(failed.body).toContain("REDACTED_RPC_ENDPOINT");
+    expect(failed.body).not.toContain("invalid-key-value");
+    expect(failed.body).not.toContain("tenant-secret");
     expect(h.stopEngine).not.toHaveBeenCalled();
     expect(h.saveSettings).not.toHaveBeenCalled();
     expect(h.reinitClients).not.toHaveBeenCalled();
@@ -876,6 +1159,158 @@ describe("revisioned API lifecycle", () => {
     expect(h.runtime.lock).toHaveBeenCalledOnce();
     expect(h.startEngine).not.toHaveBeenCalled();
     expect(h.runtime.unlocked).toBe(false);
+    await app.close();
+  });
+
+  it("requires explicit risk acknowledgement before public-to-mainnet can reactivate a persisted bid", async () => {
+    h.appConfig.mode = "public";
+    h.runtime.strategy = {
+      ...h.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    };
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { mode: "mainnet" },
+    });
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toContain("explicit acknowledgement");
+    expect(h.getChainId).not.toHaveBeenCalled();
+    expect(h.resolveBuilderIncentiveForMode).not.toHaveBeenCalled();
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.saveSettings).not.toHaveBeenCalled();
+    expect(h.appConfig.mode).toBe("public");
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("keeps an environment-owned submission mode immutable even with risk acknowledgement", async () => {
+    h.appConfig.mode = "public";
+    h.appConfig.modeConfiguredByEnvironment = true;
+    h.runtime.strategy = {
+      ...h.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    };
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { mode: "mainnet", acknowledgeCoinbaseBidRisk: true },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain("fixed by the MODE environment variable");
+    expect(h.getChainId).not.toHaveBeenCalled();
+    expect(h.resolveBuilderIncentiveForMode).not.toHaveBeenCalled();
+    expect(h.saveSettings).not.toHaveBeenCalled();
+    expect(h.appConfig.mode).toBe("public");
+    await app.close();
+  });
+
+  it("validates the candidate mainnet chain and payer before saving, then emits the authoritative mode", async () => {
+    h.appConfig.mode = "public";
+    h.runtime.strategy = {
+      ...h.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    };
+    h.runtime.running = true;
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { mode: "mainnet", acknowledgeCoinbaseBidRisk: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.resolveBuilderIncentiveForMode).toHaveBeenCalledWith(
+      h.runtime.strategy,
+      1,
+      "mainnet",
+      h.publicClient,
+    );
+    expect(h.resolveBuilderIncentiveForMode.mock.invocationCallOrder[0]).toBeLessThan(
+      h.stopEngine.mock.invocationCallOrder[0]!,
+    );
+    expect(h.resolveBuilderIncentiveForMode.mock.invocationCallOrder[0]).toBeLessThan(
+      h.saveSettings.mock.invocationCallOrder[0]!,
+    );
+    expect(h.appConfig.mode).toBe("mainnet");
+    expect(h.runtime.chainId).toBe(1);
+    expect(h.runtime.emitStatus).toHaveBeenCalledOnce();
+    expect(h.startEngine).toHaveBeenCalledOnce();
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("rejects a public-to-mainnet transition when the pinned payer check fails", async () => {
+    h.appConfig.mode = "public";
+    h.runtime.strategy = {
+      ...h.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    };
+    h.runtime.running = true;
+    h.resolveBuilderIncentiveForMode.mockResolvedValueOnce({
+      active: false,
+      reason: "CoinbasePayer bytecode does not match the approved stateless runtime",
+    });
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: { mode: "mainnet", acknowledgeCoinbaseBidRisk: true },
+    });
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toContain("does not match");
+    expect(h.stopEngine).not.toHaveBeenCalled();
+    expect(h.saveSettings).not.toHaveBeenCalled();
+    expect(h.appConfig.mode).toBe("public");
+    expect(h.runtime.running).toBe(true);
+    await app.close();
+  });
+
+  it("checks a reactivating payer against a replacement RPC candidate rather than the old client", async () => {
+    h.appConfig.mode = "public";
+    h.runtime.strategy = {
+      ...h.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.01",
+      coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+    };
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/settings", headers: { host: "localhost" },
+      payload: {
+        alchemyApiKey: "replacement-key-value",
+        mode: "mainnet",
+        acknowledgeCoinbaseBidRisk: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.validateRpc).toHaveBeenCalledOnce();
+    const candidateClient = h.resolveBuilderIncentiveForMode.mock.calls[0]![3];
+    expect(candidateClient).not.toBe(h.publicClient);
+    expect(candidateClient).toEqual(expect.objectContaining({ getBytecode: expect.any(Function) }));
+    expect(h.resolveBuilderIncentiveForMode).toHaveBeenCalledWith(
+      h.runtime.strategy,
+      1,
+      "mainnet",
+      candidateClient,
+    );
+    expect(h.getChainId).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -966,6 +1401,25 @@ describe("revisioned API lifecycle", () => {
     expect(response.json().error).toContain("RPC HTTP URL is not configured");
     expect(h.recoverAuthorizedSubmissions).not.toHaveBeenCalled();
     expect(h.startEngine).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("redacts provider endpoints and serialized transactions from HTTP errors", async () => {
+    const raw = `0X${"AB".repeat(100)}`;
+    h.getChainId.mockRejectedValueOnce(new Error(
+      `request failed URL: https://tenant-secret.rpc.example/v2/operator-key body=${raw}`,
+    ));
+    const app = await buildServer();
+    const response = await app.inject({
+      method: "POST", url: "/api/start", headers: { host: "localhost" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toContain("[REDACTED_RPC_ENDPOINT]");
+    expect(response.body).toContain("[REDACTED_SERIALIZED_TRANSACTION]");
+    expect(response.body).not.toContain("tenant-secret");
+    expect(response.body).not.toContain("operator-key");
+    expect(response.body).not.toContain(raw);
     await app.close();
   });
 

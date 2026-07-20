@@ -5,6 +5,14 @@ import { writeFileAtomicDurableSync } from "./durability.js";
 
 export type JournalDeliveryState = "prepared" | "accepted" | "rejected" | "ambiguous" | "expired";
 
+export type SubmissionPurpose = "builder-incentive";
+export type PrivateCohortRole = "mandatory" | "allowed-revert" | "builder-incentive";
+
+export interface PrivateCohortMetadata {
+  id: string;
+  role: PrivateCohortRole;
+}
+
 export interface JournalDeliveryAttempt {
   channel: "public" | "private";
   endpoint: string;
@@ -20,6 +28,12 @@ export interface JournalFlight {
   nonce: number;
   rawSignedTx: Hex;
   txHash: Hex;
+  /** A private-only semantic that must never be independently replayed through
+   * the public recovery path. */
+  purpose?: SubmissionPurpose;
+  /** Atomic private-delivery membership. Roles are persisted so restart
+   * inspection cannot reinterpret an optional suffix as an ordinary flight. */
+  privateCohort?: PrivateCohortMetadata;
   obligation: {
     to: Address;
     data: Hex;
@@ -121,6 +135,29 @@ function isDecimal(value: unknown): value is string {
   return typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value);
 }
 
+function isPrivateCohort(value: unknown): value is PrivateCohortMetadata {
+  if (!value || typeof value !== "object") return false;
+  const cohort = value as Partial<PrivateCohortMetadata>;
+  return typeof cohort.id === "string"
+    && cohort.id.trim().length > 0
+    && cohort.id.length <= 256
+    && (cohort.role === "mandatory"
+      || cohort.role === "allowed-revert"
+      || cohort.role === "builder-incentive");
+}
+
+function privateMetadataIsValid(flight: Partial<JournalFlight>): boolean {
+  if (flight.purpose !== undefined && flight.purpose !== "builder-incentive") return false;
+  if (flight.privateCohort !== undefined && !isPrivateCohort(flight.privateCohort)) return false;
+  const builderPurpose = flight.purpose === "builder-incentive";
+  const builderRole = flight.privateCohort?.role === "builder-incentive";
+  if (builderPurpose !== builderRole) return false;
+  // Builder incentives are private-only by construction. Persisting public
+  // authorization here would make restart recovery capable of paying an EOA or
+  // stale payer outside the protected bundle.
+  return !builderPurpose || flight.recovery?.publicAuthorized === false;
+}
+
 function isJournalFlight(value: unknown): value is JournalFlight {
   if (!value || typeof value !== "object") return false;
   const flight = value as Partial<JournalFlight>;
@@ -131,6 +168,7 @@ function isJournalFlight(value: unknown): value is JournalFlight {
     && (flight.nonce ?? -1) >= 0
     && isHex(flight.rawSignedTx)
     && isHex(flight.txHash, 32)
+    && privateMetadataIsValid(flight)
     && Boolean(obligation)
     && isHex(obligation?.to, 20)
     && isHex(obligation?.data)
@@ -212,6 +250,15 @@ function signedTransactionMatches(flight: JournalFlight, chainId: number): boole
 }
 
 function mergeSameHashFlight(existing: JournalFlight, incoming: JournalFlight): JournalFlight {
+  const existingCohort = existing.privateCohort;
+  const incomingCohort = incoming.privateCohort;
+  if (
+    existing.purpose !== incoming.purpose
+    || existingCohort?.id !== incomingCohort?.id
+    || existingCohort?.role !== incomingCohort?.role
+  ) {
+    throw new Error(`submission journal metadata conflict for ${incoming.txHash}`);
+  }
   const attempts = [...existing.attempts];
   const seen = new Set(attempts.map((attempt) => JSON.stringify(attempt)));
   for (const attempt of incoming.attempts) {
@@ -445,6 +492,9 @@ export class SubmissionFlightJournal {
     const chainId = this.chainId();
     if (additions.some((flight) => flight.wallet.toLowerCase() !== wallet.toLowerCase())) {
       throw new Error("submission journal batch contains another wallet");
+    }
+    if (additions.some((flight) => !isJournalFlight(flight))) {
+      throw new Error("submission journal batch contains invalid private-delivery metadata");
     }
     if (additions.some((flight) => !signedTransactionMatches(flight, chainId))) {
       throw new Error(`submission journal batch contains a transaction outside chain ${chainId}`);

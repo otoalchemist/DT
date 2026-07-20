@@ -34,6 +34,15 @@ export type BackendCompatibility =
   | { compatible: true; backendVersion: string; status: BotStatus }
   | { compatible: false; backendVersion: string | null; reason: string };
 
+export type BuilderIncentiveCapability =
+  | {
+      active: true;
+      payer: string;
+      bidWei: string;
+      runtimeCodeHash: string;
+    }
+  | { active: false; reason: string };
+
 /**
  * `/api/status` is the bootstrap compatibility envelope. Keep this check small
  * and independent from strategy/settings parsing so a stale dashboard never
@@ -61,6 +70,7 @@ export function inspectBackendCompatibility(payload: unknown): BackendCompatibil
   }
 
   const schemaCompatible = typeof status.unlocked === "boolean"
+    && (status.mode === "mainnet" || status.mode === "public" || status.mode === "local")
     && typeof status.jitEnabled === "boolean"
     && typeof status.jitRevision === "number"
     && Array.isArray(status.jitTokenIds)
@@ -104,11 +114,20 @@ export const api = {
     req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase }) }),
   lock: () => req<{ ok: boolean }>("/api/lock", { method: "POST" }),
   getConfig: () => req<StrategySnapshot>("/api/config"),
-  setConfig: (expectedRevision: number, patch: Partial<StrategyConfig>) =>
+  setConfig: (
+    expectedRevision: number,
+    patch: Partial<StrategyConfig>,
+    acknowledgeCoinbaseBidRisk = false,
+  ) =>
     req<StrategySnapshot>("/api/config", {
       method: "PATCH",
-      body: JSON.stringify({ expectedRevision, patch }),
+      body: JSON.stringify({
+        expectedRevision,
+        patch,
+        ...(acknowledgeCoinbaseBidRisk ? { acknowledgeCoinbaseBidRisk: true } : {}),
+      }),
     }),
+  builderIncentive: () => req<BuilderIncentiveCapability>("/api/builder-incentive"),
   start: () => req<BotStatus>("/api/start", { method: "POST" }),
   stop: () => req<BotStatus>("/api/stop", { method: "POST" }),
   jit: (body: { enable: boolean; expectedRevision: number; targetEpoch?: number; tokenIds?: string[] }) =>
@@ -119,8 +138,14 @@ export const api = {
   getSettings: () => req<AppSettingsStatus>("/api/settings"),
   saveAlchemyKey: (alchemyApiKey: string) =>
     req<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify({ alchemyApiKey }) }),
-  saveMode: (mode: "mainnet" | "public") =>
-    req<{ ok: boolean; mode: string }>("/api/settings", { method: "POST", body: JSON.stringify({ mode }) }),
+  saveMode: (mode: "mainnet" | "public", acknowledgeCoinbaseBidRisk = false) =>
+    req<{ ok: boolean; mode: "mainnet" | "public" | "local" }>("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        mode,
+        ...(acknowledgeCoinbaseBidRisk ? { acknowledgeCoinbaseBidRisk: true } : {}),
+      }),
+    }),
   postMortem: (ours: string[], rivals: string[]) =>
     req<PostMortemResult>("/api/postmortem", { method: "POST", body: JSON.stringify({ ours, rivals }) }),
 };

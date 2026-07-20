@@ -1,3 +1,5 @@
+import { redactLogArgument } from "./redaction.js";
+
 // Tiny leveled logger. Avoids a dependency; timestamps + level prefix.
 type Level = "debug" | "info" | "warn" | "error";
 
@@ -9,7 +11,10 @@ function log(level: Level, ...args: unknown[]): void {
   const ts = new Date().toISOString();
   const line = `[${ts}] ${level.toUpperCase()}`;
   // eslint-disable-next-line no-console
-  (level === "error" ? console.error : console.log)(line, ...args);
+  (level === "error" ? console.error : console.log)(
+    line,
+    ...args.map(redactLogArgument),
+  );
 }
 
 export const logger = {

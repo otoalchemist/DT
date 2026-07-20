@@ -2,7 +2,9 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import websocket from "@fastify/websocket";
 import { z } from "zod";
 import type { StrategyConfig } from "@dat-bot/shared";
+import { createPublicClient, http, parseEther } from "viem";
 import { generatePrivateKey } from "viem/accounts";
+import { mainnet } from "viem/chains";
 import {
   appConfig,
   API_LOOPBACK_HOSTS,
@@ -12,7 +14,16 @@ import {
   validateMainnetRpcCandidate,
 } from "./config.js";
 import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
-import { RevisionConflictError, runtime, strategyPatchSchema } from "./runtime.js";
+import {
+  RevisionConflictError,
+  runtime,
+  strategyConfigSchema,
+  strategyPatchSchema,
+} from "./runtime.js";
+import {
+  resolveBuilderIncentive,
+  resolveBuilderIncentiveForMode,
+} from "./builder-incentive.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
 import { AtomicWriteCommittedError } from "./durability.js";
@@ -40,15 +51,28 @@ import {
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { filterOwnedTokenIds } from "./index-tokens.js";
 import { runPostMortem } from "./postmortem.js";
+import { redactSensitiveText } from "./redaction.js";
 
 const strategyMutationSchema = z.object({
   expectedRevision: z.number().int().min(0),
   patch: strategyPatchSchema.refine((patch) => Object.keys(patch).length > 0, "patch must not be empty"),
+  acknowledgeCoinbaseBidRisk: z.literal(true).optional(),
 }).strict();
 
 function revisionConflict(reply: FastifyReply, err: unknown) {
   if (!(err instanceof RevisionConflictError)) throw err;
   return reply.code(409).send({ error: err.message, currentRevision: err.currentRevision });
+}
+
+export function builderIncentiveRiskIncreases(
+  current: StrategyConfig,
+  candidate: StrategyConfig,
+): boolean {
+  if (!current.coinbaseBidEnabled && candidate.coinbaseBidEnabled) return true;
+  if (!candidate.coinbaseBidEnabled) return false;
+  if (parseEther(candidate.coinbaseBidEth) > parseEther(current.coinbaseBidEth)) return true;
+  if (candidate.coinbasePayerAddress !== current.coinbasePayerAddress) return true;
+  return !current.combinedBoundaryBundle && candidate.combinedBoundaryBundle;
 }
 
 /** Extract the hostname from a Host header, dropping the port (handles [::1]). */
@@ -103,6 +127,11 @@ function effectiveUrlsForKey(key: string) {
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(websocket);
+  // Error payloads are often sourced from viem/fetch diagnostics, which may
+  // embed a provider API key in the RPC URL. Apply the same final redaction used
+  // by logs and activity before any HTTP response leaves the loopback API.
+  app.addHook("onSend", async (_req, _reply, payload) =>
+    typeof payload === "string" ? redactSensitiveText(payload) : payload);
   // Serialize lifecycle mutations so a later Stop/Lock cannot race an earlier
   // Settings/Unlock continuation that was waiting for the same old tick.
   let lifecycleTail: Promise<void> = Promise.resolve();
@@ -110,6 +139,34 @@ export async function buildServer(): Promise<FastifyInstance> {
     const run = lifecycleTail.then(operation, operation);
     lifecycleTail = run.then(() => undefined, () => undefined);
     return run;
+  };
+  // Start/JIT recovery is allowed to replay already-signed WAL entries. A Stop
+  // or Lock therefore revokes authority immediately, even while the lifecycle
+  // queue is waiting on authorization, balance, or simulation RPCs.
+  let executionAuthorityGeneration = 0;
+  const activeRecoveryControllers = new Set<AbortController>();
+  const revokeExecutionAuthority = (): void => {
+    executionAuthorityGeneration += 1;
+    for (const controller of activeRecoveryControllers) controller.abort();
+  };
+  const recoverWithExecutionAuthority = async (
+    address: `0x${string}`,
+    generation: number,
+  ): Promise<void> => {
+    if (generation !== executionAuthorityGeneration) {
+      throw new Error("submission recovery cancelled by a later Stop or Lock");
+    }
+    const controller = new AbortController();
+    activeRecoveryControllers.add(controller);
+    if (generation !== executionAuthorityGeneration) controller.abort();
+    try {
+      await recoverAuthorizedSubmissions(address, controller.signal);
+      if (controller.signal.aborted || generation !== executionAuthorityGeneration) {
+        throw new Error("submission recovery cancelled by a later Stop or Lock");
+      }
+    } finally {
+      activeRecoveryControllers.delete(controller);
+    }
   };
 
   // Defense in depth for the loopback-only listener: a hostile web page can
@@ -139,6 +196,35 @@ export async function buildServer(): Promise<FastifyInstance> {
   // --- status & config ---
   app.get("/api/status", async () => runtime.status());
   app.get("/api/config", async () => runtime.strategySnapshot());
+  app.get("/api/builder-incentive", async () => {
+    const status = runtime.status();
+    if (!status.journalHealthy) {
+      return { active: false as const, reason: "Submission journal is unhealthy" };
+    }
+    if (!runtime.strategy.combinedBoundaryBundle) {
+      return { active: false as const, reason: "Combined boundary bundles are disabled" };
+    }
+    let chainId = runtime.chainId;
+    if (runtime.strategy.coinbaseBidEnabled && chainId === null) {
+      try {
+        chainId = await getChainId();
+      } catch (error) {
+        return {
+          active: false as const,
+          reason: `Could not verify Ethereum chain ID: ${(error as Error).message}`,
+        };
+      }
+    }
+    const resolution = await resolveBuilderIncentive(runtime.strategy, chainId);
+    return resolution.active
+      ? {
+          active: true as const,
+          payer: resolution.payer,
+          bidWei: resolution.bidWei.toString(),
+          runtimeCodeHash: resolution.runtimeCodeHash,
+        }
+      : resolution;
+  });
 
   const mutateStrategy = async (req: FastifyRequest, reply: FastifyReply) => runLifecycle(async () => {
     const parsed = strategyMutationSchema.safeParse(req.body);
@@ -148,6 +234,33 @@ export async function buildServer(): Promise<FastifyInstance> {
         error: `Revision conflict; current revision is ${runtime.strategyRevision}`,
         currentRevision: runtime.strategyRevision,
       });
+    }
+    const candidate = strategyConfigSchema.safeParse({
+      ...runtime.strategy,
+      ...parsed.data.patch,
+    });
+    if (!candidate.success) return reply.code(400).send({ error: candidate.error.message });
+    if (
+      builderIncentiveRiskIncreases(runtime.strategy, candidate.data)
+      && parsed.data.acknowledgeCoinbaseBidRisk !== true
+    ) {
+      return reply.code(422).send({
+        error: "This change increases direct builder-incentive risk; explicit acknowledgement is required",
+      });
+    }
+    if (candidate.data.coinbaseBidEnabled) {
+      let chainId = runtime.chainId;
+      try {
+        chainId ??= await getChainId();
+      } catch (error) {
+        return reply.code(503).send({
+          error: `Could not validate the CoinbasePayer chain: ${(error as Error).message}`,
+        });
+      }
+      const resolution = await resolveBuilderIncentive(candidate.data, chainId);
+      if (!resolution.active) {
+        return reply.code(422).send({ error: resolution.reason });
+      }
     }
     const wasRunning = runtime.running;
     if (wasRunning) stopEngine();
@@ -322,6 +435,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     // waiting behind a slow settings/unlock validation already in lifecycleTail.
     // Repeat the stop inside the queue as well so an older operation cannot
     // restart the engine in its finally block after this request arrived.
+    revokeExecutionAuthority();
     stopEngine();
     return runLifecycle(async () => {
       stopEngine();
@@ -332,7 +446,9 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   // --- engine control ---
-  app.post("/api/start", async (_req, reply) => runLifecycle(async () => {
+  app.post("/api/start", async (_req, reply) => {
+    const executionAuthority = executionAuthorityGeneration;
+    return runLifecycle(async () => {
     if (!runtime.unlocked) return reply.code(400).send({ error: "Unlock the wallet first" });
     if (!runtime.running) {
       // An auto-stopping JIT tick can set running=false before its journal/nonce
@@ -356,7 +472,7 @@ export async function buildServer(): Promise<FastifyInstance> {
         });
       }
       try {
-        await recoverAuthorizedSubmissions(runtime.account!.address);
+        await recoverWithExecutionAuthority(runtime.account!.address, executionAuthority);
       } catch (err) {
         return reply.code(503).send({
           error: `Cannot start engine: ${(err as Error).message}`,
@@ -366,11 +482,13 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
     startEngine();
     return runtime.status();
-  }));
+    });
+  });
 
   app.post("/api/stop", async () => {
     // Fail-safe immediately even when another lifecycle request is doing remote
     // validation. The queued stop closes the race with an older finally/restart.
+    revokeExecutionAuthority();
     stopEngine();
     return runLifecycle(async () => {
       stopEngine();
@@ -380,7 +498,9 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   // --- just-in-time single-epoch payment ---
-  app.post("/api/jit", async (req, reply) => runLifecycle(async () => {
+  app.post("/api/jit", async (req, reply) => {
+    const executionAuthority = executionAuthorityGeneration;
+    return runLifecycle(async () => {
     const schema = z.object({
       enable: z.boolean(),
       expectedRevision: z.number().int().min(0),
@@ -469,7 +589,7 @@ export async function buildServer(): Promise<FastifyInstance> {
             });
           }
           try {
-            await recoverAuthorizedSubmissions(runtime.account!.address);
+            await recoverWithExecutionAuthority(runtime.account!.address, executionAuthority);
           } catch (err) {
             return reply.code(503).send({
               error: `Cannot arm JIT campaign: ${(err as Error).message}`,
@@ -543,7 +663,8 @@ export async function buildServer(): Promise<FastifyInstance> {
       schedulePreBoundaryPay();
     }
     return runtime.status();
-  }));
+    });
+  });
 
   // --- Alchemy / RPC settings ---
   app.get("/api/settings", async () => {
@@ -566,12 +687,13 @@ export async function buildServer(): Promise<FastifyInstance> {
     const schema = z.object({
       alchemyApiKey: z.string().trim().min(10).optional(),
       mode: z.enum(["mainnet", "public"]).optional(),
-    }).refine((d) => d.alchemyApiKey !== undefined || d.mode !== undefined, {
+      acknowledgeCoinbaseBidRisk: z.literal(true).optional(),
+    }).strict().refine((d) => d.alchemyApiKey !== undefined || d.mode !== undefined, {
       message: "Provide at least one of: alchemyApiKey, mode",
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    const { alchemyApiKey, mode } = parsed.data;
+    const { alchemyApiKey, mode, acknowledgeCoinbaseBidRisk } = parsed.data;
     if (alchemyApiKey && (appConfig.keyConfiguredByEnvironment ?? false)) {
       return reply.code(400).send({
         error: "The Alchemy key is fixed by the ALCHEMY_API_KEY environment variable; edit it and restart",
@@ -585,6 +707,15 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (mode && (appConfig.modeConfiguredByEnvironment ?? false)) {
       return reply.code(400).send({
         error: "Submission mode is fixed by the MODE environment variable; edit it and restart",
+      });
+    }
+    const reactivatesBuilderIncentive = appConfig.mode === "public"
+      && mode === "mainnet"
+      && runtime.strategy.coinbaseBidEnabled
+      && runtime.strategy.combinedBoundaryBundle;
+    if (reactivatesBuilderIncentive && acknowledgeCoinbaseBidRisk !== true) {
+      return reply.code(422).send({
+        error: "Switching from public to mainnet can reactivate the persisted direct builder incentive; explicit acknowledgement is required",
       });
     }
     const candidateUrls = alchemyApiKey ? effectiveUrlsForKey(alchemyApiKey) : null;
@@ -601,23 +732,48 @@ export async function buildServer(): Promise<FastifyInstance> {
           gameAddress: appConfig.gameAddress,
         });
       } catch (err) {
-        return reply.code(400).send({ error: `Alchemy RPC validation failed: ${(err as Error).message}` });
+        // The candidate is not installed in process.env yet, so the global
+        // redactor cannot recognize it if a provider echoes the bare key.
+        const safeMessage = redactSensitiveText((err as Error).message)
+          .split(alchemyApiKey!)
+          .join("[REDACTED_CANDIDATE_KEY]");
+        return reply.code(400).send({ error: `Alchemy RPC validation failed: ${safeMessage}` });
       }
     }
     // Reject a semantically incompatible mode before persisting it. This keeps a
     // failed local/public transition from being applied behind stale dashboard
-    // state. A key-bearing candidate was already chain-validated above.
-    if (mode && !candidateUrls) {
-      let chainId: number;
-      try {
-        chainId = await getChainId();
-      } catch (err) {
-        return reply.code(400).send({
-          error: `Cannot switch mode because chain ID could not be verified: ${(err as Error).message}`,
+    // state. A key-bearing candidate was already validated as chain 1 above.
+    let validatedModeChainId: number | null = null;
+    if (mode) {
+      if (candidateUrls) {
+        validatedModeChainId = 1;
+      } else {
+        try {
+          validatedModeChainId = await getChainId();
+        } catch (err) {
+          return reply.code(400).send({
+            error: `Cannot switch mode because chain ID could not be verified: ${(err as Error).message}`,
+          });
+        }
+      }
+      const modeError = chainModeError(mode, validatedModeChainId);
+      if (modeError) return reply.code(400).send({ error: `Cannot switch mode: ${modeError}` });
+    }
+    if (reactivatesBuilderIncentive) {
+      const candidateClient = candidateUrls
+        ? createPublicClient({ chain: mainnet, transport: http(candidateUrls.httpUrl) })
+        : publicClient;
+      const resolution = await resolveBuilderIncentiveForMode(
+        runtime.strategy,
+        validatedModeChainId,
+        "mainnet",
+        candidateClient,
+      );
+      if (!resolution.active) {
+        return reply.code(422).send({
+          error: `Cannot switch to mainnet while the persisted direct builder incentive could reactivate: ${resolution.reason}`,
         });
       }
-      const modeError = chainModeError(mode, chainId);
-      if (modeError) return reply.code(400).send({ error: `Cannot switch mode: ${modeError}` });
     }
     const wasRunning = runtime.running;
     if (wasRunning) {
@@ -650,6 +806,8 @@ export async function buildServer(): Promise<FastifyInstance> {
 
       if (mode) {
         appConfig.mode = mode;
+        runtime.chainId = validatedModeChainId;
+        runtime.emitStatus();
         logger.info(`Submission mode switched to: ${mode}`);
       }
 
@@ -737,7 +895,9 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/ws", { websocket: true }, (socket) => {
     const send = (type: string, data: unknown) => {
       try {
-        socket.send(JSON.stringify({ type, data }));
+        // WebSocket frames bypass Fastify's onSend hook. Sanitize the final
+        // serialized frame as a defense-in-depth boundary as well.
+        socket.send(redactSensitiveText(JSON.stringify({ type, data })));
       } catch {
         /* ignore */
       }

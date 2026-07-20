@@ -1,1 +1,6 @@
 * text=auto eol=lf
+
+# Stamp the release version into the VERSION file when GitHub (or `git archive`)
+# builds a download ZIP/tarball, so an extracted archive is identifiable even when
+# the filename isn't (e.g. the branch "Download ZIP" button gives DT-master.zip).
+VERSION export-subst

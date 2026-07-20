@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
 import { ApiError, api } from "./api.js";
 import { Config } from "./Config.js";
@@ -58,12 +58,20 @@ const config: StrategyConfig = {
   offenseDynamicTipEnabled: true,
   offenseDynamicTipMaxGwei: 20.1,
   offenseReplacementPriorityFeeCapGwei: 20.1,
-  offenseBoundaryScheduling: false,
   racePublicMempool: true,
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,
+  combinedBoundaryBundle: false,
+  coinbaseBidEnabled: false,
+  coinbaseBidEth: "0",
+  coinbasePayerAddress: "",
   maxPaymentEth: 0,
 };
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("Config revision conflicts", () => {
   beforeEach(() => {
@@ -102,5 +110,90 @@ describe("Config revision conflicts", () => {
     expect(await screen.findByText(/Configuration changed elsewhere/)).toBeTruthy();
     expect(defense.checked).toBe(false);
     expect(onChange).toHaveBeenCalledWith(authoritative);
+  });
+
+  it("warns, confirms, and acknowledges a public-to-mainnet bid reactivation", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({
+      alchemyKeySet: true,
+      rpcConfigured: true,
+      ownershipConfigured: true,
+      setupReady: true,
+      mode: "public",
+      modeConfiguredByEnvironment: false,
+      keyConfiguredByEnvironment: false,
+    });
+    vi.mocked(api.saveMode).mockResolvedValue({ ok: true, mode: "mainnet" });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const initial: StrategySnapshot = {
+      revision: 1,
+      config: {
+        ...config,
+        combinedBoundaryBundle: true,
+        coinbaseBidEnabled: true,
+        coinbaseBidEth: "0.01",
+        coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+      },
+    };
+
+    const onSettingsChange = vi.fn();
+
+    render(<Config initial={initial} onChange={vi.fn()} onSettingsChange={onSettingsChange} />);
+    expect(await screen.findByText(/Switching to mainnet can reactivate/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "mainnet" }));
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("non-refundable payment"));
+    await waitFor(() => expect(api.saveMode).toHaveBeenCalledWith("mainnet", true));
+    expect(await screen.findByText("Mode switched to mainnet.")).toBeTruthy();
+    expect(onSettingsChange).toHaveBeenCalledOnce();
+  });
+
+  it("announces a successful RPC replacement so capability state is refreshed", async () => {
+    vi.mocked(api.saveAlchemyKey).mockResolvedValue({ ok: true });
+    const onSettingsChange = vi.fn();
+
+    render(
+      <Config
+        initial={{ revision: 1, config }}
+        onChange={vi.fn()}
+        onSettingsChange={onSettingsChange}
+      />,
+    );
+    await screen.findByText("Submission mode");
+    fireEvent.change(screen.getByLabelText("Update Alchemy API key"), {
+      target: { value: "replacement-key-value" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update key" }));
+
+    await waitFor(() => expect(api.saveAlchemyKey).toHaveBeenCalledWith("replacement-key-value"));
+    expect(onSettingsChange).toHaveBeenCalledOnce();
+  });
+
+  it("does not request a reactivating mode switch when the operator declines", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({
+      alchemyKeySet: true,
+      rpcConfigured: true,
+      ownershipConfigured: true,
+      setupReady: true,
+      mode: "public",
+      modeConfiguredByEnvironment: false,
+      keyConfiguredByEnvironment: false,
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const initial: StrategySnapshot = {
+      revision: 1,
+      config: {
+        ...config,
+        combinedBoundaryBundle: true,
+        coinbaseBidEnabled: true,
+        coinbaseBidEth: "0.01",
+        coinbasePayerAddress: "0x3333333333333333333333333333333333333333",
+      },
+    };
+
+    render(<Config initial={initial} onChange={vi.fn()} />);
+    await screen.findByText(/Switching to mainnet can reactivate/);
+    fireEvent.click(screen.getByRole("button", { name: "mainnet" }));
+
+    expect(api.saveMode).not.toHaveBeenCalled();
   });
 });

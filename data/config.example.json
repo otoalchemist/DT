@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "strategy": {
     "revision": 0,
     "config": {
@@ -15,7 +15,7 @@
       "preBoundaryLeadMainnetMs": 5000,
       "offenseEnabled": false,
       "autoAudit": true,
-      "autoKill": true,
+      "autoKill": false,
       "endgameOnlyWithin": null,
       "offenseTargetTokenIds": [
         "206",
@@ -69,6 +69,7 @@
       ],
       "preBoundaryAudit": false,
       "preBoundaryKill": false,
+      "combinedBoundaryBundle": false,
       "maxBaseFeeGwei": 69.1,
       "priorityFeeGwei": 15.1,
       "minBalanceEth": 0.01,
@@ -79,10 +80,12 @@
       "offenseDynamicTipEnabled": true,
       "offenseDynamicTipMaxGwei": 20.1,
       "offenseReplacementPriorityFeeCapGwei": 20.1,
-      "offenseBoundaryScheduling": false,
       "racePublicMempool": true,
       "dynamicTipEnabled": true,
       "dynamicTipMaxGwei": 50.1,
+      "coinbaseBidEnabled": false,
+      "coinbaseBidEth": "0",
+      "coinbasePayerAddress": "",
       "maxPaymentEth": 0
     }
   },

@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import type { ActivityEntry } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { redactSensitiveText, sanitizeActivityEntry } from "./redaction.js";
+import { writeFileAtomicDurableSync } from "./durability.js";
 
 // Append-only activity log with an in-memory ring buffer, periodically flushed
 // to a JSON file. Avoids a native DB dependency. Emits to subscribers (WS).
@@ -28,7 +30,15 @@ class ActivityLog {
   private load(): void {
     try {
       if (fs.existsSync(this.file)) {
-        this.entries = JSON.parse(fs.readFileSync(this.file, "utf8"));
+        const parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as unknown;
+        if (!Array.isArray(parsed)) throw new Error("activity log root must be an array");
+        this.entries = parsed.slice(-MAX_ENTRIES).flatMap((value) => {
+          const entry = sanitizeActivityEntry(value);
+          return entry === null ? [] : [entry];
+        });
+        // Rewrite legacy content through redaction and restrictive permissions,
+        // even if no new activity arrives during this process lifetime.
+        this.dirty = true;
       }
     } catch (err) {
       logger.warn("Could not load activity log:", (err as Error).message);
@@ -38,8 +48,10 @@ class ActivityLog {
   private flush(): void {
     if (!this.dirty) return;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify(this.entries.slice(-MAX_ENTRIES)));
+      writeFileAtomicDurableSync(
+        this.file,
+        JSON.stringify(this.entries.slice(-MAX_ENTRIES)),
+      );
       this.dirty = false;
     } catch (err) {
       logger.warn("Could not flush activity log:", (err as Error).message);
@@ -47,7 +59,12 @@ class ActivityLog {
   }
 
   add(entry: Omit<ActivityEntry, "id" | "ts">): ActivityEntry {
-    const full: ActivityEntry = { id: randomUUID(), ts: Date.now(), ...entry };
+    const full: ActivityEntry = {
+      id: randomUUID(),
+      ts: Date.now(),
+      ...entry,
+      message: redactSensitiveText(entry.message),
+    };
     this.entries.push(full);
     if (this.entries.length > MAX_ENTRIES) {
       this.entries.splice(0, this.entries.length - MAX_ENTRIES);
@@ -61,7 +78,7 @@ class ActivityLog {
       }
     }
     const label = `${entry.kind}/${entry.status}`;
-    logger.info(`activity ${label}: ${entry.message}`);
+    logger.info(`activity ${label}: ${full.message}`);
     return full;
   }
 
@@ -70,7 +87,9 @@ class ActivityLog {
   update(id: string, patch: Partial<Omit<ActivityEntry, "id" | "ts">>): ActivityEntry | null {
     const entry = this.entries.find((e) => e.id === id);
     if (!entry) return null;
-    Object.assign(entry, patch);
+    Object.assign(entry, patch, patch.message === undefined
+      ? {}
+      : { message: redactSensitiveText(patch.message) });
     this.dirty = true;
     for (const l of this.listeners) {
       try {

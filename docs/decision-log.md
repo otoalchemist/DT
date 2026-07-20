@@ -44,7 +44,26 @@ Release archives are built only from a clean commit and must agree with every ma
 Treat direct `block.coinbase` payments as a separate, disabled-by-default feature,
 not a synonym for raising the ordinary gas tip. The game owner checks rule out a
 wrapper for owner-scoped calls; the viable design is a trailing transaction to a
-verified stateless payer inside the same atomic private bundle. Do not ship it
-until the extra nonce/value is cohort-journaled, balance-capped, simulation-gated,
-private-only, and covered by replacement, cancellation, recovery, and reorg tests.
+verified stateless payer inside a declared private cohort.
+
+Implement that cohort only as an optional suffix to already prepared mandatory
+boundary payments. Mandatory payments remain fail-closed in whole-bundle
+simulation and retain public fallback. Optional audits may be explicitly
+allowlisted to revert privately and retain their authorized public fallback. The
+single final bid is also revertible so it cannot invalidate a payment, but is
+strictly private, has finite target/journal lifetime, and is never independently
+replayed. Private size limits include the complete cohort or none of it.
+
+Capability verification requires both default-off switches, explicit
+acknowledgement of any risk increase, private mainnet mode on verified chain ID 1,
+a healthy journal, a positive fixed amount, and exact deployed-runtime equality
+with the reproducibly compiled, pinned `CoinbasePayer` artifact. A public-to-mainnet
+mode change that can reactivate persisted switches requires the same explicit
+acknowledgement and revalidates the candidate chain and payer before saving.
+Capability does not imply current execution: the engine must also be running and
+unlocked, Dry Run must be off, pre-boundary payment must be enabled, and a mandatory
+payment must be due. Migrations force the activation switches off even when
+they preserve a staged legacy amount/address. Automated and disposable-Anvil QA
+do not constitute live financial QA. No direct payment is represented as
+guaranteeing inclusion, block position, transaction ordering, or audit success.
 See `docs/builder-incentives.md`.

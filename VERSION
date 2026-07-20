@@ -1,0 +1,18 @@
+Death & Taxes Bot — release version
+
+This file is auto-stamped when the code is downloaded as a ZIP/tarball from GitHub
+(the "Download ZIP" button, or a tag/release archive). The placeholders below are
+replaced by `git archive` via .gitattributes `export-subst`:
+
+  Version: $Format:%(describe:tags)$
+  Commit:  $Format:%H$
+  Date:    $Format:%cI$
+
+Notes:
+  - Downloaded from a tag (e.g. v0.3.0)  -> Version reads "v0.3.0".
+  - Downloaded from the master branch    -> Version reads "v0.3.0-<n>-g<sha>"
+    (the latest release plus how many commits past it you are).
+  - In a plain `git clone` these stay as raw, unsubstituted placeholders, because
+    substitution only happens at archive time. In that case, check the "version"
+    field in package.json, the VERSION constant in
+    packages/shared/src/constants.ts, or run `git describe --tags`.

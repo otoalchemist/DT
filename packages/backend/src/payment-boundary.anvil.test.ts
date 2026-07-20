@@ -10,6 +10,7 @@ import {
   encodeFunctionData,
   http,
   keccak256,
+  parseEther,
   parseGwei,
   type Abi,
   type Address,
@@ -585,6 +586,134 @@ describe("epoch-priced payment replacement", () => {
       await strategy.waitForEngineIdle();
       runtime.lock();
       await app.close();
+    }
+  }, 30_000);
+});
+
+describe("CoinbasePayer production bytecode", () => {
+  it("reproduces the approved artifact from the pinned source and compiler settings", () => {
+    const payerManifest = JSON.parse(fs.readFileSync(
+      path.resolve(process.cwd(), "../../contracts/CoinbasePayer.build.json"),
+      "utf8",
+    )) as {
+      creationBytecode: Hex;
+      runtimeBytecode: Hex;
+      runtimeCodeHash: Hex;
+    };
+    const compiled = JSON.parse(fs.readFileSync(
+      path.resolve(
+        process.cwd(),
+        "test/foundry/out/payer-compiled/CoinbasePayer.sol/CoinbasePayer.json",
+      ),
+      "utf8",
+    )) as {
+      bytecode: { object: Hex };
+      deployedBytecode: { object: Hex };
+    };
+
+    expect(compiled.bytecode.object).toBe(payerManifest.creationBytecode);
+    expect(compiled.deployedBytecode.object).toBe(payerManifest.runtimeBytecode);
+    expect(keccak256(compiled.deployedBytecode.object)).toBe(payerManifest.runtimeCodeHash);
+  });
+
+  it("forwards exact value to EOA and contract fee recipients and reverts safely on rejection", async () => {
+    await publicClient.request({ method: "evm_setAutomine" as never, params: [true] as never });
+
+    const payerManifest = JSON.parse(fs.readFileSync(
+      path.resolve(process.cwd(), "../../contracts/CoinbasePayer.build.json"),
+      "utf8",
+    )) as {
+      creationBytecode: Hex;
+      runtimeBytecode: Hex;
+      runtimeCodeHash: Hex;
+    };
+    const fixtureDirectory = path.resolve(
+      process.cwd(),
+      "test/foundry/out/EpochPricedTaxes.sol",
+    );
+    const acceptingArtifact = JSON.parse(fs.readFileSync(
+      path.join(fixtureDirectory, "AcceptingCoinbase.json"),
+      "utf8",
+    )) as { abi: Abi; bytecode: { object: Hex } };
+    const rejectingArtifact = JSON.parse(fs.readFileSync(
+      path.join(fixtureDirectory, "RejectingCoinbase.json"),
+      "utf8",
+    )) as { abi: Abi; bytecode: { object: Hex } };
+
+    const payerDeployment = await walletClient.deployContract({
+      abi: [],
+      bytecode: payerManifest.creationBytecode,
+    });
+    const payerReceipt = await publicClient.waitForTransactionReceipt({ hash: payerDeployment });
+    const payer = payerReceipt.contractAddress!;
+    expect(keccak256((await publicClient.getBytecode({ address: payer }))!))
+      .toBe(payerManifest.runtimeCodeHash);
+    expect(await publicClient.getBytecode({ address: payer })).toBe(payerManifest.runtimeBytecode);
+
+    const acceptingDeployment = await walletClient.deployContract({
+      abi: acceptingArtifact.abi,
+      bytecode: acceptingArtifact.bytecode.object,
+    });
+    const acceptingReceipt = await publicClient.waitForTransactionReceipt({ hash: acceptingDeployment });
+    const acceptingCoinbase = acceptingReceipt.contractAddress!;
+
+    const rejectingDeployment = await walletClient.deployContract({
+      abi: rejectingArtifact.abi,
+      bytecode: rejectingArtifact.bytecode.object,
+    });
+    const rejectingReceipt = await publicClient.waitForTransactionReceipt({ hash: rejectingDeployment });
+    const rejectingCoinbase = rejectingReceipt.contractAddress!;
+
+    const eoaCoinbase = "0x000000000000000000000000000000000000beef" as Address;
+    const eoaBid = parseEther("0.001");
+    const contractBid = parseEther("0.002");
+    const rejectedBid = parseEther("0.003");
+    const sendBid = async (value: bigint) => {
+      const hash = await walletClient.sendTransaction({
+        to: payer,
+        value,
+        gas: 100_000n,
+        maxFeePerGas: parseGwei("10"),
+        maxPriorityFeePerGas: 0n,
+      });
+      return publicClient.waitForTransactionReceipt({ hash });
+    };
+
+    try {
+      await publicClient.request({
+        method: "anvil_setCoinbase" as never,
+        params: [eoaCoinbase] as never,
+      });
+      const eoaBefore = await publicClient.getBalance({ address: eoaCoinbase });
+      expect((await sendBid(eoaBid)).status).toBe("success");
+      expect(await publicClient.getBalance({ address: eoaCoinbase })).toBe(eoaBefore + eoaBid);
+
+      await publicClient.request({
+        method: "anvil_setCoinbase" as never,
+        params: [acceptingCoinbase] as never,
+      });
+      const contractBefore = await publicClient.getBalance({ address: acceptingCoinbase });
+      expect((await sendBid(contractBid)).status).toBe("success");
+      expect(await publicClient.getBalance({ address: acceptingCoinbase }))
+        .toBe(contractBefore + contractBid);
+      expect(await publicClient.readContract({
+        address: acceptingCoinbase,
+        abi: acceptingArtifact.abi,
+        functionName: "totalReceived",
+      })).toBe(contractBid);
+
+      await publicClient.request({
+        method: "anvil_setCoinbase" as never,
+        params: [rejectingCoinbase] as never,
+      });
+      expect((await sendBid(rejectedBid)).status).toBe("reverted");
+      expect(await publicClient.getBalance({ address: payer })).toBe(0n);
+      expect(await publicClient.getBalance({ address: rejectingCoinbase })).toBe(0n);
+    } finally {
+      await publicClient.request({
+        method: "anvil_setCoinbase" as never,
+        params: [account.address] as never,
+      });
     }
   }, 30_000);
 });

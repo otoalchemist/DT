@@ -16,10 +16,14 @@ function AlchemyKeySection({
   initialMode,
   modeConfiguredByEnvironment,
   keyConfiguredByEnvironment,
+  builderIncentiveMayReactivate,
+  onSettingsChange,
 }: {
   initialMode: SubmissionMode;
   modeConfiguredByEnvironment: boolean;
   keyConfiguredByEnvironment: boolean;
+  builderIncentiveMayReactivate: boolean;
+  onSettingsChange: () => void;
 }) {
   const [key, setKey] = useState("");
   const [mode, setMode] = useState<SubmissionMode>(initialMode);
@@ -40,6 +44,7 @@ function AlchemyKeySection({
       await api.saveAlchemyKey(key.trim());
       setMsg("Saved — RPC clients updated.");
       setKey("");
+      onSettingsChange();
     } catch (e) {
       try {
         setMode((await api.getSettings()).mode);
@@ -53,12 +58,23 @@ function AlchemyKeySection({
   };
 
   const switchMode = async (next: "mainnet" | "public") => {
-    setMode(next);
+    const acknowledgesRisk = mode === "public"
+      && next === "mainnet"
+      && builderIncentiveMayReactivate;
+    if (acknowledgesRisk && !window.confirm(
+      "Confirm direct builder-incentive reactivation risk\n\n"
+      + "The persisted direct-incentive and combined-cohort switches are enabled. "
+      + "Switching to mainnet will revalidate the configured CoinbasePayer and can reactivate "
+      + "a non-refundable payment of the configured bid plus gas when a mandatory boundary payment is due. "
+      + "It does not guarantee inclusion, placement, or transaction ordering.",
+    )) return;
     setBusyMode(true);
     setMsg(null);
     try {
-      await api.saveMode(next);
-      setMsg(`Mode switched to ${next}.`);
+      const saved = await api.saveMode(next, acknowledgesRisk);
+      setMode(saved.mode);
+      setMsg(`Mode switched to ${saved.mode}.`);
+      onSettingsChange();
     } catch (e) {
       setMsg(`Error: ${(e as Error).message}`);
       try {
@@ -104,6 +120,12 @@ function AlchemyKeySection({
         {modeConfiguredByEnvironment && (
           <p className="hint">Mode is fixed by the MODE environment variable; edit it and restart to change modes.</p>
         )}
+        {!modeConfiguredByEnvironment && mode === "public" && builderIncentiveMayReactivate && (
+          <p className="err" role="note">
+            Switching to mainnet can reactivate the persisted direct builder incentive after the backend
+            revalidates chain 1 and the pinned payer runtime. The bid plus gas is non-refundable if included.
+          </p>
+        )}
       </div>
 
       <label className="field">
@@ -131,7 +153,15 @@ function AlchemyKeySection({
 }
 
 // Strategy configuration form. Persists via revisioned PATCH /api/config.
-export function Config({ initial, onChange }: { initial: StrategySnapshot; onChange: (snapshot: StrategySnapshot) => void }) {
+export function Config({
+  initial,
+  onChange,
+  onSettingsChange = () => {},
+}: {
+  initial: StrategySnapshot;
+  onChange: (snapshot: StrategySnapshot) => void;
+  onSettingsChange?: () => void;
+}) {
   const [cfg, setCfg] = useState<StrategyConfig>(initial.config);
   const [revision, setRevision] = useState(initial.revision);
   const [dirty, setDirty] = useState<Partial<StrategyConfig>>({});
@@ -362,19 +392,6 @@ export function Config({ initial, onChange }: { initial: StrategySnapshot; onCha
       <label className="check">
         <input
           type="checkbox"
-          checked={cfg.offenseBoundaryScheduling}
-          onChange={chk("offenseBoundaryScheduling")}
-          disabled={!cfg.offenseEnabled}
-        />
-        Pre-schedule offense at deadlines
-      </label>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-        Fires a tick just before each audit-expiry / epoch boundary so kills and audits compete in the
-        first eligible block instead of the block after (~12s sooner).
-      </p>
-      <label className="check">
-        <input
-          type="checkbox"
           checked={cfg.racePublicMempool}
           onChange={chk("racePublicMempool")}
           disabled={!cfg.offenseEnabled}
@@ -416,6 +433,10 @@ export function Config({ initial, onChange }: { initial: StrategySnapshot; onCha
         initialMode={currentMode}
         modeConfiguredByEnvironment={modeConfiguredByEnvironment}
         keyConfiguredByEnvironment={keyConfiguredByEnvironment}
+        builderIncentiveMayReactivate={
+          cfg.coinbaseBidEnabled && cfg.combinedBoundaryBundle
+        }
+        onSettingsChange={onSettingsChange}
       />
     </div>
   );

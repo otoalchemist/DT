@@ -3,9 +3,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as loadEnv } from "dotenv";
 import { acquireDataDirLock, type DataDirLock } from "./data-dir-lock.js";
+import { redactLogArgument } from "./redaction.js";
 
 let dataDirLock: DataDirLock | null = null;
-let logError: (...args: unknown[]) => void = (...args) => console.error(...args);
+let logError: (...args: unknown[]) => void = (...args) =>
+  console.error(...args.map(redactLogArgument));
 
 function releaseDataDirLock(): void {
   if (!dataDirLock) return;

@@ -28,6 +28,33 @@ On first startup, the bot atomically migrates the old flat strategy file to the 
   matching the prior effective `prepayEpochs` ceiling.
 - Race-audit and race-kill remain enabled only when they were explicitly present
   in a legacy file; clean 0.3.0 installations default both advanced races off.
+- Automatic killing remains disabled unless the legacy file explicitly enabled
+  it; upgrading a partial offense configuration never grants new kill authority.
+- Direct builder incentives never become active through migration. Clean and
+  versioned upgrades initialize `coinbaseBidEnabled` and
+  `combinedBoundaryBundle` to `false`. A valid amount/address found in a legacy
+  flat configuration may be retained as staged data, but both authority bits are
+  reset and require a new explicit risk acknowledgement.
+
+Version 0.3.0 implements the optional combined boundary cohort, but it remains
+disabled by default. When separately enabled, at least one mandatory boundary
+payment leads the cohort and keeps public fallback; optional audits are
+revertible privately and keep an authorized public fallback; the one final
+builder incentive is revertible, private-only, finite-target, and never recovered
+as an independent public transaction. A cohort that does not fit the private
+count, byte, or gas limits is excluded from private delivery as a whole. This
+mechanism does not guarantee inclusion, block position, ordering, or audit
+success.
+
+Do not enable it merely to complete an upgrade. First complete the no-funded-wallet
+QA gate, run the exact compiler comparison, independently review and deploy the
+recorded `CoinbasePayer` creation bytecode,
+verify its on-chain runtime byte-for-byte and by the pinned hash, keep Dry Run on,
+and require the loopback capability endpoint/dashboard to report the expected
+mainnet payer, bid, and verified capability. The operator-specific deployment,
+exact runtime verification, and switch-disable procedure are in
+[`builder-incentives.md`](builder-incentives.md). Deployment and funded
+mainnet validation are operator actions outside release/owner QA.
 
 UI-saved settings now live at `<DATA_DIR>/settings.json`. When `DATA_DIR` differs from the repository default, the old settings file is copied once and retained as a migration backup.
 
@@ -43,7 +70,7 @@ also listen only on loopback. Remove LAN/public listeners, port forwarding, and
 external tunnels, and do not rewrite a non-loopback `Host` or `Origin` as a
 loopback value.
 
-Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. Treat it as exclusive to one running backend; use a distinct directory, port, and keystore for every concurrent instance. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
+Keep a custom `DATA_DIR` outside the repository because only the default in-tree state paths are covered by `.gitignore`. Treat the whole directory as secret: it can contain a plaintext dashboard-saved provider key and replayable raw signed transactions as well as wallet/reputation-key material. Treat it as exclusive to one running backend; use a distinct directory, port, and keystore for every concurrent instance. The curated rival-target asset remains part of the application package and no longer needs to be copied into a custom state directory.
 
 The local configuration API now uses revisioned, field-scoped writes. Integrations must read the current strategy or JIT revision before mutating it and handle HTTP 409 by refetching. JIT arm requests must send a future `targetEpoch` and a nonempty explicit `tokenIds` list.
 

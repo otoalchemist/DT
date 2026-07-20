@@ -41,6 +41,7 @@ export type ActivityKind =
   | "use-bribe"
   | "audit"
   | "kill"
+  | "builder-incentive"
   | "info"
   | "error";
 
@@ -134,6 +135,10 @@ export interface StrategyConfig {
    *  so the kill lands in the first eligible block. The future-timestamp semantic
    *  simulation must succeed before submission. */
   preBoundaryKill: boolean;
+  /** ADVANCED: allow an explicitly prepared boundary payment and audit cohort to
+   *  share one private bundle. This is separately opt-in because sharing changes
+   *  audit fallback behavior; it never guarantees inclusion or block position. */
+  combinedBoundaryBundle: boolean;
 
   // --- Guardrails ---
   /** Max base fee (gwei) the bot will transact at. Applies to tax payments
@@ -166,10 +171,6 @@ export interface StrategyConfig {
   offenseReplacementPriorityFeeCapGwei: number;
 
   // --- Latency (mainnet mode only) ---
-  /** Fire an extra tick just before each offense deadline (nearest audit
-   *  expiry / next epoch boundary) so kills/audits compete in the first
-   *  eligible block instead of the block after. */
-  offenseBoundaryScheduling: boolean;
   /** Also broadcast time-critical offense txs to the public mempool alongside
    *  the Flashbots bundle, so any builder can include them in the next block.
    *  Trades bundle privacy for lower inclusion latency. Defense/JIT overrides
@@ -182,6 +183,16 @@ export interface StrategyConfig {
   /** Upper bound (gwei) the dynamic tip may scale to at a 100%-full block.
    *  Ignored when dynamicTipEnabled is false. */
   dynamicTipMaxGwei: number;
+  /** Explicit authority for a private, trailing payment to the winning block's
+   *  fee recipient. Inert unless the amount, chain, journal, and payer bytecode
+   *  all pass backend validation. */
+  coinbaseBidEnabled: boolean;
+  /** Exact ETH amount for at most one direct builder-incentive transaction in an
+   *  eligible cohort. Canonical base-10 string with at most 18 decimal places. */
+  coinbaseBidEth: string;
+  /** Deployed address of the approved stateless CoinbasePayer runtime. Empty when
+   *  unconfigured; an address alone never enables the feature. */
+  coinbasePayerAddress: string;
 
   /** Hard cap (ETH) on the value of any single transaction (payments in
    *  particular). A tx whose value exceeds this is skipped, not sent — a
@@ -244,7 +255,8 @@ export interface PostMortemVerdict {
   ourLabel: string;
   rivalLabel: string;
   sameAction: boolean;
-  /** "won" | "lost-timing" | "lost-fee" | "unknown". */
+  /** `lost-fee` is the legacy wire name for a same-block ordering/builder-
+   * economics loss; priority fee alone is not treated as causal evidence. */
   outcome: "won" | "lost-timing" | "lost-fee" | "unknown";
   detail: string;
 }
@@ -260,6 +272,8 @@ export interface PostMortemResult {
 export interface BotStatus {
   /** The bot's release version (see VERSION in constants). */
   version: string;
+  /** Authoritative submission mode currently used by the backend. */
+  mode: "mainnet" | "public" | "local";
   running: boolean;
   unlocked: boolean;
   dryRun: boolean;

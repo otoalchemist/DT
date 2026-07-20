@@ -5,6 +5,7 @@ import {
   EPOCH_DURATION_SECONDS,
   BASE_TAX_RATE_WEI,
   citizensAbi,
+  type StrategyConfig,
 } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
@@ -42,15 +43,23 @@ import {
 import { resolveGas, effectiveTipGwei, cappedReplacementFees, canAffordSpend, isEligibleAuditor, isAuditable, isKillable, preBoundaryTaxWei, cappedAutoPayEpochs, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 import { AtomicWriteCommittedError } from "./durability.js";
+import {
+  COINBASE_PAYER_GAS,
+  resolveBuilderIncentive,
+  type BuilderIncentiveResolution,
+} from "./builder-incentive.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
 // Preliminary guard uses at least the largest fixed campaign gas limit. The
 // transport's post-estimation authorization below rechecks the exact quote.
 const GAS_GUESS = 250_000n;
+// Optional combined-cohort discovery must leave enough wall-clock room to
+// authorize/sign the already-discovered nonce sequence. If this cutoff is
+// missed, survival payments fall back to their ordinary payment-only batch.
+const COMBINED_BOUNDARY_HANDOFF_RESERVE_MS = 1_000;
 
 let timer: NodeJS.Timeout | null = null;
 let boundaryTimer: NodeJS.Timeout | null = null;
-let offenseBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryAuditTimer: NodeJS.Timeout | null = null;
 let preBoundaryKillTimer: NodeJS.Timeout | null = null;
@@ -411,8 +420,33 @@ async function flushBatch(): Promise<void> {
   for (const entry of entries) {
     const { entryId, nonce } = entry;
     const r = results.get(nonce);
-    if (!r || (!r.ok && !r.uncertain)) {
+    if (!r || (!r.ok && !r.uncertain && !r.retained)) {
       reconcileFailedBatchEntry(entry, r?.error ?? "bundle was not delivered");
+      continue;
+    }
+    if (r.retained) {
+      activity.update(entryId, {
+        status: "prepared",
+        txHash: r.txHash,
+        message: `${entry.message} — retained in the submission journal without delivery`,
+      });
+      const flight = currentBatchPaymentFlight(entry);
+      if (flight) {
+        flight.txHash = r.txHash ?? flight.txHash;
+        flight.lineageId = r.lineageId ?? flight.lineageId;
+        flight.retryImmediately = false;
+      }
+      const actionFlight = currentBatchActionFlight(entry);
+      if (actionFlight) {
+        actionFlight.txHash = r.txHash ?? actionFlight.txHash;
+        actionFlight.lineageId = r.lineageId ?? actionFlight.lineageId;
+        actionFlight.retryImmediately = false;
+      }
+      const liability = currentBatchLiability(entry);
+      if (liability) liability.txHash = r.txHash ?? liability.txHash;
+      // No transport request started, so queued delivery state is intentional
+      // and a receipt watcher for this deterministic-but-unpublished hash would
+      // be both misleading and permanently noisy.
       continue;
     }
     activity.update(entryId, {
@@ -1402,7 +1436,10 @@ export async function preflightSubmissionRecovery(address: Address): Promise<voi
 /** Retry durable prepared hashes only under an explicit execution command.
  * Unlike the paused preflight, this may dispatch an already-signed transaction
  * and therefore must only be called by Start or a paused JIT arm request. */
-export async function recoverAuthorizedSubmissions(address: Address): Promise<void> {
+export async function recoverAuthorizedSubmissions(
+  address: Address,
+  signal?: AbortSignal,
+): Promise<void> {
   const normalized = address.toLowerCase();
   if (paymentFlightAccount !== null && paymentFlightAccount.toLowerCase() !== normalized) {
     resetPaymentTracking();
@@ -1412,7 +1449,7 @@ export async function recoverAuthorizedSubmissions(address: Address): Promise<vo
   try {
     const reconciliation = await recoverPreparedSubmissions(
       address,
-      undefined,
+      signal,
       createRecoveryFlightAuthorizer(address),
     );
     restoreJournalFlights(address, reconciliation.retained, reconciliation.currentBlock);
@@ -1420,6 +1457,9 @@ export async function recoverAuthorizedSubmissions(address: Address): Promise<vo
     runtime.setJournalHealth(true);
   } catch (err) {
     const message = (err as Error).message;
+    if (signal?.aborted) {
+      throw new Error("submission recovery cancelled by operator", { cause: err });
+    }
     runtime.setJournalHealth(false, message);
     throw new Error(`submission recovery failed; refusing to start: ${message}`);
   }
@@ -1507,14 +1547,12 @@ export function stopEngine(): void {
   runtime.running = false;
   if (timer) clearInterval(timer);
   if (boundaryTimer) clearTimeout(boundaryTimer);
-  if (offenseBoundaryTimer) clearTimeout(offenseBoundaryTimer);
   if (preBoundaryTimer) clearTimeout(preBoundaryTimer);
   if (preBoundaryAuditTimer) clearTimeout(preBoundaryAuditTimer);
   if (preBoundaryKillTimer) clearTimeout(preBoundaryKillTimer);
   if (unwatchBlocks) unwatchBlocks();
   timer = null;
   boundaryTimer = null;
-  offenseBoundaryTimer = null;
   preBoundaryTimer = null;
   preBoundaryAuditTimer = null;
   preBoundaryKillTimer = null;
@@ -1553,6 +1591,88 @@ interface PreBoundaryPayPlan {
   jitCampaignRevision: number | null;
   jitTokenIds: readonly string[];
   includeProactive: boolean;
+}
+
+/** The combined path is an additional, capability-gated suffix on an existing
+ * mandatory boundary-payment plan. A configured amount/address is never enough:
+ * journal health and the live, pinned payer runtime must both be verified. */
+export async function resolveCombinedBoundaryIncentive(
+  config: StrategyConfig,
+  chainId: number | null,
+  journalHealthy: boolean,
+): Promise<BuilderIncentiveResolution> {
+  if (!config.combinedBoundaryBundle) {
+    return { active: false, reason: "Combined boundary bundles are disabled" };
+  }
+  if (!journalHealthy) {
+    return { active: false, reason: "Submission journal is unhealthy" };
+  }
+  return resolveBuilderIncentive(config, chainId);
+}
+
+type ActiveBuilderIncentive = Extract<BuilderIncentiveResolution, { active: true }>;
+
+interface CombinedBoundaryAuditDiscovery {
+  auditors: bigint[];
+  targetTokenIds: string[];
+}
+
+interface CombinedBoundaryPreparation {
+  resolved: ActiveBuilderIncentive;
+  audits: CombinedBoundaryAuditDiscovery;
+}
+
+/** Bound transaction-state-pure optional work without leaving an unhandled
+ * rejection behind. The losing work may finish and warm read caches, but it has
+ * no nonce, flight, liability, activity, or batch mutations to apply later. */
+function beforeCombinedDiscoveryDeadline<T>(
+  work: () => Promise<T>,
+  deadlineMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => finish(() => reject(new Error("combined boundary discovery aborted")));
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      complete();
+    };
+
+    if (signal?.aborted) {
+      finish(() => reject(new Error("combined boundary discovery aborted")));
+      return;
+    }
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      finish(() => reject(new Error("combined boundary discovery missed its handoff deadline")));
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(
+      () => finish(() => reject(new Error("combined boundary discovery missed its handoff deadline"))),
+      remainingMs,
+    );
+    // Attach both handlers even after the deadline wins so a later rejection is
+    // consumed and a later resolution cannot mutate the active campaign.
+    let pending: Promise<T>;
+    try {
+      pending = work();
+    } catch (error) {
+      finish(() => reject(error));
+      return;
+    }
+    pending.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }
 
 function selectedOwnedJitTokenIds(
@@ -1690,6 +1810,38 @@ interface BoundaryPaymentCandidate {
   replace?: PaymentFlight;
 }
 
+/** Combined routing is safe only when this batch owns one fresh contiguous
+ * nonce suffix. Replacement lineages, semantic actions, restored liabilities,
+ * or cleanup work already queued in the batch can place a non-cohort nonce
+ * between mandatory payments and the optional tail. The ordinary payment path
+ * remains authorized and public-raced in every one of these fallback cases. */
+function combinedBoundaryLineageError(
+  address: Address,
+  candidates: readonly BoundaryPaymentCandidate[],
+): string | undefined {
+  const normalized = address.toLowerCase();
+  if (batchEntries.length > 0) return "the boundary batch already contains non-cohort cleanup work";
+  if (candidates.some((candidate) => candidate.replace !== undefined)) {
+    return "a mandatory payment requires a same-nonce replacement";
+  }
+  if ([...paymentFlights.values()].some((flight) =>
+    flight.account.toLowerCase() === normalized)) {
+    return "an unresolved payment lineage already owns a wallet nonce";
+  }
+  if ([...actionFlights.values()].some((flight) =>
+    flight.account.toLowerCase() === normalized)) {
+    return "an unresolved action or filler lineage already owns a wallet nonce";
+  }
+  if ([...pendingLiabilities.values()].some((liability) =>
+    liability.account.toLowerCase() === normalized)) {
+    return "an unresolved signed liability already owns a wallet nonce";
+  }
+  if (nonceManager.hasInvisibleReservation()) {
+    return "the nonce manager has an unacknowledged reservation";
+  }
+  return undefined;
+}
+
 /**
  * Transport integration seam for a boundary payment batch. Discovery and
  * reconciliation finish for every token before this function is entered, so a
@@ -1701,9 +1853,12 @@ async function submitBoundaryPaymentBatch(
   candidates: readonly BoundaryPaymentCandidate[],
   targetEpoch: bigint,
   boundaryTs: bigint,
-): Promise<void> {
+  cohortId?: string,
+): Promise<number> {
+  const deadlineMs = Number(boundaryTs) * 1_000;
+  let prepared = 0;
   for (const candidate of candidates) {
-    await act(
+    const result = await act(
       {
         to: appConfig.gameAddress,
         data: encodePayTaxes(candidate.tokenId, 1),
@@ -1716,6 +1871,14 @@ async function submitBoundaryPaymentBatch(
         message: `Pre-boundary ${candidate.jitDue ? "JIT" : "tax-skip"} pay #${candidate.tokenKey} for epoch ${targetEpoch} = ${formatEther(candidate.valueWei)} ETH (boundary race)`,
         race: true,
         simTimestamp: boundaryTs,
+        privateCohort: cohortId === undefined
+          ? undefined
+          : { id: cohortId, role: "mandatory" },
+        // Payment-only fallback must retain the same hard handoff cutoff as a
+        // combined cohort. Otherwise timed-out optional discovery could leave
+        // an unbounded exact-balance/ownership authorization signing after the
+        // boundary it was priced for.
+        deadlineMs,
         payment: {
           startingLastEpochPaid: candidate.lastEpochPaid,
           expectedLastEpochPaid: candidate.lastEpochPaid + 1n,
@@ -1728,7 +1891,248 @@ async function submitBoundaryPaymentBatch(
         },
       },
     );
+    if (result?.ok || result?.uncertain) prepared += 1;
   }
+  return prepared;
+}
+
+function boundaryCohortId(address: Address, targetEpoch: bigint, generation: number): string {
+  return `boundary:${runtime.chainId ?? "unknown"}:${address.toLowerCase()}:${targetEpoch}:${generation}`;
+}
+
+function builderIncentiveAuthorizationError(
+  resolved: ActiveBuilderIncentive,
+  generation: number,
+  deadlineMs: number,
+): string | undefined {
+  if (!executionIsCurrent(generation)) return "engine generation changed";
+  if (Date.now() >= deadlineMs) return "boundary cohort missed its deadline";
+  if (!runtime.status().journalHealthy) return "submission journal became unhealthy";
+  if (runtime.chainId !== 1) return "Ethereum mainnet chain identity is no longer verified";
+  const strategy = runtime.strategy;
+  if (!strategy.combinedBoundaryBundle) return "combined boundary bundles were disabled";
+  if (!strategy.coinbaseBidEnabled) return "direct builder incentive was disabled";
+  let bidWei: bigint;
+  try {
+    bidWei = parseEther(strategy.coinbaseBidEth);
+  } catch {
+    return "builder incentive amount became invalid";
+  }
+  if (bidWei !== resolved.bidWei) return "builder incentive amount changed";
+  if (strategy.coinbasePayerAddress.toLowerCase() !== resolved.payer.toLowerCase()) {
+    return "CoinbasePayer address changed";
+  }
+  return undefined;
+}
+
+function combinedAuditAuthorizationError(
+  resolved: ActiveBuilderIncentive,
+  targetTokenId: string,
+  citizenSupply: bigint,
+  generation: number,
+  deadlineMs: number,
+): string | undefined {
+  const incentiveError = builderIncentiveAuthorizationError(
+    resolved,
+    generation,
+    deadlineMs,
+  );
+  if (incentiveError) return incentiveError;
+  const strategy = runtime.strategy;
+  if (!strategy.preBoundaryAudit || !strategy.offenseEnabled || !strategy.autoAudit) {
+    return "pre-boundary audit authority was withdrawn";
+  }
+  if (
+    strategy.endgameOnlyWithin !== null
+    && citizenSupply - WINNERS > BigInt(strategy.endgameOnlyWithin)
+  ) {
+    return "offense is outside the configured endgame window";
+  }
+  const pinned = explicitOffenseTargetSet(strategy.offenseTargetTokenIds);
+  if (pinned && !pinned.has(targetTokenId)) return `target #${targetTokenId} left the allowlist`;
+  return undefined;
+}
+
+/** Discover optional audit work before any mandatory transaction is prepared.
+ * This phase is transaction-state-pure so its caller can abandon it at a hard
+ * handoff deadline without a late nonce/flight mutation. */
+async function discoverCombinedBoundaryAudits(args: {
+  address: Address;
+  citizensAddress: Address;
+  citizenSupply: bigint;
+  ownedIds: bigint[];
+  targetEpoch: bigint;
+  boundaryTs: bigint;
+  generation: number;
+  resolved: ActiveBuilderIncentive;
+}): Promise<CombinedBoundaryAuditDiscovery> {
+  const {
+    address,
+    citizensAddress,
+    citizenSupply,
+    ownedIds,
+    targetEpoch,
+    boundaryTs,
+    generation,
+    resolved,
+  } = args;
+  const deadlineMs = Number(boundaryTs) * 1_000;
+  if (builderIncentiveAuthorizationError(resolved, generation, deadlineMs)) {
+    return { auditors: [], targetTokenIds: [] };
+  }
+  const s = runtime.strategy;
+  if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) {
+    return { auditors: [], targetTokenIds: [] };
+  }
+  if (
+    s.endgameOnlyWithin !== null
+    && citizenSupply - WINNERS > BigInt(s.endgameOnlyWithin)
+  ) return { auditors: [], targetTokenIds: [] };
+
+  const auditors = reservePendingAuditorCapacity(
+    await findPreBoundaryAuditors(ownedIds, targetEpoch),
+    address,
+  );
+  if (auditors.length === 0) return { auditors: [], targetTokenIds: [] };
+  const candidateIds = includeExplicitOffenseCandidates(
+    await fetchCandidateTokenIds(citizensAddress),
+    s.offenseTargetTokenIds,
+  );
+  const liveRaw = await filterLiveTokenIds(citizensAddress, candidateIds);
+  const live = orderBySalt(liveRaw, (target) => target.id.toString(), engineSalt);
+  const owned = new Set(ownedIds.map((tokenId) => tokenId.toString()));
+  const pinned = explicitOffenseTargetSet(s.offenseTargetTokenIds);
+  const nowSec = BigInt(Math.floor(Date.now() / 1_000));
+  const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
+  const targetTokenIds: string[] = [];
+  for (const target of statuses) {
+    if (!executionIsCurrent(generation) || Date.now() >= deadlineMs) break;
+    if (target.owner.toLowerCase() === address.toLowerCase()) continue;
+    if (owned.has(target.tokenId)) continue;
+    if (pinned && !pinned.has(target.tokenId)) continue;
+    if (target.auditDueTimestamp !== "0") continue;
+    if (!isAuditable(BigInt(target.lastEpochPaid), targetEpoch)) continue;
+    // A clean combined lineage should have no action flight, but retain this
+    // synchronous check so discovery stays safe if authority changes in-process.
+    if (pendingActionFor("audit", undefined, target.tokenId, address)) continue;
+    if (targetTokenIds.length >= auditors.length) break;
+    targetTokenIds.push(target.tokenId);
+  }
+  return { auditors, targetTokenIds };
+}
+
+/** Queue already-discovered optional audits only behind an already prepared
+ * mandatory payment. No candidate/indexer/reconciliation work is allowed here.
+ * Audits retain public fallback and may revert in the private cohort without
+ * invalidating its mandatory prefix. */
+async function submitCombinedBoundaryAudits(args: {
+  address: Address;
+  citizensAddress: Address;
+  citizenSupply: bigint;
+  targetEpoch: bigint;
+  boundaryTs: bigint;
+  generation: number;
+  cohortId: string;
+  resolved: ActiveBuilderIncentive;
+  discovery: CombinedBoundaryAuditDiscovery;
+}): Promise<number> {
+  const {
+    address,
+    citizensAddress,
+    citizenSupply,
+    targetEpoch,
+    boundaryTs,
+    generation,
+    cohortId,
+    resolved,
+    discovery,
+  } = args;
+  const deadlineMs = Number(boundaryTs) * 1_000;
+  let auditorIndex = 0;
+  let prepared = 0;
+  for (const targetTokenId of discovery.targetTokenIds) {
+    if (!executionIsCurrent(generation) || Date.now() >= deadlineMs) break;
+    if (pendingActionFor("audit", undefined, targetTokenId, address)) continue;
+    const auditor = discovery.auditors[auditorIndex];
+    if (auditor === undefined) break;
+    const result = await act(
+      {
+        to: appConfig.gameAddress,
+        data: encodeAudit(auditor, BigInt(targetTokenId)),
+        value: AUDIT_COST_WEI,
+        gas: PRE_BOUNDARY_OFFENSE_GAS,
+      },
+      "audit",
+      {
+        tokenId: auditor.toString(),
+        targetTokenId,
+        message: `Pre-boundary audit #${targetTokenId} from #${auditor} for epoch ${targetEpoch} (combined boundary cohort)`,
+        race: true,
+        simTimestamp: boundaryTs,
+        revertible: true,
+        privateCohort: { id: cohortId, role: "allowed-revert" },
+        deadlineMs,
+        actionUrgency: "boundary",
+        citizensAddress,
+        finalAuthorization: () => combinedAuditAuthorizationError(
+          resolved,
+          targetTokenId,
+          citizenSupply,
+          generation,
+          deadlineMs,
+        ),
+      },
+    );
+    if (result?.ok || result?.uncertain) {
+      auditorIndex += 1;
+      prepared += 1;
+    }
+  }
+  return prepared;
+}
+
+async function submitBoundaryBuilderIncentive(args: {
+  resolved: ActiveBuilderIncentive;
+  targetEpoch: bigint;
+  boundaryTs: bigint;
+  generation: number;
+  cohortId: string;
+}): Promise<boolean> {
+  const { resolved, targetEpoch, boundaryTs, generation, cohortId } = args;
+  const deadlineMs = Number(boundaryTs) * 1_000;
+  const authorizationError = builderIncentiveAuthorizationError(
+    resolved,
+    generation,
+    deadlineMs,
+  );
+  if (authorizationError) {
+    logger.warn(`builder incentive skipped: ${authorizationError}`);
+    return false;
+  }
+  const result = await act(
+    {
+      to: resolved.payer,
+      data: "0x",
+      value: resolved.bidWei,
+      gas: COINBASE_PAYER_GAS,
+    },
+    "builder-incentive",
+    {
+      message: `Direct builder incentive ${formatEther(resolved.bidWei)} ETH for boundary epoch ${targetEpoch}`,
+      race: false,
+      simTimestamp: boundaryTs,
+      revertible: true,
+      purpose: "builder-incentive",
+      privateCohort: { id: cohortId, role: "builder-incentive" },
+      deadlineMs,
+      finalAuthorization: () => builderIncentiveAuthorizationError(
+        resolved,
+        generation,
+        deadlineMs,
+      ),
+    },
+  );
+  return Boolean(result?.ok || result?.uncertain);
 }
 
 /**
@@ -1885,7 +2289,91 @@ async function firePreBoundaryPay(plan: PreBoundaryPayPlan, generation = engineG
       : candidates.flatMap((candidate) => candidate.proactiveDue
           ? [{ ...candidate, jitDue: false, jitCampaignRevision: null }]
           : []);
-    await submitBoundaryPaymentBatch(finalCandidates, targetEpoch, boundaryTs);
+    const deadlineMs = Number(boundaryTs) * 1_000;
+    let combinedPreparation: CombinedBoundaryPreparation | null = null;
+    if (finalCandidates.length > 0 && !paymentWorkUnsafeThisTick) {
+      const lineageError = combinedBoundaryLineageError(address, finalCandidates);
+      if (lineageError) {
+        if (s.combinedBoundaryBundle && s.coinbaseBidEnabled) {
+          logger.warn(`combined boundary cohort unavailable: ${lineageError}`);
+        }
+      } else {
+        const discoveryDeadlineMs = deadlineMs - COMBINED_BOUNDARY_HANDOFF_RESERVE_MS;
+        try {
+          combinedPreparation = await beforeCombinedDiscoveryDeadline(async () => {
+            const resolution = await resolveCombinedBoundaryIncentive(
+              s,
+              runtime.chainId,
+              runtime.status().journalHealthy,
+            );
+            if (!resolution.active) throw new Error(resolution.reason);
+            const authorizationError = builderIncentiveAuthorizationError(
+              resolution,
+              generation,
+              deadlineMs,
+            );
+            if (authorizationError) throw new Error(authorizationError);
+            const audits = await discoverCombinedBoundaryAudits({
+              address,
+              citizensAddress: fresh.citizensAddress,
+              citizenSupply: fresh.citizenSupply,
+              ownedIds,
+              targetEpoch,
+              boundaryTs,
+              generation,
+              resolved: resolution,
+            });
+            return { resolved: resolution, audits };
+          }, discoveryDeadlineMs, engineAbortController?.signal);
+        } catch (err) {
+          if (executionIsCurrent(generation) && s.combinedBoundaryBundle && s.coinbaseBidEnabled) {
+            logger.warn(`combined boundary cohort unavailable: ${(err as Error).message}`);
+          }
+        }
+      }
+    }
+    if (!executionIsCurrent(generation)) return;
+    const combined = combinedPreparation?.resolved ?? null;
+    const cohortId = combined === null
+      ? null
+      : boundaryCohortId(address, targetEpoch, generation);
+    const preparedPayments = await submitBoundaryPaymentBatch(
+      finalCandidates,
+      targetEpoch,
+      boundaryTs,
+      cohortId ?? undefined,
+    );
+    // V1 never creates an audit-only, kill-only, or bid-only cohort. Optional
+    // work is considered only after at least one mandatory payment has safely
+    // passed the ordinary simulation/authorization/WAL preparation path.
+    if (
+      combined !== null
+      && cohortId !== null
+      && preparedPayments > 0
+      && !paymentWorkUnsafeThisTick
+      && executionIsCurrent(generation)
+    ) {
+      await submitCombinedBoundaryAudits({
+        address,
+        citizensAddress: fresh.citizensAddress,
+        citizenSupply: fresh.citizenSupply,
+        targetEpoch,
+        boundaryTs,
+        generation,
+        cohortId,
+        resolved: combined,
+        discovery: combinedPreparation!.audits,
+      });
+      // Exactly one incentive is attempted, always last. Failure leaves every
+      // already prepared payment/audit entry intact for the normal batch flush.
+      await submitBoundaryBuilderIncentive({
+        resolved: combined,
+        targetEpoch,
+        boundaryTs,
+        generation,
+        cohortId,
+      });
+    }
   } catch (err) {
     markPaymentWorkUnsafe();
     logger.error("pre-boundary pay error:", (err as Error).message);
@@ -2178,53 +2666,6 @@ async function firePreBoundaryKill(
       schedulePreBoundaryKill();
     }
   }
-}
-
-// Lead time before an offense deadline at which we fire the pre-emptive tick, so
-// the tx is built and submitted in time to compete in the first eligible block.
-const OFFENSE_LEAD_MS = 1_500;
-
-/**
- * Fire an extra tick just before the soonest offense deadline so kills/audits
- * land in the FIRST eligible block instead of the block after (the ~12s latency
- * gap seen in race post-mortems). Two kinds of deadline:
- *   - kill: the nearest pending audit's expiry (`nextKillDeadlineSec`) — after
- *     this instant, kill() succeeds.
- *   - audit: the next epoch boundary — a token 1 epoch behind becomes auditable
- *     (2+ behind) when the epoch rolls, and fresh delinquencies appear then too.
- * Picks whichever is sooner and schedules a tick ~OFFENSE_LEAD_MS before it.
- */
-export function scheduleOffenseBoundary(): void {
-  if (offenseBoundaryTimer) {
-    clearTimeout(offenseBoundaryTimer);
-    offenseBoundaryTimer = null;
-  }
-  const s = runtime.strategy;
-  if (!runtime.running || !s.offenseEnabled || !s.offenseBoundaryScheduling) return;
-  if (runtime.startTime === null || runtime.currentEpoch === null) return;
-
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-
-  // Candidate 1: next epoch boundary. Epoch N begins at startTime + (N-1)*DUR,
-  // so the boundary that starts epoch (current+1) is startTime + current*DUR.
-  const nextEpochBoundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS;
-
-  // Candidate 2: soonest pending audit expiry that is still in the future.
-  const candidates = [nextEpochBoundary];
-  if (nextKillDeadlineSec !== null && nextKillDeadlineSec > nowSec) {
-    candidates.push(nextKillDeadlineSec);
-  }
-  const soonest = candidates.filter((c) => c > nowSec).sort((a, b) => (a < b ? -1 : 1))[0];
-  if (soonest === undefined) return;
-
-  const deltaMs = Number(soonest - nowSec) * 1000 - OFFENSE_LEAD_MS;
-  if (deltaMs <= 0) {
-    void tick();
-    return;
-  }
-  const delayMs = Math.min(deltaMs, 2_000_000_000);
-  const generation = engineGeneration;
-  offenseBoundaryTimer = setTimeout(() => fireBoundaryTick(generation), delayMs);
 }
 
 async function refreshSnapshot(address: Address): Promise<void> {
@@ -2581,6 +3022,16 @@ interface ActContext {
   message: string;
   race?: boolean;
   simTimestamp?: bigint;
+  revertible?: boolean;
+  purpose?: "builder-incentive";
+  privateCohort?: {
+    id: string;
+    role: "mandatory" | "allowed-revert" | "builder-incentive";
+  };
+  deadlineMs?: number;
+  /** Synchronous final policy check composed with the exact balance/ownership
+   * authorization immediately before nonce reservation and signing. */
+  finalAuthorization?: () => string | undefined;
   payment?: PaymentActContext;
   actionReplacement?: ActionFlight;
   actionUrgency?: ActionUrgency;
@@ -2589,11 +3040,14 @@ interface ActContext {
 }
 
 function ownershipScopeForAct(
-  kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
+  kind: "pay-taxes" | "use-bribe" | "audit" | "kill" | "builder-incentive",
   ctx: ActContext,
 ): OwnershipAuthorizationScope {
   const citizensAddress = ctx.citizensAddress ?? runtime.citizensAddress as Address | null;
   if (ctx.inert) {
+    return { citizensAddress, mustOwnTokenIds: [], mustNotOwnTokenIds: [] };
+  }
+  if (kind === "builder-incentive") {
     return { citizensAddress, mustOwnTokenIds: [], mustNotOwnTokenIds: [] };
   }
   if (kind === "pay-taxes" || kind === "use-bribe") {
@@ -3167,13 +3621,14 @@ function replacementDue(
 
 async function act(
   intent: TxIntent,
-  kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
+  kind: "pay-taxes" | "use-bribe" | "audit" | "kill" | "builder-incentive",
   ctx: ActContext,
 ): Promise<SubmitResult | null> {
   const dryRun = runtime.strategy.dryRun;
   const offense = kind === "audit" || kind === "kill";
   const payment = kind === "pay-taxes";
-  const semanticKind = payment ? undefined : kind as SemanticActionKind;
+  const builderIncentive = kind === "builder-incentive";
+  const semanticKind = payment || builderIncentive ? undefined : kind as SemanticActionKind;
   const actionKey = semanticKind === undefined
     ? null
     : semanticActionKey(semanticKind, ctx.tokenId, ctx.targetTokenId);
@@ -3270,7 +3725,29 @@ async function act(
     });
     return null;
   }
+  if (ctx.deadlineMs !== undefined && Date.now() >= ctx.deadlineMs) {
+    if (payment) markPaymentWorkUnsafe();
+    activity.add({
+      kind: "info",
+      status: "skipped",
+      tokenId: ctx.tokenId,
+      targetTokenId: ctx.targetTokenId,
+      message: `${ctx.message} — submission deadline passed before spend preparation`,
+    });
+    return null;
+  }
   const guard = await canSpend(intent.value, offense, replacement);
+  if (ctx.deadlineMs !== undefined && Date.now() >= ctx.deadlineMs) {
+    if (payment) markPaymentWorkUnsafe();
+    activity.add({
+      kind: "info",
+      status: "skipped",
+      tokenId: ctx.tokenId,
+      targetTokenId: ctx.targetTokenId,
+      message: `${ctx.message} — submission deadline passed during spend preparation`,
+    });
+    return null;
+  }
   if (!guard.ok) {
     if (payment) markPaymentWorkUnsafe();
     activity.add({
@@ -3294,19 +3771,35 @@ async function act(
       // fallback so a private-only offense nonce cannot invisibly fence a later
       // emergency payment. Offense is nevertheless submitted only after the
       // payment prefix has been safely released by tick().
-      race: ctx.inert
-        ? true
-        : offense
-          ? Boolean(ctx.race && (
-            runtime.strategy.racePublicMempool
-            || runtime.strategy.defenseEnabled
-            || jitCampaignIsArmed()
-          ))
-          : true,
+      race: builderIncentive
+        ? false
+        : ctx.inert
+          ? true
+          : offense
+            ? Boolean(ctx.race && (
+              runtime.strategy.racePublicMempool
+              || runtime.strategy.defenseEnabled
+              || jitCampaignIsArmed()
+            ))
+            : true,
       offense,
       simTimestamp: ctx.simTimestamp,
+      revertible: ctx.revertible,
+      purpose: ctx.purpose,
+      privateCohort: ctx.privateCohort,
+      deadlineMs: ctx.deadlineMs,
       signal: engineAbortController?.signal,
-      authorize: (quote) => authorizeExactSpend(quote, replacement, ownership),
+      authorize: async (quote) => {
+        const authorization = await authorizeExactSpend(quote, replacement, ownership);
+        const policyError = ctx.finalAuthorization?.();
+        const error = authorization.error ?? policyError;
+        return {
+          ok: authorization.ok && policyError === undefined,
+          error,
+          stillValid: () => authorization.stillValid()
+            && ctx.finalAuthorization?.() === undefined,
+        };
+      },
       replacement: replacement
         ? {
             nonce: replacement.nonce,
@@ -3973,9 +4466,8 @@ async function offensePass(
     });
   }
 
-  // Publish the nearest kill deadline and (re)arm the pre-emptive boundary tick.
+  // Publish the nearest kill deadline and (re)arm the dedicated kill timer.
   nextKillDeadlineSec = soonestKillDeadline;
-  scheduleOffenseBoundary();
   schedulePreBoundaryKill();
 }
 

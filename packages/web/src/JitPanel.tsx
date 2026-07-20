@@ -1,8 +1,41 @@
 import { useEffect, useState } from "react";
 import type { BotStatus, OwnedTokenStatus, StrategyConfig, StrategySnapshot } from "@dat-bot/shared";
 import { EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
-import { ApiError, api } from "./api.js";
+import { ApiError, api, type BuilderIncentiveCapability } from "./api.js";
 import { countdown, weiToEth } from "./util.js";
+
+const CANONICAL_ETH = /^(0|[1-9]\d*)(\.\d{1,18})?$/;
+const ADDRESS = /^0x[a-fA-F0-9]{40}$/;
+
+function ethWei(value: string): bigint | null {
+  if (!CANONICAL_ETH.test(value)) return null;
+  const [whole, fraction = ""] = value.split(".");
+  return BigInt(whole) * 10n ** 18n + BigInt((fraction + "0".repeat(18)).slice(0, 18));
+}
+
+type BuilderSettings = Pick<
+  StrategyConfig,
+  "coinbaseBidEnabled" | "coinbaseBidEth" | "coinbasePayerAddress" | "combinedBoundaryBundle"
+>;
+
+function builderSettings(config: StrategyConfig): BuilderSettings {
+  return {
+    coinbaseBidEnabled: config.coinbaseBidEnabled,
+    coinbaseBidEth: config.coinbaseBidEth,
+    coinbasePayerAddress: config.coinbasePayerAddress,
+    combinedBoundaryBundle: config.combinedBoundaryBundle,
+  };
+}
+
+function builderRiskIncreases(current: BuilderSettings, candidate: BuilderSettings): boolean {
+  if (!current.coinbaseBidEnabled && candidate.coinbaseBidEnabled) return true;
+  if (!candidate.coinbaseBidEnabled) return false;
+  const oldBid = ethWei(current.coinbaseBidEth) ?? 0n;
+  const newBid = ethWei(candidate.coinbaseBidEth) ?? 0n;
+  return newBid > oldBid
+    || candidate.coinbasePayerAddress !== current.coinbasePayerAddress
+    || (!current.combinedBoundaryBundle && candidate.combinedBoundaryBundle);
+}
 
 export function JitPanel({
   status,
@@ -10,12 +43,14 @@ export function JitPanel({
   strategy,
   onStrategyChange,
   onStatusChange,
+  capabilityRefreshToken = 0,
 }: {
   status: BotStatus | null;
   tokens: OwnedTokenStatus[];
   strategy: StrategySnapshot | null;
   onStrategyChange: (snapshot: StrategySnapshot) => void;
   onStatusChange: (status: BotStatus) => void;
+  capabilityRefreshToken?: number;
 }) {
   const config = strategy?.config ?? null;
   const [busy, setBusy] = useState(false);
@@ -145,17 +180,76 @@ export function JitPanel({
   const [gasBusy, setGasBusy] = useState(false);
   const [gasSaved, setGasSaved] = useState(false);
   const [gasErr, setGasErr] = useState<string | null>(null);
-  const gasField = (k: keyof StrategyConfig, v: number | boolean) => {
+  const [savedBuilder, setSavedBuilder] = useState<BuilderSettings | null>(
+    () => config ? builderSettings(config) : null,
+  );
+  const [builderCapability, setBuilderCapability] = useState<BuilderIncentiveCapability | null>(null);
+  const [builderCapabilityLoading, setBuilderCapabilityLoading] = useState(false);
+
+  useEffect(() => {
+    if (config) setSavedBuilder(builderSettings(config));
+  }, [strategy?.revision]);
+
+  useEffect(() => {
+    if (!config) return;
+    let cancelled = false;
+    setBuilderCapabilityLoading(true);
+    api.builderIncentive()
+      .then((capability) => {
+        if (!cancelled) setBuilderCapability(capability);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setBuilderCapability({
+            active: false,
+            reason: `Backend capability check failed: ${(error as Error).message}`,
+          });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setBuilderCapabilityLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [
+    strategy?.revision,
+    status?.mode,
+    status?.chainId,
+    status?.journalHealthy,
+    capabilityRefreshToken,
+  ]);
+
+  const gasField = (k: keyof StrategyConfig, v: number | boolean | string) => {
     if (!config) return;
     onStrategyChange({ ...strategy!, config: { ...config, [k]: v } });
     setGasSaved(false);
   };
   const saveGas = async () => {
     if (!config) return;
+    const bidWei = ethWei(config.coinbaseBidEth);
+    if (config.coinbaseBidEnabled && (bidWei === null || bidWei === 0n)) {
+      setGasErr("Enter a positive canonical ETH amount with at most 18 decimal places.");
+      return;
+    }
+    if (config.coinbaseBidEnabled && !ADDRESS.test(config.coinbasePayerAddress)) {
+      setGasErr("Enter the deployed CoinbasePayer address before enabling the incentive.");
+      return;
+    }
+    const nextBuilder = builderSettings(config);
+    const acknowledgesRisk = savedBuilder === null
+      ? nextBuilder.coinbaseBidEnabled
+      : builderRiskIncreases(savedBuilder, nextBuilder);
+    if (acknowledgesRisk && !window.confirm(
+      "Confirm direct builder-incentive risk\n\n"
+      + "An included incentive irreversibly sends ETH to the block fee recipient, plus gas. "
+      + "It does not guarantee inclusion, top-of-block placement, transaction order, or audit success. Continue?",
+    )) {
+      setGasErr("Builder-incentive changes were not saved because risk acknowledgement was cancelled.");
+      return;
+    }
     setGasBusy(true);
     setGasErr(null);
     try {
-      const next = await api.setConfig(strategy!.revision, {
+      const patch = {
         maxBaseFeeGwei: config.maxBaseFeeGwei,
         priorityFeeGwei: config.priorityFeeGwei,
         dynamicTipEnabled: config.dynamicTipEnabled,
@@ -165,9 +259,25 @@ export function JitPanel({
         preBoundaryLeadMs: config.preBoundaryLeadMs,
         preBoundaryLeadMainnetMs: config.preBoundaryLeadMainnetMs,
         maxAutoPayEpochs: config.maxAutoPayEpochs,
-      });
+        coinbaseBidEnabled: config.coinbaseBidEnabled,
+        coinbaseBidEth: config.coinbaseBidEth,
+        coinbasePayerAddress: config.coinbasePayerAddress,
+        combinedBoundaryBundle: config.combinedBoundaryBundle,
+      };
+      const next = acknowledgesRisk
+        ? await api.setConfig(strategy!.revision, patch, true)
+        : await api.setConfig(strategy!.revision, patch);
       onStrategyChange(next);
+      setSavedBuilder(builderSettings(next.config));
       setGasSaved(true);
+      try {
+        setBuilderCapability(await api.builderIncentive());
+      } catch (error) {
+        setBuilderCapability({
+          active: false,
+          reason: `Saved, but the backend capability refresh failed: ${(error as Error).message}`,
+        });
+      }
     } catch (e) {
       if (e instanceof ApiError && (e.status === 409 || e.status === 503)) {
         try {
@@ -401,7 +511,169 @@ export function JitPanel({
               both leads under one 12-second slot. The larger mainnet default gives builders more time.
             </p>
           </div>
-          <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>
+
+          <div
+            style={{
+              marginTop: 12,
+              paddingTop: 10,
+              borderTop: "1px solid var(--border)",
+              ...(config.coinbaseBidEnabled
+                ? {
+                    borderLeft: "3px solid var(--accent)",
+                    background: "rgba(91,157,255,0.08)",
+                    paddingLeft: 10,
+                    marginLeft: -10,
+                    borderRadius: 6,
+                  }
+                : {}),
+            }}
+          >
+            <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+              ⚠ DIRECT BUILDER INCENTIVE (advanced, private mainnet)
+              {builderCapabilityLoading && (
+                <span className="badge" style={{ marginLeft: 8, fontSize: 10 }}>VERIFYING…</span>
+              )}
+              {!builderCapabilityLoading && builderCapability?.active && (
+                <span
+                  className="badge"
+                  style={{ marginLeft: 8, background: "var(--accent)", color: "#fff", fontSize: 10 }}
+                >
+                  CONFIG / CHAIN / CODE VERIFIED
+                </span>
+              )}
+              {!builderCapabilityLoading && builderCapability && !builderCapability.active && (
+                <span className="badge warn" style={{ marginLeft: 8, fontSize: 10 }}>INACTIVE</span>
+              )}
+            </div>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={config.coinbaseBidEnabled}
+                onChange={(e) => gasField("coinbaseBidEnabled", e.target.checked)}
+              />
+              Enable a direct builder incentive for eligible combined boundary cohorts
+            </label>
+            <div
+              role="note"
+              aria-label="Builder incentive risk warning"
+              style={{ fontSize: 11, margin: "6px 0 10px 24px", lineHeight: 1.5 }}
+            >
+              <p className="err" style={{ margin: "0 0 4px 0" }}>
+                <b>Non-refundable ETH:</b> if included, this sends the configured amount to the block fee
+                recipient, plus transaction gas. The stateless payer has no owner or withdrawal path.
+              </p>
+              <p className="muted" style={{ margin: "0 0 4px 0" }}>
+                <b>No guarantee:</b> paying a builder does not guarantee bundle inclusion, top-of-block
+                position, transaction order, or a successful payment/audit outcome.
+              </p>
+              <p className="muted" style={{ margin: "0 0 4px 0" }}>
+                <b>Private mainnet only:</b> the backend requires Ethereum mainnet, a healthy submission
+                journal, and the exact pinned CoinbasePayer runtime at the configured address.
+              </p>
+              <p className="muted" style={{ margin: 0 }}>
+                <b>No bid-only submission:</b> the incentive is never sent on its own; it is only an
+                allowed-to-revert tail transaction behind an eligible mandatory boundary payment.
+              </p>
+            </div>
+            <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
+              <label className="field" style={{ flex: "1 1 170px" }}>
+                Builder incentive (ETH)
+                <input
+                  aria-label="Builder incentive amount (ETH)"
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="0.01"
+                  value={config.coinbaseBidEth}
+                  onChange={(e) => gasField("coinbaseBidEth", e.target.value)}
+                  disabled={!config.coinbaseBidEnabled}
+                />
+              </label>
+              <label className="field" style={{ flex: "2 1 280px" }}>
+                Approved CoinbasePayer address
+                <input
+                  aria-label="CoinbasePayer address"
+                  type="text"
+                  placeholder="0x…"
+                  value={config.coinbasePayerAddress}
+                  onChange={(e) => gasField("coinbasePayerAddress", e.target.value)}
+                  disabled={!config.coinbaseBidEnabled}
+                />
+              </label>
+            </div>
+            {config.coinbaseBidEnabled
+              && (ethWei(config.coinbaseBidEth) ?? 0n) === 0n && (
+              <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
+                Enter a positive canonical ETH amount with at most 18 decimal places.
+              </p>
+            )}
+            {config.coinbaseBidEnabled && !ADDRESS.test(config.coinbasePayerAddress) && (
+              <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
+                Enter the deployed 0x CoinbasePayer address. The backend will verify its runtime bytecode.
+              </p>
+            )}
+            {!builderCapabilityLoading && builderCapability && !builderCapability.active && (
+              <p className="hint" aria-label="Builder incentive backend state" style={{ marginTop: 6 }}>
+                Backend state: {builderCapability.reason}
+              </p>
+            )}
+            {!builderCapabilityLoading && builderCapability?.active && (
+              <p className="hint" aria-label="Builder incentive backend state" style={{ marginTop: 6 }}>
+                Capability only: persisted switches, mainnet chain, healthy journal, payer/bid, and the
+                pinned runtime are verified. This is not an executable-now signal. Payer {builderCapability.payer}.
+              </p>
+            )}
+            <div
+              className="hint"
+              role="note"
+              aria-label="Builder incentive execution requirements"
+              style={{ marginTop: 6, lineHeight: 1.5 }}
+            >
+              Execution still requires mainnet mode (currently {status?.mode ?? "unknown"}), pre-boundary
+              payments ({config.preBoundaryPay ? "enabled" : "disabled"}), a running engine
+              ({status?.running ? "running" : "stopped"}), an unlocked wallet
+              ({status?.unlocked ? "unlocked" : "locked"}), and a healthy journal
+              ({status?.journalHealthy ? "healthy" : "unhealthy"}). {status?.dryRun
+                ? "Dry Run is on, so no transaction will be signed or sent. "
+                : "Dry Run is off. "}
+              A due mandatory boundary payment and the final financial authorization must also pass at
+              execution time; capability verification alone never sends a bid.
+            </div>
+
+            <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={config.combinedBoundaryBundle}
+                  onChange={(e) => gasField("combinedBoundaryBundle", e.target.checked)}
+                />
+                Allow a combined boundary payment / audit private cohort
+              </label>
+              <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 24px", lineHeight: 1.5 }}>
+                Combined mode adds eligible audits behind an already prepared mandatory payment in the same
+                private cohort. Each audit is explicitly <b>allowed to revert</b>, so a stale or raced audit
+                cannot invalidate the mandatory payment prefix. A public audit race may still occur under the
+                offense settings; this is not atomic and does not guarantee inclusion or ordering.
+              </p>
+              {!config.combinedBoundaryBundle && config.coinbaseBidEnabled && (
+                <p className="hint" style={{ fontSize: 11, margin: "4px 0 0 24px" }}>
+                  The direct incentive remains inactive until combined boundary cohorts are also enabled.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <button
+            className="primary"
+            onClick={saveGas}
+            disabled={
+              gasBusy
+              || (config.coinbaseBidEnabled && (
+                (ethWei(config.coinbaseBidEth) ?? 0n) === 0n
+                || !ADDRESS.test(config.coinbasePayerAddress)
+              ))
+            }
+            style={{ marginTop: 8 }}
+          >
             {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment settings"}
           </button>
           {gasErr && <p className="err" style={{ marginTop: 6 }}>{gasErr}</p>}

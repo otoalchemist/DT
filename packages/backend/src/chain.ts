@@ -45,7 +45,9 @@ export function reinitClients(httpUrl: string, wsUrl?: string | null): void {
   publicClient = createPublicClient({ chain: mainnet, transport: makeHttpTransport(httpUrl) });
   wsClient = wsUrl ? createPublicClient({ chain: mainnet, transport: webSocket(wsUrl) }) : null;
   cachedBlock = null; // drop any block cached against the old client
-  logger.info(`RPC clients reinitialized (${httpUrl.slice(0, 40)}…)`);
+  // Do not log any part of the configured endpoint. Private gateways can carry
+  // credentials in userinfo, paths, queries, or generated subdomains.
+  logger.info("RPC clients reinitialized (configured endpoint)");
 }
 
 // Short-lived cache of the latest block. Within one engine tick the base fee is

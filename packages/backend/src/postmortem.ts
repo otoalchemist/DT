@@ -1,6 +1,8 @@
 // Race post-mortem: compare one or more of OUR transactions against rival
 // transactions for the same epoch and explain, per pair, whether we lost on
-// TIMING (landed in a later block) or on FEE (same block, out-priced).
+// TIMING (landed in a later block) or same-block ORDERING/BUILDER ECONOMICS.
+// Visible priority tips are evidence only; direct coinbase transfers and other
+// bundle revenue can determine placement.
 //
 // Reusable core: runPostMortem() returns structured PostMortemResult (used by
 // the API + UI). The CLI wrapper below prints it as a table.
@@ -10,7 +12,7 @@
 //   tsx src/postmortem.ts --ours 0xabc... --rivals 0x111...,0x222...
 //
 // Requires an RPC endpoint (ALCHEMY_API_KEY or RPC_HTTP_URL), same as the bot.
-import { formatGwei, decodeFunctionData, type Hex } from "viem";
+import { formatEther, formatGwei, decodeFunctionData, type Hex } from "viem";
 import {
   deathAndTaxesAbi,
   type PostMortemTx,
@@ -19,9 +21,21 @@ import {
 } from "@dat-bot/shared";
 import { publicClient } from "./chain.js";
 import { appConfig } from "./config.js";
+import { redactSensitiveText } from "./redaction.js";
 
-/** Decode the contract call into a human label; falls back to the raw selector. */
-function describe(input: Hex): { action: string; args: string } {
+/** Decode the contract call into a human label; falls back to the raw selector.
+ * Empty-data value transfers are called out because they can be the outer
+ * transaction that funds a direct block.coinbase forwarder. This is a clue, not
+ * proof: a complete bundle-profit analysis still needs traces/builder data. */
+export function describePostMortemTransaction(
+  input: Hex,
+  value: bigint,
+): { action: string; args: string } {
+  if (input === "0x") {
+    return value > 0n
+      ? { action: "value-transfer", args: `${formatEther(value)} ETH; possible builder incentive` }
+      : { action: "empty-call", args: "" };
+  }
   try {
     const { functionName, args } = decodeFunctionData({ abi: deathAndTaxesAbi, data: input });
     const argStr = (args ?? []).map((a) => (typeof a === "bigint" ? a.toString() : String(a))).join(", ");
@@ -50,7 +64,7 @@ async function loadTx(hash: Hex, role: "ours" | "rival"): Promise<PostMortemTx> 
   // Effective tip = effectiveGasPrice - baseFee, capped by maxPriorityFeePerGas.
   const tip = effective !== null && baseFee !== null ? effective - baseFee : (tx.maxPriorityFeePerGas ?? null);
 
-  const { action, args } = describe(tx.input as Hex);
+  const { action, args } = describePostMortemTransaction(tx.input as Hex, tx.value);
   return {
     ...base,
     found: true,
@@ -76,7 +90,10 @@ function seq(r: PostMortemTx): [number, number] {
   return [r.blockNumber === null ? Infinity : Number(r.blockNumber), r.txIndex ?? Infinity];
 }
 
-function judge(ours: PostMortemTx, rival: PostMortemTx): { outcome: PostMortemVerdict["outcome"]; detail: string } {
+export function judgePostMortemPair(
+  ours: PostMortemTx,
+  rival: PostMortemTx,
+): { outcome: PostMortemVerdict["outcome"]; detail: string } {
   if (!ours.found || !rival.found) {
     return { outcome: "unknown", detail: "cannot compare (tx not found / still pending)" };
   }
@@ -97,10 +114,12 @@ function judge(ours: PostMortemTx, rival: PostMortemTx): { outcome: PostMortemVe
       : ` — their tip was ${fmt(rival.tipGwei)} gwei vs our ${fmt(ours.tipGwei)}; higher tip *might* have helped only if we reached their block`;
     return { outcome: "lost-timing", detail: `WE LOST on TIMING: ${blocks} block(s) / ~${secs}s late${feeNote}` };
   }
-  // Same block, they had a lower index than us → fee/ordering loss.
+  // Same block, they had a lower index than us. Transaction priority tips are
+  // useful evidence but cannot establish why a builder chose that order: direct
+  // coinbase transfers and bundle-level revenue may dominate the visible tip.
   return {
     outcome: "lost-fee",
-    detail: `WE LOST on FEE/ORDERING (same block, they sat ${oi - ri} slots higher): their tip ${fmt(rival.tipGwei)} gwei vs our ${fmt(ours.tipGwei)} gwei`,
+    detail: `WE LOST on ORDERING/BUILDER ECONOMICS (same block, they sat ${oi - ri} slots higher): their visible tip ${fmt(rival.tipGwei)} gwei vs our ${fmt(ours.tipGwei)} gwei. Priority tip alone is not conclusive; a direct coinbase transfer or other bundle-level revenue may have determined builder ordering.`,
   };
 }
 
@@ -115,7 +134,7 @@ export async function runPostMortem(ours: Hex[], rivals: Hex[]): Promise<PostMor
   const verdicts: PostMortemVerdict[] = [];
   for (const o of ourRows) {
     for (const r of rivalRows) {
-      const { outcome, detail } = judge(o, r);
+      const { outcome, detail } = judgePostMortemPair(o, r);
       verdicts.push({
         ourHash: o.hash,
         rivalHash: r.hash,
@@ -135,7 +154,7 @@ export async function runPostMortem(ours: Hex[], rivals: Hex[]): Promise<PostMor
     const lateBy = Math.min(...ourBlocks) - Math.min(...rivalBlocks);
     if (lateBy > 0) summary = `Our earliest tx landed ${lateBy} block(s) after the rivals' earliest — a timing gap, not a fee gap.`;
     else if (lateBy < 0) summary = `Our earliest tx beat the rivals' earliest by ${-lateBy} block(s).`;
-    else summary = "We shared the earliest block with a rival — ordering (tip) was the deciding factor.";
+    else summary = "We shared the earliest block with a rival. Ordering and total builder economics decided the result; visible priority tip alone is not conclusive because direct coinbase transfers or other bundled revenue may apply.";
   } else if (rivalRows.length === 0) {
     summary = "No rival transactions supplied — pass rival hashes to get win/loss verdicts.";
   }
@@ -215,7 +234,7 @@ if (invokedDirectly) {
   runPostMortem(ours, rivals)
     .then(printResult)
     .catch((err) => {
-      console.error("post-mortem failed:", (err as Error).message);
+      console.error("post-mortem failed:", redactSensitiveText((err as Error).message));
       process.exit(1);
     });
 }

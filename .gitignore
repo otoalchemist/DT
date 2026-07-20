@@ -18,6 +18,7 @@ data/flashbots-signer.key
 data/*.keystore.json
 data/submission-flights/
 data/.*.tmp
+data/.dt-process.lock*
 keystore/
 
 # Foundry integration-test build output

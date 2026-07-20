@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { WalletClient } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
+import { formatEther, getAddress, parseEther } from "viem";
 import { z } from "zod";
 import {
   VERSION,
@@ -14,6 +15,7 @@ import { appConfig, bundledDataDir, writeJsonAtomic } from "./config.js";
 import { logger } from "./logger.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
 import { AtomicWriteCommittedError } from "./durability.js";
+import { redactSensitiveText } from "./redaction.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
@@ -51,11 +53,12 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // actually work, so they're pre-armed rather than left for them to discover.
   offenseEnabled: false,
   autoAudit: true,
-  autoKill: true,
+  autoKill: false, // opt-in: killing an expired-audit token is irreversible and aggressive
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadDefaultRivalTargets(),
   preBoundaryAudit: false,
   preBoundaryKill: false,
+  combinedBoundaryBundle: false,
   // Payment gas — tuned to win the boundary bundle race: a ~15 gwei tip clears
   // the observed batch-audit bundles (~3 gwei) with margin, dynamic tip scales it
   // up in contested boundary blocks, and the base-fee cap is generous (boundary
@@ -73,14 +76,16 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseDynamicTipEnabled: true,
   offenseDynamicTipMaxGwei: 20.1,
   offenseReplacementPriorityFeeCapGwei: 20.1,
-  offenseBoundaryScheduling: false,
   racePublicMempool: true,
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,
+  coinbaseBidEnabled: false,
+  coinbaseBidEth: "0",
+  coinbasePayerAddress: "",
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 
-export const strategyConfigSchema = z.object({
+const strategyCommonShape = {
   defenseEnabled: z.boolean(),
   dryRun: z.boolean(),
   auditSafetyBufferSeconds: z.number().int().min(0),
@@ -110,14 +115,56 @@ export const strategyConfigSchema = z.object({
   offenseDynamicTipEnabled: z.boolean(),
   offenseDynamicTipMaxGwei: z.number().positive(),
   offenseReplacementPriorityFeeCapGwei: z.number().positive(),
-  offenseBoundaryScheduling: z.boolean(),
   racePublicMempool: z.boolean(),
   dynamicTipEnabled: z.boolean(),
   dynamicTipMaxGwei: z.number().positive(),
   maxPaymentEth: z.number().min(0),
+};
+
+const canonicalCoinbaseBidEthSchema = z.string()
+  .trim()
+  .regex(
+    /^(0|[1-9]\d*)(\.\d{1,18})?$/,
+    "must be a non-negative base-10 ETH amount with at most 18 decimal places",
+  )
+  .transform((value) => formatEther(parseEther(value)));
+
+const coinbasePayerAddressSchema = z.string()
+  .trim()
+  .regex(/^(0x[0-9a-fA-F]{40})?$/, "must be a 0x address or empty")
+  .transform((value): string => value === "" ? "" : getAddress(value.toLowerCase()))
+  .refine(
+    (value) => value === "" || value !== "0x0000000000000000000000000000000000000000",
+    "must not be the zero address",
+  );
+
+const strategyConfigBaseSchema = z.object({
+  ...strategyCommonShape,
+  combinedBoundaryBundle: z.boolean(),
+  coinbaseBidEnabled: z.boolean(),
+  coinbaseBidEth: canonicalCoinbaseBidEthSchema,
+  coinbasePayerAddress: coinbasePayerAddressSchema,
 }).strict();
 
-export const strategyPatchSchema = strategyConfigSchema.partial().strict();
+export const strategyConfigSchema = strategyConfigBaseSchema.superRefine((config, ctx) => {
+  if (!config.coinbaseBidEnabled) return;
+  if (parseEther(config.coinbaseBidEth) === 0n) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["coinbaseBidEth"],
+      message: "must be greater than zero when the builder incentive is enabled",
+    });
+  }
+  if (config.coinbasePayerAddress === "") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["coinbasePayerAddress"],
+      message: "is required when the builder incentive is enabled",
+    });
+  }
+});
+
+export const strategyPatchSchema = strategyConfigBaseSchema.partial().strict();
 
 const jitCampaignSchema = z.object({
   revision: z.number().int().min(0),
@@ -131,7 +178,14 @@ const jitCampaignSchema = z.object({
   completedAt: z.number().int().min(0).optional(),
 }).strict();
 
-const STRATEGY_SCHEMA_VERSION = 2 as const;
+const strategyConfigV2Schema = z.object({
+  ...strategyCommonShape,
+  // This generic timer was superseded by the explicit, future-simulated audit
+  // and kill schedulers. It exists only to parse schema-v2 envelopes safely.
+  offenseBoundaryScheduling: z.boolean(),
+}).strict();
+
+const STRATEGY_SCHEMA_VERSION = 3 as const;
 const persistedEnvelopeSchema = z.object({
   schemaVersion: z.literal(STRATEGY_SCHEMA_VERSION),
   strategy: z.object({
@@ -141,7 +195,40 @@ const persistedEnvelopeSchema = z.object({
   jitCampaign: jitCampaignSchema,
 }).strict();
 
+const persistedEnvelopeV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  strategy: z.object({
+    revision: z.number().int().min(0),
+    config: strategyConfigV2Schema,
+  }).strict(),
+  jitCampaign: jitCampaignSchema,
+}).strict();
+
 type PersistedEnvelope = z.infer<typeof persistedEnvelopeSchema>;
+type PersistedEnvelopeV2 = z.infer<typeof persistedEnvelopeV2Schema>;
+
+function canonicalLegacyCoinbaseBid(value: unknown): string {
+  if (value === undefined) return DEFAULT_STRATEGY.coinbaseBidEth;
+  const candidate = typeof value === "number"
+    ? Number.isFinite(value) && value >= 0 && value < 1e21
+      ? value.toString().toLowerCase().includes("e")
+        ? value.toFixed(18)
+        : value.toString()
+      : null
+    : typeof value === "string"
+      ? value
+      : null;
+  const parsed = candidate === null
+    ? null
+    : canonicalCoinbaseBidEthSchema.safeParse(candidate);
+  if (!parsed?.success) {
+    throw new Error("legacy coinbaseBidEth must be a non-negative ETH amount with at most 18 decimals");
+  }
+  if (typeof value === "number" && value > 0 && parseEther(parsed.data) === 0n) {
+    throw new Error("legacy coinbaseBidEth is nonzero but smaller than one wei");
+  }
+  return parsed.data;
+}
 
 export class RevisionConflictError extends Error {
   constructor(public readonly currentRevision: number) {
@@ -216,6 +303,26 @@ export class Runtime {
     writeJsonAtomic(this.configPath(), envelope);
   }
 
+  private migrateV2(saved: PersistedEnvelopeV2): PersistedEnvelope {
+    const { offenseBoundaryScheduling: _removed, ...prior } = saved.strategy.config;
+    return persistedEnvelopeSchema.parse({
+      schemaVersion: STRATEGY_SCHEMA_VERSION,
+      strategy: {
+        // A schema rewrite is not an operator mutation. Preserve optimistic
+        // concurrency state so a restart alone cannot manufacture a revision.
+        revision: saved.strategy.revision,
+        config: {
+          ...prior,
+          combinedBoundaryBundle: DEFAULT_STRATEGY.combinedBoundaryBundle,
+          coinbaseBidEnabled: DEFAULT_STRATEGY.coinbaseBidEnabled,
+          coinbaseBidEth: DEFAULT_STRATEGY.coinbaseBidEth,
+          coinbasePayerAddress: DEFAULT_STRATEGY.coinbasePayerAddress,
+        },
+      },
+      jitCampaign: saved.jitCampaign,
+    });
+  }
+
   private migrateLegacy(saved: Record<string, unknown>): PersistedEnvelope {
     const legacyDefense = typeof saved.defenseEnabled === "boolean"
       ? saved.defenseEnabled
@@ -249,6 +356,7 @@ export class Runtime {
         : saved.offenseDynamicTipEnabled === false
           ? offensePriority
           : Math.max(offensePriority, offenseDynamicMax);
+    const legacyCoinbaseBidEth = canonicalLegacyCoinbaseBid(saved.coinbaseBidEth);
     const merged = {
       ...DEFAULT_STRATEGY,
       ...saved,
@@ -263,12 +371,19 @@ export class Runtime {
         : {}),
       replacementPriorityFeeCapGwei,
       offenseReplacementPriorityFeeCapGwei,
+      // Flat upstream configs had no separate financial-authority bit and
+      // defaulted combined routing on. Preserve their staged amount/address but
+      // require a fresh explicit acknowledgement before either can become live.
+      combinedBoundaryBundle: false,
+      coinbaseBidEnabled: false,
+      coinbaseBidEth: legacyCoinbaseBidEth,
       ...(migratedBuffer === undefined ? {} : { auditSafetyBufferSeconds: migratedBuffer }),
     } as Record<string, unknown>;
     delete merged.enabled;
     delete merged.jitEnabled;
     delete merged.jitTargetEpoch;
     delete merged.jitTokenIds;
+    delete merged.offenseBoundaryScheduling;
     const strategy = strategyConfigSchema.parse(merged);
 
     const legacyIds = Array.isArray(saved.jitTokenIds)
@@ -303,18 +418,27 @@ export class Runtime {
     try {
       const raw = JSON.parse(fs.readFileSync(p, "utf8")) as unknown;
       const rawRecord = z.record(z.unknown()).parse(raw);
-      if (rawRecord.schemaVersion !== undefined && rawRecord.schemaVersion !== STRATEGY_SCHEMA_VERSION) {
-        throw new Error(`Unsupported strategy schemaVersion ${String(rawRecord.schemaVersion)}`);
-      }
       const current = persistedEnvelopeSchema.safeParse(raw);
-      if (rawRecord.schemaVersion === STRATEGY_SCHEMA_VERSION && !current.success) {
-        throw new Error(`Invalid strategy envelope: ${current.error.message}`);
+      let envelope: PersistedEnvelope;
+      let migrated = false;
+      if (rawRecord.schemaVersion === STRATEGY_SCHEMA_VERSION) {
+        if (!current.success) throw new Error(`Invalid strategy envelope: ${current.error.message}`);
+        envelope = current.data;
+      } else if (rawRecord.schemaVersion === 2) {
+        const prior = persistedEnvelopeV2Schema.safeParse(raw);
+        if (!prior.success) throw new Error(`Invalid strategy v2 envelope: ${prior.error.message}`);
+        envelope = this.migrateV2(prior.data);
+        migrated = true;
+      } else if (rawRecord.schemaVersion !== undefined) {
+        throw new Error(`Unsupported strategy schemaVersion ${String(rawRecord.schemaVersion)}`);
+      } else {
+        envelope = this.migrateLegacy(rawRecord);
+        migrated = true;
       }
-      const envelope = current.success ? current.data : this.migrateLegacy(rawRecord);
       this.strategy = envelope.strategy.config;
       this.strategyRevision = envelope.strategy.revision;
       this.jitCampaign = envelope.jitCampaign;
-      if (!current.success) this.persist(envelope);
+      if (migrated) this.persist(envelope);
     } catch (err) {
       throw new Error(`Could not load strategy config: ${(err as Error).message}`);
     }
@@ -394,7 +518,7 @@ export class Runtime {
 
   setJournalHealth(healthy: boolean, error: string | null = null): void {
     this.journalHealthy = healthy;
-    this.journalError = healthy ? null : error;
+    this.journalError = healthy || error === null ? null : redactSensitiveText(error);
     this.emitStatus();
   }
 
@@ -414,6 +538,7 @@ export class Runtime {
   status(): BotStatus {
     return {
       version: VERSION,
+      mode: appConfig.mode,
       running: this.running,
       unlocked: this.unlocked,
       dryRun: this.strategy.dryRun,

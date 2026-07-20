@@ -2,7 +2,7 @@
 
 A self-hosted automation bot for the on-chain game **[Death & Taxes](https://etherscan.io/address/0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F)** by Transient Labs. It watches the game for you and acts automatically:
 
-- **Defense (primary):** reduce the chance that one of your Citizen tokens is killed. By default, the bot reacts as soon as it observes a fresh 24-hour audit and tries to clear it by **paying taxes**. It also pays proactively at each boundary where a token would otherwise become auditable, and can prepay up to 7 epochs to lock the current (lower) tax rate. It **won't spend a held bribe** to clear an audit unless you opt in (`autoUseBribe`, off by default) — a bribe is free but consumed and leaves the token still delinquent.
+- **Defense (primary):** reduce the chance that one of your Citizen tokens is killed. When Defense is enabled, the bot reacts as soon as it observes a fresh 24-hour audit and tries to clear it by **paying taxes**. It also pays proactively at each boundary where a token would otherwise become auditable, and can prepay up to 7 epochs to lock the current (lower) tax rate. It **won't spend a held bribe** to clear an audit unless you opt in (`autoUseBribe`, off by default) — a bribe is free but consumed and leaves the token still delinquent.
 - **Just-in-time epoch payment (one-shot):** arm the bot for one explicit future epoch and an explicit set of Citizens. It pays exactly one epoch for only those Citizens as that epoch begins on-chain, then records the campaign as complete and disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per selected citizen. JIT is independent of recurring Defense: arming one Citizen never enables payments for the rest of the wallet.
 - **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. It audits **multiple rivals per epoch** — up to each eligible citizen's **`auditLimit`** (auditor-role tokens can audit several times per epoch; the bot reads each token's remaining capacity and uses all of it), instead of just one. This is a game strategy, not a profit engine — see below.
 - **Reliable submission paths:** choose **`mainnet`** (the default: private **bundles** fanned out to several block builders, with tax payments also mirrored to the public mempool as an independent fallback) or **`public`** (mempool only). [Builders decide inclusion and ordering](https://docs.flashbots.net/flashbots-auction/advanced/bundle-pricing) from profitability and available orderflow; neither route guarantees inclusion or block position. Latency edges let payments/offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
@@ -10,7 +10,7 @@ A self-hosted automation bot for the on-chain game **[Death & Taxes](https://eth
   simulation, submission, delivery-uncertain, rejection, inclusion, or revert
   state. Submitted transactions link to Etherscan and update when the outcome is
   reconciled.
-- **Race post-mortem:** after the fact, paste your tx hash and a rival's to see whether you lost on **timing** (later block) or **fee** (same block, out-priced) — in the dashboard or from the CLI.
+- **Race post-mortem:** after the fact, paste your tx hash and a rival's to compare **timing** (later block) with same-block **ordering/builder economics** — in the dashboard or from the CLI. Visible priority tips are not treated as proof because direct coinbase transfers or other bundle revenue may dominate them.
 
 You run it on your own machine with your own key. It ships with a local web dashboard.
 
@@ -163,9 +163,11 @@ web UI or `gh release create`).
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
 | `MAX_CANDIDATES` | Offense-only cap on rival enumeration (default 500). Owned Citizens are always fully paginated and then verified with `ownerOf`. |
 
-Secrets live in `.env` and the default `data/` directory (the encrypted keystore
-and a Flashbots reputation key). Both are git-ignored. A custom `DATA_DIR` is not
-automatically ignored, so keep it outside the repository. **Never commit it.**
+Treat `.env` and the entire `DATA_DIR` as secret. In addition to the encrypted
+keystore and Flashbots reputation key, the directory can contain a plaintext
+dashboard-saved provider key and replayable raw signed transactions in the
+submission journal. The default paths are git-ignored; a custom `DATA_DIR` is not
+automatically ignored, so keep it outside the repository. **Never commit or share it.**
 
 Strategy settings are edited from the dashboard and saved to `<DATA_DIR>/config.json`.
 With no such file the bot starts from safe defaults — dry-run on, offense/defense
@@ -262,11 +264,6 @@ cp data/config.example.json "$DATA_DIR/config.json"
 Rivals often win by landing in an *earlier block*, not by paying more. These
 configurable edges close that gap (configure them in the dashboard):
 
-- **Pre-schedule offense at deadlines** — fires an extra tick just before each
-  offense deadline (the nearest audit expiry, or the next epoch boundary) so kills
-  and audits compete in the **first eligible block** instead of the block after. A
-  boundary tick is never dropped just because a routine tick is mid-flight — it
-  retries as soon as the engine is free, so the race isn't lost to bad luck.
 - **Race the public mempool** (`mainnet` mode only) — also broadcasts a
   time-critical **offense** tx to the public mempool alongside the bundle, so *any*
   builder can include it next block. The tx is identical (same nonce), so only one
@@ -295,6 +292,23 @@ configurable edges close that gap (configure them in the dashboard):
   chain reads do not stack another payment and definite failures can be retried.
   Future-valid public transactions are built early but held until the boundary;
   mainnet bundles carry the same timestamp as their minimum inclusion time.
+- **Direct builder incentive** (advanced, explicit opt-in, `mainnet` only) — an
+  owner-signed, private-only transaction can pay a configured amount through the
+  bundled `CoinbasePayer`, whose checked call forwards the value to the winning
+  block's `block.coinbase`. The backend enables this only on chain 1 after matching
+  the deployed runtime bytecode to the reproducibly compiled, pinned runtime in
+  `contracts/CoinbasePayer.build.json`; no shared third-party payer is trusted by default.
+  The incentive is prepared only behind at least one mandatory boundary payment,
+  passes the same balance floor, spend cap, durable journal, recovery, and receipt
+  accounting as every other transaction, and is never replayed or broadcast on its
+  own. Direct payment improves the bundle's economics for builders, but does **not**
+  guarantee inclusion, transaction index zero, or any particular ordering.
+- **Optional combined payment + audit cohort** (`mainnet` only) — a separate opt-in
+  can place due boundary payments first, audits second, and one builder incentive
+  last in a single nonce-ordered private cohort. Payments remain mandatory and keep
+  their public fallback; audits and the incentive are explicitly allowed to revert,
+  so either can fail without invalidating a payment. Audits retain a public fallback,
+  and if the full cohort does not fit builder limits the incentive is not sent.
 - **Nonce-ordered payment campaigns (`mainnet` mode, automatic)** — every Citizen you hold
   is owned by the same wallet, so paying/auditing several in one cycle produces
   multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only
@@ -306,7 +320,9 @@ configurable edges close that gap (configure them in the dashboard):
   are signed before the boundary wait; the public fallback dispatches the prepared
   sequence without serializing one wait per Citizen. Bundles are validated against
   the builder limits (100 transactions, 300,000 encoded bytes, and aggregate gas).
-  Optional audit/kill work is never attached to a survival payment bundle.
+  Kill work is never attached to a survival payment bundle. Audits join one only
+  through the separately enabled combined-boundary cohort described above, where
+  they are explicitly allowed to revert without invalidating the payment.
 - **Race audits/kills into the first block** (advanced, opt-in) — the offense
   equivalents. *Race audits* pre-submits audits just before the epoch boundary so
   they land the instant rivals become delinquent (like a batch-auditor); *race
@@ -328,17 +344,21 @@ configurable edges close that gap (configure them in the dashboard):
 
 ## Race post-mortem
 
-Compare your transaction against a rival's to diagnose *why* you lost a race —
-**timing** (you landed in a later block; more gas wouldn't have helped) vs **fee**
-(same block, out-priced). Available in the dashboard, or from the CLI:
+Compare your transaction against a rival's to diagnose whether you lost on
+**timing** (you landed in a later block) or same-block **ordering/builder
+economics**. A same-block result does not claim the visible priority tip was the
+cause: direct coinbase transfers and other bundle-level revenue can determine a
+builder's ordering. Available in the dashboard, or from the CLI:
 
 ```bash
 # your tx first, then one or more rival txs
 npx tsx packages/backend/src/postmortem.ts <yourTx> <rivalTx> [<rivalTx> ...]
 ```
 
-It reports each tx's block, index, and effective priority tip, then a per-pair
-verdict and a summary. Needs an RPC (`ALCHEMY_API_KEY` or `RPC_HTTP_URL`).
+It reports each tx's block, index, effective priority tip, and decoded action;
+empty-data value transfers are flagged as possible builder incentives. That flag
+is only a clue—complete builder-profit attribution requires traces or builder
+data. Needs an RPC (`ALCHEMY_API_KEY` or `RPC_HTTP_URL`).
 
 ---
 

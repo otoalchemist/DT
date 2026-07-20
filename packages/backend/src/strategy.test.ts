@@ -5,6 +5,7 @@ import type { PrivateKeyAccount } from "viem/accounts";
 const EPOCH_SECONDS = 86_400n;
 const BASE_TAX_RATE_WEI = 690_000_000_000_000n;
 const START_TIME = 0n;
+const COINBASE_PAYER = "0x00000000000000000000000000000000000000b1" as const;
 
 const testState = vi.hoisted(() => ({
   lastEpochPaid: 0n,
@@ -50,6 +51,7 @@ const testState = vi.hoisted(() => ({
     ok: boolean;
     error?: string;
     uncertain?: boolean;
+    retained?: boolean;
     retryImmediately?: boolean;
     txHash?: Hex;
     replacementUuids?: string[];
@@ -67,6 +69,19 @@ const testState = vi.hoisted(() => ({
     auditDueTimestamp: string;
     killable: boolean;
   }>,
+  builderIncentive: {
+    active: true as const,
+    payer: "0x00000000000000000000000000000000000000b1" as const,
+    bidWei: 15_000_000_000_000_000n,
+    runtimeCodeHash: `0x${"ab".repeat(32)}` as Hex,
+  } as
+    | {
+      active: true;
+        payer: `0x${string}`;
+        bidWei: bigint;
+        runtimeCodeHash: Hex;
+      }
+    | { active: false; reason: string },
   nextActivityId: 0,
 }));
 
@@ -234,11 +249,23 @@ vi.mock("./index-tokens.js", () => ({
   ownershipIndexingAvailable: vi.fn(() => true),
 }));
 
+vi.mock("./builder-incentive.js", () => ({
+  COINBASE_PAYER_GAS: 100_000n,
+  resolveBuilderIncentive: vi.fn(async () => testState.builderIncentive),
+}));
+
 vi.mock("./flashbots.js", () => ({
   submitTx: vi.fn(async (
-    intent: { value: bigint },
+    intent: { to?: `0x${string}`; data?: Hex; value: bigint; gas?: bigint },
     opts: {
       dryRun: boolean;
+      race?: boolean;
+      revertible?: boolean;
+      purpose?: "builder-incentive";
+      privateCohort?: {
+        id: string;
+        role: "mandatory" | "allowed-revert" | "builder-incentive";
+      };
       replacement?: { nonce: number };
       authorize?: (quote: {
         valueWei: bigint;
@@ -272,12 +299,27 @@ vi.mock("./flashbots.js", () => ({
         };
       }
     }
+    if (opts.dryRun) {
+      return {
+        ok: true,
+        simulated: true,
+        nonce: opts.replacement?.nonce ?? testState.nextNonce,
+        valueWei: intent.value,
+        gasWei: testState.submittedGasWei,
+        maxFeePerGas: testState.submittedMaxFeePerGas,
+        maxPriorityFeePerGas: testState.submittedMaxPriorityFeePerGas,
+      };
+    }
     const ok = testState.submitOutcomes.shift() ?? true;
-    if (ok) testState.signedCount += 1;
+    const nonce = opts.replacement?.nonce ?? testState.nextNonce;
+    if (ok) {
+      testState.signedCount += 1;
+      if (opts.replacement === undefined) testState.nextNonce += 1;
+    }
     return {
       ok,
       simulated: true,
-      nonce: opts.replacement?.nonce ?? testState.nextNonce++,
+      nonce,
       valueWei: intent.value,
       gasWei: testState.submittedGasWei,
       maxFeePerGas: testState.submittedMaxFeePerGas,
@@ -400,10 +442,11 @@ const { submitTx, recoverPreparedSubmissions } = await import("./flashbots.js");
 const { beginBundle, flushBundle, discardBundle } = await import("./flashbots.js");
 const { reconcileSubmissionJournal } = await import("./flashbots.js");
 const { nonceManager } = await import("./nonce.js");
-const { getLatestBlockCached, wsClient } = await import("./chain.js");
+const { getLatestBlockCached, publicClient, wsClient } = await import("./chain.js");
 const { appConfig } = await import("./config.js");
 const { encodePayTaxes, encodeAudit, filterLiveTokenIds, gameContract } = await import("./contract.js");
 const { AtomicWriteCommittedError } = await import("./durability.js");
+const { resolveBuilderIncentive } = await import("./builder-incentive.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const {
   startEngine,
@@ -414,6 +457,7 @@ const {
   preflightSubmissionRecovery,
   recoverAuthorizedSubmissions,
   schedulePreBoundaryPay,
+  resolveCombinedBoundaryIncentive,
 } = await import("./strategy.js");
 
 const saveJitCampaign = vi.spyOn(runtime, "saveJitCampaign").mockImplementation((next) => {
@@ -578,6 +622,45 @@ async function startAt(nowSec: bigint): Promise<void> {
   await vi.advanceTimersByTimeAsync(0);
 }
 
+function arrangeCombinedBoundaryScenario(
+  overrides: TestStrategyOverrides = {},
+): void {
+  appConfig.mode = "mainnet";
+  testState.submitQueued = true;
+  testState.submittedGasWei = 1_000n;
+  testState.lastEpochPaid = 4n;
+  testState.ownedIds = [1n, 2n];
+  testState.lastEpochPaidByToken = new Map([["1", 4n], ["2", 5n]]);
+  testState.auditLimitByToken = new Map([["2", 1n]]);
+  testState.candidateIds = [99n];
+  testState.liveTargets = [{
+    id: 99n,
+    owner: "0x9999999999999999999999999999999999999999",
+  }];
+  testState.targetStatuses = [{
+    tokenId: "99",
+    owner: "0x9999999999999999999999999999999999999999",
+    lastEpochPaid: "4",
+    delinquent: false,
+    epochsBehind: 1,
+    auditable: false,
+    auditDueTimestamp: "0",
+    killable: false,
+  }];
+  configure({
+    offenseEnabled: true,
+    autoAudit: true,
+    autoKill: false,
+    preBoundaryAudit: true,
+    combinedBoundaryBundle: true,
+    coinbaseBidEnabled: true,
+    coinbaseBidEth: "0.015",
+    coinbasePayerAddress: COINBASE_PAYER,
+    offenseTargetTokenIds: ["99"],
+    ...overrides,
+  });
+}
+
 describe("defensive payment scheduling and retries", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -623,11 +706,18 @@ describe("defensive payment scheduling and retries", () => {
     testState.candidateIds = [];
     testState.liveTargets = [];
     testState.targetStatuses = [];
+    testState.builderIncentive = {
+      active: true,
+      payer: COINBASE_PAYER,
+      bidWei: 15_000_000_000_000_000n,
+      runtimeCodeHash: `0x${"ab".repeat(32)}` as Hex,
+    };
     testState.nextActivityId = 0;
     appConfig.mode = "public";
     vi.mocked(nonceManager.hasInvisibleReservation).mockReturnValue(false);
 
     runtime.account = FAKE_ACCOUNT;
+    runtime.chainId = 1;
     runtime.running = false;
     runtime.balanceWei = null;
     runtime.currentEpoch = null;
@@ -659,6 +749,354 @@ describe("defensive payment scheduling and retries", () => {
     expect(intent.value).toBe(6n * BASE_TAX_RATE_WEI);
     expect(opts.simTimestamp).toBe(epochStart(6));
   });
+
+  it("gates combined boundary routing on explicit opt-in, journal health, and verified capability", async () => {
+    const configured = {
+      ...runtime.strategy,
+      combinedBoundaryBundle: true,
+      coinbaseBidEnabled: true,
+      coinbaseBidEth: "0.015",
+      coinbasePayerAddress: COINBASE_PAYER,
+    };
+
+    await expect(resolveCombinedBoundaryIncentive(
+      { ...configured, combinedBoundaryBundle: false },
+      1,
+      true,
+    )).resolves.toEqual(expect.objectContaining({ active: false }));
+    expect(resolveBuilderIncentive).not.toHaveBeenCalled();
+
+    await expect(resolveCombinedBoundaryIncentive(configured, 1, false)).resolves.toEqual(
+      expect.objectContaining({ active: false, reason: expect.stringContaining("journal") }),
+    );
+    expect(resolveBuilderIncentive).not.toHaveBeenCalled();
+
+    await expect(resolveCombinedBoundaryIncentive(configured, 1, true)).resolves.toEqual(
+      testState.builderIncentive,
+    );
+    expect(resolveBuilderIncentive).toHaveBeenCalledWith(configured, 1);
+  });
+
+  it("orders mandatory payments, public-fallback audits, and exactly one private incentive", async () => {
+    arrangeCombinedBoundaryScenario();
+    testState.flushResults = new Map([
+      [0, { ok: true }],
+      [1, { ok: true }],
+      [2, { ok: true }],
+    ]);
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([intent]) => intent.data)).toEqual(["0xPAYTAXES", "0xAUDIT", "0x"]);
+    const cohortIds = calls.map(([, opts]) => opts.privateCohort?.id);
+    expect(cohortIds[0]).toEqual(expect.any(String));
+    expect(cohortIds.every((id) => id === cohortIds[0])).toBe(true);
+    expect(calls[0]![1]).toMatchObject({
+      race: true,
+      privateCohort: { role: "mandatory" },
+    });
+    expect(calls[1]![1]).toMatchObject({
+      race: true,
+      revertible: true,
+      privateCohort: { role: "allowed-revert" },
+    });
+    expect(calls[2]![0]).toMatchObject({
+      to: COINBASE_PAYER,
+      value: testState.builderIncentive.active
+        ? testState.builderIncentive.bidWei
+        : 0n,
+      gas: 100_000n,
+    });
+    expect(calls[2]![1]).toMatchObject({
+      race: false,
+      revertible: true,
+      purpose: "builder-incentive",
+      privateCohort: { role: "builder-incentive" },
+    });
+    expect(calls.filter(([, opts]) => opts.purpose === "builder-incentive")).toHaveLength(1);
+    const expectedExposure = calls.reduce(
+      (sum, [intent]) => sum + intent.value + testState.submittedGasWei,
+      0n,
+    );
+    expect(runtime.status().pendingExposureWei).toBe(expectedExposure.toString());
+  });
+
+  it("never creates an audit-only or bid-only cohort when no mandatory payment is due", async () => {
+    arrangeCombinedBoundaryScenario();
+    testState.ownedIds = [2n];
+    testState.lastEpochPaid = 5n;
+    testState.lastEpochPaidByToken = new Map([["2", 5n]]);
+    testState.flushResults = new Map([[0, { ok: true }]]);
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_500);
+
+    expect(resolveBuilderIncentive).not.toHaveBeenCalled();
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xAUDIT"]);
+    expect(vi.mocked(submitTx).mock.calls[0]![1].privateCohort).toBeUndefined();
+    expect(vi.mocked(submitTx).mock.calls[0]![1].purpose).toBeUndefined();
+  });
+
+  it("falls back to a public-raced payment-only batch when optional discovery misses its handoff budget", async () => {
+    arrangeCombinedBoundaryScenario();
+    testState.flushResults = new Map([[0, { ok: true }]]);
+    const boundary = epochStart(6);
+    const gate = deferred<bigint[]>();
+
+    await startAt(boundary - 10n);
+    // Let the ordinary startup tick finish before delaying only the combined
+    // boundary discovery path.
+    testState.candidateGate = gate.promise;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(submitTx).not.toHaveBeenCalled();
+
+    // Combined discovery reserves the final second for payment handoff. The
+    // unresolved indexer call must be abandoned while the payment still has time
+    // to be prepared and handed to the transport.
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([intent]) => intent.data)).toEqual(["0xPAYTAXES"]);
+    expect(calls[0]![1]).toMatchObject({ race: true });
+    expect(calls[0]![1].deadlineMs).toBe(Number(boundary) * 1_000);
+    expect(calls[0]![1].privateCohort).toBeUndefined();
+    expect(calls[0]![1].purpose).toBeUndefined();
+    expect(Date.now()).toBeLessThan(Number(boundary) * 1_000);
+    expect(flushBundle).toHaveBeenCalledTimes(1);
+
+    // Completion of the abandoned pure read cannot append a late audit/bid or
+    // mutate the already-flushed payment campaign.
+    gate.resolve([99n]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xPAYTAXES",
+    ]);
+  });
+
+  it("abandons pure combined discovery immediately when the engine stops", async () => {
+    arrangeCombinedBoundaryScenario();
+    const boundary = epochStart(6);
+    const gate = deferred<bigint[]>();
+
+    await startAt(boundary - 10n);
+    testState.candidateGate = gate.promise;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(submitTx).not.toHaveBeenCalled();
+
+    stopEngine();
+    await waitForEngineIdle();
+    expect(runtime.running).toBe(false);
+    expect(submitTx).not.toHaveBeenCalled();
+    expect(flushBundle).not.toHaveBeenCalled();
+
+    gate.resolve([99n]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(submitTx).not.toHaveBeenCalled();
+  });
+
+  it("never attaches a combined cohort to a same-nonce payment replacement", async () => {
+    arrangeCombinedBoundaryScenario({ preBoundaryAudit: false });
+    const payData = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "payTaxes",
+      args: [1n, 1],
+    });
+    // The newest same-nonce alternative is deliberately non-semantic while the
+    // older raw preserves a target-epoch-6 payment obligation. This reconstructs
+    // a live replacement lineage whose current signed value differs from the
+    // payment now required at the boundary.
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce({
+      confirmedNonce: 0,
+      pendingNonce: 1,
+      currentBlock: 100n,
+      retained: [
+        journalFlight({
+          nonce: 0,
+          data: payData,
+          valueWei: 6n * BASE_TAX_RATE_WEI,
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        }),
+        journalFlight({
+          nonce: 0,
+          to: FAKE_ACCOUNT.address,
+          data: "0x",
+          valueWei: 1n,
+          createdAtMs: 2,
+          updatedAtMs: 2,
+        }),
+      ],
+      consumed: [],
+      expired: [],
+    });
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    testState.flushResults = new Map([[0, { ok: true }]]);
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([intent]) => intent.data)).toEqual(["0xPAYTAXES"]);
+    expect(calls[0]![1].replacement?.nonce).toBe(0);
+    expect(calls[0]![1]).toMatchObject({ race: true });
+    expect(calls[0]![1].privateCohort).toBeUndefined();
+    expect(calls[0]![1].purpose).toBeUndefined();
+    expect(resolveBuilderIncentive).not.toHaveBeenCalled();
+  });
+
+  it("keeps a non-cohort action filler and its following payment out of combined routing", async () => {
+    arrangeCombinedBoundaryScenario({
+      preBoundaryAudit: false,
+      autoKill: true,
+      offenseTargetTokenIds: ["99", "100"],
+    });
+    const boundary = epochStart(6);
+    const killData = encodeFunctionData({
+      abi: gameContract.abi,
+      functionName: "kill",
+      args: [100n],
+    });
+    testState.auditDueByToken.set("100", boundary - 1n);
+    vi.mocked(reconcileSubmissionJournal).mockResolvedValueOnce({
+      confirmedNonce: 0,
+      pendingNonce: 1,
+      currentBlock: 100n,
+      retained: [journalFlight({
+        nonce: 0,
+        data: killData,
+        notBeforeTimestamp: boundary,
+      })],
+      consumed: [],
+      expired: [],
+    });
+    await preflightSubmissionRecovery(FAKE_ACCOUNT.address);
+    testState.nextNonce = 1;
+    testState.flushResults = new Map([
+      [0, { ok: true }],
+      [1, { ok: true }],
+    ]);
+
+    await startAt(boundary - 10n);
+    // The ordinary startup sweep may refresh an already-obsolete filler. Measure
+    // the boundary batch independently; the recovered lineage intentionally
+    // remains unresolved across both sweeps.
+    vi.mocked(submitTx).mockClear();
+    vi.mocked(resolveBuilderIncentive).mockClear();
+    vi.mocked(flushBundle).mockClear();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([intent]) => intent.data)).toEqual(["0x", "0xPAYTAXES"]);
+    expect(calls[0]![1].replacement?.nonce).toBe(0);
+    expect(calls[1]![1]).toMatchObject({ race: true });
+    expect(calls.every(([, opts]) => opts.privateCohort === undefined)).toBe(true);
+    expect(calls.every(([, opts]) => opts.purpose === undefined)).toBe(true);
+    expect(resolveBuilderIncentive).not.toHaveBeenCalled();
+    expect(flushBundle).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the standalone audit path when payer capability is not verified", async () => {
+    arrangeCombinedBoundaryScenario();
+    testState.builderIncentive = { active: false, reason: "payer bytecode mismatch" };
+    testState.flushResults = new Map([
+      [0, { ok: true }],
+      [1, { ok: true }],
+    ]);
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual(["0xPAYTAXES"]);
+
+    // The hardened standalone path waits for the survival-payment nonce to be
+    // terminal before exposing offense. Once that prefix is observed consumed,
+    // the still-armed audit scheduler provides the fallback.
+    testState.confirmedNonce = 1;
+    await vi.advanceTimersByTimeAsync(500);
+
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.map(([intent]) => intent.data)).toEqual(["0xPAYTAXES", "0xAUDIT"]);
+    expect(calls.every(([, opts]) => opts.privateCohort === undefined)).toBe(true);
+    expect(calls.every(([, opts]) => opts.purpose === undefined)).toBe(true);
+  });
+
+  it("models a combined cohort in dry-run without signing, queuing, or exposing a nonce", async () => {
+    arrangeCombinedBoundaryScenario({ dryRun: true });
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xPAYTAXES",
+      "0xAUDIT",
+      "0x",
+    ]);
+    expect(vi.mocked(submitTx).mock.calls.every(([, opts]) => opts.dryRun)).toBe(true);
+    expect(testState.signedCount).toBe(0);
+    expect(testState.nextNonce).toBe(0);
+    expect(runtime.status().pendingExposureWei).toBe("0");
+    expect(flushBundle).not.toHaveBeenCalled();
+    expect(discardBundle).toHaveBeenCalledWith("empty batch");
+  });
+
+  it("flushes prepared payment and audit work when incentive preparation fails", async () => {
+    arrangeCombinedBoundaryScenario();
+    testState.submitOutcomes = [true, true, false];
+    testState.flushResults = new Map([
+      [0, { ok: true }],
+      [1, { ok: true }],
+    ]);
+
+    await startAt(epochStart(6) - 10n);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+      "0xPAYTAXES",
+      "0xAUDIT",
+      "0x",
+    ]);
+    expect(flushBundle).toHaveBeenCalledTimes(1);
+    expect(testState.nextNonce).toBe(2);
+    const deliveredExposure = vi.mocked(submitTx).mock.calls.slice(0, 2).reduce(
+      (sum, [intent]) => sum + intent.value + testState.submittedGasWei,
+      0n,
+    );
+    expect(runtime.status().pendingExposureWei).toBe(deliveredExposure.toString());
+  });
+
+  it.each(["floor", "cap"] as const)(
+    "counts the incentive value and gas against the %s guardrail",
+    async (guardrail) => {
+      arrangeCombinedBoundaryScenario(guardrail === "floor"
+        ? {
+            minBalanceEth: 0.004,
+            priorityFeeGwei: 0,
+            dynamicTipEnabled: false,
+            separateOffenseGas: false,
+          }
+        : { maxPaymentEth: 0.01 });
+      if (guardrail === "floor") {
+        testState.baseFeePerGas = 0n;
+        testState.balanceWei = 10_000_000_000_000_000n;
+      }
+      testState.flushResults = new Map([
+        [0, { ok: true }],
+        [1, { ok: true }],
+      ]);
+
+      await startAt(epochStart(6) - 10n);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(vi.mocked(submitTx).mock.calls.map(([intent]) => intent.data)).toEqual([
+        "0xPAYTAXES",
+        "0xAUDIT",
+      ]);
+      expect(vi.mocked(submitTx).mock.calls.some(([, opts]) =>
+        opts.purpose === "builder-incentive")).toBe(false);
+      expect(flushBundle).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each([true, false])(
     "gives a boundary payment nonce priority without coupling audit offense (accepted=%s)",
@@ -3166,6 +3604,38 @@ describe("defensive payment scheduling and retries", () => {
 
     await vi.advanceTimersByTimeAsync(12_000);
     expect(submitTx).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a WAL-fenced queued liability without receipt tracking or a fresh retry", async () => {
+    appConfig.mode = "mainnet";
+    testState.lastEpochPaid = 12n;
+    testState.estimatedPayWei = 14n * BASE_TAX_RATE_WEI;
+    testState.submitQueued = true;
+    testState.flushResults = new Map([[
+      0,
+      {
+        ok: false,
+        retained: true,
+        txHash: TX_HASH_0,
+        lineageId: `${FAKE_ACCOUNT.address.toLowerCase()}:0`,
+        error: "optional deadline expired; journal cleanup failed and nonce remains fenced",
+      },
+    ]]);
+
+    await startAt(epochStart(14) + 100n);
+
+    expect(submitTx).toHaveBeenCalledTimes(1);
+    expect(runtime.status().pendingExposureWei).toBe(
+      (testState.estimatedPayWei + testState.submittedGasWei).toString(),
+    );
+    expect(publicClient.waitForTransactionReceipt).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(submitTx).toHaveBeenCalledTimes(1);
+    expect(runtime.status().pendingExposureWei).toBe(
+      (testState.estimatedPayWei + testState.submittedGasWei).toString(),
+    );
+    expect(publicClient.waitForTransactionReceipt).not.toHaveBeenCalled();
   });
 
   it("defers offense until the mainnet defense nonce confirms", async () => {

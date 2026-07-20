@@ -117,6 +117,31 @@ describe("SubmissionFlightJournal", () => {
     expect(() => journal.load(WALLET)).toThrow(JournalCorruptionError);
   });
 
+  it("persists private-cohort semantics and rejects public builder recovery", () => {
+    const builder = flight({
+      purpose: "builder-incentive",
+      privateCohort: { id: "combined-1", role: "builder-incentive" },
+      recovery: { publicAuthorized: false },
+      maxPrivateTargetBlock: "102",
+    });
+    journal.upsert(builder);
+
+    expect(new SubmissionFlightJournal(directory).load(WALLET)).toEqual([builder]);
+    expect(() => journal.upsert(flight({
+      purpose: "builder-incentive",
+      privateCohort: { id: "combined-2", role: "builder-incentive" },
+      recovery: { publicAuthorized: true },
+    }))).toThrow("invalid private-delivery metadata");
+  });
+
+  it("refuses to reinterpret an existing signed hash with different cohort metadata", () => {
+    journal.upsert(flight());
+
+    expect(() => journal.upsert(flight({
+      privateCohort: { id: "combined-1", role: "mandatory" },
+    }))).toThrow("metadata conflict");
+  });
+
   it("rejects a structurally valid record whose signed hash and obligation disagree", () => {
     fs.mkdirSync(path.dirname(journal.pathFor(WALLET)), { recursive: true });
     fs.writeFileSync(journal.pathFor(WALLET), JSON.stringify({

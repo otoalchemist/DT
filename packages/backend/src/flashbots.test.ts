@@ -37,6 +37,11 @@ const h = vi.hoisted(() => {
     load: vi.fn(),
     pathFor: vi.fn(),
   };
+  const logger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  };
   return {
     appConfig: {
       mode: "mainnet" as "mainnet" | "public" | "local",
@@ -61,6 +66,7 @@ const h = vi.hoisted(() => {
     publicClient,
     nonceManager,
     journal,
+    logger,
     getLatestBlockCached: vi.fn(),
     reputationKey: `0x${"22".repeat(32)}` as string,
     reputationKeyExists: true,
@@ -125,7 +131,7 @@ vi.mock("./logic.js", async () => {
   };
 });
 vi.mock("./logger.js", () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  logger: h.logger,
 }));
 
 const fetchMock = vi.fn();
@@ -160,6 +166,16 @@ function response(result: unknown): Response {
 }
 function rejected(message: string): Response {
   return { ok: true, status: 200, json: async () => ({ error: { message } }) } as Response;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 async function queue(count: number, options: { race?: boolean; simTimestamp?: bigint } = {}) {
@@ -624,6 +640,60 @@ describe("prepared delivery campaigns", () => {
     expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
+  it("does not reserve or sign when final authorization crosses the submission deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    h.appConfig.mode = "public";
+    const authorizationGate = deferred<boolean>();
+    const authorize = vi.fn(() => authorizationGate.promise);
+    const submitting = submitTx(
+      { to: TO, data: "0x1212", value: 7n, gas: 50_000n },
+      { dryRun: false, race: true, deadlineMs: 2_000, authorize },
+    );
+    await vi.waitFor(() => expect(authorize).toHaveBeenCalledOnce());
+
+    vi.setSystemTime(2_000);
+    authorizationGate.resolve(true);
+    const result = await submitting;
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: "transaction authorization missed its submission deadline",
+    });
+    expect(h.nonceManager.reserve).not.toHaveBeenCalled();
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("releases a fresh reservation without queueing when signing crosses the submission deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    h.appConfig.mode = "public";
+    const signingGate = deferred<Hex>();
+    vi.spyOn(ACCOUNT, "signTransaction").mockImplementationOnce(() => signingGate.promise);
+    beginBundle();
+    const submitting = submitTx(
+      { to: TO, data: "0x1213", value: 7n, gas: 50_000n },
+      { dryRun: false, race: true, deadlineMs: 2_000 },
+    );
+    await vi.waitFor(() => expect(h.nonceManager.reserve).toHaveBeenCalledOnce());
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await submitting;
+    signingGate.resolve("0x01");
+
+    expect(result).toMatchObject({
+      ok: false,
+      nonce: 7,
+      error: "transaction signing missed its submission deadline",
+    });
+    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([7]);
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.journal.upsertMany).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(await flushBundle()).toEqual(new Map());
+  });
+
   it("writes one prepared and one post-delivery atomic journal barrier", async () => {
     await queue(5);
     await flushBundle();
@@ -634,12 +704,503 @@ describe("prepared delivery campaigns", () => {
     expect(h.journal.update).not.toHaveBeenCalled();
   });
 
+  it("persists opaque redacted builder attempts and logs only accepted counts", async () => {
+    const secretBuilder = "https://tenant-secret.builder.test/private-api-key";
+    h.appConfig.builderUrls = [h.appConfig.flashbotsRelayUrl, secretBuilder];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: call.params[0].txs.map(() => ({})) }));
+      }
+      if (call.method === "eth_sendBundle" && call.url === secretBuilder) {
+        return Promise.resolve(rejected(`upstream ${secretBuilder} refused the request`));
+      }
+      return Promise.resolve(response({ bundleHash: "0xaccepted" }));
+    });
+
+    const [queued] = await queue(1);
+    const result = await flushBundle();
+
+    const mutation = h.journal.mutate.mock.calls[0]![1];
+    const attempts = mutation.updates[0].update.attempts as Array<{
+      channel: "private" | "public";
+      endpoint: string;
+      error?: string;
+    }>;
+    const privateAttempts = attempts.filter((attempt) => attempt.channel === "private");
+    expect(new Set(privateAttempts.map((attempt) => attempt.endpoint))).toEqual(new Set([
+      "flashbots-relay",
+      "configured-builder",
+    ]));
+    expect(JSON.stringify(privateAttempts)).not.toContain("tenant-secret");
+    expect(JSON.stringify(privateAttempts)).not.toContain("private-api-key");
+    expect(privateAttempts.filter((attempt) => attempt.error !== undefined).every(
+      (attempt) => attempt.error?.includes("REDACTED") === true,
+    )).toBe(true);
+    const resultError = result.get(queued!.nonce)?.error ?? "";
+    expect(resultError).toContain("REDACTED_RPC_ENDPOINT");
+    expect(resultError).not.toContain("tenant-secret");
+    expect(resultError).not.toContain("private-api-key");
+
+    const acceptedLog = h.logger.info.mock.calls.find(([message]) =>
+      String(message).includes("accepted by"),
+    );
+    expect(acceptedLog?.[0]).toContain("accepted by 1/2 builders");
+    expect(String(acceptedLog?.[0])).not.toContain("relay.test");
+    expect(String(acceptedLog?.[0])).not.toContain("tenant-secret");
+  });
+
   it("persists public recovery policy and provisional private expiry before dispatch", async () => {
     await queue(1, { race: false });
     await flushBundle();
 
     const prepared = h.journal.upsertMany.mock.calls[0]![1][0];
     expect(prepared).toMatchObject({
+      recovery: { publicAuthorized: false },
+      maxPrivateTargetBlock: "102",
+    });
+  });
+
+  it("rejects revert allowances without an explicit private cohort before preparation", async () => {
+    await expect(submitTx(
+      { to: TO, data: "0x13", value: 0n, gas: 50_000n },
+      { dryRun: false, race: true, revertible: true },
+    )).rejects.toThrow("require an explicit private cohort");
+
+    expect(h.nonceManager.reserve).not.toHaveBeenCalled();
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("keeps builder-incentive dry runs free of signing, reservation, WAL, and delivery", async () => {
+    beginBundle();
+    const result = await submitTx(
+      { to: TO, data: "0x14", value: 1n, gas: 50_000n },
+      {
+        dryRun: true,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        privateCohort: { id: "dry-run-cohort", role: "builder-incentive" },
+      },
+    );
+
+    expect(result).toMatchObject({ ok: true, simulated: true });
+    expect(result.txHash).toBeUndefined();
+    expect(h.nonceManager.reserve).not.toHaveBeenCalled();
+    expect(h.journal.upsert).not.toHaveBeenCalled();
+    expect(h.journal.upsertMany).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(await flushBundle()).toEqual(new Map());
+  });
+
+  it("rejects public authorization for builder incentives", async () => {
+    beginBundle();
+    await expect(submitTx(
+      { to: TO, data: "0x1414", value: 1n, gas: 50_000n },
+      {
+        dryRun: true,
+        race: true,
+        revertible: true,
+        purpose: "builder-incentive",
+        privateCohort: { id: "public-bid", role: "builder-incentive" },
+      },
+    )).rejects.toThrow("cannot authorize public delivery");
+
+    expect(h.nonceManager.reserve).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await flushBundle()).toEqual(new Map());
+  });
+
+  it("allows public audit fallback while keeping the builder incentive private-only", async () => {
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: [{}, { revert: "audit already complete" }, {}] }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xcohort" }));
+    });
+
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x15", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        privateCohort: { id: "combined-1", role: "mandatory" },
+      },
+    );
+    const audit = await submitTx(
+      { to: TO, data: "0x16", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        revertible: true,
+        privateCohort: { id: "combined-1", role: "allowed-revert" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: "0x17", value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        privateCohort: { id: "combined-1", role: "builder-incentive" },
+      },
+    );
+
+    const result = await flushBundle();
+
+    expect([...result.values()].every((entry) => entry.ok)).toBe(true);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(2);
+    expect(h.publicClient.sendRawTransaction.mock.calls.map(([arg]) =>
+      parseTransaction(arg.serializedTransaction).nonce,
+    )).toEqual([payment.nonce, audit.nonce]);
+    const privateSends = calls.filter((call) => call.method === "eth_sendBundle");
+    expect(privateSends).toHaveLength(4);
+    expect(privateSends.every((call) => call.params[0].txs.length === 3)).toBe(true);
+    expect(privateSends.every((call) =>
+      JSON.stringify(call.params[0].revertingTxHashes)
+        === JSON.stringify([audit.txHash, incentive.txHash]),
+    )).toBe(true);
+
+    const prepared = h.journal.upsertMany.mock.calls[0]![1];
+    expect(prepared.find((flight: any) => flight.nonce === audit.nonce)).toMatchObject({
+      privateCohort: { id: "combined-1", role: "allowed-revert" },
+      recovery: { publicAuthorized: true },
+    });
+    expect(prepared.find((flight: any) => flight.nonce === incentive.nonce)).toMatchObject({
+      purpose: "builder-incentive",
+      privateCohort: { id: "combined-1", role: "builder-incentive" },
+      recovery: { publicAuthorized: false },
+      maxPrivateTargetBlock: "102",
+    });
+  });
+
+  it("drops an expired optional cohort suffix without suppressing the mandatory public fallback", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: call.params[0].txs.map(() => ({})) }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xmandatory" }));
+    });
+
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x1710", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        deadlineMs: 2_000,
+        privateCohort: { id: "expired-cohort", role: "mandatory" },
+      },
+    );
+    const audit = await submitTx(
+      { to: TO, data: "0x1711", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        revertible: true,
+        deadlineMs: 2_000,
+        privateCohort: { id: "expired-cohort", role: "allowed-revert" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: "0x1712", value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        deadlineMs: 2_000,
+        privateCohort: { id: "expired-cohort", role: "builder-incentive" },
+      },
+    );
+    vi.setSystemTime(2_000);
+
+    const result = await flushBundle();
+
+    expect(result.get(payment.nonce)?.ok).toBe(true);
+    expect(result.get(audit.nonce)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("deadline expired"),
+    });
+    expect(result.get(incentive.nonce)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("deadline expired"),
+    });
+    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([
+      audit.nonce,
+      incentive.nonce,
+    ]);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(parseTransaction(
+      h.publicClient.sendRawTransaction.mock.calls[0]![0].serializedTransaction,
+    ).nonce).toBe(payment.nonce);
+    const privateSends = calls.filter((call) => call.method === "eth_sendBundle");
+    expect(privateSends).toEqual([]);
+    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(1);
+  });
+
+  it("fails open from a mandatory-only target-block deadline to the public fallback", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const targetBlockGate = deferred<bigint>();
+    h.publicClient.getBlockNumber.mockImplementationOnce(() => targetBlockGate.promise);
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x1713", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        deadlineMs: 2_000,
+        privateCohort: { id: "target-timeout", role: "mandatory" },
+      },
+    );
+
+    const flushing = flushBundle();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await flushing;
+    targetBlockGate.resolve(100n);
+
+    expect(result.get(payment.nonce)?.ok).toBe(true);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(parseTransaction(
+      h.publicClient.sendRawTransaction.mock.calls[0]![0].serializedTransaction,
+    ).nonce).toBe(payment.nonce);
+    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(1);
+    const transportMethods = fetchMock.mock.calls.map(([url, init]) => rpcCall(url, init).method);
+    expect(transportMethods).not.toContain("eth_callBundle");
+    expect(transportMethods).not.toContain("eth_sendBundle");
+  });
+
+  it("removes an optional suffix whose deadline crosses during the prepared-WAL barrier", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: call.params[0].txs.map(() => ({})) }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xpost-wal" }));
+    });
+    h.journal.upsertMany.mockImplementationOnce(() => {
+      vi.setSystemTime(2_000);
+    });
+
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x1720", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        deadlineMs: 2_000,
+        privateCohort: { id: "wal-deadline", role: "mandatory" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: "0x1721", value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        deadlineMs: 2_000,
+        privateCohort: { id: "wal-deadline", role: "builder-incentive" },
+      },
+    );
+
+    const result = await flushBundle();
+
+    expect(result.get(payment.nonce)?.ok).toBe(true);
+    expect(result.get(incentive.nonce)?.ok).toBe(false);
+    expect(h.journal.upsertMany.mock.calls[0]![1]).toHaveLength(2);
+    expect(h.journal.removeMany).toHaveBeenCalledWith(ACCOUNT.address, [incentive.txHash]);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(calls.filter((call) => call.method === "eth_sendBundle").every((call) => {
+      const txs = call.params[0].txs as Hex[];
+      return txs.length === 1 && parseTransaction(txs[0]!).nonce === payment.nonce;
+    })).toBe(true);
+  });
+
+  it("keeps an expired optional nonce fenced without suppressing mandatory delivery when WAL cleanup fails", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    h.journal.upsertMany.mockImplementationOnce(() => {
+      vi.setSystemTime(2_000);
+    });
+    h.journal.removeMany.mockImplementationOnce(() => {
+      throw new Error("cleanup disk unavailable");
+    });
+
+    beginBundle();
+    const payment = await submitTx(
+      { to: TO, data: "0x1730", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        deadlineMs: 2_000,
+        privateCohort: { id: "wal-cleanup-failure", role: "mandatory" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: "0x1731", value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        deadlineMs: 2_000,
+        privateCohort: { id: "wal-cleanup-failure", role: "builder-incentive" },
+      },
+    );
+
+    const result = await flushBundle();
+
+    expect(result.get(payment.nonce)?.ok).toBe(true);
+    expect(result.get(incentive.nonce)).toMatchObject({
+      ok: false,
+      retained: true,
+      error: expect.stringContaining("nonce remains fenced"),
+    });
+    expect(h.nonceManager.releaseContiguous).not.toHaveBeenCalled();
+    expect(h.runtime.setJournalHealth).toHaveBeenCalledWith(
+      false,
+      expect.stringContaining("failed to remove submission journal flights"),
+    );
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(parseTransaction(
+      h.publicClient.sendRawTransaction.mock.calls[0]![0].serializedTransaction,
+    ).nonce).toBe(payment.nonce);
+    const privateSends = fetchMock.mock.calls
+      .map(([url, init]) => rpcCall(url, init))
+      .filter((call) => call.method === "eth_sendBundle");
+    expect(privateSends).toEqual([]);
+  });
+
+  it("cuts before a cohort when one of its mandatory members fails simulation", async () => {
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: [{}, { revert: "payment failed" }, {}] }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xprefix" }));
+    });
+
+    beginBundle();
+    const ordinary = await submitTx(
+      { to: TO, data: "0x18", value: 0n, gas: 50_000n },
+      { dryRun: false, race: true },
+    );
+    const mandatory = await submitTx(
+      { to: TO, data: "0x19", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        privateCohort: { id: "failed-cohort", role: "mandatory" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: "0x1a", value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        privateCohort: { id: "failed-cohort", role: "builder-incentive" },
+      },
+    );
+
+    const result = await flushBundle();
+
+    expect(result.get(ordinary.nonce)?.ok).toBe(true);
+    expect(result.get(mandatory.nonce)?.error).toContain("payment failed");
+    expect(result.get(incentive.nonce)?.error).toContain("payment failed");
+    expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([mandatory.nonce, incentive.nonce]);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    const privateSends = calls.filter((call) => call.method === "eth_sendBundle");
+    expect(privateSends).toHaveLength(4);
+    expect(privateSends.every((call) => {
+      const txs = call.params[0].txs as Hex[];
+      return txs.length === 1 && parseTransaction(txs[0]!).nonce === ordinary.nonce;
+    })).toBe(true);
+  });
+
+  it("excludes an entire cohort when private gas limits would split it", async () => {
+    h.getLatestBlockCached.mockResolvedValue({
+      number: 100n,
+      baseFeePerGas: 1_000_000_000n,
+      gasUsed: 50_000n,
+      gasLimit: 100_000n,
+    });
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") {
+        return Promise.resolve(response({ results: call.params[0].txs.map(() => ({})) }));
+      }
+      return Promise.resolve(response({ bundleHash: "0xlimit" }));
+    });
+
+    beginBundle();
+    const ordinary = await submitTx(
+      { to: TO, data: "0x1b", value: 0n, gas: 50_000n },
+      { dryRun: false, race: true },
+    );
+    const mandatory = await submitTx(
+      { to: TO, data: "0x1c", value: 0n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: true,
+        privateCohort: { id: "oversize-cohort", role: "mandatory" },
+      },
+    );
+    const incentive = await submitTx(
+      { to: TO, data: "0x1d", value: 1n, gas: 50_000n },
+      {
+        dryRun: false,
+        race: false,
+        revertible: true,
+        purpose: "builder-incentive",
+        privateCohort: { id: "oversize-cohort", role: "builder-incentive" },
+      },
+    );
+
+    const result = await flushBundle();
+
+    expect(result.get(ordinary.nonce)?.ok).toBe(true);
+    expect(result.get(mandatory.nonce)?.ok).toBe(true);
+    expect(result.get(incentive.nonce)?.ok).toBe(false);
+    expect(h.publicClient.sendRawTransaction.mock.calls.map(([arg]) =>
+      parseTransaction(arg.serializedTransaction).nonce,
+    )).toEqual([ordinary.nonce, mandatory.nonce]);
+    const privateCalls = calls.filter((call) =>
+      call.method === "eth_callBundle" || call.method === "eth_sendBundle",
+    );
+    expect(privateCalls).toHaveLength(5);
+    expect(privateCalls.every((call) => {
+      const txs = call.params[0].txs as Hex[];
+      return txs.length === 1 && parseTransaction(txs[0]!).nonce === ordinary.nonce;
+    })).toBe(true);
+    expect(h.journal.upsertMany.mock.calls[0]![1].find(
+      (flight: any) => flight.nonce === incentive.nonce,
+    )).toMatchObject({
+      purpose: "builder-incentive",
       recovery: { publicAuthorized: false },
       maxPrivateTargetBlock: "102",
     });
@@ -959,6 +1520,87 @@ describe("prepared delivery campaigns", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["missing", null],
+    ["absent", {}],
+    ["short", { results: [{}, {}] }],
+    ["malformed", { results: [{}, null, {}] }],
+  ] as const)(
+    "treats %s cohort simulation results as unavailable and exposes only authorized public fallbacks",
+    async (_label, simulationResult) => {
+      const calls: RpcCall[] = [];
+      fetchMock.mockImplementation((url, init) => {
+        const call = rpcCall(url, init);
+        calls.push(call);
+        if (call.method === "eth_callBundle") {
+          return Promise.resolve(response(simulationResult));
+        }
+        throw new Error("malformed simulation must disable private delivery");
+      });
+
+      beginBundle();
+      const payment = await submitTx(
+        { to: TO, data: "0x7810", value: 0n, gas: 50_000n },
+        {
+          dryRun: false,
+          race: true,
+          privateCohort: { id: "malformed-sim", role: "mandatory" },
+        },
+      );
+      const audit = await submitTx(
+        { to: TO, data: "0x7811", value: 0n, gas: 50_000n },
+        {
+          dryRun: false,
+          race: true,
+          revertible: true,
+          privateCohort: { id: "malformed-sim", role: "allowed-revert" },
+        },
+      );
+      const incentive = await submitTx(
+        { to: TO, data: "0x7812", value: 1n, gas: 50_000n },
+        {
+          dryRun: false,
+          race: false,
+          revertible: true,
+          purpose: "builder-incentive",
+          privateCohort: { id: "malformed-sim", role: "builder-incentive" },
+        },
+      );
+
+      const result = await flushBundle();
+
+      expect(result.get(payment.nonce)?.ok).toBe(true);
+      expect(result.get(audit.nonce)?.ok).toBe(true);
+      expect(result.get(incentive.nonce)?.ok).toBe(false);
+      expect(h.publicClient.sendRawTransaction.mock.calls.map(([arg]) =>
+        parseTransaction(arg.serializedTransaction).nonce,
+      )).toEqual([payment.nonce, audit.nonce]);
+      expect(calls.filter((call) => call.method === "eth_callBundle")).toHaveLength(1);
+      expect(calls.filter((call) => call.method === "eth_sendBundle")).toHaveLength(0);
+      expect(h.nonceManager.releaseContiguous).toHaveBeenCalledWith([incentive.nonce]);
+    },
+  );
+
+  it("disables direct private delivery when the relay returns a malformed simulation", async () => {
+    const calls: RpcCall[] = [];
+    fetchMock.mockImplementation((url, init) => {
+      const call = rpcCall(url, init);
+      calls.push(call);
+      if (call.method === "eth_callBundle") return Promise.resolve(response({}));
+      throw new Error("malformed simulation must disable direct private delivery");
+    });
+
+    const result = await submitTx(
+      { to: TO, data: "0x7820", value: 0n, gas: 50_000n },
+      { dryRun: false, race: true },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(h.publicClient.call).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(calls.map((call) => call.method)).toEqual(["eth_callBundle"]);
+  });
+
   it("submits a 100-tx private prefix and all 101 prepared payments publicly", async () => {
     h.appConfig.builderUrls = ["https://relay.test"];
     const calls: RpcCall[] = [];
@@ -1242,6 +1884,151 @@ describe("durable prepared-flight recovery", () => {
         txHash: flight.txHash,
         update: expect.objectContaining({ state: "accepted", publicExposure: true }),
       })],
+    );
+  });
+
+  it("does not start journal reconciliation with already-revoked recovery authority", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    )).rejects.toThrow("recovery aborted");
+
+    expect(h.journal.load).not.toHaveBeenCalled();
+    expect(h.publicClient.getBlock).not.toHaveBeenCalled();
+    expect(h.publicClient.getTransactionCount).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("honors recovery cancellation while semantic authorization is in flight", async () => {
+    const flight = await recoveredFlight(true);
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+    const authorizationGate = deferred<void>();
+    const authorize = vi.fn(async () => {
+      await authorizationGate.promise;
+      return true;
+    });
+    const controller = new AbortController();
+
+    const recovery = recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+      authorize,
+    ).catch((error) => error as Error);
+    await vi.waitFor(() => expect(authorize).toHaveBeenCalledTimes(1));
+    controller.abort();
+    const error = await recovery;
+    authorizationGate.resolve();
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("recovery aborted");
+    expect(h.publicClient.getBalance).not.toHaveBeenCalled();
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("honors recovery cancellation while the exact-balance check is in flight", async () => {
+    const flight = await recoveredFlight(true);
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+    const balanceGate = deferred<bigint>();
+    h.publicClient.getBalance.mockImplementationOnce(() => balanceGate.promise);
+    const controller = new AbortController();
+
+    const recovery = recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    ).catch((error) => error as Error);
+    await vi.waitFor(() => expect(h.publicClient.getBalance).toHaveBeenCalledTimes(1));
+    controller.abort();
+    const error = await recovery;
+    balanceGate.resolve(parseEther("100"));
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("recovery aborted");
+    expect(h.publicClient.call).not.toHaveBeenCalled();
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("honors recovery cancellation while semantic simulation is in flight", async () => {
+    const flight = await recoveredFlight(true);
+    h.journal.load.mockReturnValue([flight]);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained: [flight],
+      consumed: [],
+      expired: [],
+    });
+    const simulationGate = deferred<{ data: Hex }>();
+    h.publicClient.call.mockImplementationOnce(() => simulationGate.promise);
+    const controller = new AbortController();
+
+    const recovery = recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    ).catch((error) => error as Error);
+    await vi.waitFor(() => expect(h.publicClient.call).toHaveBeenCalledTimes(1));
+    controller.abort();
+    const error = await recovery;
+    simulationGate.resolve({ data: "0x" });
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("recovery aborted");
+    expect(h.publicClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("never starts a higher recovery replay after cancellation during a lower send", async () => {
+    const first = await recoveredFlight(true, undefined, { nonce: 7, data: "0x7310" });
+    const second = await recoveredFlight(true, undefined, { nonce: 8, data: "0x7311" });
+    const retained = [first, second];
+    h.journal.load.mockReturnValue(retained);
+    h.journal.reconcile.mockReturnValue({
+      confirmedNonce: 7,
+      pendingNonce: 7,
+      currentBlock: 100n,
+      retained,
+      consumed: [],
+      expired: [],
+    });
+    const controller = new AbortController();
+    h.publicClient.sendRawTransaction.mockImplementationOnce(async () => {
+      controller.abort();
+      return `0x${"44".repeat(32)}` as Hex;
+    });
+
+    const error = await recoverPreparedSubmissions(
+      ACCOUNT.address,
+      controller.signal,
+    ).catch((caught) => caught as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("recovery aborted");
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(h.publicClient.sendRawTransaction).toHaveBeenCalledWith({
+      serializedTransaction: first.rawSignedTx,
+    });
+    expect(h.journal.updateMany).toHaveBeenCalledWith(
+      ACCOUNT.address,
+      [expect.objectContaining({ txHash: first.txHash })],
     );
   });
 
