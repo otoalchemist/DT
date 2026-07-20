@@ -291,8 +291,30 @@ export function JitPanel({
             </p>
           </div>
 
-          <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>⚠ COINBASE BID (advanced, mainnet)</div>
+          <div
+            style={{
+              marginTop: 12, paddingTop: 10,
+              borderTop: "1px solid var(--border)",
+              ...(config.coinbaseBidEth > 0
+                ? {
+                    borderLeft: "3px solid var(--accent)",
+                    background: "rgba(91,157,255,0.08)",
+                    paddingLeft: 10, marginLeft: -10, borderRadius: 6,
+                  }
+                : {}),
+            }}
+          >
+            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+              ⚠ COINBASE BID (advanced, mainnet)
+              {config.coinbaseBidEth > 0 && (
+                <span
+                  className="badge"
+                  style={{ marginLeft: 8, background: "var(--accent)", color: "#fff", fontSize: 10 }}
+                >
+                  ACTIVE · {config.coinbaseBidEth} ETH
+                </span>
+              )}
+            </div>
             <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5 }}>
               A <b>flat payment straight to the block builder</b> added to the pre-boundary payment bundle,
               to bid it to the <b>top of the boundary block</b> — independent of tip. This is the lever
@@ -308,6 +330,7 @@ export function JitPanel({
                   type="number" min={0} step={0.001}
                   value={config.coinbaseBidEth}
                   onChange={(e) => gasField("coinbaseBidEth", Math.max(0, Number(e.target.value) || 0))}
+                  style={config.coinbaseBidEth > 0 ? { borderColor: "var(--accent)", fontWeight: 600 } : undefined}
                 />
               </label>
               <label className="field" style={{ flex: "2 1 260px" }}>
@@ -338,15 +361,19 @@ export function JitPanel({
             </label>
             <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 24px", lineHeight: 1.5 }}>
               At a boundary, sends your pre-boundary <b>payment and audit as one bundle</b> (sequential nonces)
-              instead of two — so they land consecutively top-of-block and can't demote each other. Payment is
-              mandatory; audits ride allowed-to-revert (never drop the payment) and aren't mempool-mirrored.
-              Includes whichever of pre-boundary pay / audit are on (payment-only, audit-only, or both). <b>Most
-              effective with a coinbase bid</b> above — the bid wins the slot so the bundle-only audits actually
-              land. Without a bid, the bundle may lose and the audits won't fall back to the mempool.
+              instead of two — so they land consecutively top-of-block, share a single coinbase bid, and can't
+              demote each other. <b>Self-guarding:</b> it only fuses them <b>when a coinbase bid is set</b> above.
+              Without a bid it's a no-op — the bot sends separate bundles so audits keep their mempool fallback —
+              so it's safe to leave on. Payment is always mempool-mirrored either way and is never dropped.
             </p>
             {config.combinedBoundaryBundle && config.coinbaseBidEth <= 0 && (
               <p className="hint" style={{ fontSize: 11, margin: "4px 0 0 24px" }}>
-                Tip: set a coinbase bid so this bundle reliably wins the slot (else audits may not land).
+                Inactive until you set a coinbase bid above — until then, payment and audit fire as separate bundles.
+              </p>
+            )}
+            {config.combinedBoundaryBundle && config.coinbaseBidEth > 0 && (
+              <p className="hint" style={{ fontSize: 11, margin: "4px 0 0 24px", color: "var(--accent)" }}>
+                Active — payment + audit will fuse into one bundle with a single {config.coinbaseBidEth} ETH bid.
               </p>
             )}
           </div>

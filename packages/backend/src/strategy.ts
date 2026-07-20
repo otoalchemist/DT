@@ -1,5 +1,5 @@
 import { parseEther, formatEther, type Address } from "viem";
-import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
+import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
@@ -232,7 +232,7 @@ export function schedulePreBoundaryPay(): void {
     preBoundaryTimer = null;
   }
   const s = runtime.strategy;
-  if (s.combinedBoundaryBundle) return; // combined fire handles payment + audit together
+  if (combinedBundleActive(s)) return; // combined fire handles payment + audit together
   if (!runtime.running || !s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null || runtime.startTime === null) {
     return;
   }
@@ -328,6 +328,16 @@ async function maybeQueueCoinbaseBid(): Promise<void> {
   }
 }
 
+/** Whether the combined pay+audit fire should actually fuse the two into one bundle.
+ *  It only does so when a coinbase bid will fire: without a bid, the bundle-only
+ *  audits have no mempool fallback and can silently fail if the bundle loses the
+ *  slot, so we fall back to SEPARATE bundles (where the audit keeps its mirror).
+ *  The toggle is thus a no-op — behaviourally identical to separate — until a bid
+ *  is set, which makes it safe to leave on by default. */
+function combinedBundleActive(s: StrategyConfig): boolean {
+  return s.combinedBoundaryBundle && s.coinbaseBidEth > 0 && !!s.coinbasePayerAddress;
+}
+
 // Generous fixed gas for an unsimulated offense pre-submit (real audits used
 // ~113–130k on-chain; we can't eth_estimateGas an action that isn't valid yet).
 const PRE_BOUNDARY_OFFENSE_GAS = 250_000n;
@@ -366,7 +376,7 @@ export function schedulePreBoundaryAudit(): void {
     preBoundaryAuditTimer = null;
   }
   const s = runtime.strategy;
-  if (s.combinedBoundaryBundle) return; // combined fire handles payment + audit together
+  if (combinedBundleActive(s)) return; // combined fire handles payment + audit together
   if (!runtime.running || !s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
@@ -503,14 +513,11 @@ async function firePreBoundaryBundle(): Promise<void> {
       auditQueued = await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: true });
       if (auditQueued) anything = true;
     }
-    // Coinbase bid tails the bundle to win the slot (what makes bundle-only audits land).
-    const bidOn = s.coinbaseBidEth > 0 && !!s.coinbasePayerAddress;
+    // Coinbase bid tails the bundle to win the slot (what makes bundle-only audits
+    // land). This fire only runs when a bid is active (combinedBundleActive), so the
+    // bundle-only audits always have the bid backing them — no-bid falls back to the
+    // separate schedulers, where audits keep their mempool mirror.
     if (anything) await maybeQueueCoinbaseBid();
-    // Bundle-only audits rely on WINNING the slot; without a bid the bundle may lose
-    // and those audits (no mempool fallback) won't land. Surface that once per fire.
-    if (auditQueued && !bidOn) {
-      logger.warn("combined boundary bundle queued audits without a coinbase bid — audits won't land if the bundle loses the slot");
-    }
   } catch (err) {
     logger.error("pre-boundary bundle error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary bundle error: ${(err as Error).message}` });
@@ -528,7 +535,7 @@ export function schedulePreBoundaryBundle(): void {
     preBoundaryBundleTimer = null;
   }
   const s = runtime.strategy;
-  if (!runtime.running || !s.combinedBoundaryBundle) return;
+  if (!runtime.running || !combinedBundleActive(s)) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
   // Fires only if some pre-boundary action could be due at the next boundary.
   const payDue = s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) === runtime.currentEpoch + 1n;

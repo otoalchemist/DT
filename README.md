@@ -240,6 +240,15 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   receives to `block.coinbase`), so you only need the bid amount. Prefer your own?
   Deploy `CoinbasePayer.sol` once (e.g. in Remix) and paste that address instead.
   **Off by default.**
+- **Combine payment + audit into one atomic bundle (`mainnet` only)** — when a
+  pre-boundary payment and an audit are both due at the same epoch boundary, fuse
+  them into a **single** bundle (sequential nonces) instead of two, so they land
+  consecutively top-of-block, share **one** coinbase bid instead of two, and can't
+  demote each other. **Self-guarding and on by default:** it only actually fuses when
+  a coinbase bid is set (`coinbaseBidEth > 0`); without a bid it's a no-op and the bot
+  sends separate bundles so the audit keeps its public-mempool fallback. Payment is
+  always mempool-mirrored either way and is never dropped. So a later coinbase bid
+  "just works" without a second toggle — but nothing changes until you set one.
 - **Atomic multi-tx bundles (`mainnet` mode, automatic)** — every Citizen you hold
   is owned by the same wallet, so paying/auditing several in one cycle produces
   multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only

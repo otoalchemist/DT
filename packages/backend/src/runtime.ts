@@ -49,7 +49,11 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseTargetTokenIds: loadDefaultRivalTargets(),
   preBoundaryAudit: true,
   preBoundaryKill: false, // opt-in: race kills into the first block after audit expiry
-  combinedBoundaryBundle: false, // opt-in: pay + audit in one atomic bundle
+  // On by default, but self-guarding: it only fuses payment + audit into one bundle
+  // when a coinbase bid is set (coinbaseBidEth > 0). Without a bid it's a no-op — the
+  // bot sends separate bundles so audits keep their mempool fallback — so leaving it
+  // on is safe and means a later bid "just works" without a second toggle to find.
+  combinedBoundaryBundle: true,
   // Payment gas — tuned to win the boundary bundle race: a ~15 gwei tip clears
   // the observed batch-audit bundles (~3 gwei) with margin, dynamic tip scales it
   // up in contested boundary blocks, and the base-fee cap is generous (boundary
