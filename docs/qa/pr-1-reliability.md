@@ -1,9 +1,9 @@
 # Owner QA — PR #1 Reliability
 
-This gate uses only dry-run mode and a disposable Anvil mainnet fork. It needs a read-only mainnet RPC URL for the fork. Do not import or fund a production wallet.
+This gate uses only dry-run mode and a disposable Anvil mainnet fork. It needs a read-only mainnet RPC URL that supports exact-block/archive state requests for the fork. Do not import or fund a production wallet.
 
 1. Run `npm ci`, `npm test`, `npm run test:integration`, and `npm run build`; confirm all commands pass.
-2. Start `anvil --fork-url <YOUR_READ_ONLY_MAINNET_RPC>` in one terminal. Use only Anvil's documented disposable accounts and keys below; never use a production key.
+2. Start `anvil --fork-url <YOUR_READ_ONLY_MAINNET_RPC> --chain-id 31337 --host 127.0.0.1 --port 8545` in one terminal. The explicit non-mainnet chain ID is required because local mode deliberately refuses direct broadcast to chain ID 1, even when the endpoint is a fork. Use only Anvil's documented disposable accounts and keys below; never use a production key.
 3. In another shell, transfer Citizens 272 and 382 on the fork to Anvil's first disposable account. The bot now verifies `ownerOf`, so `OWNED_TOKENS` alone intentionally cannot claim ownership:
 
    ```bash
