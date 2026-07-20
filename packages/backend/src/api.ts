@@ -94,12 +94,12 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.post("/api/config", async (req, reply) => {
     const parsed = strategyPatch.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    const prev = runtime.strategy;
     const next = runtime.saveStrategy(parsed.data);
-    const wasActive = prev.enabled || prev.offenseEnabled;
     const nowActive = next.enabled || next.offenseEnabled;
-    // Only auto-start when a flag just turned on; don't restart a manually paused engine.
-    if (nowActive && !wasActive && runtime.unlocked && !runtime.running) startEngine();
+    // Saving strategy never auto-STARTS the engine — starting is explicit (the "Start
+    // bot" button, or arming a JIT payment) so the user can finish configuring (coinbase
+    // bid, gas, payment strategy) before going live. We still auto-STOP in the safe
+    // direction: if every strategy flag is now off, a running engine has nothing to do.
     if (!nowActive && runtime.running) stopEngine();
     scheduleDefenseBoundary();
     schedulePreBoundaryPay();
