@@ -475,11 +475,13 @@ async function firePreBoundaryAudit(): Promise<void> {
 }
 
 /**
- * Combined pre-boundary fire (opt-in `combinedBoundaryBundle`): payment + audit in
+ * Combined pre-boundary fire (runs when `combinedBundleActive`): payment + audit in
  * ONE atomic bundle from your wallet, so they land consecutively top-of-block and
- * can't demote each other. Payment is mandatory (mirrored); audits ride
- * allowed-to-revert and bundle-only; an optional coinbase bid tails the bundle to
- * win the slot. Includes whichever of preBoundaryPay / preBoundaryAudit are enabled
+ * can't demote each other. Payment is mandatory (mirrored). Audits ride
+ * allowed-to-revert and bundle-only WHEN a payment shares the bundle (to protect it);
+ * when it's audit-only, they instead mirror per racePublicMempool so the bid bids for
+ * the slot with the mempool as a fallback. An optional coinbase bid tails the bundle
+ * to win the slot. Includes whichever of preBoundaryPay / preBoundaryAudit are enabled
  * (payment-only, audit-only, or both). Fires at the NEXT epoch boundary.
  */
 async function firePreBoundaryBundle(): Promise<void> {
@@ -496,28 +498,30 @@ async function firePreBoundaryBundle(): Promise<void> {
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
     await nonceManager.sync(address, appConfig.mode);
-    let anything = false;
+    let paymentQueued = false;
     let auditQueued = false;
     // Payment first (lowest nonces): its amount is only valid top-of-block, and a
     // just-paid auditor token is current before it audits. Only if JIT is armed for
     // THIS boundary (jitTargetEpoch === currentEpoch + 1).
     if (s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) === targetEpoch) {
-      if (await queuePreBoundaryPayments(address, targetEpoch, boundaryTs)) anything = true;
+      paymentQueued = await queuePreBoundaryPayments(address, targetEpoch, boundaryTs);
     }
-    // Audits next (higher nonces), allowed-to-revert so a defended target can't drop
-    // the payment; bundle-only (no mempool mirror).
+    // Audits next (higher nonces). They ride allowed-to-revert (bundle-only, no mempool
+    // mirror) ONLY when a payment shares the bundle — so a reverting audit can't drop the
+    // payment and no extra mempool nonce demotes it. With no payment to protect (audit-only
+    // boundary), send them revertible:false so they ALSO mirror to the mempool per
+    // racePublicMempool: the bid still bids for the slot, and the mirror is a fallback if
+    // the bundle loses it.
     if (
       s.preBoundaryAudit && s.offenseEnabled && s.autoAudit &&
       !(s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin))
     ) {
-      auditQueued = await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: true });
-      if (auditQueued) anything = true;
+      auditQueued = await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: paymentQueued });
     }
-    // Coinbase bid tails the bundle to win the slot (what makes bundle-only audits
-    // land). This fire only runs when a bid is active (combinedBundleActive), so the
-    // bundle-only audits always have the bid backing them — no-bid falls back to the
-    // separate schedulers, where audits keep their mempool mirror.
-    if (anything) await maybeQueueCoinbaseBid();
+    // Coinbase bid tails the bundle to win the slot. This fire only runs when a bid is
+    // active (combinedBundleActive), so the audits always have the bid backing them —
+    // no-bid falls back to the separate schedulers, where audits keep their mempool mirror.
+    if (paymentQueued || auditQueued) await maybeQueueCoinbaseBid();
   } catch (err) {
     logger.error("pre-boundary bundle error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary bundle error: ${(err as Error).message}` });
