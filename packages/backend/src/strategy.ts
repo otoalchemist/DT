@@ -334,7 +334,7 @@ async function maybeQueueCoinbaseBid(): Promise<void> {
  *  slot, so we fall back to SEPARATE bundles (where the audit keeps its mirror).
  *  The toggle is thus a no-op — behaviourally identical to separate — until a bid
  *  is set, which makes it safe to leave on by default. */
-function combinedBundleActive(s: StrategyConfig): boolean {
+export function combinedBundleActive(s: StrategyConfig): boolean {
   return s.combinedBoundaryBundle && s.coinbaseBidEth > 0 && !!s.coinbasePayerAddress;
 }
 

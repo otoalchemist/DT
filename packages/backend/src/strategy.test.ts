@@ -101,7 +101,39 @@ vi.mock("./contract.js", () => ({
 const { submitTx } = await import("./flashbots.js");
 const { fetchOwnedTokenIds } = await import("./index-tokens.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine } = await import("./strategy.js");
+const { startEngine, stopEngine, combinedBundleActive } = await import("./strategy.js");
+
+// combinedBundleActive is the single predicate that routes every pre-boundary
+// pathway: true -> one fused pay+audit bundle (firePreBoundaryBundle), false ->
+// the separate pay/audit schedulers (each keeps its mempool mirror). It must only
+// fuse when a coinbase bid will actually fire, else bundle-only audits have no
+// fallback. This truth table pins that so a refactor can't quietly re-introduce the
+// no-bid footgun or flip the safe default.
+describe("combinedBundleActive routing predicate", () => {
+  const base = { ...DEFAULT_STRATEGY, coinbasePayerAddress: "0x00000000000000000000000000000000000000b1" };
+
+  it("is false for the shipped default (combine on, no bid) — the safe no-op state", () => {
+    expect(DEFAULT_STRATEGY.combinedBoundaryBundle).toBe(true); // on by default...
+    expect(DEFAULT_STRATEGY.coinbaseBidEth).toBe(0); // ...but inert without a bid
+    expect(combinedBundleActive(DEFAULT_STRATEGY)).toBe(false);
+  });
+
+  it("is true only when combine is on AND a bid is set AND a payer is present", () => {
+    expect(combinedBundleActive({ ...base, combinedBoundaryBundle: true, coinbaseBidEth: 0.01 })).toBe(true);
+  });
+
+  it("is false when the bid is zero even if combine is on", () => {
+    expect(combinedBundleActive({ ...base, combinedBoundaryBundle: true, coinbaseBidEth: 0 })).toBe(false);
+  });
+
+  it("is false when combine is off even if a bid is set", () => {
+    expect(combinedBundleActive({ ...base, combinedBoundaryBundle: false, coinbaseBidEth: 0.01 })).toBe(false);
+  });
+
+  it("is false when a bid is set but no payer address is configured", () => {
+    expect(combinedBundleActive({ ...base, combinedBoundaryBundle: true, coinbaseBidEth: 0.01, coinbasePayerAddress: "" })).toBe(false);
+  });
+});
 
 describe("proactive pay only fires at the epoch boundary, never on generic tick detection", () => {
   const FAKE_ACCOUNT = {
