@@ -65,7 +65,6 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offensePriorityFeeGwei: 10.1,
   offenseDynamicTipEnabled: true,
   offenseDynamicTipMaxGwei: 20.1,
-  offenseBoundaryScheduling: false,
   racePublicMempool: true,
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 50.1,

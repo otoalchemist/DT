@@ -51,7 +51,6 @@ const strategyPatch = z
     offensePriorityFeeGwei: z.number().min(0),
     offenseDynamicTipEnabled: z.boolean(),
     offenseDynamicTipMaxGwei: z.number().positive(),
-    offenseBoundaryScheduling: z.boolean(),
     racePublicMempool: z.boolean(),
     dynamicTipEnabled: z.boolean(),
     dynamicTipMaxGwei: z.number().positive(),

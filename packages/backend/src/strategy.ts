@@ -30,7 +30,6 @@ const GAS_GUESS = 200_000n; // for pre-flight spend-cap checks only
 
 let timer: NodeJS.Timeout | null = null;
 let boundaryTimer: NodeJS.Timeout | null = null;
-let offenseBoundaryTimer: NodeJS.Timeout | null = null;
 let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryAuditTimer: NodeJS.Timeout | null = null;
@@ -180,7 +179,6 @@ export function startEngine(): void {
 export function stopEngine(): void {
   if (timer) clearInterval(timer);
   if (boundaryTimer) clearTimeout(boundaryTimer);
-  if (offenseBoundaryTimer) clearTimeout(offenseBoundaryTimer);
   if (defenseBoundaryTimer) clearTimeout(defenseBoundaryTimer);
   if (preBoundaryTimer) clearTimeout(preBoundaryTimer);
   if (preBoundaryAuditTimer) clearTimeout(preBoundaryAuditTimer);
@@ -189,7 +187,6 @@ export function stopEngine(): void {
   if (unwatchBlocks) unwatchBlocks();
   timer = null;
   boundaryTimer = null;
-  offenseBoundaryTimer = null;
   defenseBoundaryTimer = null;
   preBoundaryTimer = null;
   preBoundaryAuditTimer = null;
@@ -607,51 +604,6 @@ async function firePreBoundaryKill(): Promise<void> {
   }
 }
 
-// Lead time before an offense deadline at which we fire the pre-emptive tick, so
-// the tx is built and submitted in time to compete in the first eligible block.
-const OFFENSE_LEAD_MS = 1_500;
-
-/**
- * Fire an extra tick just before the soonest offense deadline so kills/audits
- * land in the FIRST eligible block instead of the block after (the ~12s latency
- * gap seen in race post-mortems). Two kinds of deadline:
- *   - kill: the nearest pending audit's expiry (`nextKillDeadlineSec`) — after
- *     this instant, kill() succeeds.
- *   - audit: the next epoch boundary — a token 1 epoch behind becomes auditable
- *     (2+ behind) when the epoch rolls, and fresh delinquencies appear then too.
- * Picks whichever is sooner and schedules a tick ~OFFENSE_LEAD_MS before it.
- */
-export function scheduleOffenseBoundary(): void {
-  if (offenseBoundaryTimer) {
-    clearTimeout(offenseBoundaryTimer);
-    offenseBoundaryTimer = null;
-  }
-  const s = runtime.strategy;
-  if (!runtime.running || !s.offenseEnabled || !s.offenseBoundaryScheduling) return;
-  if (runtime.startTime === null || runtime.currentEpoch === null) return;
-
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-
-  // Candidate 1: next epoch boundary. Epoch N begins at startTime + (N-1)*DUR,
-  // so the boundary that starts epoch (current+1) is startTime + current*DUR.
-  const nextEpochBoundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS;
-
-  // Candidate 2: soonest pending audit expiry that is still in the future.
-  const candidates = [nextEpochBoundary];
-  if (nextKillDeadlineSec !== null && nextKillDeadlineSec > nowSec) {
-    candidates.push(nextKillDeadlineSec);
-  }
-  const soonest = candidates.filter((c) => c > nowSec).sort((a, b) => (a < b ? -1 : 1))[0];
-  if (soonest === undefined) return;
-
-  const deltaMs = Number(soonest - nowSec) * 1000 - OFFENSE_LEAD_MS;
-  if (deltaMs <= 0) {
-    void tick();
-    return;
-  }
-  const delayMs = Math.min(deltaMs, 2_000_000_000);
-  offenseBoundaryTimer = setTimeout(() => fireBoundaryTick(false), delayMs);
-}
 
 // Lead time before the next epoch boundary at which we fire the proactive-pay
 // tick, so the tx is built and broadcast right as the new epoch begins instead
@@ -1135,9 +1087,8 @@ async function offensePass(
     });
   }
 
-  // Publish the nearest kill deadline and (re)arm the pre-emptive boundary tick.
+  // Publish the nearest kill deadline and (re)arm the pre-emptive kill tick.
   nextKillDeadlineSec = soonestKillDeadline;
-  scheduleOffenseBoundary();
   schedulePreBoundaryKill();
 }
 

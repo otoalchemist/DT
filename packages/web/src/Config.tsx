@@ -265,19 +265,6 @@ export function Config({ initial }: { initial: StrategyConfig }) {
       <label className="check">
         <input
           type="checkbox"
-          checked={cfg.offenseBoundaryScheduling}
-          onChange={chk("offenseBoundaryScheduling")}
-          disabled={!cfg.offenseEnabled}
-        />
-        Pre-schedule offense at deadlines
-      </label>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-        Fires a tick just before each audit-expiry / epoch boundary so kills and audits compete in the
-        first eligible block instead of the block after (~12s sooner).
-      </p>
-      <label className="check">
-        <input
-          type="checkbox"
           checked={cfg.racePublicMempool}
           onChange={chk("racePublicMempool")}
           disabled={!cfg.offenseEnabled}

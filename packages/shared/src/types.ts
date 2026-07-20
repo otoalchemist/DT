@@ -177,10 +177,6 @@ export interface StrategyConfig {
   offenseDynamicTipMaxGwei: number;
 
   // --- Latency (mainnet mode only) ---
-  /** Fire an extra tick just before each offense deadline (nearest audit
-   *  expiry / next epoch boundary) so kills/audits compete in the first
-   *  eligible block instead of the block after. */
-  offenseBoundaryScheduling: boolean;
   /** Also broadcast time-critical offense txs to the public mempool alongside
    *  the Flashbots bundle, so any builder can include them in the next block.
    *  Trades bundle privacy for lower inclusion latency. */

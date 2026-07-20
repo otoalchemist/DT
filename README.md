@@ -202,11 +202,6 @@ cp data/config.example.json data/config.json
 Rivals often win by landing in an *earlier block*, not by paying more. These
 optional, off-by-default edges close that gap (configure them in the dashboard):
 
-- **Pre-schedule offense at deadlines** — fires an extra tick just before each
-  offense deadline (the nearest audit expiry, or the next epoch boundary) so kills
-  and audits compete in the **first eligible block** instead of the block after. A
-  boundary tick is never dropped just because a routine tick is mid-flight — it
-  retries as soon as the engine is free, so the race isn't lost to bad luck.
 - **Race the public mempool** (`mainnet` mode only) — also broadcasts a
   time-critical **offense** tx to the public mempool alongside the bundle, so *any*
   builder can include it next block. The tx is identical (same nonce), so only one
