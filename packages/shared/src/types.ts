@@ -141,6 +141,14 @@ export interface StrategyConfig {
    *  so the kill lands in the first eligible block. Unsimulated; a too-early kill
    *  reverts (gas only). */
   preBoundaryKill: boolean;
+  /** ADVANCED: at a boundary, emit the pre-boundary payment AND audit as ONE atomic
+   *  bundle (from your wallet, sequential nonces) instead of two separate bundles,
+   *  so they land consecutively top-of-block and can't demote each other. Payment is
+   *  mandatory; audits ride allowed-to-revert (never drop the payment) and aren't
+   *  mempool-mirrored. Includes whichever of preBoundaryPay / preBoundaryAudit are
+   *  enabled (payment-only, audit-only, or both). Most effective WITH a coinbase bid
+   *  (which wins the slot so the bundle-only audits actually land). OFF by default. */
+  combinedBoundaryBundle: boolean;
 
   // --- Guardrails ---
   /** Max base fee (gwei) the bot will transact at. Applies to tax payments

@@ -369,6 +369,10 @@ export async function submitTx(
     offense?: boolean;
     /** Simulate at this future unix-second timestamp (pre-boundary races). */
     simTimestamp?: bigint;
+    /** Mark this tx allowed-to-revert in the bundle (revertingTxHashes) so it can
+     *  never invalidate the bundle / drop a mandatory tx. Used for audits riding a
+     *  payment bundle in combined mode. */
+    revertible?: boolean;
   },
 ): Promise<SubmitResult> {
   const account = runtime.account;
@@ -482,7 +486,7 @@ export async function submitTx(
   // whole tick's txs go out as ONE atomic multi-tx bundle with valid sequential
   // nonces (see flushBundle). Hashes are filled in by the caller after flush.
   if (bundleQueue !== null) {
-    bundleQueue.push({ signed, nonce, race: opts.race ?? false });
+    bundleQueue.push({ signed, nonce, race: opts.race ?? false, revertible: opts.revertible ?? false });
     return { ...base, ok: true, queued: true, targetBlock };
   }
 

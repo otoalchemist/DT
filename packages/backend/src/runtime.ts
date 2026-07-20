@@ -49,6 +49,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseTargetTokenIds: loadDefaultRivalTargets(),
   preBoundaryAudit: true,
   preBoundaryKill: true,
+  combinedBoundaryBundle: false, // opt-in: pay + audit in one atomic bundle
   // Payment gas — tuned to win the boundary bundle race: a ~15 gwei tip clears
   // the observed batch-audit bundles (~3 gwei) with margin, dynamic tip scales it
   // up in contested boundary blocks, and the base-fee cap is generous (boundary

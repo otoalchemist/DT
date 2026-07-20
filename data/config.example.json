@@ -68,6 +68,7 @@
   ],
   "preBoundaryAudit": true,
   "preBoundaryKill": true,
+  "combinedBoundaryBundle": false,
   "maxBaseFeeGwei": 69.1,
   "priorityFeeGwei": 15.1,
   "minBalanceEth": 0.01,

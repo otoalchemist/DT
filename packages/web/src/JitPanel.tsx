@@ -105,6 +105,7 @@ export function JitPanel({
         maxAutoPayEpochs: config.maxAutoPayEpochs,
         coinbaseBidEth: config.coinbaseBidEth,
         coinbasePayerAddress: config.coinbasePayerAddress,
+        combinedBoundaryBundle: config.combinedBoundaryBundle,
       });
       onConfigChange(next);
       setGasSaved(true);
@@ -321,6 +322,31 @@ export function JitPanel({
             {config.coinbaseBidEth > 0 && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
               <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
                 Set a valid CoinbasePayer address, or the bid won't fire.
+              </p>
+            )}
+          </div>
+
+          <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>⚠ COMBINED BOUNDARY BUNDLE (advanced, mainnet)</div>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={config.combinedBoundaryBundle}
+                onChange={(e) => gasField("combinedBoundaryBundle", e.target.checked)}
+              />
+              Combine payment + audit into one atomic bundle
+            </label>
+            <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 24px", lineHeight: 1.5 }}>
+              At a boundary, sends your pre-boundary <b>payment and audit as one bundle</b> (sequential nonces)
+              instead of two — so they land consecutively top-of-block and can't demote each other. Payment is
+              mandatory; audits ride allowed-to-revert (never drop the payment) and aren't mempool-mirrored.
+              Includes whichever of pre-boundary pay / audit are on (payment-only, audit-only, or both). <b>Most
+              effective with a coinbase bid</b> above — the bid wins the slot so the bundle-only audits actually
+              land. Without a bid, the bundle may lose and the audits won't fall back to the mempool.
+            </p>
+            {config.combinedBoundaryBundle && config.coinbaseBidEth <= 0 && (
+              <p className="hint" style={{ fontSize: 11, margin: "4px 0 0 24px" }}>
+                Tip: set a coinbase bid so this bundle reliably wins the slot (else audits may not land).
               </p>
             )}
           </div>
