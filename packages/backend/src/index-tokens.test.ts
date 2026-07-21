@@ -39,7 +39,10 @@ describe("authoritative owned-token filtering", () => {
     h.appConfig.ownedTokensOverride = [];
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
 
   it("keeps only deduplicated token IDs whose current ownerOf matches the wallet", async () => {
     const wallet = "0x1111111111111111111111111111111111111111" as const;
@@ -95,6 +98,7 @@ describe("authoritative owned-token filtering", () => {
   });
 
   it("recovers an owned Citizen when Alchemy's owner index incorrectly returns empty", async () => {
+    vi.useFakeTimers({ now: new Date("2026-07-21T19:00:00Z") });
     h.appConfig.nftUrl = "https://nft.example";
     const citizens = "0x5555555555555555555555555555555555555555" as const;
     const wallet = "0x6666666666666666666666666666666666666666" as const;
@@ -106,7 +110,7 @@ describe("authoritative owned-token filtering", () => {
           ? wallet
           : "0x7777777777777777777777777777777777777777",
       })));
-    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes("/getNFTsForOwner")) {
         return new Response(JSON.stringify({ ownedNfts: [] }), {
@@ -117,11 +121,22 @@ describe("authoritative owned-token filtering", () => {
       return new Response(JSON.stringify({
         nfts: [{ tokenId: "101" }, { tokenId: "707" }],
       }), { status: 200, headers: { "content-type": "application/json" } });
-    }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     await expect(fetchOwnedTokenIds(citizens, wallet)).resolves.toEqual([707n]);
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(h.warn).toHaveBeenCalledWith(expect.stringContaining("owner index mismatch"));
+
+    // Once the stale owner index is reconciled, a later cache refresh verifies
+    // the remembered token on-chain instead of scanning every collection page
+    // again. The immediate caller receives the stale-while-revalidate value.
+    vi.advanceTimersByTime(5 * 60_000 + 1);
+    await expect(fetchOwnedTokenIds(citizens, wallet)).resolves.toEqual([707n]);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls.filter(
+      ([input]) => String(input).includes("/getNFTsForContract"),
+    )).toHaveLength(1);
   });
 
   it("fails visibly when neither Alchemy index can account for balanceOf", async () => {

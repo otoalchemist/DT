@@ -56,7 +56,7 @@ export function ownershipIndexingAvailable(): boolean {
 // Ownership changes rarely; the candidate set (mints/kills) even more rarely.
 // Cache both so the Alchemy NFT API stays off the hot path of the boundary tick —
 // the cached list is served instantly and refreshed in the background once stale.
-const OWNED_TTL_MS = 30_000;
+const OWNED_TTL_MS = 5 * 60_000;
 const CANDIDATES_TTL_MS = 5 * 60_000;
 const ownedCache = makeIdCache<bigint[]>({
   onError: (e) => logger.warn("Owned-token refresh failed:", (e as Error).message),
@@ -64,6 +64,12 @@ const ownedCache = makeIdCache<bigint[]>({
 const candidateCache = makeIdCache<bigint[]>({
   onError: (e) => logger.warn("Candidate enumeration failed:", (e as Error).message),
 });
+// When an owner index is stale, remember the token IDs recovered from the full
+// collection. Future refreshes still verify them with ownerOf and compare the
+// result to balanceOf, but they do not rescan every historical collection page
+// unless the authoritative balance changes or a remembered ownerOf no longer
+// matches. The map is process-local and contains public token IDs only.
+const recoveredOwnedHints = new Map<string, bigint[]>();
 
 async function fetchOwnedFromApi(citizens: Address, owner: Address): Promise<bigint[]> {
   const ids: bigint[] = [];
@@ -136,20 +142,29 @@ async function fetchReconciledOwnedFromApi(
   citizens: Address,
   owner: Address,
 ): Promise<bigint[]> {
-  const indexed = await fetchOwnedFromApi(citizens, owner);
-  const [expectedBalance, verifiedIndexed] = await Promise.all([
+  const key = `${owner.toLowerCase()}:${citizens.toLowerCase()}`;
+  const [indexed, expectedBalance] = await Promise.all([
+    fetchOwnedFromApi(citizens, owner),
     publicClient.readContract({
       address: citizens,
       abi: citizensAbi,
       functionName: "balanceOf",
       args: [owner],
     }) as Promise<bigint>,
-    filterOwnedTokenIds(citizens, indexed, owner),
   ]);
-  if (BigInt(verifiedIndexed.length) === expectedBalance) return verifiedIndexed;
+  const remembered = recoveredOwnedHints.get(key) ?? [];
+  const candidates = [...new Map(
+    [...indexed, ...remembered].map((tokenId) => [tokenId.toString(), tokenId]),
+  ).values()];
+  const verified = await filterOwnedTokenIds(citizens, candidates, owner);
+  if (BigInt(verified.length) === expectedBalance) {
+    if (verified.length === 0) recoveredOwnedHints.delete(key);
+    else recoveredOwnedHints.set(key, verified);
+    return verified;
+  }
 
   logger.warn(
-    `Alchemy owner index mismatch for ${owner}: indexed ${verifiedIndexed.length}, balanceOf ${expectedBalance}; recovering from collection index`,
+    `Alchemy owner index mismatch for ${owner}: verified ${verified.length}, balanceOf ${expectedBalance}; recovering from collection index`,
   );
   const recovered = await recoverOwnedFromContractApi(citizens, owner, expectedBalance);
   if (BigInt(recovered.length) !== expectedBalance) {
@@ -157,6 +172,7 @@ async function fetchReconciledOwnedFromApi(
       `Citizen ownership lookup is incomplete: contract balanceOf reports ${expectedBalance}, but only ${recovered.length} token ID(s) were verified`,
     );
   }
+  recoveredOwnedHints.set(key, recovered);
   return recovered;
 }
 
