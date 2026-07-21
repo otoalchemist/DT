@@ -62,6 +62,12 @@ cp .env.example .env        # then edit .env and set ALCHEMY_API_KEY
 npm run dev                 # starts backend (:8787) + dashboard (:5173)
 ```
 
+**One-click launch:** double-click **`start.bat`** on Windows or **`start.command`**
+on macOS. Either one installs dependencies on first run, starts the dev server, and
+opens the dashboard. On macOS the first launch may need a right-click → **Open** to
+clear Gatekeeper, and if double-click doesn't run it, mark it executable once with
+`chmod +x start.command`.
+
 Open the dashboard at **`http://localhost:5173`** and:
 
 1. **Create a hot wallet** — generate a fresh burner or import a private key. It's

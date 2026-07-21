@@ -1,5 +1,11 @@
 * text=auto eol=lf
 
+# Shell launchers must keep LF endings to run on macOS/Linux; the Windows
+# launcher keeps CRLF so cmd.exe is happy.
+*.command text eol=lf
+*.sh      text eol=lf
+*.bat     text eol=crlf
+
 # Stamp the release version into the VERSION file when GitHub (or `git archive`)
 # builds a download ZIP/tarball, so an extracted archive is identifiable even when
 # the filename isn't (e.g. the branch "Download ZIP" button gives DT-master.zip).
