@@ -407,23 +407,27 @@ async function queuePreBoundaryAudits(
   const s = runtime.strategy;
   const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
   const auditors = await findPreBoundaryAuditors(ownedIds, targetEpoch);
-  if (auditors.length === 0) return false;
 
   const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
   const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
   const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
-  // Auditable AT the target epoch, not already under audit.
   const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
+  // Rivals that will be auditable AT the target epoch (2+ behind) and aren't already
+  // under audit — the full set, independent of how many auditor slots we have.
+  const auditable = statuses.filter(
+    (t) =>
+      !owned.has(t.tokenId) &&
+      (!pinned || pinned.has(t.tokenId)) &&
+      t.auditDueTimestamp === "0" &&
+      isAuditable(BigInt(t.lastEpochPaid), targetEpoch),
+  );
+
   let idx = 0;
-  let queued = false;
-  for (const t of statuses) {
-    if (idx >= auditors.length) break;
-    if (owned.has(t.tokenId)) continue;
-    if (pinned && !pinned.has(t.tokenId)) continue;
-    if (t.auditDueTimestamp !== "0") continue; // already under audit
-    if (!isAuditable(BigInt(t.lastEpochPaid), targetEpoch)) continue; // won't be auditable at the boundary
+  let queued = 0;
+  for (const t of auditable) {
+    if (idx >= auditors.length) break; // out of auditor capacity this epoch
     const guard = await canSpend(AUDIT_COST_WEI, true);
     if (!guard.ok) continue;
     const from = auditors[idx]!;
@@ -439,9 +443,18 @@ async function queuePreBoundaryAudits(
         revertible: opts.revertible,
       },
     );
-    if (res?.ok) { idx++; queued = true; }
+    if (res?.ok) { idx++; queued++; }
   }
-  return queued;
+
+  // One-line decision summary each fire, so a silent no-op is diagnosable: e.g.
+  // "3 auditable target(s), 0 auditor slot(s)" tells you it had targets but no
+  // paid-current token to audit from.
+  activity.add({
+    kind: "info",
+    status: "info",
+    message: `Pre-boundary audit (epoch ${targetEpoch}): ${auditable.length} auditable target(s), ${auditors.length} auditor slot(s), queued ${queued}`,
+  });
+  return queued > 0;
 }
 
 /** Standalone pre-boundary audit bundle. Used when combinedBoundaryBundle is OFF. */
