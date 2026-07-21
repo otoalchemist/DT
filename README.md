@@ -123,6 +123,42 @@ stripped) from the repo's **Tags**/**Releases** page and at
 release on that tag and upload the `npm run package` artifact as an asset (via the
 web UI or `gh release create`).
 
+Any archive also carries a stamped top-level **`VERSION`** file (filled in at
+download time via `git archive` `export-subst`), so even the unversioned
+`DT-master.zip` from the green button is identifiable — it reads e.g.
+`v0.3.0-3-g<sha>`.
+
+#### `DEFAULTS_VERSION` — pushing new defaults to existing users
+
+`DEFAULTS_VERSION` (in `packages/backend/src/runtime.ts`) is **separate from
+`VERSION`** and is what makes updated recommended settings actually reach people
+who already run the bot.
+
+Users keep their `data/` folder across updates (it holds the wallet keystore and
+API key), so their `data/config.json` survives — and saved values win per-field,
+meaning a changed default would otherwise *never* reach them. On load, a config
+stamped with an older `DEFAULTS_VERSION` has its recommended fields re-applied
+(gas tuning, behaviour flags, and the curated `data/rival-targets.json` list),
+while their own choices are preserved: run mode, coinbase bid + payer, spend
+guardrails, and JIT selection. The change is reported to the log and the activity
+feed. It's deliberately *not* tied to `VERSION` so a routine release doesn't reset
+anyone's tuning.
+
+#### Release checklist
+
+1. Bump **`VERSION`** in `packages/shared/src/constants.ts` **and** the `version`
+   field in the root + all three `packages/*/package.json` (`npm run package`
+   refuses to run if they disagree), then `npm install --package-lock-only`.
+2. **Bump `DEFAULTS_VERSION`** in `packages/backend/src/runtime.ts` **if — and only
+   if — you changed a recommended default or edited `data/rival-targets.json`.**
+   Skipping this means existing users silently stay on the old settings; bumping it
+   needlessly resets their tuning.
+3. Mirror any default changes into `data/config.example.json` (docs only, but keep
+   it honest).
+4. `npm run build && npm test`, then commit.
+5. `npm run package` to write `release/death-and-taxes-bot-v<VERSION>.zip`.
+6. `git tag -a v<VERSION> -m "v<VERSION>" && git push origin v<VERSION>`.
+
 ---
 
 ## Configuration (`.env`)
