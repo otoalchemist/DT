@@ -1,4 +1,5 @@
 {
+  "defaultsVersion": 1,
   "enabled": false,
   "dryRun": true,
   "auditSafetyBufferSeconds": 10800,

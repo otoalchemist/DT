@@ -5,6 +5,7 @@ import type { PrivateKeyAccount } from "viem/accounts";
 import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { activity } from "./activity.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
@@ -80,6 +81,37 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 
+/**
+ * Bump ONLY when the recommended defaults change (gas tuning, behaviour flags, or
+ * the curated rival-target list in data/rival-targets.json).
+ *
+ * A saved `data/config.json` stamped with an older value is migrated on load: the
+ * RECOMMENDED_FIELDS below are refreshed to the current defaults, so a user who
+ * carries their data/ folder across updates isn't silently stuck on stale settings.
+ * Tied to this constant rather than VERSION so an unrelated release doesn't reset
+ * anyone's tuning.
+ */
+export const DEFAULTS_VERSION = 1;
+
+/**
+ * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
+ * listed is PRESERVED from the user's saved config — their mode/run-state
+ * (enabled, dryRun, offenseEnabled, endgameOnlyWithin), wallet-side settings
+ * (coinbaseBidEth, coinbasePayerAddress), spend guardrails (minBalanceEth,
+ * maxPaymentEth), and JIT session (jitEnabled, jitTargetEpoch, jitTokenIds).
+ */
+const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
+  "auditSafetyBufferSeconds", "proactivePay", "prepayEpochs", "autoUseBribe", "maxAutoPayEpochs",
+  "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
+  "autoAudit", "autoKill", "preBoundaryAudit", "preBoundaryKill", "combinedBoundaryBundle",
+  "maxBaseFeeGwei", "priorityFeeGwei",
+  "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
+  "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
+  "racePublicMempool", "dynamicTipEnabled", "dynamicTipMaxGwei",
+  // Re-pulls the curated list shipped in data/rival-targets.json.
+  "offenseTargetTokenIds",
+];
+
 class Runtime {
   account: PrivateKeyAccount | null = null;
   walletClient: WalletClient | null = null;
@@ -118,23 +150,64 @@ class Runtime {
   loadStrategy(): void {
     try {
       const p = this.configPath();
-      if (fs.existsSync(p)) {
-        const saved = JSON.parse(fs.readFileSync(p, "utf8"));
-        this.strategy = { ...DEFAULT_STRATEGY, ...saved };
+      // No saved config (fresh install/extract) -> DEFAULT_STRATEGY already IS the
+      // recommended set, so there's nothing to migrate.
+      if (!fs.existsSync(p)) return;
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      // Meta key, not part of StrategyConfig. Absent => pre-versioning config (0).
+      const savedDefaults = typeof raw.defaultsVersion === "number" ? raw.defaultsVersion : 0;
+      // Keep only keys DEFAULT_STRATEGY still declares, so config.json doesn't carry
+      // dead fields from retired settings across upgrades (and `defaultsVersion`
+      // itself, which is file meta rather than strategy, is dropped here too).
+      const merged: Record<string, unknown> = {};
+      for (const k of Object.keys(DEFAULT_STRATEGY) as (keyof StrategyConfig)[]) {
+        merged[k] = k in raw ? raw[k] : DEFAULT_STRATEGY[k];
+      }
+      this.strategy = merged as unknown as StrategyConfig;
+      if (savedDefaults < DEFAULTS_VERSION) {
+        this.strategy = this.applyRecommendedDefaults(this.strategy, savedDefaults);
+        this.writeConfig(); // persist the migration + new stamp so it runs once
       }
     } catch (err) {
       logger.warn("Could not load strategy config:", (err as Error).message);
     }
   }
 
-  saveStrategy(next: Partial<StrategyConfig>): StrategyConfig {
-    this.strategy = { ...this.strategy, ...next };
+  /** Refresh the RECOMMENDED_FIELDS to current defaults, preserving user choices.
+   *  Reports exactly what changed so the refresh is never silent. */
+  private applyRecommendedDefaults(saved: StrategyConfig, fromVersion: number): StrategyConfig {
+    const out = { ...saved };
+    const changed: string[] = [];
+    for (const k of RECOMMENDED_FIELDS) {
+      const def = DEFAULT_STRATEGY[k];
+      if (JSON.stringify(out[k]) !== JSON.stringify(def)) changed.push(k);
+      (out as Record<string, unknown>)[k] = def;
+    }
+    const detail = changed.length ? `refreshed: ${changed.join(", ")}` : "already current";
+    const msg =
+      `Config updated to recommended defaults v${DEFAULTS_VERSION} (was v${fromVersion}) — ${detail}. ` +
+      `Kept your run mode, wallet/payer, coinbase bid, spend caps and JIT selection.`;
+    logger.info(msg);
+    activity.add({ kind: "info", status: "info", message: msg });
+    return out;
+  }
+
+  /** Write config.json, stamping the defaults version it was written against. */
+  private writeConfig(): void {
     try {
       fs.mkdirSync(appConfig.dataDir, { recursive: true });
-      fs.writeFileSync(this.configPath(), JSON.stringify(this.strategy, null, 2));
+      fs.writeFileSync(
+        this.configPath(),
+        JSON.stringify({ ...this.strategy, defaultsVersion: DEFAULTS_VERSION }, null, 2),
+      );
     } catch (err) {
       logger.warn("Could not save strategy config:", (err as Error).message);
     }
+  }
+
+  saveStrategy(next: Partial<StrategyConfig>): StrategyConfig {
+    this.strategy = { ...this.strategy, ...next };
+    this.writeConfig();
     this.emitStatus();
     return this.strategy;
   }
