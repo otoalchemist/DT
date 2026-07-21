@@ -370,6 +370,12 @@ export async function submitTx(
     offense?: boolean;
     /** Simulate at this future unix-second timestamp (pre-boundary races). */
     simTimestamp?: bigint;
+    /** Skip simulation entirely. Only for a tx whose validity depends on ANOTHER tx
+     *  earlier in the same bundle (an audit from a token paid by that same bundle):
+     *  every sim runs it standalone against pre-bundle state and would wrongly
+     *  reject it. Such a tx must also be `revertible` so it can never invalidate
+     *  the bundle. */
+    skipSim?: boolean;
     /** Mark this tx allowed-to-revert in the bundle (revertingTxHashes) so it can
      *  never invalidate the bundle / drop a mandatory tx. Used for audits riding a
      *  payment bundle in combined mode. */
@@ -404,7 +410,10 @@ export async function submitTx(
   };
 
   // --- Simulation ---
-  if (opts.simTimestamp !== undefined) {
+  if (opts.skipSim) {
+    // Depends on an earlier tx in this bundle; any standalone sim would misjudge it.
+    logger.info("skipping simulation: tx depends on an earlier tx in the same bundle");
+  } else if (opts.simTimestamp !== undefined) {
     // Future-timestamp race (pre-boundary pay/audit/kill): validate at the instant
     // the tx will actually execute. Always uses eth_call block overrides against
     // OUR OWN RPC — verified working, and deliberately not the relay's

@@ -35,6 +35,25 @@ describe("delinquency / audit math", () => {
     expect(isEligibleAuditor(10n, 10n, 3n, 3n)).toBe(false);
   });
 
+  // The combined bundle pays a token and then audits FROM it in the same atomic
+  // bundle (the batch-auditor pattern). findPreBoundaryAuditors re-tests eligibility
+  // with lastEpochPaid+1 for tokens paid earlier in that bundle, because the chain
+  // still reads the pre-payment value. This pins that arithmetic.
+  it("a token paid earlier in the same bundle becomes an eligible auditor", () => {
+    // Real case: token 2036 sits at lastEpochPaid=140 racing into epoch 142.
+    const lastEpochPaid = 140n;
+    const targetEpoch = 142n;
+    // As the chain reads it: 2 behind at 142 -> auditable itself -> cannot audit.
+    expect(isEligibleAuditor(lastEpochPaid, targetEpoch, 0n, 1n)).toBe(false);
+    // After the bundle's payTaxes(+1 epoch) lands first, it is current -> can audit.
+    expect(isEligibleAuditor(lastEpochPaid + 1n, targetEpoch, 0n, 1n)).toBe(true);
+    // One epoch of credit is not a blank cheque: 3 behind is still disqualified,
+    // so we never queue an audit the payment can't actually rescue.
+    expect(isEligibleAuditor(139n + 1n, targetEpoch, 0n, 1n)).toBe(false);
+    // Capacity still applies to a just-paid auditor.
+    expect(isEligibleAuditor(lastEpochPaid + 1n, targetEpoch, 1n, 1n)).toBe(false);
+  });
+
   it("is killable only after the audit deadline passes", () => {
     expect(isKillable(0n, 1000n)).toBe(false); // not under audit
     expect(isKillable(1000n, 999n)).toBe(false); // before deadline
