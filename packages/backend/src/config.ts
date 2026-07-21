@@ -3,7 +3,7 @@ import { z } from "zod";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { encodeFunctionData } from "viem";
+import { decodeFunctionResult, encodeFunctionData } from "viem";
 import { GAME_CONTRACT_ADDRESS, deathAndTaxesAbi } from "@dat-bot/shared";
 import { writeFileAtomicDurableSync } from "./durability.js";
 
@@ -215,11 +215,13 @@ export async function validateMainnetRpcCandidate(
       functionName: "currentEpoch",
     });
     const stateData = encodeFunctionData({ abi: deathAndTaxesAbi, functionName: "state" });
-    const [chainId, blockNumber, currentEpoch, gameState] = await Promise.all([
+    const citizensData = encodeFunctionData({ abi: deathAndTaxesAbi, functionName: "citizens" });
+    const [chainId, blockNumber, currentEpoch, gameState, citizensResult] = await Promise.all([
       rpc(1, "eth_chainId", []),
       rpc(2, "eth_blockNumber", []),
       rpc(3, "eth_call", [{ to: candidate.gameAddress, data: currentEpochData }, "latest"]),
       rpc(4, "eth_call", [{ to: candidate.gameAddress, data: stateData }, "latest"]),
+      rpc(5, "eth_call", [{ to: candidate.gameAddress, data: citizensData }, "latest"]),
     ]);
     if (typeof chainId !== "string" || BigInt(chainId) !== 1n) {
       throw new Error(`Expected Ethereum mainnet chainId 1, received ${String(chainId)}`);
@@ -233,13 +235,36 @@ export async function validateMainnetRpcCandidate(
     if (typeof gameState !== "string" || !/^0x[0-9a-f]{64}$/i.test(gameState)) {
       throw new Error("Game contract state call returned invalid data");
     }
+    if (typeof citizensResult !== "string" || !/^0x[0-9a-f]{64}$/i.test(citizensResult)) {
+      throw new Error("Game contract citizens call returned invalid data");
+    }
+    const citizensAddress = decodeFunctionResult({
+      abi: deathAndTaxesAbi,
+      functionName: "citizens",
+      data: citizensResult as `0x${string}`,
+    });
 
     const nftUrl = new URL(`${candidate.nftUrl.replace(/\/$/, "")}/getNFTsForOwner`);
     nftUrl.searchParams.set("owner", "0x000000000000000000000000000000000000dEaD");
+    // Alchemy rejects unfiltered ownership enumeration for burn addresses. The
+    // live collection read also proves that this API key can enumerate the
+    // exact Citizens collection the bot will use after wallet unlock.
+    nftUrl.searchParams.append("contractAddresses[]", citizensAddress);
     nftUrl.searchParams.set("withMetadata", "false");
     nftUrl.searchParams.set("pageSize", "1");
     const nftResponse = await fetchImpl(nftUrl, { signal: controller.signal });
-    if (!nftResponse.ok) throw new Error(`NFT endpoint returned HTTP ${nftResponse.status}`);
+    if (!nftResponse.ok) {
+      let detail = "";
+      try {
+        detail = (await nftResponse.text()).replace(/\s+/g, " ").trim().slice(0, 300);
+      } catch {
+        // The HTTP status remains actionable even when the provider body cannot
+        // be read. Candidate-key redaction is applied at the API boundary.
+      }
+      throw new Error(
+        `NFT endpoint returned HTTP ${nftResponse.status}${detail ? `: ${detail}` : ""}`,
+      );
+    }
     const nftPayload = await nftResponse.json() as { ownedNfts?: unknown };
     if (!nftPayload || typeof nftPayload !== "object" || !Array.isArray(nftPayload.ownedNfts)) {
       throw new Error("NFT endpoint returned invalid JSON");

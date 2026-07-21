@@ -154,6 +154,22 @@ describe("JitPanel campaign scope", () => {
     });
   });
 
+  it("surfaces ownership enumeration errors instead of presenting an empty wallet", async () => {
+    render(
+      <JitPanel
+        status={status()}
+        tokens={[]}
+        strategy={strategy}
+        tokenLookupError="contract balanceOf reports 1 but enumeration found 0"
+        onStatusChange={vi.fn()}
+        onStrategyChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/Owned Citizen lookup failed:.*balanceOf reports 1/)).toBeTruthy();
+    expect(screen.queryByText("No owned citizens found for this wallet.")).toBeNull();
+  });
+
   it("arms the displayed epoch and exact selected IDs, then applies the mutation response", async () => {
     const initialStatus = status();
     const mutationStatus = status({

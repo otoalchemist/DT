@@ -73,6 +73,7 @@ export function JitPanel({
   status,
   tokens,
   strategy,
+  tokenLookupError,
   onStrategyChange,
   onStatusChange,
   capabilityRefreshToken = 0,
@@ -80,6 +81,7 @@ export function JitPanel({
   status: BotStatus | null;
   tokens: OwnedTokenStatus[];
   strategy: StrategySnapshot | null;
+  tokenLookupError?: string | null;
   onStrategyChange: (snapshot: StrategySnapshot) => void;
   onStatusChange: (status: BotStatus) => void;
   capabilityRefreshToken?: number;
@@ -753,8 +755,10 @@ export function JitPanel({
       )}
 
       {tokens.length === 0 && (
-        <p className="hint">
-          {status?.nftConfigured
+        <p className={tokenLookupError ? "err" : "hint"}>
+          {tokenLookupError
+            ? `Owned Citizen lookup failed: ${tokenLookupError}`
+            : status?.nftConfigured
             ? "No owned citizens found for this wallet."
             : "No owned citizens detected yet — set your Alchemy key so the bot can find them."}
         </p>

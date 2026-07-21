@@ -203,6 +203,25 @@ describe("Dashboard dry-run revision conflicts", () => {
     expect(container.querySelector(".pill.delivery-uncertain")?.textContent).toBe("delivery-uncertain");
   });
 
+  it("surfaces an ownership lookup failure instead of claiming the wallet owns nothing", async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(initialStrategy);
+    vi.mocked(api.tokens).mockRejectedValue(new Error(
+      "Citizen ownership lookup is incomplete: contract balanceOf reports 1, but only 0 token ID(s) were verified",
+    ));
+
+    render(
+      <Dashboard
+        status={status}
+        activity={[]}
+        connected={true}
+        pushStatus={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText(/Owned Citizen lookup failed:.*balanceOf reports 1/)).toBeTruthy();
+    expect(screen.queryByText("No owned Citizen tokens found for this wallet.")).toBeNull();
+  });
+
   it("never lets a late lower-revision panel response regress the shared snapshot", async () => {
     vi.mocked(api.getConfig).mockResolvedValue(initialStrategy);
     render(

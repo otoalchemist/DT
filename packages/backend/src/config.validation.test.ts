@@ -73,11 +73,22 @@ describe("candidate endpoint validation", () => {
   it("checks chain, latest block, both game reads, and NFT availability without mutation", async () => {
     const fetchImpl = validFetch();
     await expect(validateMainnetRpcCandidate(candidate, fetchImpl)).resolves.toBeUndefined();
-    expect(fetchImpl).toHaveBeenCalledTimes(5);
-    const rpcMethods = vi.mocked(fetchImpl).mock.calls.slice(0, 4).map(([, init]) =>
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
+    const rpcMethods = vi.mocked(fetchImpl).mock.calls.slice(0, 5).map(([, init]) =>
       (JSON.parse(String(init?.body)) as { method: string }).method,
     );
-    expect(rpcMethods).toEqual(["eth_chainId", "eth_blockNumber", "eth_call", "eth_call"]);
+    expect(rpcMethods).toEqual([
+      "eth_chainId",
+      "eth_blockNumber",
+      "eth_call",
+      "eth_call",
+      "eth_call",
+    ]);
+    const nftUrl = new URL(String(vi.mocked(fetchImpl).mock.calls[5]?.[0]));
+    expect(nftUrl.searchParams.get("owner"))
+      .toBe("0x000000000000000000000000000000000000dEaD");
+    expect(nftUrl.searchParams.getAll("contractAddresses[]"))
+      .toEqual(["0x0000000000000000000000000000000000000001"]);
   });
 
   it("rejects a wrong chain or unavailable NFT endpoint", async () => {

@@ -80,6 +80,7 @@ export function Dashboard({
   const [strategy, setStrategy] = useState<StrategySnapshot | null>(null);
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
+  const [tokenLookupError, setTokenLookupError] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [capabilityRefreshToken, setCapabilityRefreshToken] = useState(0);
 
@@ -109,13 +110,25 @@ export function Dashboard({
   }, [status?.strategyRevision, strategy?.revision, acceptStrategy]);
 
   const refresh = useCallback(async () => {
-    try {
-      const [t, g] = await Promise.all([api.tokens().catch(() => []), api.targets().catch(() => [])]);
-      setTokens(t);
-      setTargets(g);
+    const [ownedResult, targetResult] = await Promise.allSettled([
+      api.tokens(),
+      api.targets(),
+    ]);
+    if (ownedResult.status === "fulfilled") {
+      setTokens(ownedResult.value);
+      setTokenLookupError(null);
+    } else {
+      setTokenLookupError(ownedResult.reason instanceof Error
+        ? ownedResult.reason.message
+        : String(ownedResult.reason));
+    }
+    if (targetResult.status === "fulfilled") {
+      setTargets(targetResult.value);
       setErr(null);
-    } catch (e) {
-      setErr((e as Error).message);
+    } else {
+      setErr(targetResult.reason instanceof Error
+        ? targetResult.reason.message
+        : String(targetResult.reason));
     }
   }, []);
 
@@ -255,6 +268,7 @@ export function Dashboard({
           status={status}
           tokens={tokens}
           strategy={strategy}
+          tokenLookupError={tokenLookupError}
           onStrategyChange={acceptStrategy}
           onStatusChange={pushStatus}
           capabilityRefreshToken={capabilityRefreshToken}
@@ -264,8 +278,10 @@ export function Dashboard({
         <div className="panel">
           <h2>Your tokens</h2>
           {tokens.length === 0 ? (
-            <p className="muted">
-              {status?.nftConfigured
+            <p className={tokenLookupError ? "err" : "muted"}>
+              {tokenLookupError
+                ? `Owned Citizen lookup failed: ${tokenLookupError}`
+                : status?.nftConfigured
                 ? "No owned Citizen tokens found for this wallet."
                 : "No owned Citizen tokens detected (needs the Alchemy NFT API for enumeration)."}
             </p>

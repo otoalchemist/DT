@@ -83,6 +83,83 @@ async function fetchOwnedFromApi(citizens: Address, owner: Address): Promise<big
   return ids;
 }
 
+/**
+ * Recover ownership when Alchemy's owner index disagrees with the contract.
+ *
+ * The Citizen contract is not ERC721Enumerable, so there is no on-chain
+ * tokenOfOwnerByIndex fallback. The collection endpoint gives us candidate
+ * token IDs; ownerOf remains authoritative and lets us stop as soon as the
+ * contract's balanceOf count has been satisfied. This path deliberately does
+ * not inherit MAX_CANDIDATES, which is an offense-only limit.
+ */
+async function recoverOwnedFromContractApi(
+  citizens: Address,
+  owner: Address,
+  expectedBalance: bigint,
+): Promise<bigint[]> {
+  const owned = new Map<string, bigint>();
+  const deadlineMs = Date.now() + NFT_OPERATION_TIMEOUT_MS;
+  const seenPageKeys = new Set<string>();
+  let pageKey: string | undefined;
+  do {
+    const q =
+      `/getNFTsForContract?contractAddress=${citizens}`
+      + `&withMetadata=false&limit=100`
+      + (pageKey ? `&pageKey=${encodeURIComponent(pageKey)}` : "");
+    const data = await alchemyGet<{ nfts: AlchemyNft[]; pageKey?: string }>(q, deadlineMs);
+    const pageIds = data.nfts.map((nft) => BigInt(nft.tokenId));
+    const verified = await filterOwnedTokenIds(citizens, pageIds, owner);
+    for (const tokenId of verified) owned.set(tokenId.toString(), tokenId);
+
+    if (BigInt(owned.size) === expectedBalance) return [...owned.values()];
+    if (BigInt(owned.size) > expectedBalance) {
+      throw new Error(
+        `ownership recovery found ${owned.size} Citizens but balanceOf reports ${expectedBalance}`,
+      );
+    }
+
+    pageKey = data.pageKey;
+    if (pageKey) {
+      if (seenPageKeys.has(pageKey)) throw new Error("Alchemy NFT collection pagination repeated a page key");
+      seenPageKeys.add(pageKey);
+    }
+  } while (pageKey);
+
+  return [...owned.values()];
+}
+
+/**
+ * Reconcile Alchemy's owner index against authoritative contract state. An
+ * empty/stale index must never quietly turn an owned Citizen into no work.
+ */
+async function fetchReconciledOwnedFromApi(
+  citizens: Address,
+  owner: Address,
+): Promise<bigint[]> {
+  const indexed = await fetchOwnedFromApi(citizens, owner);
+  const [expectedBalance, verifiedIndexed] = await Promise.all([
+    publicClient.readContract({
+      address: citizens,
+      abi: citizensAbi,
+      functionName: "balanceOf",
+      args: [owner],
+    }) as Promise<bigint>,
+    filterOwnedTokenIds(citizens, indexed, owner),
+  ]);
+  if (BigInt(verifiedIndexed.length) === expectedBalance) return verifiedIndexed;
+
+  logger.warn(
+    `Alchemy owner index mismatch for ${owner}: indexed ${verifiedIndexed.length}, balanceOf ${expectedBalance}; recovering from collection index`,
+  );
+  const recovered = await recoverOwnedFromContractApi(citizens, owner, expectedBalance);
+  if (BigInt(recovered.length) !== expectedBalance) {
+    throw new Error(
+      `Citizen ownership lookup is incomplete: contract balanceOf reports ${expectedBalance}, but only ${recovered.length} token ID(s) were verified`,
+    );
+  }
+  return recovered;
+}
+
 async function fetchCandidatesFromApi(citizens: Address): Promise<bigint[]> {
   const ids: bigint[] = [];
   const deadlineMs = Date.now() + NFT_OPERATION_TIMEOUT_MS;
@@ -109,7 +186,7 @@ export async function fetchOwnedTokenIds(
   }
   if (!appConfig.nftUrl) return []; // unconfigured: degrade quietly, engine idles
   const key = `${owner.toLowerCase()}:${citizens.toLowerCase()}`;
-  return ownedCache(key, OWNED_TTL_MS, () => fetchOwnedFromApi(citizens, owner));
+  return ownedCache(key, OWNED_TTL_MS, () => fetchReconciledOwnedFromApi(citizens, owner));
 }
 
 /** Filter cached/indexed ownership through authoritative on-chain ownerOf reads.
