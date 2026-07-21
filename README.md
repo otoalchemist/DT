@@ -149,6 +149,22 @@ stripped) from the repo's **Tags**/**Releases** page and at
 release on that tag and upload the `npm run package` artifact as an asset (via the
 web UI or `gh release create`).
 
+Any archive also carries a stamped top-level **`VERSION`** file (filled in at
+download time via `git archive` `export-subst`), so even the unversioned
+`DT-master.zip` from the green button is identifiable — it reads e.g.
+`v0.3.0-3-g<sha>`.
+
+#### Release checklist
+
+1. Bump **`VERSION`** in `packages/shared/src/constants.ts` **and** the `version`
+   field in the root + all three `packages/*/package.json` (`npm run package`
+   refuses to run if they disagree), then `npm install --package-lock-only`.
+2. Mirror any default changes into `data/config.example.json` (docs only, but keep
+   it honest).
+3. `npm run build && npm test`, then commit.
+4. `npm run package` to write `release/death-and-taxes-bot-v<VERSION>.zip`.
+5. `git tag -a v<VERSION> -m "v<VERSION>" && git push origin v<VERSION>`.
+
 ---
 
 ## Configuration (`.env`)
