@@ -244,7 +244,7 @@ export function Dashboard({
 
         <div className="spacer" />
         <div className="grid cols-2">
-          {config && <Config initial={config} />}
+          {config && <Config cfg={config} onChange={setConfig} />}
 
           <div className="panel">
             <h2>Activity</h2>

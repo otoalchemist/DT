@@ -105,8 +105,14 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
 }
 
 // Strategy configuration form. Persists via POST /api/config.
-export function Config({ initial }: { initial: StrategyConfig }) {
-  const [cfg, setCfg] = useState<StrategyConfig>(initial);
+//
+// Controlled component: `cfg` is owned by Dashboard and shared with JitPanel, so
+// there is a SINGLE source of truth for the config. Previously this panel kept its
+// own local copy seeded from an `initial` prop and re-synced via useEffect; edits
+// made here (e.g. "Enable offense") lived only in that copy, so an edit in JitPanel
+// (which writes the shared config) would re-flow through the prop and silently clobber
+// them. Reading/writing the shared object directly removes that stale-copy race.
+export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next: StrategyConfig) => void }) {
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
@@ -114,14 +120,12 @@ export function Config({ initial }: { initial: StrategyConfig }) {
   // misreport before GET /api/settings resolves; corrected on load if it differs.
   const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("mainnet");
 
-  useEffect(() => setCfg(initial), [initial]);
-
   useEffect(() => {
     api.getSettings().then((s) => setCurrentMode(s.mode)).catch(() => {});
   }, []);
 
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
-    setCfg((c) => ({ ...c, [k]: v }));
+    onChange({ ...cfg, [k]: v });
     setSaved(false);
   };
 
@@ -129,7 +133,10 @@ export function Config({ initial }: { initial: StrategyConfig }) {
     setBusy(true);
     setSaveErr(null);
     try {
-      await api.setConfig(cfg);
+      // Persist, then adopt the server-normalized config so the shared state stays
+      // in lockstep with the backend.
+      const next = await api.setConfig(cfg);
+      onChange(next);
       setSaved(true);
     } catch (e) {
       setSaveErr((e as Error).message);
