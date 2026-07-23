@@ -30,6 +30,7 @@ export const api = {
     req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase }) }),
   lock: () => req<{ ok: boolean }>("/api/lock", { method: "POST" }),
   getConfig: () => req<StrategyConfig>("/api/config"),
+  defaultRivalTargets: () => req<{ tokenIds: string[] }>("/api/default-rival-targets"),
   setConfig: (patch: Partial<StrategyConfig>) =>
     req<StrategyConfig>("/api/config", { method: "POST", body: JSON.stringify(patch) }),
   start: () => req<BotStatus>("/api/start", { method: "POST" }),

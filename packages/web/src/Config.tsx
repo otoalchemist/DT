@@ -119,9 +119,13 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
   // Seed with the actual shipped default (mainnet) so the panel doesn't briefly
   // misreport before GET /api/settings resolves; corrected on load if it differs.
   const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("mainnet");
+  // The curated rival list shipped in git, fetched so "reset to default" can
+  // restore it after the user edits their offense targets.
+  const [defaultRivals, setDefaultRivals] = useState<string[]>([]);
 
   useEffect(() => {
     api.getSettings().then((s) => setCurrentMode(s.mode)).catch(() => {});
+    api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
   }, []);
 
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
@@ -193,6 +197,27 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
           onChange={(e) => set("endgameOnlyWithin", e.target.value === "" ? null : Number(e.target.value))}
         />
       </label>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <button
+          type="button"
+          onClick={() => set("offenseTargetTokenIds", [...defaultRivals])}
+          disabled={
+            !cfg.offenseEnabled ||
+            defaultRivals.length === 0 ||
+            (cfg.offenseTargetTokenIds.length === defaultRivals.length &&
+              cfg.offenseTargetTokenIds.every((id, i) => id === defaultRivals[i]))
+          }
+          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
+          title="Restore the curated rival list that ships with the bot"
+        >
+          Reset to default list
+        </button>
+        {defaultRivals.length > 0 && (
+          <span className="muted" style={{ fontSize: 11 }}>
+            {defaultRivals.length} default target{defaultRivals.length !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
       <label className="field">
         Rival token IDs to target (one per line or comma-separated — blank = all delinquent rivals)
         <textarea
