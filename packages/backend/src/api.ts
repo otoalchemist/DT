@@ -4,7 +4,7 @@ import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
 import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
-import { runtime, DEFAULT_STRATEGY } from "./runtime.js";
+import { runtime, DEFAULT_STRATEGY, loadRivalSkippers } from "./runtime.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
 import {
@@ -97,6 +97,12 @@ export async function buildServer(): Promise<FastifyInstance> {
   // after the user has edited their offense targets.
   app.get("/api/default-rival-targets", async () => ({
     tokenIds: DEFAULT_STRATEGY.offenseTargetTokenIds,
+  }));
+
+  // "Rival skippers" — the subset of default targets that pay on a ~2-epoch cadence
+  // (data/rival-skippers.json). Offered as a one-click focused target list.
+  app.get("/api/rival-skippers", async () => ({
+    tokenIds: loadRivalSkippers(),
   }));
 
   app.post("/api/config", async (req, reply) => {

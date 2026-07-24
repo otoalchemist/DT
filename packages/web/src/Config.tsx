@@ -122,11 +122,20 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
   // The curated rival list shipped in git, fetched so "reset to default" can
   // restore it after the user edits their offense targets.
   const [defaultRivals, setDefaultRivals] = useState<string[]>([]);
+  // The "skippers" subset — rivals that pay on a ~2-epoch cadence — offered as a
+  // one-click focused target list.
+  const [skippers, setSkippers] = useState<string[]>([]);
 
   useEffect(() => {
     api.getSettings().then((s) => setCurrentMode(s.mode)).catch(() => {});
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
+    api.rivalSkippers().then((r) => setSkippers(r.tokenIds)).catch(() => {});
   }, []);
+
+  // True when the current target list already equals `list` (same ids, same order).
+  const targetsEqual = (list: string[]) =>
+    cfg.offenseTargetTokenIds.length === list.length &&
+    cfg.offenseTargetTokenIds.every((id, i) => id === list[i]);
 
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
     onChange({ ...cfg, [k]: v });
@@ -197,24 +206,28 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
           onChange={(e) => set("endgameOnlyWithin", e.target.value === "" ? null : Number(e.target.value))}
         />
       </label>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
         <button
           type="button"
           onClick={() => set("offenseTargetTokenIds", [...defaultRivals])}
-          disabled={
-            !cfg.offenseEnabled ||
-            defaultRivals.length === 0 ||
-            (cfg.offenseTargetTokenIds.length === defaultRivals.length &&
-              cfg.offenseTargetTokenIds.every((id, i) => id === defaultRivals[i]))
-          }
+          disabled={!cfg.offenseEnabled || defaultRivals.length === 0 || targetsEqual(defaultRivals)}
           style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
           title="Restore the curated rival list that ships with the bot"
         >
           Reset to default list
         </button>
+        <button
+          type="button"
+          onClick={() => set("offenseTargetTokenIds", [...skippers])}
+          disabled={!cfg.offenseEnabled || skippers.length === 0 || targetsEqual(skippers)}
+          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
+          title="Target only rivals that pay on a ~2-epoch cadence (delinquent at every second boundary)"
+        >
+          Rival Skippers
+        </button>
         {defaultRivals.length > 0 && (
           <span className="muted" style={{ fontSize: 11 }}>
-            {defaultRivals.length} default target{defaultRivals.length !== 1 ? "s" : ""}
+            {defaultRivals.length} default{skippers.length > 0 ? ` · ${skippers.length} skippers` : ""}
           </span>
         )}
       </div>

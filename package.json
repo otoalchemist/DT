@@ -17,7 +17,8 @@
     "build": "npm run build:shared && npm run build -w @dat-bot/backend && npm run build -w @dat-bot/web",
     "start": "npm run build:shared && node packages/backend/dist/main.js",
     "test": "npm run test -w @dat-bot/backend",
-    "package": "node scripts/package.mjs"
+    "package": "node scripts/package.mjs",
+    "rival-skippers": "node scripts/rival-skippers.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

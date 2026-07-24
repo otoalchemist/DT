@@ -13,17 +13,32 @@ import { ownershipIndexingAvailable } from "./index-tokens.js";
 // Curated rival token IDs ship in git (data/rival-targets.json, unlike the
 // gitignored data/config.json) so a fresh clone has offense targets without
 // needing to `cp data/config.example.json data/config.json` first.
-function loadDefaultRivalTargets(): string[] {
+function loadRivalIdFile(fileName: string, label: string): string[] {
   try {
-    const p = path.join(appConfig.dataDir, "rival-targets.json");
+    const p = path.join(appConfig.dataDir, fileName);
     if (fs.existsSync(p)) {
       const ids = JSON.parse(fs.readFileSync(p, "utf8"));
       if (Array.isArray(ids)) return ids.map(String);
     }
   } catch (err) {
-    logger.warn("Could not load default rival targets:", (err as Error).message);
+    logger.warn(`Could not load ${label}:`, (err as Error).message);
   }
   return [];
+}
+
+function loadDefaultRivalTargets(): string[] {
+  return loadRivalIdFile("rival-targets.json", "default rival targets");
+}
+
+/**
+ * "Rival skippers" — a curated subset of the default targets that empirically pay
+ * on a ~2-epoch cadence (they let themselves go 2+ epochs behind, so they're
+ * auditable at every second boundary). Shipped in git (data/rival-skippers.json)
+ * and offered in the Config UI as a one-click focused target list. Regenerate with
+ * scripts/rival-skippers.mjs (see that file for the detection heuristic).
+ */
+export function loadRivalSkippers(): string[] {
+  return loadRivalIdFile("rival-skippers.json", "rival skippers");
 }
 
 export const DEFAULT_STRATEGY: StrategyConfig = {
