@@ -125,6 +125,42 @@ export function cappedAutoPayEpochs(requestedEpochs: number, maxAutoPayEpochs: n
 }
 
 /**
+ * Resolve (and validate) the epoch a JIT arm should target.
+ *
+ * JIT pays a **future** epoch the instant it begins on-chain, so the target must be
+ * strictly greater than the current epoch. The default is `currentEpoch + 1` (the
+ * upcoming boundary); an explicit `requestedTarget` overrides it but is still held to
+ * the same future-only rule.
+ *
+ * CRITICAL: `currentEpoch` MUST be a freshly-read chain value, not a cached one. The
+ * caller (`/api/jit`) previously defaulted off `runtime.currentEpoch`, which is only
+ * refreshed while the engine is RUNNING — frozen at its unlock-time value while
+ * paused. If it had gone stale by an epoch, `currentEpoch + 1` resolved to an epoch
+ * that had ALREADY begun, and `jitPass` fires a current/past target on the very next
+ * block instead of at a boundary, spending immediately. The future-only guard here is
+ * the second line of defence: even if a stale or explicit value slips through, a
+ * target that isn't strictly future is rejected rather than paid.
+ */
+export function resolveJitTarget(
+  currentEpoch: number | null,
+  requestedTarget?: number,
+): { ok: true; target: number } | { ok: false; error: string } {
+  if (currentEpoch === null) {
+    return { ok: false, error: "Unknown current epoch — start the bot once so it can read chain state" };
+  }
+  const target = requestedTarget ?? currentEpoch + 1;
+  if (target <= currentEpoch) {
+    return {
+      ok: false,
+      error:
+        `Target epoch ${target} has already begun (current epoch is ${currentEpoch}). ` +
+        `JIT pays a future epoch at its boundary — arm for ${currentEpoch + 1} or later.`,
+    };
+  }
+  return { ok: true, target };
+}
+
+/**
  * Deterministically order items by a salted hash of their key.
  *
  * Every bot enumerates rival candidates in the same order (the NFT API returns a

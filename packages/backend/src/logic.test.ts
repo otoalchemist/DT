@@ -13,6 +13,7 @@ import {
   preBoundaryTaxWei,
   cappedAutoPayEpochs,
   orderBySalt,
+  resolveJitTarget,
 } from "./logic.js";
 
 describe("delinquency / audit math", () => {
@@ -191,6 +192,45 @@ describe("orderBySalt (per-engine rival sweep shuffle)", () => {
 
   it("handles an empty list", () => {
     expect(orderBySalt([], (x: string) => x, 99)).toEqual([]);
+  });
+});
+
+describe("resolveJitTarget (arm-time epoch validation)", () => {
+  it("defaults to the upcoming epoch when no target is given", () => {
+    expect(resolveJitTarget(143)).toEqual({ ok: true, target: 144 });
+  });
+
+  it("accepts an explicit future target", () => {
+    expect(resolveJitTarget(143, 200)).toEqual({ ok: true, target: 200 });
+  });
+
+  it("rejects an explicit target that has already begun (current epoch)", () => {
+    const r = resolveJitTarget(143, 143);
+    expect(r.ok).toBe(false);
+  });
+
+  it("rejects an explicit target in the past", () => {
+    expect(resolveJitTarget(143, 140).ok).toBe(false);
+  });
+
+  it("rejects when the current epoch is unknown", () => {
+    expect(resolveJitTarget(null).ok).toBe(false);
+  });
+
+  // The stale-epoch incident: the engine sat paused across the 142->143 boundary, so
+  // runtime.currentEpoch was frozen at 142 while the chain was really in 143. Arming
+  // off the STALE value defaulted the target to 143 — an epoch already underway — and
+  // jitPass paid it on the next block instead of waiting for a boundary. The fix reads
+  // the epoch fresh before resolving; these two cases pin the before/after so a refactor
+  // can't reintroduce the footgun.
+  it("off a STALE epoch (142) it defaults to 143 — the already-current epoch (the bug)", () => {
+    // Demonstrates why the caller MUST refresh: with a stale 142 the default is 143,
+    // which is <= the true current epoch and fires immediately.
+    expect(resolveJitTarget(142)).toEqual({ ok: true, target: 143 });
+  });
+
+  it("off the FRESH epoch (143) it defaults to 144 — a real future boundary (the fix)", () => {
+    expect(resolveJitTarget(143)).toEqual({ ok: true, target: 144 });
   });
 });
 

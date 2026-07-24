@@ -16,6 +16,7 @@ import {
   normalizePrivateKey,
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
+import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
@@ -232,12 +233,32 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
 
     if (!runtime.unlocked) return reply.code(400).send({ error: "Unlock the wallet first" });
-    // Default target = the upcoming epoch.
-    const current = runtime.currentEpoch !== null ? Number(runtime.currentEpoch) : null;
-    const target = targetEpoch ?? (current !== null ? current + 1 : null);
-    if (target === null) {
-      return reply.code(400).send({ error: "Unknown current epoch — start the bot once so it can read chain state" });
+
+    // The target epoch is computed relative to the CURRENT epoch, so read it fresh
+    // from chain here — do NOT trust runtime.currentEpoch, which is only refreshed by
+    // the engine's tick loop (refreshSnapshot) and is frozen at its unlock-time value
+    // while the engine is paused. Arming off a stale epoch made "next epoch" resolve
+    // to one that had already begun, and jitPass then pays it on the next block instead
+    // of at the boundary. Fail closed (don't arm off a possibly-stale cache) if the
+    // read fails.
+    try {
+      const snap = await getGameSnapshot();
+      runtime.currentEpoch = snap.currentEpoch;
+      runtime.startTime = snap.startTime;
+      runtime.gameState = snap.state;
+      runtime.citizenSupply = snap.citizenSupply;
+      runtime.citizensAddress = snap.citizensAddress;
+      runtime.emitStatus();
+    } catch (err) {
+      return reply.code(502).send({ error: `Could not read the current epoch from chain — try again: ${(err as Error).message}` });
     }
+
+    const resolved = resolveJitTarget(
+      runtime.currentEpoch !== null ? Number(runtime.currentEpoch) : null,
+      targetEpoch,
+    );
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+    const target = resolved.target;
     runtime.saveStrategy({
       jitEnabled: true,
       jitTargetEpoch: target,
