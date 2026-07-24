@@ -10,9 +10,9 @@
 // new epoch — so it doesn't matter whether they pay in block 1 or block 500). A
 // token "crossed delinquent" into epoch E when lastEpochPaid + 2 <= E. We then score
 // by how often it crossed AND how regular the cadence is:
-//   - crossings >= MIN_CROSSINGS over the window, AND
-//   - same-parity streak (crossed on boundaries of one parity) >= MIN_PARITY_STREAK,
-//     OR total crossings >= STRONG_CROSSINGS (frequent even if slightly irregular).
+//   - crossings >= MIN_CROSSINGS over the window, OR
+//   - same-parity streak (crossed on boundaries of one parity) >= MIN_PARITY_STREAK, OR
+//   - total crossings >= STRONG_CROSSINGS (frequent even if slightly irregular).
 // Both thresholds are tunable below. Tokens are drawn from data/rival-targets.json
 // (the pinned universe) so skippers are always a subset of what you already target.
 //
@@ -42,8 +42,14 @@ const SEL_CITIZENS = "0x7c2e7201";        // citizens()
 const SEL_OWNER_OF = "0x6352211e";        // ownerOf(uint256)
 
 // --- tunable thresholds ---
+// A rival qualifies if it crossed delinquent >= MIN_CROSSINGS times in the window.
+// Set to 2 so the mixed-signal tier (rivals that skipped on 2-3 boundaries) folds in
+// alongside the strong 4-5x cadence payers — a single crossing is treated as noise,
+// two or more as an intentional pattern worth targeting. MIN_PARITY_STREAK /
+// STRONG_CROSSINGS remain as the ORed "clean-cadence" and "frequent" shortcuts, but
+// with MIN_CROSSINGS at 2 they no longer gate anything extra; kept for easy tightening.
 const DEFAULT_EPOCHS = 10;   // how many recent boundaries to inspect
-const MIN_CROSSINGS = 4;     // must cross this many times in the window to qualify
+const MIN_CROSSINGS = 2;     // must cross this many times in the window to qualify
 const MIN_PARITY_STREAK = 4; // ...OR cross this many times on one parity (clean 2-epoch cadence)
 const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cadence allowed to wobble)
 
@@ -190,8 +196,11 @@ async function main() {
   for (const [token, epochs] of Object.entries(crossings)) {
     const total = epochs.length;
     const streak = parityStreak(epochs);
+    // Primary gate is crossing count. The parity/frequency shortcuts still qualify a
+    // token on their own, so tightening MIN_CROSSINGS later can't silently drop a
+    // clean-cadence or high-frequency skipper.
     const qualifies =
-      total >= MIN_CROSSINGS && (streak >= MIN_PARITY_STREAK || total >= STRONG_CROSSINGS);
+      total >= MIN_CROSSINGS || streak >= MIN_PARITY_STREAK || total >= STRONG_CROSSINGS;
     if (qualifies) {
       skippers.push(BigInt(token));
       detail.push({ token, total, streak, epochs });
