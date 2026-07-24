@@ -3,6 +3,7 @@ import type { OwnedTokenStatus, TargetTokenStatus } from "@dat-bot/shared";
 import { runtime } from "./runtime.js";
 import { getGameSnapshot, getOwnedTokenStatus, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds } from "./index-tokens.js";
+import { logger } from "./logger.js";
 
 // Read-only helpers used by the API for the dashboard (independent of the engine loop).
 
@@ -33,6 +34,23 @@ export async function readTargets(outputLimit = 50): Promise<TargetTokenStatus[]
 
   // Fetch all statuses in ONE multicall instead of one per token.
   const allStatuses = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
+
+  // The dashboard "Rival targets" panel derives its rows (incl. "My rivals") from
+  // this result, so an empty return renders as "No pinned rivals" even when pins are
+  // configured — easy to misread as a config problem. Make the read's shape visible:
+  // warn loudly for the telling failure (pins configured but none survived liveness —
+  // a bad RPC/citizens address, or every pin genuinely burned), else a debug summary.
+  const livePinned = live.reduce((n, t) => (pinnedSet.has(t.id.toString()) ? n + 1 : n), 0);
+  if (pinnedIds.length > 0 && livePinned === 0) {
+    logger.warn(
+      `readTargets: ${pinnedIds.length} pinned target(s) configured but 0 survived the liveness check ` +
+        `(union ${unionIds.length}, live ${live.length}) — check RPC / citizens address; pinned rivals won't show.`,
+    );
+  } else {
+    logger.debug(
+      `readTargets: pinned=${pinnedIds.length} candidates=${candidates.length} union=${unionIds.length} live=${live.length} livePinned=${livePinned}`,
+    );
+  }
 
   const pinned: TargetTokenStatus[] = [];
   const actionable: TargetTokenStatus[] = [];
