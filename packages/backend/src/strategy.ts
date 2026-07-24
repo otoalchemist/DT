@@ -347,6 +347,30 @@ export function combinedBundleActive(s: StrategyConfig): boolean {
 const PRE_BOUNDARY_OFFENSE_GAS = 250_000n;
 
 /**
+ * Canonical set of pinned offense target IDs, or null when none are pinned.
+ *
+ * Membership is tested against a token's `t.tokenId`, which is always the canonical
+ * decimal form (`bigint.toString()`) produced by batchGetTargetStatuses. A raw config
+ * value that isn't already in that form ("01612", "0x64", " 100 ") would be scanned by
+ * fetchOffenseCandidates (which normalizes via BigInt) but then MISS this filter and be
+ * silently skipped — the same class of silent-skip bug as the token-1612 miss. Normalize
+ * every pin through BigInt so both sides speak the same string. Non-parseable entries are
+ * dropped (with a warning) rather than poisoning the whole set.
+ */
+function pinnedTargetSet(s: StrategyConfig): Set<string> | null {
+  if (s.offenseTargetTokenIds.length === 0) return null;
+  const out = new Set<string>();
+  for (const raw of s.offenseTargetTokenIds) {
+    try {
+      out.add(BigInt(raw).toString());
+    } catch {
+      logger.warn(`offense target #${raw} is not a valid token ID; ignoring it`);
+    }
+  }
+  return out;
+}
+
+/**
  * Live token IDs an offense sweep should consider, salt-ordered.
  *
  * When a pinned target list (offenseTargetTokenIds) is set, scan EXACTLY those IDs.
@@ -356,13 +380,20 @@ const PRE_BOUNDARY_OFFENSE_GAS = 250_000n;
  * though it showed up in the dashboard (readTargets already unions the pins). Since
  * the list is small and explicit, there's no reason to discover it by paging the
  * whole collection: feed the IDs straight in. With no pins we fall back to the capped
- * enumeration (union the pins in defensively in case the caller passes a partial set).
- * `filterLiveTokenIds` drops any burned/killed IDs, so stale pins are harmless.
+ * enumeration. `filterLiveTokenIds` drops any burned/killed IDs, so stale pins are harmless.
  */
 export async function fetchOffenseCandidates(): Promise<{ id: bigint; owner: Address }[]> {
   const s = runtime.strategy;
   const citizens = runtime.citizensAddress as Address;
-  const pinnedIds = s.offenseTargetTokenIds.map((x) => BigInt(x));
+  // Drop any non-parseable entries so a single bad pin can't abort the whole sweep.
+  const pinnedIds: bigint[] = [];
+  for (const raw of s.offenseTargetTokenIds) {
+    try {
+      pinnedIds.push(BigInt(raw));
+    } catch {
+      logger.warn(`offense target #${raw} is not a valid token ID; ignoring it`);
+    }
+  }
   // Pinned mode: the pins ARE the candidate set (bypass the enumeration cap).
   const ids =
     pinnedIds.length > 0
@@ -453,7 +484,9 @@ export function schedulePreBoundaryAudit(): void {
  * mode so a defended target can never drop the payment. When not revertible (the
  * standalone fire) audits mirror per racePublicMempool. Returns whether any queued.
  */
-async function queuePreBoundaryAudits(
+// Exported for tests: this is the audit-queue unit that a boundary miss like
+// token 1612 flows through, so an integration test drives it directly.
+export async function queuePreBoundaryAudits(
   address: Address,
   targetEpoch: bigint,
   nowSec: bigint,
@@ -466,7 +499,7 @@ async function queuePreBoundaryAudits(
 
   const live = await fetchOffenseCandidates();
   const owned = new Set(ownedIds.map((x) => x.toString()));
-  const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+  const pinned = pinnedTargetSet(s);
   const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
   // Rivals that will be auditable AT the target epoch (2+ behind) and aren't already
   // under audit — the full set, independent of how many auditor slots we have.
@@ -695,7 +728,7 @@ async function firePreBoundaryKill(): Promise<void> {
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
     const live = await fetchOffenseCandidates();
     const owned = new Set(ownedIds.map((x) => x.toString()));
-    const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+    const pinned = pinnedTargetSet(s);
     const statuses = await batchGetTargetStatuses(live, runtime.currentEpoch ?? 0n, nowSec);
     for (const t of statuses) {
       if (owned.has(t.tokenId)) continue;
@@ -1136,7 +1169,7 @@ async function offensePass(
 
   const live = await fetchOffenseCandidates();
   const owned = new Set(ownedIds.map((x) => x.toString()));
-  const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
+  const pinned = pinnedTargetSet(s);
 
   // Narrow to tokens we could actually act on BEFORE reading their status, then
   // fetch all their statuses in ONE multicall — a serial getTargetStatus per

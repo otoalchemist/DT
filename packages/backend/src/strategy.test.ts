@@ -21,8 +21,18 @@ vi.mock("./chain.js", () => ({
     getBlock: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n })), // 10 gwei
     getBalance: vi.fn(async () => 10_000_000_000_000_000_000n), // 10 ETH
     getBlockNumber: vi.fn(async () => 100n),
+    // Used by findPreBoundaryAuditors (lastEpochPaid + auditLimit per owned token).
+    // Default: every owned token is well-paid (lastEpochPaid huge, so never itself
+    // auditable at any realistic targetEpoch) with auditLimit 1 — i.e. an eligible
+    // auditor with one slot. Tests needing a different pool override this.
+    multicall: vi.fn(async ({ contracts }: { contracts: { functionName: string }[] }) =>
+      contracts.map((c) => ({
+        status: "success" as const,
+        result: c.functionName === "auditLimit" ? 1n : 1_000_000n, // lastEpochPaid huge (current), auditLimit=1
+      })),
+    ),
   },
-  getLatestBlockCached: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n, number: 100n })), // 10 gwei
+  getLatestBlockCached: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n, number: 100n, gasUsed: 0n, gasLimit: 30_000_000n })), // 10 gwei
   wsClient: null, // force the 12s-poll fallback path, no block-watch subscription to simulate
 }));
 
@@ -100,9 +110,10 @@ vi.mock("./contract.js", () => ({
 
 const { submitTx } = await import("./flashbots.js");
 const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tokens.js");
-const { filterLiveTokenIds } = await import("./contract.js");
+const { filterLiveTokenIds, batchGetTargetStatuses } = await import("./contract.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates } = await import("./strategy.js");
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, queuePreBoundaryAudits } =
+  await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
 // pathway: true -> one fused pay+audit bundle (firePreBoundaryBundle), false ->
@@ -179,6 +190,92 @@ describe("fetchOffenseCandidates: pinned targets bypass the enumeration cap", ()
     ]);
     const out = await fetchOffenseCandidates();
     expect(out.map((t) => t.id.toString())).toEqual(["1612"]);
+  });
+
+  it("normalizes non-canonical pin strings so they still resolve to a live token", async () => {
+    // Leading zero and hex forms must canonicalize to the same decimal ID the rest
+    // of the pipeline speaks — otherwise they'd be scanned but skipped by the filter.
+    runtime.strategy.offenseTargetTokenIds = ["01612", "0x64"]; // -> 1612 and 100
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString()).sort()).toEqual(["100", "1612"]);
+  });
+
+  it("ignores an unparseable pin without aborting the sweep", async () => {
+    runtime.strategy.offenseTargetTokenIds = ["1612", "not-a-number"];
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString())).toEqual(["1612"]); // bad entry dropped, good one kept
+  });
+});
+
+// End-to-end regression for the token-1612 miss: a pinned, high-ID rival that is
+// delinquent LEADING INTO the next epoch (lastEpochPaid == targetEpoch-2, i.e. 2
+// behind at the boundary) must actually get an audit QUEUED through the real
+// pre-boundary path — not merely appear in the candidate list. This is the assertion
+// that a future refactor of the enumeration/filter wiring can't silently re-break.
+describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit queued", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const TARGET_EPOCH = 144n;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtime.account = { address: ADDR } as unknown as PrivateKeyAccount;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.balanceWei = 10_000_000_000_000_000_000n; // 10 ETH, well above the floor
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      dryRun: false,
+      offenseEnabled: true,
+      autoAudit: true,
+      preBoundaryAudit: true,
+      minBalanceEth: 0,
+      maxPaymentEth: 0,
+      offenseTargetTokenIds: ["1612"], // the pinned high-ID rival
+    };
+    // We own token #1 (our auditor). fetchOwnedTokenIds default mock returns [1n].
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    // #1612 is live.
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
+    );
+    // #1612 reads as 2-behind at the target epoch (auditable), not under audit.
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "1612",
+        owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(),
+        delinquent: true,
+        epochsBehind: 2,
+        auditable: true,
+        auditDueTimestamp: "0",
+        killable: false,
+      },
+    ]);
+  });
+
+  it("queues exactly one audit of #1612 from our owned auditor token", async () => {
+    const queued = await queuePreBoundaryAudits(ADDR, TARGET_EPOCH, 0n, 0n, { revertible: false });
+    expect(queued).toBe(true);
+    // The audit tx was actually submitted (encodeAudit calldata), value == AUDIT_COST_WEI.
+    const auditCalls = vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT");
+    expect(auditCalls).toHaveLength(1);
+  });
+
+  it("does NOT queue when #1612 is paid up (not auditable at the boundary)", async () => {
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "1612",
+        owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: TARGET_EPOCH.toString(), // current -> not auditable
+        delinquent: false,
+        epochsBehind: 0,
+        auditable: false,
+        auditDueTimestamp: "0",
+        killable: false,
+      },
+    ]);
+    const queued = await queuePreBoundaryAudits(ADDR, TARGET_EPOCH, 0n, 0n, { revertible: false });
+    expect(queued).toBe(false);
+    expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
   });
 });
 
