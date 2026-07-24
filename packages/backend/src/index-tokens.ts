@@ -73,6 +73,41 @@ async function fetchCandidatesFromApi(citizens: Address): Promise<bigint[]> {
   return ids.slice(0, appConfig.maxCandidates);
 }
 
+interface AlchemyOwnerEntry {
+  ownerAddress: string;
+  tokenBalances: { tokenId: string }[];
+}
+
+/**
+ * Live citizen tokens with their current owners, via Alchemy's owner index
+ * (getOwnersForContract). This index is keyed on CURRENT ownership, so it already
+ * excludes burned/killed tokens — the exact live set, in ~1 page (~105 tokens here),
+ * with no separate ownerOf sweep. Far cheaper than getNFTsForContract, which returns
+ * the whole minted range (thousands, ~99% burned) and then needs an ownerOf pass.
+ * Returns [] when the NFT API isn't configured so the caller can fall back to the
+ * enumerate-then-liveness path (local/anvil overrides).
+ */
+export async function fetchLiveCitizens(
+  citizens: Address,
+): Promise<{ id: bigint; owner: Address }[]> {
+  if (!appConfig.nftUrl) return [];
+  const out: { id: bigint; owner: Address }[] = [];
+  let pageKey: string | undefined;
+  do {
+    const q =
+      `/getOwnersForContract?contractAddress=${citizens}&withTokenBalances=true` +
+      (pageKey ? `&pageKey=${encodeURIComponent(pageKey)}` : "");
+    const data = await alchemyGet<{ owners: AlchemyOwnerEntry[]; pageKey?: string }>(q);
+    for (const o of data.owners) {
+      for (const b of o.tokenBalances ?? []) {
+        out.push({ id: BigInt(b.tokenId), owner: o.ownerAddress as Address });
+      }
+    }
+    pageKey = data.pageKey;
+  } while (pageKey && out.length < appConfig.maxCandidates);
+  return out.slice(0, appConfig.maxCandidates);
+}
+
 /** Enumerate tokenIds of the Citizen collection owned by `owner` (cached). */
 export async function fetchOwnedTokenIds(
   citizens: Address,

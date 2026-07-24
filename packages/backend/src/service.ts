@@ -2,7 +2,7 @@ import type { Address } from "viem";
 import type { OwnedTokenStatus, TargetTokenStatus } from "@dat-bot/shared";
 import { runtime } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
-import { fetchOwnedTokenIds, fetchCandidateTokenIds } from "./index-tokens.js";
+import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { makeIdCache } from "./id-cache.js";
 import { logger } from "./logger.js";
 
@@ -17,21 +17,27 @@ export async function readOwnedStatuses(): Promise<OwnedTokenStatus[]> {
   return batchGetOwnedStatuses(ids, snap.currentEpoch, nowSec, runtime.strategy.prepayEpochs);
 }
 
-// The live-citizen set (full-collection enumeration + ownerOf liveness) is the slow
-// part of readTargets — ~15s cold, because the collection isn't ERC721Enumerable and
-// Alchemy pages the whole minted range (thousands, ~99% burned) 100 at a time — but
-// it changes only when a citizen is killed/burned. Cache it (SWR, 60s) so only the
-// first load pays the cost and the rest serve instantly with a background refresh.
-// Token STATUS (delinquency / audit) is deliberately NOT cached here: it's re-read
-// fresh each call over the small live set (cheap) and must stay current.
+// The live-citizen set changes only when a citizen is killed/burned, so cache it (SWR,
+// 60s) — the first load pays for it, the rest serve instantly with a background
+// refresh. Token STATUS (delinquency / audit) is deliberately NOT cached here: it's
+// re-read fresh each call over the small live set (cheap) and must stay current.
 const LIVE_CANDIDATES_TTL_MS = 60_000;
 const liveCandidatesCache = makeIdCache<{ id: bigint; owner: Address }[]>({
   onError: (e) => logger.warn("Live-candidate refresh failed:", (e as Error).message),
 });
 
-/** Live (non-burned) citizen tokens from the full-collection enumeration, cached SWR. */
+/**
+ * Live citizen tokens (with owners), cached SWR. Primary path is Alchemy's owner index
+ * (getOwnersForContract) — keyed on current ownership, so it returns ONLY live tokens
+ * (~1 page, no ownerOf sweep). Falls back to enumerate-then-liveness (getNFTsForContract
+ * + ownerOf) when the NFT owner index is unavailable, e.g. local/anvil TARGET_TOKENS
+ * overrides, so testing without Alchemy still works.
+ */
 async function getLiveCandidates(citizens: Address): Promise<{ id: bigint; owner: Address }[]> {
   return liveCandidatesCache(citizens.toLowerCase(), LIVE_CANDIDATES_TTL_MS, async () => {
+    const live = await fetchLiveCitizens(citizens);
+    if (live.length > 0) return live;
+    // No owner index (unconfigured NFT API / override mode): enumerate + on-chain liveness.
     const candidates = await fetchCandidateTokenIds(citizens);
     return filterLiveTokenIds(citizens, candidates);
   });
@@ -53,20 +59,11 @@ export async function readTargets(outputLimit = 50): Promise<TargetTokenStatus[]
   const snap = await getGameSnapshot();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
 
-  const pinnedIds = runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x));
-  const pinnedSet = new Set(pinnedIds.map((x) => x.toString()));
+  const pinnedSet = new Set(runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x).toString()));
 
-  // "Others" come from the cached live set. Pins are liveness-checked directly (cheap,
-  // just the configured IDs) and unioned in, so a pin outside the cached candidate set
-  // — or one just added — shows immediately without waiting for the 60s refresh.
-  const [liveCandidates, livePins] = await Promise.all([
-    getLiveCandidates(snap.citizensAddress),
-    filterLiveTokenIds(snap.citizensAddress, pinnedIds),
-  ]);
-  const liveById = new Map<string, { id: bigint; owner: Address }>();
-  for (const t of liveCandidates) liveById.set(t.id.toString(), t);
-  for (const t of livePins) liveById.set(t.id.toString(), t);
-  const live = [...liveById.values()];
+  // The cached live set already contains EVERY live token (Alchemy owner index), so a
+  // live pinned rival is included by definition — no separate pin liveness check needed.
+  const live = await getLiveCandidates(snap.citizensAddress);
 
   // Fetch all statuses in ONE multicall instead of one per token.
   const allStatuses = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
@@ -74,17 +71,16 @@ export async function readTargets(outputLimit = 50): Promise<TargetTokenStatus[]
   // The dashboard "Rival targets" panel derives its rows (incl. "My rivals") from this
   // result, so an empty return renders as "No pinned rivals" even when pins are
   // configured — easy to misread as a config problem. Make the read's shape visible:
-  // warn loudly for the telling failure (pins configured but none survived liveness —
-  // a bad RPC/citizens address, or every pin genuinely burned), else a debug summary.
-  if (pinnedIds.length > 0 && livePins.length === 0) {
+  // warn loudly for the telling failure (pins configured but none are live — a bad
+  // RPC/citizens address, or every pin genuinely burned), else a debug summary.
+  const livePinned = live.reduce((n, t) => (pinnedSet.has(t.id.toString()) ? n + 1 : n), 0);
+  if (pinnedSet.size > 0 && livePinned === 0) {
     logger.warn(
-      `readTargets: ${pinnedIds.length} pinned target(s) configured but 0 survived the liveness check ` +
+      `readTargets: ${pinnedSet.size} pinned target(s) configured but 0 are live ` +
         `— check RPC / citizens address; pinned rivals won't show.`,
     );
   } else {
-    logger.debug(
-      `readTargets: pinned=${pinnedIds.length} livePins=${livePins.length} liveCandidates=${liveCandidates.length} live=${live.length}`,
-    );
+    logger.debug(`readTargets: pinned=${pinnedSet.size} live=${live.length} livePinned=${livePinned}`);
   }
 
   const pinned: TargetTokenStatus[] = [];
