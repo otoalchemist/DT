@@ -273,32 +273,48 @@ export function encodeUseBribe(tokenId: bigint): `0x${string}` {
   });
 }
 
+// Max ownerOf calls per multicall request. viem already chunks a multicall
+// internally, but the http transport's request batching (batch:true) then coalesces
+// those chunks into ONE JSON-RPC batch. A union spanning the whole minted range
+// (thousands of IDs) makes that batch large enough for the RPC to reject wholesale —
+// and with allowFailure:true the rejection surfaces as EVERY call failing, so NOT ONE
+// token reads as live (observed against Alchemy: 6961 IDs -> 0 live, while 3000 IDs
+// worked). Splitting into bounded, sequentially-awaited requests keeps each batch
+// under that limit and scales as the collection grows. Sequential (not Promise.all)
+// on purpose: concurrent multicalls would be re-coalesced by batch:true into the same
+// oversized request this is avoiding.
+const LIVENESS_MULTICALL_CHUNK = 1_000;
+
 /** Strip burned/killed token IDs by batch-checking ownerOf on the citizens contract.
- *  ownerOf reverts for burned ERC-721 tokens; allowFailure:true lets us catch that. */
+ *  ownerOf reverts for burned ERC-721 tokens; allowFailure:true lets us catch that.
+ *  Chunked so a whole-collection sweep can't overflow the RPC batch (see above). */
 export async function filterLiveTokenIds(
   citizens: Address,
   ids: bigint[],
 ): Promise<{ id: bigint; owner: Address }[]> {
   if (ids.length === 0) return [];
-  const results = await publicClient.multicall({
-    allowFailure: true,
-    contracts: ids.map((id) => ({
-      address: citizens,
-      abi: citizensAbi,
-      functionName: "ownerOf" as const,
-      args: [id],
-    })),
-  });
   const zero = "0x0000000000000000000000000000000000000000" as Address;
   const live: { id: bigint; owner: Address }[] = [];
-  for (let i = 0; i < ids.length; i++) {
-    const r = results[i];
-    const id = ids[i];
-    if (!r || id === undefined) continue;
-    if (r.status === "failure") continue; // burned / killed
-    const owner = r.result as Address;
-    if (!owner || owner === zero) continue;
-    live.push({ id, owner });
+  for (let start = 0; start < ids.length; start += LIVENESS_MULTICALL_CHUNK) {
+    const chunk = ids.slice(start, start + LIVENESS_MULTICALL_CHUNK);
+    const results = await publicClient.multicall({
+      allowFailure: true,
+      contracts: chunk.map((id) => ({
+        address: citizens,
+        abi: citizensAbi,
+        functionName: "ownerOf" as const,
+        args: [id],
+      })),
+    });
+    for (let i = 0; i < chunk.length; i++) {
+      const r = results[i];
+      const id = chunk[i];
+      if (!r || id === undefined) continue;
+      if (r.status === "failure") continue; // burned / killed
+      const owner = r.result as Address;
+      if (!owner || owner === zero) continue;
+      live.push({ id, owner });
+    }
   }
   return live;
 }
