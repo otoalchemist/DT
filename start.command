@@ -20,7 +20,21 @@ fi
 lsof -ti tcp:5173 2>/dev/null | xargs kill -9 2>/dev/null
 lsof -ti tcp:8787 2>/dev/null | xargs kill -9 2>/dev/null
 
-# Open the dashboard once the dev server has had a moment to come up, then run
-# the server in the foreground so its logs stay visible in this window.
-( sleep 6; open http://localhost:5173 ) &
+# Open the dashboard once the backend API (port 8787) is actually accepting
+# connections, then run the server in the foreground so its logs stay visible.
+# The backend starts after the shared build and does a network round-trip before
+# it listens, so a fixed delay often opened the UI too early — its first API calls
+# then hit a not-yet-listening backend and the Vite proxy returned HTTP 500. Poll
+# instead, up to ~60s, falling back to opening anyway so we never hang forever.
+(
+    for _ in $(seq 1 60); do
+        # bash's /dev/tcp probe — succeeds only once something is listening on 8787.
+        if (exec 3<>/dev/tcp/127.0.0.1/8787) 2>/dev/null; then
+            exec 3>&- 3<&-
+            break
+        fi
+        sleep 1
+    done
+    open http://localhost:5173
+) &
 npm run dev
