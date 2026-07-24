@@ -99,9 +99,10 @@ vi.mock("./contract.js", () => ({
 }));
 
 const { submitTx } = await import("./flashbots.js");
-const { fetchOwnedTokenIds } = await import("./index-tokens.js");
+const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tokens.js");
+const { filterLiveTokenIds } = await import("./contract.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive } = await import("./strategy.js");
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates } = await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
 // pathway: true -> one fused pay+audit bundle (firePreBoundaryBundle), false ->
@@ -132,6 +133,52 @@ describe("combinedBundleActive routing predicate", () => {
 
   it("is false when a bid is set but no payer address is configured", () => {
     expect(combinedBundleActive({ ...base, combinedBoundaryBundle: true, coinbaseBidEth: 0.01, coinbasePayerAddress: "" })).toBe(false);
+  });
+});
+
+// Regression: a pinned offense target whose tokenId sits past the enumeration cap
+// (fetchCandidateTokenIds is tokenId-ordered and capped at maxCandidates) used to be
+// sliced off BEFORE the pinned filter ran, so it was never scanned for audit — the
+// token-1612-at-epoch-144 miss. fetchOffenseCandidates must scan pinned IDs directly,
+// independent of what the (capped) full enumeration returns.
+describe("fetchOffenseCandidates: pinned targets bypass the enumeration cap", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    // Simulate a capped enumeration that only returns low IDs (as if the cap sliced
+    // off everything past ~500). A high-ID pin must NOT depend on this set.
+    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([1n, 2n, 3n]);
+    // filterLiveTokenIds echoes whatever IDs it's handed as live (owner = zero-ish).
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
+    );
+  });
+
+  it("scans exactly the pinned IDs (including ones past the cap) when a target list is set", async () => {
+    runtime.strategy.offenseTargetTokenIds = ["1612", "6953"]; // both past the low enumeration
+    const out = await fetchOffenseCandidates();
+    const ids = out.map((t) => t.id.toString()).sort();
+    expect(ids).toEqual(["1612", "6953"]);
+    // Must NOT have fallen back to the capped full enumeration.
+    expect(fetchCandidateTokenIds).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the full enumeration when no targets are pinned", async () => {
+    runtime.strategy.offenseTargetTokenIds = [];
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString()).sort()).toEqual(["1", "2", "3"]);
+    expect(fetchCandidateTokenIds).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops burned/killed pins (filterLiveTokenIds omits them) without error", async () => {
+    runtime.strategy.offenseTargetTokenIds = ["1612", "9999"];
+    // 9999 is burned: filterLiveTokenIds returns only the live one.
+    vi.mocked(filterLiveTokenIds).mockResolvedValueOnce([
+      { id: 1612n, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` },
+    ]);
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString())).toEqual(["1612"]);
   });
 });
 

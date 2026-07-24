@@ -66,8 +66,13 @@ const schema = z.object({
   /** Comma-separated tokenId overrides for local/anvil testing (no NFT API). */
   OWNED_TOKENS: z.string().optional(),
   TARGET_TOKENS: z.string().optional(),
-  /** Max citizen tokens to enumerate as audit/kill candidates per sweep. */
-  MAX_CANDIDATES: z.coerce.number().default(500),
+  /** Max citizen tokens to enumerate as audit/kill candidates per sweep. Enumeration
+   *  is tokenId-ordered, so this is effectively "scan IDs up to N". The collection
+   *  mints IDs well past the old 500 default (7000+), which meant high-ID rivals were
+   *  never scanned for the un-pinned "other delinquent rivals" view. Pinned offense
+   *  targets bypass this cap entirely (see fetchOffenseCandidates); this only bounds
+   *  the broad sweep. Raised to cover the current ID range with headroom. */
+  MAX_CANDIDATES: z.coerce.number().default(8000),
 });
 
 function parseIds(csv: string | undefined): bigint[] {

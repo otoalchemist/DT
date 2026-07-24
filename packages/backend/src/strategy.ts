@@ -346,6 +346,32 @@ export function combinedBundleActive(s: StrategyConfig): boolean {
 // ~113–130k on-chain; we can't eth_estimateGas an action that isn't valid yet).
 const PRE_BOUNDARY_OFFENSE_GAS = 250_000n;
 
+/**
+ * Live token IDs an offense sweep should consider, salt-ordered.
+ *
+ * When a pinned target list (offenseTargetTokenIds) is set, scan EXACTLY those IDs.
+ * The full-collection enumeration (fetchCandidateTokenIds) is ID-ordered and capped
+ * at appConfig.maxCandidates, so a pinned rival whose ID sits past the cap was being
+ * sliced off BEFORE the pinned filter ran — invisible to every offense path even
+ * though it showed up in the dashboard (readTargets already unions the pins). Since
+ * the list is small and explicit, there's no reason to discover it by paging the
+ * whole collection: feed the IDs straight in. With no pins we fall back to the capped
+ * enumeration (union the pins in defensively in case the caller passes a partial set).
+ * `filterLiveTokenIds` drops any burned/killed IDs, so stale pins are harmless.
+ */
+export async function fetchOffenseCandidates(): Promise<{ id: bigint; owner: Address }[]> {
+  const s = runtime.strategy;
+  const citizens = runtime.citizensAddress as Address;
+  const pinnedIds = s.offenseTargetTokenIds.map((x) => BigInt(x));
+  // Pinned mode: the pins ARE the candidate set (bypass the enumeration cap).
+  const ids =
+    pinnedIds.length > 0
+      ? pinnedIds
+      : await fetchCandidateTokenIds(citizens);
+  const liveRaw = await filterLiveTokenIds(citizens, ids);
+  return orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
+}
+
 /** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
  *  auditable at `targetEpoch` (so still current now) and with full capacity
  *  (the new epoch has 0 audits used). One audit per token. */
@@ -438,9 +464,7 @@ async function queuePreBoundaryAudits(
   const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
   const { auditors, needsPayment } = await findPreBoundaryAuditors(ownedIds, targetEpoch, opts.paidInBundle);
 
-  const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-  const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
-  const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
+  const live = await fetchOffenseCandidates();
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
   const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
@@ -453,6 +477,32 @@ async function queuePreBoundaryAudits(
       t.auditDueTimestamp === "0" &&
       isAuditable(BigInt(t.lastEpochPaid), targetEpoch),
   );
+
+  // Per-pin diagnostics: when a target list is set, explain any pin that WON'T be
+  // audited this fire, so a miss (like token 1612 at epoch 144) is never silent.
+  // A pin can drop out for two reasons: it's not in the live status set (burned,
+  // killed, or — the old bug — sliced off by the enumeration cap), or it's live
+  // but not auditable at targetEpoch (paid up, or already under audit).
+  if (pinned) {
+    const statusById = new Map(statuses.map((t) => [t.tokenId, t]));
+    const reasons: string[] = [];
+    for (const id of pinned) {
+      if (owned.has(id)) continue; // never audit our own token
+      const t = statusById.get(id);
+      if (!t) { reasons.push(`#${id}: not in live set (burned/killed)`); continue; }
+      if (t.auditDueTimestamp !== "0") { reasons.push(`#${id}: already under audit`); continue; }
+      if (!isAuditable(BigInt(t.lastEpochPaid), targetEpoch)) {
+        reasons.push(`#${id}: not auditable (lastEpochPaid=${t.lastEpochPaid}, needs <=${targetEpoch - 2n} at epoch ${targetEpoch})`);
+      }
+    }
+    if (reasons.length > 0) {
+      activity.add({
+        kind: "info",
+        status: "info",
+        message: `Pre-boundary audit (epoch ${targetEpoch}): pinned targets skipped — ${reasons.join("; ")}`,
+      });
+    }
+  }
 
   let idx = 0;
   let queued = 0;
@@ -643,9 +693,7 @@ async function firePreBoundaryKill(): Promise<void> {
   try {
     await nonceManager.sync(address, appConfig.mode);
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
-    const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-    const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
-    const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
+    const live = await fetchOffenseCandidates();
     const owned = new Set(ownedIds.map((x) => x.toString()));
     const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
     const statuses = await batchGetTargetStatuses(live, runtime.currentEpoch ?? 0n, nowSec);
@@ -1086,9 +1134,7 @@ async function offensePass(
     if (supply - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   }
 
-  const candidateIds = await fetchCandidateTokenIds(runtime.citizensAddress as Address);
-  const liveRaw = await filterLiveTokenIds(runtime.citizensAddress as Address, candidateIds);
-  const live = orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
+  const live = await fetchOffenseCandidates();
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = s.offenseTargetTokenIds.length > 0 ? new Set(s.offenseTargetTokenIds) : null;
 
