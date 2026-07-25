@@ -26,7 +26,7 @@ function loadRivalIdFile(fileName: string, label: string): string[] {
   return [];
 }
 
-function loadDefaultRivalTargets(): string[] {
+export function loadDefaultRivalTargets(): string[] {
   return loadRivalIdFile("rival-targets.json", "default rival targets");
 }
 
@@ -43,7 +43,6 @@ export function loadRivalSkippers(): string[] {
 
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
-  dryRun: true,
   auditSafetyBufferSeconds: 3 * 60 * 60, // clear audits with >=3h to spare
   proactivePay: true,
   prepayEpochs: 1,
@@ -55,14 +54,14 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   preBoundaryPay: true,
   preBoundaryLeadMs: 3000,
   preBoundaryLeadMainnetMs: 5000,
-  // Offense stays OFF by default (it spends ETH and is a game strategy, not a
-  // profit engine) — but when a user turns it on, these are the settings that
-  // actually work, so they're pre-armed rather than left for them to discover.
-  offenseEnabled: false,
+  // Offense is ON by default, focused on the curated "skippers" list (rivals that
+  // reliably fall 2+ epochs behind, so they're auditable at every boundary). The
+  // supporting settings below are pre-armed so it works out of the box.
+  offenseEnabled: true,
   autoAudit: true,
   autoKill: false, // opt-in: killing an expired-audit token is free but aggressive
   endgameOnlyWithin: null,
-  offenseTargetTokenIds: loadDefaultRivalTargets(),
+  offenseTargetTokenIds: loadRivalSkippers(),
   preBoundaryAudit: true,
   preBoundaryKill: false, // opt-in: race kills into the first block after audit expiry
   // On by default, but self-guarding: it only fuses payment + audit into one bundle
@@ -106,12 +105,12 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
  * Tied to this constant rather than VERSION so an unrelated release doesn't reset
  * anyone's tuning.
  */
-export const DEFAULTS_VERSION = 1;
+export const DEFAULTS_VERSION = 2;
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
  * listed is PRESERVED from the user's saved config — their mode/run-state
- * (enabled, dryRun, offenseEnabled, endgameOnlyWithin), wallet-side settings
+ * (enabled, offenseEnabled, endgameOnlyWithin), wallet-side settings
  * (coinbaseBidEth, coinbasePayerAddress), spend guardrails (minBalanceEth,
  * maxPaymentEth), and JIT session (jitEnabled, jitTargetEpoch, jitTokenIds).
  */
@@ -123,7 +122,7 @@ const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
   "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
   "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
   "racePublicMempool", "dynamicTipEnabled", "dynamicTipMaxGwei",
-  // Re-pulls the curated list shipped in data/rival-targets.json.
+  // Re-pulls the curated skippers list shipped in data/rival-skippers.json.
   "offenseTargetTokenIds",
 ];
 
@@ -246,7 +245,6 @@ class Runtime {
       version: VERSION,
       running: this.running,
       unlocked: this.unlocked,
-      dryRun: this.strategy.dryRun,
       address: this.account?.address ?? null,
       balanceWei: this.balanceWei?.toString() ?? null,
       chainId: this.chainId,

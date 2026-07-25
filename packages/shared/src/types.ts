@@ -51,7 +51,6 @@ export type ActivityStatus =
   | "included"
   | "reverted"
   | "skipped"
-  | "dry-run"
   | "info";
 
 export interface ActivityEntry {
@@ -72,8 +71,6 @@ export interface ActivityEntry {
 export interface StrategyConfig {
   /** Master switch: when false, the engine observes but never submits. */
   enabled: boolean;
-  /** Simulate/plan only; never actually send. Defaults true on first run. */
-  dryRun: boolean;
 
   // --- Defense ---
   /** Clear an audit when it will expire within this many seconds. */
@@ -252,7 +249,6 @@ export interface BotStatus {
   version: string;
   running: boolean;
   unlocked: boolean;
-  dryRun: boolean;
   address: string | null;
   balanceWei: string | null;
   chainId: number | null;

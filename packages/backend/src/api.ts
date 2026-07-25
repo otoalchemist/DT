@@ -4,7 +4,7 @@ import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
 import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
-import { runtime, DEFAULT_STRATEGY, loadRivalSkippers } from "./runtime.js";
+import { runtime, loadRivalSkippers, loadDefaultRivalTargets } from "./runtime.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
 import {
@@ -24,7 +24,6 @@ import { runPostMortem } from "./postmortem.js";
 const strategyPatch = z
   .object({
     enabled: z.boolean(),
-    dryRun: z.boolean(),
     auditSafetyBufferSeconds: z.number().int().min(0),
     proactivePay: z.boolean(),
     prepayEpochs: z.number().int().min(1).max(7),
@@ -96,7 +95,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   // the Config UI can offer a "reset to default" that restores the shipped list
   // after the user has edited their offense targets.
   app.get("/api/default-rival-targets", async () => ({
-    tokenIds: DEFAULT_STRATEGY.offenseTargetTokenIds,
+    tokenIds: loadDefaultRivalTargets(),
   }));
 
   // "Rival skippers" — the subset of default targets that pay on a ~2-epoch cadence

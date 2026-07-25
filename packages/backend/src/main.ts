@@ -15,11 +15,7 @@ async function main(): Promise<void> {
   const app = await buildServer();
   await app.listen({ port: appConfig.port, host: appConfig.host });
   logger.info(`API listening on http://${appConfig.host}:${appConfig.port}`);
-  logger.info(
-    runtime.strategy.dryRun
-      ? "DRY-RUN is ON — no transactions will be sent until you turn it off."
-      : "DRY-RUN is OFF — the bot will submit real transactions when unlocked and enabled.",
-  );
+  logger.info("LIVE FIRE — the bot submits real transactions when unlocked and enabled.");
 
   // Warm the rival-target caches in the background so the first dashboard load is fast
   // (the cold full-collection enumeration is ~15s). Best-effort; needs the NFT API.

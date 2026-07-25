@@ -887,11 +887,9 @@ async function act(
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
   ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean },
 ): Promise<SubmitResult | null> {
-  const dryRun = runtime.strategy.dryRun;
   const offense = kind === "audit" || kind === "kill";
   try {
     const result = await submitTx(intent, {
-      dryRun,
       // In mainnet mode a bundle only lands if a builder we sent it to wins the
       // slot — so PAYMENTS always mirror to the public mempool as a fallback: one
       // that never lands can cost a citizen, and a tax payment isn't meaningfully
@@ -918,13 +916,13 @@ async function act(
       });
       return result;
     }
-    if (!dryRun) runtime.recordSpend(result.valueWei + result.gasWei);
+    runtime.recordSpend(result.valueWei + result.gasWei);
     // Count it against this tick's budget so later canSpend checks in the same
-    // tick see the reduced headroom (applies in dry-run too, to simulate faithfully).
+    // tick see the reduced headroom.
     committedThisTickWei += result.valueWei + result.gasWei;
     const entry = activity.add({
       kind,
-      status: dryRun ? "dry-run" : "submitted",
+      status: "submitted",
       tokenId: ctx.tokenId,
       targetTokenId: ctx.targetTokenId,
       txHash: result.txHash,
@@ -932,7 +930,7 @@ async function act(
       targetBlock: result.targetBlock?.toString(),
       valueWei: result.valueWei.toString(),
       gasWei: result.gasWei.toString(),
-      message: dryRun ? `[dry-run] ${ctx.message}` : ctx.message,
+      message: ctx.message,
     });
     runtime.emitStatus();
     // Queued into a bundle batch (mainnet): the tx isn't sent yet, so its hashes
@@ -944,7 +942,7 @@ async function act(
     // Watch for the receipt so the entry flips submitted -> included/reverted.
     // Only public-mempool submissions expose a tx hash; pure Flashbots bundles
     // (bundleHash only) stay "submitted" since there's nothing to poll.
-    if (!dryRun && result.txHash) void trackReceipt(entry.id, result.txHash);
+    if (result.txHash) void trackReceipt(entry.id, result.txHash);
     return result;
   } catch (err) {
     activity.add({

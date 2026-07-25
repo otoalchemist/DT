@@ -79,8 +79,7 @@ Open the dashboard at **`http://localhost:5173`** and:
    wallet's key.
 2. **Unlock** it with your passphrase.
 3. Configure your **strategy** (defense buffers, offense toggles, spend caps).
-4. Leave **Dry-run ON** first to watch what the bot *would* do — toggle it from the **DRY-RUN / LIVE FIRE** badge in the top bar (going live asks for confirmation). Turn it off to go live.
-5. Click **Start bot**.
+4. Click **Start bot**. The bot is live-fire: once unlocked, started, and `enabled`, it submits real transactions.
 
 Fund the wallet with a little ETH for taxes/audits/gas. Keep the dashboard's
 **spend cap** and **min-balance floor** set to values you're comfortable with.
@@ -118,13 +117,13 @@ ZIP* button always gives `DT-<branch>.zip` (a branch has no version). To get a
 version in the filename, push a tag:
 
 ```bash
-git tag -a v0.3.0 -m "v0.3.0"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "v0.4.0"
+git push origin v0.4.0
 ```
 
-GitHub then serves the tagged source archive as **`DT-0.3.0.zip`** (leading `v`
+GitHub then serves the tagged source archive as **`DT-0.4.0.zip`** (leading `v`
 stripped) from the repo's **Tags**/**Releases** page and at
-`https://github.com/<owner>/DT/archive/refs/tags/v0.3.0.zip`. For a published
+`https://github.com/<owner>/DT/archive/refs/tags/v0.4.0.zip`. For a published
 **Release** with the nicer `death-and-taxes-bot-v<VERSION>.zip` name, draft a
 release on that tag and upload the `npm run package` artifact as an asset (via the
 web UI or `gh release create`).
@@ -132,7 +131,7 @@ web UI or `gh release create`).
 Any archive also carries a stamped top-level **`VERSION`** file (filled in at
 download time via `git archive` `export-subst`), so even the unversioned
 `DT-master.zip` from the green button is identifiable — it reads e.g.
-`v0.3.0-3-g<sha>`.
+`v0.4.0-3-g<sha>`.
 
 #### `DEFAULTS_VERSION` — pushing new defaults to existing users
 
@@ -183,8 +182,9 @@ reputation key). Both are git-ignored. **Never commit them.**
 
 Strategy settings are edited from the dashboard and saved to `data/config.json`
 (also git-ignored, since it holds your live strategy). With no such file the bot
-starts from safe defaults — dry-run on, offense/defense off. To seed a starting
-point, copy the template:
+starts from the recommended defaults — the master switch (`enabled`) off, so
+nothing is submitted until you Start it. To seed a starting point, copy the
+template:
 
 ```bash
 cp data/config.example.json data/config.json
@@ -201,7 +201,7 @@ cp data/config.example.json data/config.json
 - **Guardrails:** min-balance floor, max base-fee, an optional **max single-payment
   cap** (skips any tax payment above a set ETH value — a backstop against a bad
   estimate or a badly-delinquent token draining the wallet in one shot; `0` = off),
-  a global **pause/kill switch**, and a **dry-run** mode that simulates without sending.
+  and a global **pause/kill switch**.
   The min-balance floor is enforced **cumulatively** — several payments in one
   cycle can't sneak the wallet below it.
 - **Per-payment epoch cap (`maxAutoPayEpochs`, default `1`):** the most epochs a
@@ -362,7 +362,7 @@ MODE=local RPC_HTTP_URL=http://127.0.0.1:8545 \
   OWNED_TOKENS=<tokenId> TARGET_TOKENS=<delinquentTokenId> \
   npm run dev
 
-# 3. In the dashboard, turn Dry-run OFF and Start. Use `cast rpc evm_increaseTime`
+# 3. In the dashboard, click Start. Use `cast rpc evm_increaseTime`
 #    to warp past an audit deadline and watch the kill path fire.
 ```
 

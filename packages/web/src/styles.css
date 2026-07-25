@@ -24,7 +24,7 @@ a { color: var(--accent); }
 code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 
 .app { max-width: 1400px; margin: 0 auto; padding: 20px; }
-.topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; row-gap: 10px; margin-bottom: 18px; }
 .brand { font-size: 20px; font-weight: 700; }
 .brand small { color: var(--muted); font-weight: 400; font-size: 12px; display: block; }
 .brand .version { font-size: 12px; font-weight: 600; color: var(--muted); vertical-align: middle; }
@@ -55,7 +55,6 @@ code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .badge.off { background: rgba(138,148,166,0.12); color: var(--muted); }
 .badge.warn { background: rgba(240,180,41,0.15); color: var(--amber); border-color: var(--amber); }
 .badge.danger { background: rgba(255,92,92,0.15); color: var(--red); border-color: var(--red); }
-.badge.dry { background: rgba(183,139,255,0.15); color: var(--purple); border-color: var(--purple); }
 
 button {
   background: var(--panel-2); color: var(--text);
@@ -67,6 +66,43 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #061021; }
 button.danger { background: var(--red); border-color: var(--red); color: #2a0808; }
 button.ghost { background: transparent; }
+
+/* Prominent, centered bot control (Start bot). */
+button.start-cta {
+  font-size: 15px; font-weight: 700; padding: 11px 30px;
+  letter-spacing: 0.02em; border-radius: 10px;
+}
+/* Draws the eye to Start while the bot is idle. */
+button.start-cta.attention {
+  box-shadow: 0 0 0 3px rgba(91,157,255,0.25);
+  animation: start-pulse 1.8s ease-in-out infinite;
+}
+button.start-cta.attention:hover { border-color: var(--accent); }
+@keyframes start-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(91,157,255,0.22); }
+  50%      { box-shadow: 0 0 0 7px rgba(91,157,255,0.08); }
+}
+@media (prefers-reduced-motion: reduce) { button.start-cta.attention { animation: none; } }
+.badge.status-lg { font-size: 13px; padding: 5px 14px; letter-spacing: 0.03em; }
+
+/* Prominent save action (Save Strategy / Save Payment Settings). */
+button.save-cta { font-size: 14px; font-weight: 700; padding: 10px 22px; }
+/* Unsaved-changes state: amber, ringed, and gently pulsing so it's obvious the
+   on-screen values differ from what the bot will actually run. */
+button.save-cta.unsaved {
+  background: var(--amber); border-color: var(--amber); color: #2a1f02;
+  box-shadow: 0 0 0 3px rgba(240,180,41,0.25);
+  animation: save-pulse 1.6s ease-in-out infinite;
+}
+button.save-cta.unsaved:hover { border-color: var(--amber); }
+@keyframes save-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(240,180,41,0.22); }
+  50%      { box-shadow: 0 0 0 5px rgba(240,180,41,0.10); }
+}
+@media (prefers-reduced-motion: reduce) { button.save-cta.unsaved { animation: none; } }
+.save-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.save-bar .unsaved-note { color: var(--amber); font-size: 12px; font-weight: 600; }
+.save-bar .saved-note { color: var(--green); font-size: 12px; font-weight: 600; }
 
 input, select {
   background: var(--bg); color: var(--text);
@@ -95,7 +131,6 @@ th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: upp
 .pill.submitted { background: rgba(91,157,255,0.2); color: var(--accent); }
 .pill.included { background: rgba(62,207,142,0.2); color: var(--green); }
 .pill.reverted, .pill.skipped { background: rgba(255,92,92,0.15); color: var(--red); }
-.pill.dry-run { background: rgba(183,139,255,0.2); color: var(--purple); }
 .pill.info { background: rgba(138,148,166,0.15); color: var(--muted); }
 
 .muted { color: var(--muted); }

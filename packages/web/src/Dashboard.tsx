@@ -78,13 +78,34 @@ export function Dashboard({
   pushStatus: (s: BotStatus) => void;
 }) {
   const [config, setConfig] = useState<StrategyConfig | null>(null);
+  // The last config known to be persisted on the backend. Panels compare their own
+  // fields against this to tell whether they hold unsaved edits.
+  const [savedConfig, setSavedConfig] = useState<StrategyConfig | null>(null);
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    api.getConfig().then(setConfig).catch(() => {});
+    api.getConfig().then((c) => { setConfig(c); setSavedConfig(c); }).catch(() => {});
   }, []);
+
+  // A panel finished persisting. `next` is the backend's authoritative full config, so
+  // it becomes the new saved baseline. For the working copy we keep any edits still
+  // pending in the OTHER panel — a field whose working value diverged from the old
+  // baseline is an unsaved edit this save didn't cover, so it must survive (and keep
+  // that panel's dirty indicator lit) rather than be clobbered by the round-trip.
+  const onConfigSaved = useCallback((next: StrategyConfig) => {
+    const merged: StrategyConfig = { ...next };
+    if (config && savedConfig) {
+      for (const key of Object.keys(next) as (keyof StrategyConfig)[]) {
+        if (JSON.stringify(config[key]) !== JSON.stringify(savedConfig[key])) {
+          merged[key] = config[key] as never;
+        }
+      }
+    }
+    setConfig(merged);
+    setSavedConfig(next);
+  }, [config, savedConfig]);
 
   const refresh = useCallback(async () => {
     try {
@@ -104,7 +125,6 @@ export function Dashboard({
   }, [refresh]);
 
   const running = status?.running ?? false;
-  const dryRun = status?.dryRun ?? true;
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
@@ -128,23 +148,6 @@ export function Dashboard({
     }
   };
 
-  const [dryToggling, setDryToggling] = useState(false);
-  const toggleDryRun = async () => {
-    const next = !dryRun;
-    // Guard the risky direction only: going live submits real transactions.
-    if (!next && !confirm("Switch to LIVE FIRE? Real transactions will be submitted with real ETH.")) return;
-    setDryToggling(true);
-    setToggleErr(null);
-    try {
-      const cfg = await api.setConfig({ dryRun: next });
-      setConfig(cfg);
-    } catch (e) {
-      setToggleErr((e as Error).message);
-    } finally {
-      setDryToggling(false);
-    }
-  };
-
   return (
     <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
 
@@ -152,7 +155,7 @@ export function Dashboard({
       <div style={{ flex: "1 1 0", minWidth: 0 }}>
 
         <div className="topbar">
-          <div className="brand">
+          <div className="brand" style={{ flex: "1 1 0", minWidth: 0 }}>
             Death &amp; Taxes Bot <span className="version">v{VERSION}</span>
             <small>
               {connected ? "● live" : "○ reconnecting…"} · {shortAddr(status?.address)}
@@ -163,32 +166,18 @@ export function Dashboard({
               )}
             </small>
           </div>
-          <div className="row wrap">
-            <span
-              className={`badge ${dryRun ? "dry" : "danger"}`}
-              role="button"
-              tabIndex={0}
-              onClick={dryToggling ? undefined : toggleDryRun}
-              onKeyDown={(e) => { if (!dryToggling && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); void toggleDryRun(); } }}
-              title={dryRun ? "Dry-run: simulating only. Click to go LIVE FIRE." : "LIVE FIRE: real transactions. Click to return to dry-run."}
-              style={{
-                cursor: dryToggling ? "wait" : "pointer",
-                userSelect: "none",
-                opacity: dryToggling ? 0.6 : 1,
-                fontSize: 15,
-                fontWeight: 700,
-                letterSpacing: "0.04em",
-                padding: "8px 18px",
-                borderWidth: 2,
-              }}
+          <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>
+            <span className={`badge status-lg ${running ? "on" : "off"}`}>{running ? "● RUNNING" : "PAUSED"}</span>
+            <button
+              className={`start-cta ${running ? "danger" : "primary attention"}`}
+              onClick={toggleRun}
+              disabled={toggling}
             >
-              {dryRun ? "DRY-RUN" : "⚠ LIVE FIRE"}
-            </span>
-            <span className={`badge ${running ? "on" : "off"}`}>{running ? "RUNNING" : "PAUSED"}</span>
-            <button className={running ? "danger" : "primary"} onClick={toggleRun} disabled={toggling}>
-              {toggling ? "…" : running ? "Pause bot" : "Start bot"}
+              {toggling ? "…" : running ? "Pause bot" : "▶ Start bot"}
             </button>
             {toggleErr && <span className="err" style={{ fontSize: 12 }}>{toggleErr}</span>}
+          </div>
+          <div className="row" style={{ flex: "1 1 0", justifyContent: "flex-end" }}>
             <button className="ghost" onClick={() => api.lock().then(() => location.reload())}>Lock</button>
           </div>
         </div>
@@ -205,7 +194,7 @@ export function Dashboard({
         </div>
 
         <div className="spacer" />
-        <JitPanel status={status} tokens={tokens} config={config} onConfigChange={setConfig} />
+        <JitPanel status={status} tokens={tokens} config={config} savedConfig={savedConfig} onConfigChange={setConfig} onConfigSaved={onConfigSaved} />
 
         <div className="spacer" />
         <div className="panel">
@@ -244,7 +233,7 @@ export function Dashboard({
 
         <div className="spacer" />
         <div className="grid cols-2">
-          {config && <Config cfg={config} onChange={setConfig} />}
+          {config && <Config cfg={config} savedCfg={savedConfig} onChange={setConfig} onSaved={onConfigSaved} />}
 
           <div className="panel">
             <h2>Activity</h2>

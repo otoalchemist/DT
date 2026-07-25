@@ -4,16 +4,28 @@ import { EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { countdown, weiToEth } from "./util.js";
 
+// Payment fields this panel owns — used to light up "Save payment settings" only
+// when one of these has unsaved edits (independent of the Strategy panel's fields).
+const PAYMENT_FIELDS: (keyof StrategyConfig)[] = [
+  "maxBaseFeeGwei", "priorityFeeGwei", "dynamicTipEnabled", "dynamicTipMaxGwei",
+  "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
+  "maxAutoPayEpochs", "coinbaseBidEth", "coinbasePayerAddress", "combinedBoundaryBundle",
+];
+
 export function JitPanel({
   status,
   tokens,
   config,
+  savedConfig,
   onConfigChange,
+  onConfigSaved,
 }: {
   status: BotStatus | null;
   tokens: OwnedTokenStatus[];
   config: StrategyConfig | null;
+  savedConfig: StrategyConfig | null;
   onConfigChange: (c: StrategyConfig) => void;
+  onConfigSaved: (c: StrategyConfig) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -82,13 +94,15 @@ export function JitPanel({
 
   // --- Payment gas (used by every tax payment, incl. the boundary-timed JIT pay) ---
   const [gasBusy, setGasBusy] = useState(false);
-  const [gasSaved, setGasSaved] = useState(false);
   const [gasErr, setGasErr] = useState<string | null>(null);
   const gasField = (k: keyof StrategyConfig, v: number | boolean | string) => {
     if (!config) return;
     onConfigChange({ ...config, [k]: v });
-    setGasSaved(false);
   };
+  // True when any payment-owned field differs from what's persisted on the backend.
+  const gasDirty =
+    !!(config && savedConfig) &&
+    PAYMENT_FIELDS.some((k) => JSON.stringify(config[k]) !== JSON.stringify(savedConfig[k]));
   const saveGas = async () => {
     if (!config) return;
     setGasBusy(true);
@@ -107,8 +121,7 @@ export function JitPanel({
         coinbasePayerAddress: config.coinbasePayerAddress,
         combinedBoundaryBundle: config.combinedBoundaryBundle,
       });
-      onConfigChange(next);
-      setGasSaved(true);
+      onConfigSaved(next);
     } catch (e) {
       setGasErr((e as Error).message);
     } finally {
@@ -378,10 +391,19 @@ export function JitPanel({
             )}
           </div>
 
-          <button className="primary" onClick={saveGas} disabled={gasBusy} style={{ marginTop: 8 }}>
-            {gasBusy ? "Saving…" : gasSaved ? "Saved ✓" : "Save payment settings"}
-          </button>
-          {gasErr && <p className="err" style={{ marginTop: 6 }}>{gasErr}</p>}
+          <div className="save-bar" style={{ marginTop: 12 }}>
+            <button
+              className={`primary save-cta${gasDirty ? " unsaved" : ""}`}
+              onClick={saveGas}
+              disabled={gasBusy || !gasDirty}
+            >
+              {gasBusy ? "Saving…" : gasDirty ? "● Save payment settings" : "Save payment settings"}
+            </button>
+            {!gasBusy && (gasDirty
+              ? <span className="unsaved-note">Unsaved changes — the bot pays with the last saved values until you save.</span>
+              : <span className="saved-note">Saved ✓</span>)}
+            {gasErr && <span className="err" style={{ fontSize: 12 }}>{gasErr}</span>}
+          </div>
         </div>
       )}
 
@@ -392,7 +414,6 @@ export function JitPanel({
             : "No owned citizens detected yet — set your Alchemy key so the bot can find them."}
         </p>
       )}
-      {status?.dryRun && <p className="hint">Dry-run is ON — arming will simulate the payment, not send it.</p>}
       {err && <p className="err">{err}</p>}
     </div>
   );

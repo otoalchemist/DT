@@ -144,8 +144,7 @@ async function signTx(
 }
 
 /**
- * Build, (optionally simulate), and submit a single tx.
- * - dryRun: builds + simulates, never sends.
+ * Build, simulate, and submit a single tx.
  * - mainnet: submits as a Flashbots bundle (block+1, block+2) after eth_callBundle sim.
  * - local: broadcasts the raw tx to the node (anvil).
  */
@@ -365,7 +364,6 @@ export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<
 export async function submitTx(
   intent: TxIntent,
   opts: {
-    dryRun: boolean;
     race?: boolean;
     offense?: boolean;
     /** Simulate at this future unix-second timestamp (pre-boundary races). */
@@ -475,10 +473,6 @@ export async function submitTx(
     } catch (err) {
       return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
     }
-  }
-
-  if (opts.dryRun) {
-    return { ...base, ok: true, targetBlock };
   }
 
   // Simulation passed — now officially consume the nonce and sign for real.

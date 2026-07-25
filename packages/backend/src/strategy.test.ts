@@ -223,7 +223,6 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
     runtime.balanceWei = 10_000_000_000_000_000_000n; // 10 ETH, well above the floor
     runtime.strategy = {
       ...DEFAULT_STRATEGY,
-      dryRun: false,
       offenseEnabled: true,
       autoAudit: true,
       preBoundaryAudit: true,
@@ -300,7 +299,6 @@ describe("proactive pay only fires at the epoch boundary, never on generic tick 
       ...DEFAULT_STRATEGY,
       enabled: true,
       proactivePay: true,
-      dryRun: false,
       offenseEnabled: false,
       jitEnabled: false,
       minBalanceEth: 0,

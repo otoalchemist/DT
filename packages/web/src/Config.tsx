@@ -112,10 +112,34 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
 // made here (e.g. "Enable offense") lived only in that copy, so an edit in JitPanel
 // (which writes the shared config) would re-flow through the prop and silently clobber
 // them. Reading/writing the shared object directly removes that stale-copy race.
-export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next: StrategyConfig) => void }) {
+// Fields this panel owns. Used to detect unsaved edits by comparing against the
+// last-persisted config (savedCfg) — independent of the payment fields the JIT panel
+// owns, so each Save button lights up only for its own section's changes.
+const STRATEGY_FIELDS: (keyof StrategyConfig)[] = [
+  "offenseEnabled", "autoAudit", "autoKill", "preBoundaryAudit", "preBoundaryKill",
+  "endgameOnlyWithin", "offenseTargetTokenIds",
+  "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
+  "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
+  "racePublicMempool", "minBalanceEth", "maxPaymentEth",
+];
+
+export function Config({
+  cfg,
+  savedCfg,
+  onChange,
+  onSaved,
+}: {
+  cfg: StrategyConfig;
+  savedCfg: StrategyConfig | null;
+  onChange: (next: StrategyConfig) => void;
+  onSaved: (next: StrategyConfig) => void;
+}) {
   const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  // True when any strategy-owned field differs from what's persisted on the backend.
+  const dirty =
+    !!savedCfg && STRATEGY_FIELDS.some((k) => JSON.stringify(cfg[k]) !== JSON.stringify(savedCfg[k]));
   // Seed with the actual shipped default (mainnet) so the panel doesn't briefly
   // misreport before GET /api/settings resolves; corrected on load if it differs.
   const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("mainnet");
@@ -139,24 +163,38 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
 
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
     onChange({ ...cfg, [k]: v });
-    setSaved(false);
   };
 
   const save = async () => {
     setBusy(true);
     setSaveErr(null);
     try {
-      // Persist, then adopt the server-normalized config so the shared state stays
-      // in lockstep with the backend.
+      // Persist, then adopt the server-normalized config as the new saved baseline so
+      // the shared state stays in lockstep with the backend and dirty clears.
       const next = await api.setConfig(cfg);
-      onChange(next);
-      setSaved(true);
+      onSaved(next);
     } catch (e) {
       setSaveErr((e as Error).message);
     } finally {
       setBusy(false);
     }
   };
+
+  const saveBar = (
+    <div className="save-bar">
+      <button
+        className={`primary save-cta${dirty ? " unsaved" : ""}`}
+        onClick={save}
+        disabled={busy || !dirty}
+      >
+        {busy ? "Saving…" : dirty ? "● Save strategy" : "Save strategy"}
+      </button>
+      {!busy && (dirty
+        ? <span className="unsaved-note">Unsaved changes — the bot runs the last saved values until you save.</span>
+        : <span className="saved-note">Saved ✓</span>)}
+      {saveErr && <span className="err" style={{ fontSize: 12 }}>{saveErr}</span>}
+    </div>
+  );
 
   const num = (k: keyof StrategyConfig) => (e: React.ChangeEvent<HTMLInputElement>) =>
     set(k, Number(e.target.value) as never);
@@ -166,9 +204,7 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
   return (
     <div className="panel">
       <h2>Strategy</h2>
-      <p className="muted" style={{ fontSize: 11, margin: "0 0 4px 0" }}>
-        Dry-run / live-fire is toggled from the badge in the top bar.
-      </p>
+      <div style={{ marginBottom: 16 }}>{saveBar}</div>
 
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
       <label className="check">
@@ -348,10 +384,7 @@ export function Config({ cfg, onChange }: { cfg: StrategyConfig; onChange: (next
         against a bad estimate or a badly-delinquent token draining the wallet in one shot.
       </p>
 
-      <button className="primary" onClick={save} disabled={busy}>
-        {busy ? "Saving…" : saved ? "Saved ✓" : "Save strategy"}
-      </button>
-      {saveErr && <p className="err" style={{ marginTop: 6 }}>{saveErr}</p>}
+      {saveBar}
 
       <AlchemyKeySection initialMode={currentMode} />
     </div>
