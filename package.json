@@ -18,7 +18,8 @@
     "start": "npm run build:shared && node packages/backend/dist/main.js",
     "test": "npm run test -w @dat-bot/backend",
     "package": "node scripts/package.mjs",
-    "rival-skippers": "node scripts/rival-skippers.mjs"
+    "rival-skippers": "node scripts/rival-skippers.mjs",
+    "rival-builder-bids": "node scripts/rival-builder-bids.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

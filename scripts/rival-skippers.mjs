@@ -53,6 +53,25 @@ const MIN_CROSSINGS = 2;     // must cross this many times in the window to qual
 const MIN_PARITY_STREAK = 4; // ...OR cross this many times on one parity (clean 2-epoch cadence)
 const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cadence allowed to wobble)
 
+/**
+ * Tokens this scan must never emit, even when they match the cadence heuristic.
+ *
+ * The detection above samples lastEpochPaid at the LAST BLOCK OF THE PRIOR EPOCH, so a
+ * token that is 2+ behind at that instant looks like a skipper. That is a false positive
+ * for anyone who then self-cures at the TOP of the new epoch's first block: they are
+ * never auditable in practice, and pinning them wastes a scarce auditor slot (one owned
+ * token audits at most `auditLimit` times per epoch) on a race that cannot be won.
+ *
+ * The five below are one operator: a batch-payer contract
+ * (0x5c50b6dc6a42c9fe6993b0801ef7a2a3fe8ea676, senders 0x28ead8f1…/0x08a24cdd…) that pays
+ * all five citizens in a single tx and pays the block builder directly in that same tx.
+ * Measured over epochs 137-146: an escalating coinbase bid (0.010 -> 0.015 -> 0.005 ->
+ * 0.030 -> 0.080 ETH) buying transaction index 0, and ZERO successful audits against any
+ * of the five by ANY player across the whole window. Re-check with
+ * scripts/rival-builder-bids-style tracing before removing an entry from this list.
+ */
+const EXCLUDED = new Set(["1575", "1661", "4650", "4957", "6737"]);
+
 // --- args ---
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
@@ -193,6 +212,7 @@ async function main() {
   };
   const skippers = [];
   const detail = [];
+  const excluded = [];
   for (const [token, epochs] of Object.entries(crossings)) {
     const total = epochs.length;
     const streak = parityStreak(epochs);
@@ -201,10 +221,22 @@ async function main() {
     // clean-cadence or high-frequency skipper.
     const qualifies =
       total >= MIN_CROSSINGS || streak >= MIN_PARITY_STREAK || total >= STRONG_CROSSINGS;
-    if (qualifies) {
-      skippers.push(BigInt(token));
-      detail.push({ token, total, streak, epochs });
+    if (!qualifies) continue;
+    // Matched the cadence but is a known top-of-block self-curer (see EXCLUDED).
+    if (EXCLUDED.has(token)) {
+      excluded.push({ token, total, streak });
+      continue;
     }
+    skippers.push(BigInt(token));
+    detail.push({ token, total, streak, epochs });
+  }
+  if (excluded.length > 0) {
+    console.error(
+      "\nExcluded (matched cadence but self-cure top-of-block via coinbase bid — never auditable):",
+    );
+    excluded
+      .sort((a, b) => Number(a.token) - Number(b.token))
+      .forEach((d) => console.error(`  #${d.token}: ${d.total}x, parity ${d.streak}  [EXCLUDED]`));
   }
   skippers.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const out = skippers.map((x) => x.toString());
