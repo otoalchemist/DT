@@ -133,6 +133,24 @@ export function Dashboard({
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
   const otherTargets = targets.filter((t) => !pinnedSet.has(t.tokenId));
 
+  // Manual per-token actions. `tokenBusy` keys off `${tokenId}:${action}` so only the
+  // pressed button shows a spinner, and both buttons on that row lock while it runs.
+  const [tokenBusy, setTokenBusy] = useState<string | null>(null);
+  const [tokenMsg, setTokenMsg] = useState<{ id: string; text: string; err: boolean } | null>(null);
+  const runTokenAction = async (tokenId: string, action: "pay" | "bribe") => {
+    setTokenBusy(`${tokenId}:${action}`);
+    setTokenMsg(null);
+    try {
+      const res = action === "pay" ? await api.payToken(tokenId) : await api.bribeToken(tokenId);
+      setTokenMsg({ id: tokenId, text: res.message, err: false });
+      await refresh(); // pull fresh on-chain status for the row
+    } catch (e) {
+      setTokenMsg({ id: tokenId, text: (e as Error).message, err: true });
+    } finally {
+      setTokenBusy(null);
+    }
+  };
+
   const [toggling, setToggling] = useState(false);
   const [toggleErr, setToggleErr] = useState<string | null>(null);
   const toggleRun = async () => {
@@ -207,10 +225,13 @@ export function Dashboard({
             </p>
           ) : (
             <table>
-              <thead><tr><th>Token</th><th>Paid</th><th>Status</th><th>Audit expires</th><th>Bribes</th><th>Pay est.</th></tr></thead>
+              <thead><tr><th>Token</th><th>Paid</th><th>Status</th><th>Audit expires</th><th>Bribes</th><th>Pay est.</th><th>Actions</th></tr></thead>
               <tbody>
                 {tokens.map((t) => {
                   const current = BigInt(t.lastEpochPaid) >= BigInt(t.currentEpoch);
+                  const underAudit = t.auditDueTimestamp !== "0";
+                  const hasBribe = BigInt(t.bribeBalance) > 0n;
+                  const rowBusy = tokenBusy?.startsWith(`${t.tokenId}:`) ?? false;
                   return (
                   <tr key={t.tokenId}>
                     <td className="mono">#{t.tokenId}</td>
@@ -222,6 +243,37 @@ export function Dashboard({
                     <td>{t.auditDueTimestamp === "0" ? "—" : countdown(t.secondsUntilKillable)}</td>
                     <td>{t.bribeBalance}</td>
                     <td>{weiToEth(t.estimatedPayWei)} ETH</td>
+                    <td>
+                      <div className="row wrap" style={{ gap: 6 }}>
+                        <button
+                          style={{ fontSize: 11, padding: "3px 10px" }}
+                          disabled={rowBusy || current}
+                          onClick={() => runTokenAction(t.tokenId, "pay")}
+                          title={current
+                            ? "Already current — nothing to pay"
+                            : `Pay ${weiToEth(t.estimatedPayWei)} ETH to make #${t.tokenId} current${underAudit ? " and clear its audit" : ""}. Uses normal network gas.`}
+                        >
+                          {tokenBusy === `${t.tokenId}:pay` ? "…" : "Pay to current"}
+                        </button>
+                        {hasBribe && (
+                          <button
+                            style={{ fontSize: 11, padding: "3px 10px" }}
+                            disabled={rowBusy || !underAudit}
+                            onClick={() => runTokenAction(t.tokenId, "bribe")}
+                            title={underAudit
+                              ? `Spend 1 bribe to clear the audit on #${t.tokenId}. Does NOT pay tax — the token stays behind and can be audited again. Uses normal network gas.`
+                              : "Only usable while under audit"}
+                          >
+                            {tokenBusy === `${t.tokenId}:bribe` ? "…" : "Clear audit (bribe)"}
+                          </button>
+                        )}
+                      </div>
+                      {tokenMsg?.id === t.tokenId && (
+                        <div className={tokenMsg.err ? "err" : "hint"} style={{ fontSize: 11, marginTop: 4 }}>
+                          {tokenMsg.text}
+                        </div>
+                      )}
+                    </td>
                   </tr>
                   );
                 })}

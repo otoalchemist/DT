@@ -14,6 +14,7 @@ import {
   encodeAudit,
   encodeKill,
   encodeUseBribe,
+  estimateTaxes,
   gameContract,
 } from "./contract.js";
 import {
@@ -885,7 +886,7 @@ async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<voi
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean; normalGas?: boolean },
 ): Promise<SubmitResult | null> {
   const offense = kind === "audit" || kind === "kill";
   try {
@@ -904,6 +905,7 @@ async function act(
       simTimestamp: ctx.simTimestamp,
       revertible: ctx.revertible,
       skipSim: ctx.skipSim,
+      normalGas: ctx.normalGas,
     });
     if (!result.ok) {
       activity.add({
@@ -1271,6 +1273,125 @@ async function offensePass(
   // Publish the nearest kill deadline and (re)arm the pre-emptive kill tick.
   nextKillDeadlineSec = soonestKillDeadline;
   schedulePreBoundaryKill();
+}
+
+// --- manual, user-initiated token actions (dashboard buttons) ---
+
+export interface ManualActionResult {
+  ok: boolean;
+  message: string;
+  txHash?: string;
+  valueWei?: string;
+}
+
+/** Wait out an in-flight tick so a manual tx can't collide with the tick's nonce
+ *  reservation / open bundle. Resolves false if the tick never clears in time. */
+async function waitForIdle(timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (ticking) {
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return true;
+}
+
+/**
+ * Run a single user-initiated tx outside the tick loop, priced with NORMAL network
+ * gas (see normalFees) rather than the configured race tips. These bypass the
+ * automatic-payment guardrails on purpose — `maxAutoPayEpochs` and the base-fee cap
+ * exist to bound what the bot does on its own, and the user pressing a button IS the
+ * decision. The min-balance floor is still honoured so a manual action can't empty
+ * the wallet.
+ */
+async function runManualAction(
+  tokenId: bigint,
+  kind: "pay-taxes" | "use-bribe",
+  build: () => Promise<{ intent: TxIntent; message: string } | { error: string }>,
+): Promise<ManualActionResult> {
+  if (!runtime.unlocked || !runtime.account) return { ok: false, message: "Unlock the wallet first" };
+  if (runtime.gameState !== 1) return { ok: false, message: "Game is not live" };
+  if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment" };
+
+  const address = runtime.account.address;
+  ticking = true;
+  committedThisTickWei = 0n;
+  beginBatch();
+  try {
+    await Promise.all([refreshSnapshot(address), nonceManager.sync(address, appConfig.mode)]);
+    const built = await build();
+    if ("error" in built) return { ok: false, message: built.error };
+
+    // Min-balance floor still applies (gas is estimated generously here).
+    const bal = runtime.balanceWei ?? 0n;
+    const floor = parseEther(String(runtime.strategy.minBalanceEth));
+    const latest = await getLatestBlockCached();
+    const gasWei = GAS_GUESS * ((latest.baseFeePerGas ?? 0n) * 2n + 2_000_000_000n);
+    if (!canAffordSpend(bal, 0n, built.intent.value, gasWei, floor)) {
+      return { ok: false, message: `Would breach the ${runtime.strategy.minBalanceEth} ETH min-balance floor` };
+    }
+
+    const res = await act(built.intent, kind, {
+      tokenId: tokenId.toString(),
+      message: built.message,
+      race: true, // mirror to the mempool so a manual action lands even if no builder wins
+      normalGas: true,
+    });
+    if (!res?.ok) return { ok: false, message: res?.error ?? "Transaction failed to submit" };
+    return {
+      ok: true,
+      message: built.message,
+      txHash: res.txHash,
+      valueWei: res.valueWei.toString(),
+    };
+  } catch (err) {
+    const message = (err as Error).message;
+    activity.add({ kind: "error", status: "skipped", tokenId: tokenId.toString(), message: `Manual ${kind} #${tokenId} failed: ${message}` });
+    return { ok: false, message };
+  } finally {
+    await flushBatch();
+    nonceManager.reset();
+    ticking = false;
+  }
+}
+
+/**
+ * Pay a token's full outstanding tax so it becomes current (and any active audit is
+ * cleared). Quotes on-chain with numEpochs=1, which force-settles every delinquent
+ * epoch — so a token N behind costs N x the current epoch rate. Deliberately NOT
+ * subject to the Auto-Pay Limit: that cap governs automatic payments only.
+ */
+export async function manualPayToCurrent(tokenId: bigint): Promise<ManualActionResult> {
+  return runManualAction(tokenId, "pay-taxes", async () => {
+    const value = await estimateTaxes(tokenId, 1);
+    if (value === 0n) return { error: `#${tokenId} is already current — nothing to pay` };
+    return {
+      intent: { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, 1), value },
+      message: `Manual pay #${tokenId} to current = ${formatEther(value)} ETH (normal gas)`,
+    };
+  });
+}
+
+/**
+ * Spend one of a token's bribes to clear its active audit. NOTE: a bribe clears the
+ * AUDIT only — it does not pay tax, so the token stays delinquent and can be audited
+ * again immediately. Use `manualPayToCurrent` to actually become current.
+ */
+export async function manualUseBribe(tokenId: bigint): Promise<ManualActionResult> {
+  return runManualAction(tokenId, "use-bribe", async () => {
+    const [status] = await batchGetOwnedStatuses(
+      [tokenId],
+      runtime.currentEpoch ?? 0n,
+      BigInt(Math.floor(Date.now() / 1000)),
+      1,
+    );
+    if (!status) return { error: `Could not read #${tokenId}` };
+    if (BigInt(status.bribeBalance) === 0n) return { error: `#${tokenId} has no bribes to spend` };
+    if (status.auditDueTimestamp === "0") return { error: `#${tokenId} is not under audit` };
+    return {
+      intent: { to: appConfig.gameAddress, data: encodeUseBribe(tokenId), value: 0n },
+      message: `Manual bribe clear of audit on #${tokenId} (still delinquent afterwards, normal gas)`,
+    };
+  });
 }
 
 // `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary

@@ -39,6 +39,17 @@ export const api = {
   jit: (body: { enable: boolean; targetEpoch?: number; tokenIds?: string[] }) =>
     req<BotStatus>("/api/jit", { method: "POST", body: JSON.stringify(body) }),
   tokens: () => req<OwnedTokenStatus[]>("/api/tokens"),
+  // Manual per-token actions — normal network gas at press time, not the race tips.
+  payToken: (tokenId: string) =>
+    req<{ ok: boolean; message: string; txHash?: string; valueWei?: string }>("/api/token/pay", {
+      method: "POST",
+      body: JSON.stringify({ tokenId }),
+    }),
+  bribeToken: (tokenId: string) =>
+    req<{ ok: boolean; message: string; txHash?: string }>("/api/token/bribe", {
+      method: "POST",
+      body: JSON.stringify({ tokenId }),
+    }),
   targets: () => req<TargetTokenStatus[]>("/api/targets"),
   activity: (limit = 200) => req<ActivityEntry[]>(`/api/activity?limit=${limit}`),
   getSettings: () => req<{ alchemyKeySet: boolean; mode: "mainnet" | "public" }>("/api/settings"),

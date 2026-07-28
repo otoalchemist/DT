@@ -95,6 +95,28 @@ function hostOf(url: string): string {
 
 // Pure — takes an already-fetched block so the caller can share one read across
 // the fee calc, the gas estimate, and the target-block derivation.
+/**
+ * "Normal" network gas, read at submit time — the node's own suggested priority fee
+ * rather than any of the configured race/offense tips. Used by manual, user-initiated
+ * actions (pay-to-current / use-bribe from the dashboard), which aren't racing anyone
+ * and shouldn't inherit boundary-race pricing. Falls back to 1 gwei if the node has
+ * no suggestion.
+ */
+async function normalFees(block: Block): Promise<{
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  baseFee: bigint;
+}> {
+  const baseFee = block.baseFeePerGas ?? 0n;
+  let priority: bigint;
+  try {
+    priority = await publicClient.estimateMaxPriorityFeePerGas();
+  } catch {
+    priority = 1_000_000_000n; // 1 gwei
+  }
+  return { maxFeePerGas: baseFee * 2n + priority, maxPriorityFeePerGas: priority, baseFee };
+}
+
 function computeFees(offense: boolean, block: Block): {
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
@@ -378,6 +400,9 @@ export async function submitTx(
      *  never invalidate the bundle / drop a mandatory tx. Used for audits riding a
      *  payment bundle in combined mode. */
     revertible?: boolean;
+    /** Price with the node's current suggested fee instead of the configured
+     *  race/offense tips. For manual, user-initiated actions (see normalFees). */
+    normalGas?: boolean;
   },
 ): Promise<SubmitResult> {
   const account = runtime.account;
@@ -391,7 +416,9 @@ export async function submitTx(
     estimateGas(account.address, intent),
     getLatestBlockCached(),
   ]);
-  const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(opts.offense ?? false, latest);
+  const { maxFeePerGas, maxPriorityFeePerGas } = opts.normalGas
+    ? await normalFees(latest)
+    : computeFees(opts.offense ?? false, latest);
   const gasWei = gas * maxFeePerGas;
   // Reuse the block's own number instead of a separate getBlockNumber round-trip.
   // Only used for sim context + reporting here; the actual bundle target block is

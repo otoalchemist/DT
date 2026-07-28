@@ -17,7 +17,7 @@ import {
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
 import { resolveJitTarget } from "./logic.js";
-import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe } from "./strategy.js";
 import { readOwnedStatuses, readTargets } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -217,6 +217,32 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.post("/api/stop", async () => {
     stopEngine();
     return runtime.status();
+  });
+
+  // --- manual, user-initiated token actions (dashboard buttons) ---
+  // Priced with normal network gas at press time, and NOT subject to the Auto-Pay
+  // Limit — that cap bounds what the bot spends on its own; pressing the button is
+  // the user's own decision. Works whether or not the engine is running.
+  const tokenAction = z.object({ tokenId: z.string().min(1) });
+
+  app.post("/api/token/pay", async (req, reply) => {
+    const parsed = tokenAction.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    let id: bigint;
+    try { id = BigInt(parsed.data.tokenId); } catch { return reply.code(400).send({ error: "Invalid token ID" }); }
+    const res = await manualPayToCurrent(id);
+    if (!res.ok) return reply.code(400).send({ error: res.message });
+    return res;
+  });
+
+  app.post("/api/token/bribe", async (req, reply) => {
+    const parsed = tokenAction.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    let id: bigint;
+    try { id = BigInt(parsed.data.tokenId); } catch { return reply.code(400).send({ error: "Invalid token ID" }); }
+    const res = await manualUseBribe(id);
+    if (!res.ok) return reply.code(400).send({ error: res.message });
+    return res;
   });
 
   // --- just-in-time single-epoch payment ---
