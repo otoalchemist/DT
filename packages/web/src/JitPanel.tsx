@@ -205,11 +205,13 @@ export function JitPanel({
         <div style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
           <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>AUTO-PAY LIMIT</div>
           <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5 }}>
-            Most epochs a single <b>automatic</b> payment may cover — a cap on ETH spent per auto payment.
-            <b> Default 1</b>: auto-payments never spend more than one day's taxes at once, so a lost/failed
-            payment never balloons into a multi-day charge. <b>The JIT single-epoch payment always fires</b>
-            (even when a citizen is momentarily 2 behind at the boundary); this only caps the multi-epoch
-            proactive-pay / defense paths. Raise it to let those auto-catch-up several epochs in one payment.
+            The most a single <b>automatic</b> payment may spend, measured in epochs of tax at the current
+            rate (N × epoch × 0.00069 ETH). <b>Default 1</b> = at most one day's taxes per auto payment.
+            <b> A payment that would cost more is skipped, not trimmed</b> — the contract force-settles every
+            delinquent epoch, so a token 2 behind is quoted 2× even for a 1-epoch request and cannot be
+            partially paid. <b>Such a token is left delinquent</b>, which keeps it auditable and eventually
+            killable: this is a spend guardrail, not a safety net. Raise it to let the bot buy its way out of
+            a multi-day catch-up. <b>The JIT single-epoch payment always fires</b> and is never capped.
           </p>
           <label className="field" style={{ maxWidth: 220 }}>
             Max epochs per auto payment

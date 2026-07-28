@@ -12,6 +12,8 @@ import {
   canAffordSpend,
   preBoundaryTaxWei,
   cappedAutoPayEpochs,
+  autoPayCapWei,
+  withinAutoPayCap,
   orderBySalt,
   resolveJitTarget,
 } from "./logic.js";
@@ -137,6 +139,46 @@ describe("spend guardrails", () => {
     it("never returns less than 1", () => {
       expect(cappedAutoPayEpochs(0, 1)).toBe(1);
       expect(cappedAutoPayEpochs(1, 0)).toBe(1);
+    });
+  });
+
+  describe("autoPayCapWei / withinAutoPayCap (per-payment SPEND cap)", () => {
+    // Verified on-chain: estimateTaxesToPay(id, n) = (epochsBehind + n - 1) * epoch * base.
+    // Probed at epoch 148 against mainnet: 1 behind -> 148 base units (0.10212 ETH),
+    // 2 behind -> 296 units (0.20424 ETH). Clamping n cannot reduce the catch-up, so
+    // the limit has to be enforced as a spend cap that DECLINES the payment.
+    const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI
+    const EPOCH = 148n;
+    const oneEpoch = 148n * BASE; // 0.10212 ETH — a token 1 behind
+    const twoEpochs = 296n * BASE; // 0.20424 ETH — a token 2 behind (mainnet tx 0x90cdbae4…)
+
+    it("caps at N epochs of tax at the current rate", () => {
+      expect(autoPayCapWei(1, EPOCH, BASE)).toBe(oneEpoch);
+      expect(autoPayCapWei(2, EPOCH, BASE)).toBe(twoEpochs);
+    });
+
+    it("limit 1 admits a 1-behind token and rejects the 2-behind catch-up", () => {
+      expect(withinAutoPayCap(oneEpoch, 1, EPOCH, BASE)).toBe(true);
+      expect(withinAutoPayCap(twoEpochs, 1, EPOCH, BASE)).toBe(false);
+    });
+
+    it("raising the limit to 2 admits the same 2-behind catch-up", () => {
+      expect(withinAutoPayCap(twoEpochs, 2, EPOCH, BASE)).toBe(true);
+    });
+
+    it("is inclusive at the boundary and rejects one wei over", () => {
+      expect(withinAutoPayCap(oneEpoch, 1, EPOCH, BASE)).toBe(true);
+      expect(withinAutoPayCap(oneEpoch + 1n, 1, EPOCH, BASE)).toBe(false);
+    });
+
+    it("treats a zero quote (already current) as within the cap", () => {
+      expect(withinAutoPayCap(0n, 1, EPOCH, BASE)).toBe(true);
+    });
+
+    it("cap scales with the epoch, since tax is priced at the current rate", () => {
+      expect(autoPayCapWei(1, 200n, BASE)).toBe(200n * BASE);
+      // A 2-behind quote at epoch 100 (200 units) still exceeds a limit-1 cap there.
+      expect(withinAutoPayCap(200n * BASE, 1, 100n, BASE)).toBe(false);
     });
   });
 

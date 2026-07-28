@@ -112,16 +112,51 @@ export function preBoundaryTaxWei(
 }
 
 /**
- * How many epochs a single automatic payTaxes should actually cover: the
- * requested count, clamped to the global `maxAutoPayEpochs` cap and to at least 1.
- * On-chain, payTaxes(tokenId, n) costs n * currentEpoch * base regardless of how
- * far behind the token is, so clamping n caps the ETH spent per auto payment
- * without ever blocking the single-epoch payment JIT relies on. Used by
- * proactive-pay and defense (which request `prepayEpochs`); JIT paths always
- * request 1, so the cap never reduces them below a full single-epoch payment.
+ * How many epochs a single automatic payTaxes should request: the requested count,
+ * clamped to the global `maxAutoPayEpochs` cap and to at least 1.
+ *
+ * NOTE: clamping `n` does NOT by itself cap the ETH spent. Verified on-chain,
+ * estimateTaxesToPay(id, n) = (epochsBehind + n - 1) * currentEpoch * base — the
+ * contract force-settles every delinquent epoch, so a token 2 behind is quoted 2x
+ * even at n=1 (mainnet tx 0x90cdbae4… paid 0.20424 ETH = 2 * 148 * base with n=1).
+ * `n` only controls how much is PREPAID on top of that mandatory catch-up.
+ * Use `autoPayCapWei` to bound the actual spend.
  */
 export function cappedAutoPayEpochs(requestedEpochs: number, maxAutoPayEpochs: number): number {
   return Math.max(1, Math.min(requestedEpochs, maxAutoPayEpochs));
+}
+
+/**
+ * The most ETH a single automatic payment may cost, derived from the same
+ * `maxAutoPayEpochs` ("Auto-Pay Limit") field the UI exposes: N epochs' worth of
+ * tax at the current rate, i.e. N * currentEpoch * base.
+ *
+ * Since the contract cannot be asked to partially settle a delinquent token (see
+ * `cappedAutoPayEpochs`), the only way to honour the limit is to DECLINE a payment
+ * that would exceed it and leave the token delinquent. That is the intended
+ * trade-off: the cap is a spend guardrail, not a liveness guarantee — a token left
+ * unpaid stays auditable and can eventually be killed.
+ *
+ * With the default limit of 1 at epoch 148: a token 1 behind quotes 1x (0.10212
+ * ETH) and is paid; a token 2 behind quotes 2x (0.20424 ETH) and is skipped.
+ */
+export function autoPayCapWei(
+  maxAutoPayEpochs: number,
+  currentEpoch: bigint,
+  baseTaxRateWei: bigint,
+): bigint {
+  return BigInt(Math.max(1, maxAutoPayEpochs)) * currentEpoch * baseTaxRateWei;
+}
+
+/** Whether a quoted payment fits under the Auto-Pay Limit. A zero/absent quote is
+ *  allowed through (nothing to spend); the caller still applies its own guardrails. */
+export function withinAutoPayCap(
+  quotedWei: bigint,
+  maxAutoPayEpochs: number,
+  currentEpoch: bigint,
+  baseTaxRateWei: bigint,
+): boolean {
+  return quotedWei <= autoPayCapWei(maxAutoPayEpochs, currentEpoch, baseTaxRateWei);
 }
 
 /**

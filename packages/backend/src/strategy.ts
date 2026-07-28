@@ -22,7 +22,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, orderBySalt } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -992,6 +992,23 @@ async function defensePass(
         continue;
       }
       const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
+      // Auto-Pay Limit as a SPEND cap. The contract force-settles every delinquent
+      // epoch, so a token N behind is quoted Nx even at n=1 — clamping `epochs`
+      // alone can't hold the limit. Decline instead of overspending; the token is
+      // left delinquent (and killable once its audit expires), which is the
+      // deliberate trade-off of setting a limit at all.
+      if (!withinAutoPayCap(value, s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI)) {
+        const cap = autoPayCapWei(s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI);
+        activity.add({
+          kind: "pay-taxes",
+          status: "skipped",
+          tokenId: st.tokenId,
+          message:
+            `Skip audit-clearing pay #${st.tokenId}: ${formatEther(value)} ETH exceeds Auto-Pay Limit ` +
+            `(${s.maxAutoPayEpochs} epoch = ${formatEther(cap)} ETH) — token is ${Number(currentEpoch - BigInt(st.lastEpochPaid))} epoch(s) behind and stays delinquent`,
+        });
+        continue;
+      }
       const guard = await canSpend(value, false);
       if (!guard.ok) {
         activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer pay #${st.tokenId}: ${guard.reason}` });
@@ -1037,6 +1054,19 @@ async function proactivePayPass(
 
     const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
     if (value === 0n) continue;
+    // Auto-Pay Limit as a SPEND cap — see the matching check in defensePass.
+    if (!withinAutoPayCap(value, s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI)) {
+      const cap = autoPayCapWei(s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI);
+      activity.add({
+        kind: "pay-taxes",
+        status: "skipped",
+        tokenId: st.tokenId,
+        message:
+          `Skip proactive pay #${st.tokenId}: ${formatEther(value)} ETH exceeds Auto-Pay Limit ` +
+          `(${s.maxAutoPayEpochs} epoch = ${formatEther(cap)} ETH) — token is ${Number(currentEpoch - BigInt(st.lastEpochPaid))} epoch(s) behind and stays delinquent`,
+      });
+      continue;
+    }
     const guard = await canSpend(value, false);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
