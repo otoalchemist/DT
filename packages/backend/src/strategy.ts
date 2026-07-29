@@ -1,5 +1,5 @@
 import { parseEther, formatEther, type Address } from "viem";
-import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, type StrategyConfig } from "@dat-bot/shared";
+import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
@@ -382,8 +382,26 @@ function pinnedTargetSet(s: StrategyConfig): Set<string> | null {
  * the list is small and explicit, there's no reason to discover it by paging the
  * whole collection: feed the IDs straight in. With no pins we fall back to the capped
  * enumeration. `filterLiveTokenIds` drops any burned/killed IDs, so stale pins are harmless.
+ *
+ * Emigrated citizens (owner == the Emigration contract) are dropped here, which is the
+ * single chokepoint every offense path shares — offensePass, queuePreBoundaryAudits and
+ * firePreBoundaryKill all source their candidates from this function. They're still live
+ * ERC-721s so `filterLiveTokenIds` keeps them, but they've left the main game: auditing
+ * one burns the 0.00069 ETH fee on a token nobody is defending, for a kill that hands the
+ * emigrant exactly the outcome they bought. Pins are filtered too — a pin that emigrates
+ * stops being a target rather than silently soaking up auditor slots.
  */
 export async function fetchOffenseCandidates(): Promise<{ id: bigint; owner: Address }[]> {
+  return (await fetchOffenseCandidatesWithSkips()).candidates;
+}
+
+/** `fetchOffenseCandidates` plus the IDs it dropped as emigrated, so a caller can
+ *  tell "this pin left the game" apart from "this pin was burned/killed" when
+ *  explaining a skip. Same work, one return value richer. */
+export async function fetchOffenseCandidatesWithSkips(): Promise<{
+  candidates: { id: bigint; owner: Address }[];
+  emigrated: Set<string>;
+}> {
   const s = runtime.strategy;
   const citizens = runtime.citizensAddress as Address;
   // Drop any non-parseable entries so a single bad pin can't abort the whole sweep.
@@ -401,7 +419,18 @@ export async function fetchOffenseCandidates(): Promise<{ id: bigint; owner: Add
       ? pinnedIds
       : await fetchCandidateTokenIds(citizens);
   const liveRaw = await filterLiveTokenIds(citizens, ids);
-  return orderBySalt(liveRaw, (t) => t.id.toString(), engineSalt);
+  const emigrated = new Set<string>();
+  const inGame: { id: bigint; owner: Address }[] = [];
+  for (const t of liveRaw) {
+    if (isEmigrated(t.owner)) emigrated.add(t.id.toString());
+    else inGame.push(t);
+  }
+  if (emigrated.size > 0) {
+    logger.debug(
+      `offense candidates: skipped ${emigrated.size} emigrated citizen(s) — out of the main game`,
+    );
+  }
+  return { candidates: orderBySalt(inGame, (t) => t.id.toString(), engineSalt), emigrated };
 }
 
 /** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
@@ -498,7 +527,7 @@ export async function queuePreBoundaryAudits(
   const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
   const { auditors, needsPayment } = await findPreBoundaryAuditors(ownedIds, targetEpoch, opts.paidInBundle);
 
-  const live = await fetchOffenseCandidates();
+  const { candidates: live, emigrated } = await fetchOffenseCandidatesWithSkips();
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = pinnedTargetSet(s);
   const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
@@ -514,14 +543,16 @@ export async function queuePreBoundaryAudits(
 
   // Per-pin diagnostics: when a target list is set, explain any pin that WON'T be
   // audited this fire, so a miss (like token 1612 at epoch 144) is never silent.
-  // A pin can drop out for two reasons: it's not in the live status set (burned,
-  // killed, or — the old bug — sliced off by the enumeration cap), or it's live
-  // but not auditable at targetEpoch (paid up, or already under audit).
+  // A pin can drop out for three reasons: it emigrated (left the game — a permanent,
+  // expected skip, so say so rather than blaming liveness), it's not in the live status
+  // set (burned, killed, or — the old bug — sliced off by the enumeration cap), or it's
+  // live but not auditable at targetEpoch (paid up, or already under audit).
   if (pinned) {
     const statusById = new Map(statuses.map((t) => [t.tokenId, t]));
     const reasons: string[] = [];
     for (const id of pinned) {
       if (owned.has(id)) continue; // never audit our own token
+      if (emigrated.has(id)) { reasons.push(`#${id}: emigrated (left the main game)`); continue; }
       const t = statusById.get(id);
       if (!t) { reasons.push(`#${id}: not in live set (burned/killed)`); continue; }
       if (t.auditDueTimestamp !== "0") { reasons.push(`#${id}: already under audit`); continue; }

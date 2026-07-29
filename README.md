@@ -28,7 +28,16 @@ You run it on your own machine with your own key. It ships with a local web dash
 | Kill | Free, callable by **anyone** once a token's audit countdown expires. Turns the Citizen into a dead "Evader". |
 | Clear an audit | The target `payTaxes` (pays back-taxes) or `useBribe` (free, if it holds a bribe) before expiry. |
 | Life insurance | **Cosmetic only** — it changes the dead-Evader artwork. It does **not** prevent death. |
+| Emigration | `safeTransferFrom` a Citizen to the [Emigration contract](https://etherscan.io/address/0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C) and it mints you a **Governor** NFT (36 available, first come). One-way: the contract holds the Citizen forever and has no way to pay taxes or spend a bribe. |
 | Winning | The game ends when the Citizen supply drops to **69**; the survivors win. |
+
+**Emigrated citizens are out of the main game.** The bot treats them that way: they're
+excluded from every offense sweep (no audits, no kills) and from the **Rival targets**
+panel, and listed on their own under **Emigrated citizens** in the dashboard. Defense
+needs no special handling — an emigrated token is no longer owned by your wallet, so it
+drops out of the owned set by itself. They still count toward the supply that ends the
+game (they leave it only when somebody else kills them), so the endgame gate
+(`endgameOnlyWithin`) still reads the raw on-chain Citizen supply.
 
 ---
 

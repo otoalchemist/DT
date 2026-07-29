@@ -12,6 +12,24 @@ export const VERSION = "0.4.0" as const;
 
 export const GAME_CONTRACT_ADDRESS = "0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F" as const;
 
+/**
+ * The Emigration contract (verified `Emigration.sol`, deployed 2026-07-29).
+ *
+ * A citizen `safeTransferFrom`-ed here is swapped for a Governor NFT and held by the
+ * contract forever — it has no `payTaxes`/`useBribe` code path and no generic executor,
+ * so an emigrated citizen can never defend itself and never acts again. It has left the
+ * main game: we don't pay for it (it isn't ours anymore), and we don't audit or kill it.
+ * `supply` is 36, which is exactly `citizenSupply - WINNERS` at deployment.
+ */
+export const EMIGRATION_CONTRACT_ADDRESS = "0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C" as const;
+
+/** True when `owner` is the Emigration contract, i.e. the citizen has emigrated.
+ *  Case-insensitive: indexers return owners in varying casings (Alchemy's owner
+ *  index is lowercase, `ownerOf` returns checksummed), so never compare raw. */
+export function isEmigrated(owner: string | null | undefined): boolean {
+  return !!owner && owner.toLowerCase() === EMIGRATION_CONTRACT_ADDRESS.toLowerCase();
+}
+
 /** Duration of one game epoch, in seconds (24 hours). */
 export const EPOCH_DURATION_SECONDS = 24n * 60n * 60n;
 

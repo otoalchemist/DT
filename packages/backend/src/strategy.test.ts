@@ -113,7 +113,7 @@ const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tok
 const { filterLiveTokenIds, batchGetTargetStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, queuePreBoundaryAudits, firePreBoundaryBundle } =
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -205,6 +205,68 @@ describe("fetchOffenseCandidates: pinned targets bypass the enumeration cap", ()
     runtime.strategy.offenseTargetTokenIds = ["1612", "not-a-number"];
     const out = await fetchOffenseCandidates();
     expect(out.map((t) => t.id.toString())).toEqual(["1612"]); // bad entry dropped, good one kept
+  });
+});
+
+// Emigrated citizens (owner == the Emigration contract) have left the main game: they
+// were swapped for a Governor NFT and the holding contract has no payTaxes/useBribe path,
+// so they can neither defend nor act. Auditing one spends the 0.00069 ETH fee for nothing.
+// fetchOffenseCandidates is the ONE chokepoint every offense sweep shares (offensePass,
+// queuePreBoundaryAudits, firePreBoundaryKill), so filtering there is what keeps all three
+// off them — these tests pin that, including the case where a pin emigrates mid-game.
+describe("fetchOffenseCandidates: emigrated citizens leave the target set", () => {
+  const EMIGRATION = "0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C" as `0x${string}`;
+  const RIVAL = "0x00000000000000000000000000000000000000dd" as `0x${string}`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([1n, 2n, 3n]);
+  });
+
+  it("excludes tokens held by the Emigration contract from the enumerated sweep", async () => {
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([
+      { id: 1n, owner: RIVAL },
+      { id: 2n, owner: EMIGRATION }, // emigrated — still a live ERC-721, but out of the game
+      { id: 3n, owner: RIVAL },
+    ]);
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString()).sort()).toEqual(["1", "3"]);
+  });
+
+  it("excludes a PINNED target that has emigrated, and reports it as such", async () => {
+    runtime.strategy.offenseTargetTokenIds = ["1612", "6953"];
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([
+      { id: 1612n, owner: EMIGRATION }, // this pin left the game
+      { id: 6953n, owner: RIVAL },
+    ]);
+    const { candidates, emigrated } = await fetchOffenseCandidatesWithSkips();
+    expect(candidates.map((t) => t.id.toString())).toEqual(["6953"]);
+    // Reported separately so the pinned-audit diagnostic can say "emigrated" rather
+    // than blaming liveness ("burned/killed"), which would send you hunting a bug.
+    expect([...emigrated]).toEqual(["1612"]);
+  });
+
+  it("matches the Emigration address case-insensitively", async () => {
+    // Alchemy's owner index returns lowercase; ownerOf returns checksummed. A raw
+    // string compare would silently keep emigrants in the target set for one of them.
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([
+      { id: 1n, owner: EMIGRATION.toLowerCase() as `0x${string}` },
+      { id: 2n, owner: RIVAL },
+    ]);
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString())).toEqual(["2"]);
+  });
+
+  it("leaves the candidate set untouched when nothing has emigrated", async () => {
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([
+      { id: 1n, owner: RIVAL },
+      { id: 2n, owner: RIVAL },
+    ]);
+    const { candidates, emigrated } = await fetchOffenseCandidatesWithSkips();
+    expect(candidates.map((t) => t.id.toString()).sort()).toEqual(["1", "2"]);
+    expect(emigrated.size).toBe(0);
   });
 });
 

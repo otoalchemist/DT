@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   VERSION,
+  EMIGRATION_CONTRACT_ADDRESS,
   type BotStatus,
   type StrategyConfig,
   type ActivityEntry,
@@ -59,6 +60,41 @@ function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: strin
   );
 }
 
+/**
+ * Citizens that emigrated: sent to the Emigration contract, swapped for a Governor NFT,
+ * and held there permanently. They're out of the main game — we never pay, audit or kill
+ * them — so this table deliberately carries no action affordance and mutes every badge.
+ * The status is shown anyway because it's the only clue to WHEN a given emigrant will
+ * finally be killed by someone else and drop out of the supply that ends the game.
+ */
+function EmigratedTable({ rows }: { rows: TargetTokenStatus[] }) {
+  if (rows.length === 0) {
+    return <p className="muted" style={{ fontSize: 12 }}>No citizens have emigrated yet.</p>;
+  }
+  return (
+    <table>
+      <thead><tr><th>Token</th><th>Behind</th><th>Fate</th></tr></thead>
+      <tbody>
+        {rows.map((t) => (
+          <tr key={t.tokenId}>
+            <td className="mono">#{t.tokenId}</td>
+            <td>{t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
+            <td>
+              <span className="badge off">
+                {t.killable
+                  ? "awaiting kill"
+                  : t.auditDueTimestamp !== "0"
+                    ? `dies in ${countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}`
+                    : "unaudited"}
+              </span>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 const sectionLabel: React.CSSProperties = {
   fontSize: 11,
   textTransform: "uppercase",
@@ -83,6 +119,7 @@ export function Dashboard({
   const [savedConfig, setSavedConfig] = useState<StrategyConfig | null>(null);
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
+  const [emigrated, setEmigrated] = useState<TargetTokenStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -109,9 +146,14 @@ export function Dashboard({
 
   const refresh = useCallback(async () => {
     try {
-      const [t, g] = await Promise.all([api.tokens().catch(() => []), api.targets().catch(() => [])]);
+      const [t, g, e] = await Promise.all([
+        api.tokens().catch(() => []),
+        api.targets().catch(() => []),
+        api.emigrated().catch(() => []),
+      ]);
       setTokens(t);
       setTargets(g);
+      setEmigrated(e);
       setErr(null);
     } catch (e) {
       setErr((e as Error).message);
@@ -343,18 +385,37 @@ export function Dashboard({
 
       </div>
 
-      {/* ── Right sidebar: Rival Targets ── */}
-      <div className="panel" style={{ width: 380, flexShrink: 0, position: "sticky", top: 20 }}>
-        <h2>Rival targets</h2>
-        <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>My rivals ({myTargets.length})</div>
-        <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." />
-        <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}>
-          Pinned rivals always appear here, even while paid up. Everything below is
-          shown only while it's delinquent, under audit, or killable.
-        </p>
+      {/* ── Right sidebar: Rival Targets + Emigrated ── */}
+      <div style={{ width: 380, flexShrink: 0, position: "sticky", top: 20 }}>
+        <div className="panel">
+          <h2>Rival targets</h2>
+          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>My rivals ({myTargets.length})</div>
+          <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." />
+          <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}>
+            Pinned rivals always appear here, even while paid up. Everything below is
+            shown only while it's delinquent, under audit, or killable.
+          </p>
+          <div className="spacer" />
+          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
+          <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
+        </div>
+
         <div className="spacer" />
-        <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
-        <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
+
+        <div className="panel">
+          <h2>Emigrated citizens ({emigrated.length})</h2>
+          <EmigratedTable rows={emigrated} />
+          <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.5 }}>
+            Traded to the{" "}
+            {explorerBase
+              ? <a href={`${explorerBase}/address/${EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">Emigration contract</a>
+              : "Emigration contract"}{" "}
+            for a Governor NFT. They've left the main game: the bot never audits or kills
+            them, and they're excluded from Rival targets. The contract can't pay taxes or
+            spend a bribe, so each one falls further behind until someone else kills it —
+            which still counts toward the {status?.citizenSupply ?? "—"} → 69 endgame.
+          </p>
+        </div>
       </div>
 
     </div>

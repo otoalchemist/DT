@@ -1,5 +1,5 @@
 import type { Address } from "viem";
-import type { OwnedTokenStatus, TargetTokenStatus } from "@dat-bot/shared";
+import { isEmigrated, type OwnedTokenStatus, type TargetTokenStatus } from "@dat-bot/shared";
 import { runtime } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
@@ -126,9 +126,18 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   const pinned: TargetTokenStatus[] = [];
   const actionable: TargetTokenStatus[] = [];
   let ownedSkipped = 0;
+  let emigratedSkipped = 0;
   for (const t of allStatuses) {
     if (isOurs(t)) {
       ownedSkipped++;
+      continue;
+    }
+    // Emigrated citizens aren't rivals either — they've left the main game and the
+    // offense engine won't touch them (see fetchOffenseCandidates). They get their own
+    // panel, fed by readEmigrated. Filtered ahead of the pin check for the same reason
+    // self-owned tokens are: a stale pin on an emigrant is dead weight, not a target.
+    if (isEmigrated(t.owner)) {
+      emigratedSkipped++;
       continue;
     }
     if (pinnedSet.has(t.tokenId)) {
@@ -139,6 +148,9 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   }
   if (ownedSkipped > 0) {
     logger.debug(`readTargets: excluded ${ownedSkipped} token(s) we own from the rival list`);
+  }
+  if (emigratedSkipped > 0) {
+    logger.debug(`readTargets: excluded ${emigratedSkipped} emigrated citizen(s) from the rival list`);
   }
 
   // Pinned rivals always appear in full; the most actionable non-pinned tokens fill
@@ -153,4 +165,27 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
     );
   }
   return [...pinned, ...actionable.slice(0, room)];
+}
+
+/**
+ * Citizens that have emigrated — currently owned by the Emigration contract.
+ *
+ * These are excluded from `readTargets` and from every offense sweep, so this is the
+ * only place they surface. They're still live ERC-721s and still accrue delinquency, so
+ * the same status fields apply and the panel can show how far behind each one is; the
+ * difference is that nothing will ever be done about it by us or by them. The contract
+ * has no way to pay taxes or spend a bribe, so an emigrant's `epochsBehind` only grows
+ * until somebody else kills it.
+ *
+ * Sorted by token ID: this is a roster, not a work queue, so a stable order beats an
+ * actionability ranking that would reshuffle rows on every poll.
+ */
+export async function readEmigrated(): Promise<TargetTokenStatus[]> {
+  const snap = await getGameSnapshot();
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const live = await getLiveCandidates(snap.citizensAddress);
+  const emigrants = live.filter((t) => isEmigrated(t.owner));
+  if (emigrants.length === 0) return [];
+  const statuses = await batchGetTargetStatuses(emigrants, snap.currentEpoch, nowSec);
+  return statuses.sort((a, b) => (BigInt(a.tokenId) < BigInt(b.tokenId) ? -1 : 1));
 }

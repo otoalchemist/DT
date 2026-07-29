@@ -18,7 +18,7 @@ import {
 import { getGameSnapshot } from "./contract.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe } from "./strategy.js";
-import { readOwnedStatuses, readTargets } from "./service.js";
+import { readOwnedStatuses, readTargets, readEmigrated } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
 
 const strategyPatch = z
@@ -358,6 +358,16 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/targets", async (_req, reply) => {
     try {
       return await readTargets();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  // Citizens held by the Emigration contract — out of the main game, so they're
+  // filtered out of /api/targets and every offense sweep and listed only here.
+  app.get("/api/emigrated", async (_req, reply) => {
+    try {
+      return await readEmigrated();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
     }
