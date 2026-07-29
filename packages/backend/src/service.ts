@@ -4,6 +4,8 @@ import { runtime } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { makeIdCache } from "./id-cache.js";
+import { loadKeystore } from "./keystore.js";
+import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 
 // Read-only helpers used by the API for the dashboard (independent of the engine loop).
@@ -109,14 +111,34 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
     logger.debug(`readTargets: pinned=${pinnedSet.size} live=${live.length} livePinned=${livePinned}`);
   }
 
+  // Our own citizens are not rivals: the offense engine already refuses to audit a
+  // token we own (see offensePass / queuePreBoundaryAudits), so listing them here is
+  // only noise — and a delinquent one reads alarmingly like a kill target. Filter on
+  // the owner already carried by the live set, so this costs no extra lookup. Applies
+  // to pinned entries too: a self-pin is a mistake, not a target.
+  //
+  // Falls back to the keystore's address when the wallet is locked — it's stored in
+  // plaintext there (only the key is encrypted), so the panel doesn't change shape
+  // the moment you unlock.
+  const self = (runtime.account?.address ?? loadKeystore(appConfig.dataDir)?.address ?? null)?.toLowerCase() ?? null;
+  const isOurs = (t: TargetTokenStatus) => self !== null && t.owner.toLowerCase() === self;
+
   const pinned: TargetTokenStatus[] = [];
   const actionable: TargetTokenStatus[] = [];
+  let ownedSkipped = 0;
   for (const t of allStatuses) {
+    if (isOurs(t)) {
+      ownedSkipped++;
+      continue;
+    }
     if (pinnedSet.has(t.tokenId)) {
       pinned.push(t);
     } else if (t.delinquent || t.killable || t.auditDueTimestamp !== "0") {
       actionable.push(t);
     }
+  }
+  if (ownedSkipped > 0) {
+    logger.debug(`readTargets: excluded ${ownedSkipped} token(s) we own from the rival list`);
   }
 
   // Pinned rivals always appear in full; the most actionable non-pinned tokens fill
