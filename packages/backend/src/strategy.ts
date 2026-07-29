@@ -619,7 +619,9 @@ async function firePreBoundaryAudit(): Promise<void> {
  * to win the slot. Includes whichever of preBoundaryPay / preBoundaryAudit are enabled
  * (payment-only, audit-only, or both). Fires at the NEXT epoch boundary.
  */
-async function firePreBoundaryBundle(): Promise<void> {
+// Exported for tests: this is the atomic pay+audit+bid path, where per-citizen audit
+// capacity and the single shared coinbase bid have to hold together.
+export async function firePreBoundaryBundle(): Promise<void> {
   const s = runtime.strategy;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return;
