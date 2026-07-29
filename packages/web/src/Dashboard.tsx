@@ -348,6 +348,10 @@ export function Dashboard({
         <h2>Rival targets</h2>
         <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>My rivals ({myTargets.length})</div>
         <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." />
+        <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}>
+          Pinned rivals always appear here, even while paid up. Everything below is
+          shown only while it's delinquent, under audit, or killable.
+        </p>
         <div className="spacer" />
         <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
         <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />

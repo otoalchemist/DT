@@ -55,7 +55,33 @@ export async function prewarmTargets(): Promise<void> {
   }
 }
 
-export async function readTargets(outputLimit = 50): Promise<TargetTokenStatus[]> {
+/**
+ * Rank an actionable (non-pinned) rival by how much it deserves a slot when the
+ * output is capped: killable first, then under audit, then auditable, then merely
+ * delinquent — most-behind first within the last group.
+ *
+ * This has to run BEFORE the slice below. The dashboard sorts rows by the same
+ * priority, but it can only sort what it received: slicing in the raw owner-index
+ * order that Alchemy returns (which has nothing to do with actionability) could drop
+ * a killable rival at position 100 before the UI ever saw it.
+ */
+function actionableRank(t: TargetTokenStatus): number {
+  if (t.killable) return 0;
+  if (t.auditDueTimestamp !== "0") return 1;
+  if (t.auditable) return 2;
+  return 3;
+}
+
+/**
+ * Rival tokens for the dashboard panel. Pinned targets always come back in full;
+ * remaining slots go to the most actionable non-pinned rivals.
+ *
+ * `outputLimit` bounds only the non-pinned tail. The default is generous because the
+ * live citizen set shrinks as the game is played (~105 at epoch 149, from a minted
+ * range in the thousands) — the old limit of 50 was sized for the collection, not the
+ * survivors, and was quietly truncating ~12 of 62 delinquent rivals.
+ */
+export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[]> {
   const snap = await getGameSnapshot();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
 
@@ -93,6 +119,16 @@ export async function readTargets(outputLimit = 50): Promise<TargetTokenStatus[]
     }
   }
 
-  // Pinned rivals always appear in full; non-pinned actionable tokens fill remaining slots.
-  return [...pinned, ...actionable.slice(0, Math.max(0, outputLimit - pinned.length))];
+  // Pinned rivals always appear in full; the most actionable non-pinned tokens fill
+  // the remaining slots. Sort BEFORE slicing so the cap sheds the least interesting
+  // rivals rather than whatever happened to sit late in the owner index.
+  actionable.sort((a, b) => actionableRank(a) - actionableRank(b) || b.epochsBehind - a.epochsBehind);
+  const room = Math.max(0, outputLimit - pinned.length);
+  if (actionable.length > room) {
+    logger.debug(
+      `readTargets: ${actionable.length - room} actionable rival(s) beyond the ${outputLimit}-row cap ` +
+        `(lowest priority dropped first)`,
+    );
+  }
+  return [...pinned, ...actionable.slice(0, room)];
 }
