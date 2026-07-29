@@ -69,24 +69,25 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // bot sends separate bundles so audits keep their mempool fallback — so leaving it
   // on is safe and means a later bid "just works" without a second toggle to find.
   combinedBoundaryBundle: true,
-  // Payment gas — tuned to win the boundary bundle race: a ~15 gwei tip clears
-  // the observed batch-audit bundles (~3 gwei) with margin, dynamic tip scales it
-  // up in contested boundary blocks, and the base-fee cap is generous (boundary
-  // blocks run near-empty at <1 gwei, but the cap protects against a fee spike).
+  // Payment gas — tuned to win the boundary bundle race. Measured rivals tip up to
+  // ~29 gwei at the boundary (and one outlier at ~90), so a 20.1 gwei static tip
+  // clears the common field with margin and the dynamic tip can escalate to 69.1 in
+  // a contested block. The base-fee cap is generous (boundary blocks run near-empty
+  // at <1 gwei; the cap only guards against a fee spike).
   maxBaseFeeGwei: 69.1,
-  priorityFeeGwei: 15.1,
+  priorityFeeGwei: 20.1,
   minBalanceEth: 0.01,
   // Offense (audit/kill) bids its own gas, independent of payments — it's a race
-  // against rivals where a payment isn't, so it carries a higher static tip and a
-  // tighter base-fee cap.
+  // against rivals where a payment isn't. Matched to the payment ceilings so an
+  // audit isn't the weak link at a contested boundary.
   separateOffenseGas: true,
-  offenseMaxBaseFeeGwei: 25.1,
-  offensePriorityFeeGwei: 10.1,
+  offenseMaxBaseFeeGwei: 69.1,
+  offensePriorityFeeGwei: 20.1,
   offenseDynamicTipEnabled: true,
-  offenseDynamicTipMaxGwei: 20.1,
+  offenseDynamicTipMaxGwei: 69.1,
   racePublicMempool: true,
   dynamicTipEnabled: true,
-  dynamicTipMaxGwei: 50.1,
+  dynamicTipMaxGwei: 69.1,
   coinbaseBidEth: 0, // off; flat builder payment for top-of-block, opt-in
   // Shared CoinbasePayer forwarder (verified on-chain to forward 100% to
   // block.coinbase). Only used when coinbaseBidEth > 0; deploy your own if you'd
@@ -105,7 +106,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
  * Tied to this constant rather than VERSION so an unrelated release doesn't reset
  * anyone's tuning.
  */
-export const DEFAULTS_VERSION = 2;
+export const DEFAULTS_VERSION = 3;
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT

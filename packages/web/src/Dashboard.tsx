@@ -138,6 +138,25 @@ export function Dashboard({
   const [tokenBusy, setTokenBusy] = useState<string | null>(null);
   const [tokenMsg, setTokenMsg] = useState<{ id: string; text: string; err: boolean } | null>(null);
   const runTokenAction = async (tokenId: string, action: "pay" | "bribe") => {
+    // Both actions submit a REAL transaction with real ETH the moment they're
+    // confirmed, so spell out the cost and the consequence before doing anything.
+    const t = tokens.find((x) => x.tokenId === tokenId);
+    const behind = t ? Number(BigInt(t.currentEpoch) - BigInt(t.lastEpochPaid)) : 0;
+    const warning =
+      action === "pay"
+        ? `Pay ${weiToEth(t?.estimatedPayWei ?? "0")} ETH to make Citizen #${tokenId} current?\n\n` +
+          `This sends a REAL transaction with real ETH, at normal network gas.\n` +
+          `#${tokenId} is ${behind} epoch(s) behind — the contract settles every ` +
+          `delinquent epoch at once, so the full amount above is charged.` +
+          (t?.auditDueTimestamp !== "0" ? `\n\nIts active audit will also be cleared.` : "")
+        : `Spend 1 bribe to clear the audit on Citizen #${tokenId}?\n\n` +
+          `This sends a REAL transaction (gas only) at normal network gas.\n\n` +
+          `WARNING: a bribe clears the AUDIT but pays NO tax. #${tokenId} stays ` +
+          `${behind} epoch(s) behind and can be audited again immediately. ` +
+          `The bribe is consumed and cannot be recovered.\n\n` +
+          `To actually make it current, use "Pay to current" instead.`;
+    if (!confirm(warning)) return;
+
     setTokenBusy(`${tokenId}:${action}`);
     setTokenMsg(null);
     try {
