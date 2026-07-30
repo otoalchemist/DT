@@ -164,10 +164,16 @@ export function JitPanel({
             CITIZENS THE BOT MAY PAY
           </div>
           <p className="muted" style={{ fontSize: 11, margin: "0 0 6px 0", lineHeight: 1.5 }}>
-            Unchecking a citizen stops <b>every</b> automatic payment for it — JIT, proactive
-            and defense. It is saved immediately and survives reloads. An unchecked citizen
-            will go delinquent, can be audited, and can eventually be <b>killed</b>: nothing
-            automatic will rescue it. Pay it yourself from the token row when you choose to.
+            Unchecking a citizen stops <b>every</b> automatic payment for it — JIT and
+            proactive. Saved immediately; survives reloads. An unchecked citizen will go
+            delinquent, can be audited, and can eventually be <b>killed</b>: nothing automatic
+            will rescue it (there is no auto-pay after an audit for <i>any</i> citizen). Pay it
+            yourself from the token row when you choose to.
+          </p>
+          <p className="muted" style={{ fontSize: 11, margin: "0 0 6px 0", lineHeight: 1.5 }}>
+            This is a <b>payment</b> opt-out only — an unchecked citizen <b>still audits rivals</b>
+            up to its full audit capacity. It stops being a usable auditor on its own once it
+            falls 2+ epochs behind, since the game forbids an auditable token from auditing.
           </p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {tokens.map((t) => {

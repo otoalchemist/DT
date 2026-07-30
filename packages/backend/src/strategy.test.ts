@@ -326,6 +326,20 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
     expect(auditCalls).toHaveLength(1);
   });
 
+  it("an EXCLUDED citizen still audits — payment opt-out is not an offense opt-out", async () => {
+    // excludedTokenIds means "never PAY this citizen". It must not remove it from the
+    // auditor pool: an unchecked citizen should still spend its full auditLimit on
+    // rivals. (Its eligibility still lapses on its own once it drifts 2+ epochs behind,
+    // because the contract forbids an auditable token from auditing — but that's the
+    // game's rule, not an exclusion effect.)
+    runtime.strategy = { ...runtime.strategy, excludedTokenIds: ["1"] };
+    const queued = await queuePreBoundaryAudits(ADDR, TARGET_EPOCH, 0n, 0n, { revertible: false });
+    expect(queued).toBe(true);
+    expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(1);
+    // ...and it audited FROM the excluded token #1.
+    expect(vi.mocked(encodeAudit).mock.calls.map(([from]) => String(from))).toContain("1");
+  });
+
   it("does NOT queue when #1612 is paid up (not auditable at the boundary)", async () => {
     vi.mocked(batchGetTargetStatuses).mockResolvedValue([
       {

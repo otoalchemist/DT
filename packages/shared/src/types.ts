@@ -108,6 +108,11 @@ export interface StrategyConfig {
    * An excluded citizen is left entirely to the user: it will go delinquent, can be
    * audited, and can eventually be killed. Nothing automatic will rescue it — use the
    * manual "Pay to current" button on the token row.
+   *
+   * This is a PAYMENT opt-out only — it is NOT an offense opt-out. An excluded citizen
+   * is still used as an audit "from" token and still spends its full `auditLimit` on
+   * rivals. Note its auditor eligibility lapses on its own once it drifts 2+ epochs
+   * behind, since the contract forbids an auditable token from auditing.
    */
   excludedTokenIds: string[];
   /** ADVANCED: pre-submit the JIT payment ~preBoundaryLeadMs *before* the target
