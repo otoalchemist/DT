@@ -33,6 +33,10 @@ vi.mock("./chain.js", () => ({
     ),
   },
   getLatestBlockCached: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n, number: 100n, gasUsed: 0n, gasLimit: 30_000_000n })), // 10 gwei
+  // Balance is read through the cache now; mirror publicClient.getBalance's 10 ETH.
+  getBalanceCached: vi.fn(async () => 10_000_000_000_000_000_000n),
+  invalidateBalanceCache: vi.fn(),
+  primeBlockCache: vi.fn(),
   wsClient: null, // force the 12s-poll fallback path, no block-watch subscription to simulate
 }));
 
@@ -110,10 +114,10 @@ vi.mock("./contract.js", () => ({
 
 const { submitTx, queueCoinbaseBid, beginBundle } = await import("./flashbots.js");
 const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tokens.js");
-const { filterLiveTokenIds, batchGetTargetStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
+const { filterLiveTokenIds, batchGetTargetStatuses, batchGetOwnedStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle } =
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, defensePass } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -396,13 +400,18 @@ describe("combined boundary bundle with multiple citizens", () => {
 
     vi.mocked(fetchOwnedTokenIds).mockResolvedValue(OWNED);
     // Per-token multicall: auditLimit from LIMITS, lastEpochPaid = 1 behind the target.
+    // lastEpochPaid = 1 behind (owes a payment, still auditor-eligible), auditLimit per
+    // LIMITS, and auditDueTimestamp 0 = NOT under audit (an audited citizen is never
+    // auto-paid, so a nonzero value here would correctly suppress every payment).
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
         result:
           c.functionName === "auditLimit"
             ? (LIMITS[String(c.args[0])] ?? 1n)
-            : TARGET_EPOCH - 1n, // lastEpochPaid: 1 behind -> owes a payment, still auditor-eligible
+            : c.functionName === "auditDueTimestamp"
+              ? 0n
+              : TARGET_EPOCH - 1n,
       })) ) as never);
     vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
       ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
@@ -498,7 +507,7 @@ describe("combined boundary bundle with multiple citizens", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? (LIMITS[String(c.args[0])] ?? 1n) : TARGET_EPOCH,
+        result: c.functionName === "auditLimit" ? (LIMITS[String(c.args[0])] ?? 1n) : c.functionName === "auditDueTimestamp" ? 0n : TARGET_EPOCH,
       })) ) as never);
 
     await firePreBoundaryBundle();
@@ -513,13 +522,117 @@ describe("combined boundary bundle with multiple citizens", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : TARGET_EPOCH, // current -> nothing owed
+        result: c.functionName === "auditLimit" ? 1n : c.functionName === "auditDueTimestamp" ? 0n : TARGET_EPOCH, // current -> nothing owed
       })) ) as never);
 
     await firePreBoundaryBundle();
 
     expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
     expect(vi.mocked(queueCoinbaseBid)).not.toHaveBeenCalled();
+  });
+});
+
+// An audited citizen must NEVER be paid automatically — catching up after an audit is
+// the user's decision (the manual "Pay to current" button). Regression guard: this used
+// to auto-pay any audited owned token within auditSafetyBufferSeconds, ignoring the JIT
+// checkboxes entirely, which paid a citizen the user had unchecked.
+describe("audited citizens are never auto-paid", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtime.account = { address: ADDR } as unknown as PrivateKeyAccount;
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.balanceWei = 10_000_000_000_000_000_000n;
+    runtime.currentEpoch = 150n;
+    runtime.startTime = 0n;
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    // Owned token #1 is UNDER AUDIT and inside the safety buffer — the exact state that
+    // previously triggered an automatic pay-to-clear.
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([
+      {
+        tokenId: "1",
+        lastEpochPaid: "148",
+        currentEpoch: "150",
+        auditDueTimestamp: String(Math.floor(Date.now() / 1000) + 600), // expires in 10min
+        secondsUntilKillable: 600,
+        bribeBalance: "0",
+        hasLifeInsurance: false,
+        risk: "at-risk",
+        estimatedPayWei: "1000000000000000",
+      },
+    ]);
+  });
+
+  afterEach(() => {
+    runtime.account = null;
+    runtime.running = false;
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    // Restore the module-factory behaviour rather than mockReset(), which strips the
+    // implementation entirely and left later describes reading `undefined` statuses.
+    vi.mocked(batchGetOwnedStatuses).mockImplementation(async (tokenIds: bigint[], currentEpoch: bigint) =>
+      tokenIds.map((tokenId) => ({
+        tokenId: tokenId.toString(),
+        lastEpochPaid: LAST_EPOCH_PAID.toString(),
+        currentEpoch: currentEpoch.toString(),
+        auditDueTimestamp: "0",
+        secondsUntilKillable: null,
+        bribeBalance: "0",
+        hasLifeInsurance: false,
+        risk: isAuditableStub(LAST_EPOCH_PAID, currentEpoch) ? "delinquent" : "safe",
+        estimatedPayWei: "1000000000000000",
+      })) as never,
+    );
+  });
+
+  it("submits nothing for an audited citizen with autoUseBribe off (the default)", async () => {
+    runtime.strategy = { ...DEFAULT_STRATEGY, enabled: true, autoUseBribe: false, offenseEnabled: false };
+    await defensePass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
+    // ...and it doesn't even read status: with no action available the pass is a no-op.
+    expect(vi.mocked(batchGetOwnedStatuses)).not.toHaveBeenCalled();
+  });
+
+  it("spends a held bribe only when autoUseBribe is explicitly on — never a payment", async () => {
+    runtime.strategy = { ...DEFAULT_STRATEGY, enabled: true, autoUseBribe: true, offenseEnabled: false };
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([
+      {
+        tokenId: "1", lastEpochPaid: "148", currentEpoch: "150",
+        auditDueTimestamp: String(Math.floor(Date.now() / 1000) + 600),
+        secondsUntilKillable: 600, bribeBalance: "1", hasLifeInsurance: false,
+        risk: "at-risk", estimatedPayWei: "1000000000000000",
+      },
+    ]);
+    await defensePass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    const calls = vi.mocked(submitTx).mock.calls;
+    expect(calls.filter(([i]) => i.data === "0xPAYTAXES")).toHaveLength(0); // never pays
+    expect(calls.filter(([i]) => i.data === "0xBRIBE")).toHaveLength(1);
+  });
+
+  it("JIT does not pay an audited citizen either, even when checked and armed", async () => {
+    // The JIT path is the one that pays a CHECKED citizen at the boundary. It must also
+    // refuse once that citizen is under audit — otherwise "no automatic payment after an
+    // audit" would only hold for defense.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      enabled: true, offenseEnabled: false, autoUseBribe: false,
+      jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
+    };
+    const { jitPass } = await import("./strategy.js");
+    await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xPAYTAXES")).toHaveLength(0);
+  });
+
+  it("skips an excluded citizen even on the bribe path", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, enabled: true, autoUseBribe: true, offenseEnabled: false,
+      excludedTokenIds: ["1"],
+    };
+    await defensePass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
+    expect(vi.mocked(batchGetOwnedStatuses)).not.toHaveBeenCalled();
   });
 });
 

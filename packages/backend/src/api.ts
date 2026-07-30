@@ -32,6 +32,7 @@ const strategyPatch = z
     jitEnabled: z.boolean(),
     jitTargetEpoch: z.number().int().min(1).nullable(),
     jitTokenIds: z.array(z.string()),
+    excludedTokenIds: z.array(z.string()),
     preBoundaryPay: z.boolean(),
     preBoundaryLeadMs: z.number().int().min(250).max(8000),
     preBoundaryLeadMainnetMs: z.number().int().min(250).max(11000),

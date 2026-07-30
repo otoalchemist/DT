@@ -102,6 +102,16 @@ export interface StrategyConfig {
   jitTargetEpoch: number | null;
   /** Specific tokenIds to cover; empty = all owned citizens. */
   jitTokenIds: string[];
+  /**
+   * Citizens the bot must NEVER pay, on any path — defense, proactive-pay and JIT all
+   * skip these. This is a persistent per-citizen opt-out (the unchecked boxes in the
+   * JIT panel), not a one-off selection like `jitTokenIds`.
+   *
+   * An excluded citizen is left entirely to the user: it will go delinquent, can be
+   * audited, and can eventually be killed. Nothing automatic will rescue it — use the
+   * manual "Pay to current" button on the token row.
+   */
+  excludedTokenIds: string[];
   /** ADVANCED: pre-submit the JIT payment ~preBoundaryLeadMs *before* the target
    *  epoch boundary so it lands in the FIRST block of the epoch (ahead of a
    *  batch-auditor), instead of the block after. The value is computed off-chain

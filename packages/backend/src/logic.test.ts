@@ -14,6 +14,7 @@ import {
   cappedAutoPayEpochs,
   autoPayCapWei,
   withinAutoPayCap,
+  excludedTokenSet,
   orderBySalt,
   resolveJitTarget,
 } from "./logic.js";
@@ -139,6 +140,30 @@ describe("spend guardrails", () => {
     it("never returns less than 1", () => {
       expect(cappedAutoPayEpochs(0, 1)).toBe(1);
       expect(cappedAutoPayEpochs(1, 0)).toBe(1);
+    });
+  });
+
+  describe("excludedTokenSet (never-pay opt-out)", () => {
+    it("normalizes ids so padded/hex forms still match", () => {
+      // The offense pin list had exactly this bug: an entry that didn't string-match its
+      // canonical form was silently skipped. Here a miss would PAY a citizen the user
+      // deliberately abandoned, so every form must collapse to the same key.
+      const { set } = excludedTokenSet(["206", "0206", "0x00ce", "1612"]);
+      expect(set.has("206")).toBe(true);
+      expect(set.has("1612")).toBe(true);
+      expect(set.size).toBe(2); // 206 / 0206 / 0xce are one citizen
+    });
+
+    it("reports unparseable entries instead of silently dropping them", () => {
+      const { set, invalid } = excludedTokenSet(["206", "not-a-token", ""]);
+      expect(set.has("206")).toBe(true);
+      expect(invalid).toEqual(["not-a-token", ""]);
+    });
+
+    it("is empty for an empty list, so nothing is excluded by default", () => {
+      const { set, invalid } = excludedTokenSet([]);
+      expect(set.size).toBe(0);
+      expect(invalid).toEqual([]);
     });
   });
 

@@ -51,6 +51,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   jitEnabled: false,
   jitTargetEpoch: null,
   jitTokenIds: [],
+  // Per-citizen "never pay" opt-out. Deliberately NOT a RECOMMENDED_FIELD: it's a user
+  // decision about their own citizens, so a defaults-version bump must never silently
+  // re-enable payments on a citizen they chose to abandon.
+  excludedTokenIds: [],
   preBoundaryPay: true,
   preBoundaryLeadMs: 3000,
   preBoundaryLeadMainnetMs: 5000,

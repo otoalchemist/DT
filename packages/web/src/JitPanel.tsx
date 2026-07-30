@@ -30,12 +30,15 @@ export function JitPanel({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [, setNowTick] = useState(0);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [excludeBusy, setExcludeBusy] = useState<string | null>(null);
 
-  // Default: all tokens selected.
-  useEffect(() => {
-    setSelected(new Set(tokens.map((t) => t.tokenId)));
-  }, [tokens.map((t) => t.tokenId).join(",")]);
+  // A citizen is "selected" (the bot may pay it) unless it's on the persisted exclusion
+  // list. Derived from config rather than held in local state: the old local-only
+  // Set defaulted to all-checked and silently reset to all whenever the owned-token
+  // list changed or the page reloaded, so an unchecked citizen could quietly become
+  // checked again.
+  const excluded = new Set(config?.excludedTokenIds ?? []);
+  const selected = new Set(tokens.map((t) => t.tokenId).filter((id) => !excluded.has(id)));
 
   // 1s clock so the countdown updates.
   useEffect(() => {
@@ -61,13 +64,23 @@ export function JitPanel({
   const totalWei =
     targetEpoch !== null ? (BigInt(targetEpoch) * BASE_TAX_RATE_WEI * BigInt(nSelected)).toString() : "0";
 
-  const toggleToken = (id: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  // Persist immediately. This is a standing instruction about real money, so it must
+  // not depend on the user remembering to press a save button, and must survive reloads.
+  const toggleToken = async (id: string) => {
+    if (!config) return;
+    const next = new Set(config.excludedTokenIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setExcludeBusy(id);
+    setErr(null);
+    try {
+      const saved = await api.setConfig({ excludedTokenIds: [...next] });
+      onConfigSaved(saved);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setExcludeBusy(null);
+    }
   };
 
   const arm = async () => {
@@ -145,43 +158,47 @@ export function JitPanel({
         <div className="stat"><span className="label">Est. total</span><span className="value">{weiToEth(totalWei, 5)} ETH</span></div>
       </div>
 
-      {tokens.length > 1 && (
+      {tokens.length > 0 && (
         <div style={{ marginBottom: 12 }}>
-          <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
-            SELECT CITIZENS TO ARM
-            <button
-              className="ghost"
-              style={{ fontSize: 11, padding: "1px 8px", marginLeft: 8 }}
-              onClick={() => setSelected(new Set(tokens.map((t) => t.tokenId)))}
-            >all</button>
-            <button
-              className="ghost"
-              style={{ fontSize: 11, padding: "1px 8px", marginLeft: 4 }}
-              onClick={() => setSelected(new Set())}
-            >none</button>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+            CITIZENS THE BOT MAY PAY
           </div>
+          <p className="muted" style={{ fontSize: 11, margin: "0 0 6px 0", lineHeight: 1.5 }}>
+            Unchecking a citizen stops <b>every</b> automatic payment for it — JIT, proactive
+            and defense. It is saved immediately and survives reloads. An unchecked citizen
+            will go delinquent, can be audited, and can eventually be <b>killed</b>: nothing
+            automatic will rescue it. Pay it yourself from the token row when you choose to.
+          </p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {tokens.map((t) => (
+            {tokens.map((t) => {
+              const on = selected.has(t.tokenId);
+              return (
               <label
                 key={t.tokenId}
+                title={on
+                  ? `#${t.tokenId} is covered by automatic payments`
+                  : `#${t.tokenId} is EXCLUDED — the bot will never pay it`}
                 style={{
                   display: "flex", alignItems: "center", gap: 5,
-                  padding: "3px 10px", borderRadius: 6, cursor: "pointer",
-                  border: `1px solid ${selected.has(t.tokenId) ? "var(--accent)" : "var(--border)"}`,
-                  background: selected.has(t.tokenId) ? "rgba(91,157,255,0.1)" : "transparent",
+                  padding: "3px 10px", borderRadius: 6,
+                  cursor: excludeBusy ? "wait" : "pointer",
+                  opacity: excludeBusy === t.tokenId ? 0.5 : 1,
+                  border: `1px solid ${on ? "var(--accent)" : "var(--red)"}`,
+                  background: on ? "rgba(91,157,255,0.1)" : "rgba(255,92,92,0.08)",
                   fontSize: 12, fontFamily: "monospace",
                 }}
               >
                 <input
                   type="checkbox"
                   style={{ width: "auto" }}
-                  checked={selected.has(t.tokenId)}
-                  onChange={() => toggleToken(t.tokenId)}
-                  disabled={armed}
+                  checked={on}
+                  onChange={() => void toggleToken(t.tokenId)}
+                  disabled={excludeBusy !== null}
                 />
                 #{t.tokenId}
               </label>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

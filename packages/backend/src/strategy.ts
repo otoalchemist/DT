@@ -1,6 +1,6 @@
 import { parseEther, formatEther, type Address } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
-import { publicClient, wsClient, getLatestBlockCached } from "./chain.js";
+import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { activity } from "./activity.js";
@@ -23,7 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, type TxIntent, type SubmitResult } from "./flashbots.js";
-import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, orderBySalt } from "./logic.js";
+import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, excludedTokenSet, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
@@ -163,9 +163,14 @@ export function startEngine(): void {
   }
 
   if (wsClient) {
-    // React on every new block (~100-500ms latency vs up to 12s with polling).
+    // React on every new block (~100-500ms latency vs up to 12s with polling). The
+    // subscription already carries the full header, so hand it to the block cache
+    // instead of letting the tick re-fetch the same block over HTTP.
     unwatchBlocks = wsClient.watchBlocks({
-      onBlock: () => void tick(),
+      onBlock: (block) => {
+        primeBlockCache(block);
+        void tick();
+      },
       onError: (err) => logger.warn("Block subscription error:", (err as Error).message),
     });
     activity.add({ kind: "info", status: "info", message: "Block subscription active (WebSocket)" });
@@ -263,19 +268,39 @@ async function queuePreBoundaryPayments(address: Address, targetEpoch: bigint, b
   const s = runtime.strategy;
   const paid = new Set<string>();
   const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
-  const selected = s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds;
+  const selected = applyExclusions(
+    s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds,
+    "pre-boundary pay",
+  );
   if (selected.length === 0) return paid;
 
   const results = await publicClient.multicall({
     allowFailure: true,
-    contracts: selected.map((id) => ({ ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const })),
+    // auditDueTimestamp rides the SAME multicall as lastEpochPaid, so guarding against
+    // an audited citizen costs no extra round-trip in this boundary race.
+    contracts: selected.flatMap((id) => [
+      { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditDueTimestamp" as const, args: [id] as const },
+    ]),
   });
   for (let i = 0; i < selected.length; i++) {
-    const r = results[i];
-    if (r?.status !== "success") continue;
+    const r = results[i * 2];
+    const due = results[i * 2 + 1];
+    if (r?.status !== "success" || due?.status !== "success") continue;
     const lastEpochPaid = r.result as bigint;
     if (lastEpochPaid >= targetEpoch) continue; // already current for the target
     const key = selected[i]!.toString();
+    // Never pay a citizen that is already under audit — catching up after an audit is
+    // the user's decision alone (manual "Pay to current"), on every path including JIT.
+    if ((due.result as bigint) > 0n) {
+      activity.add({
+        kind: "pay-taxes",
+        status: "skipped",
+        tokenId: key,
+        message: `Skip pre-boundary pay #${key}: under audit — automatic payment after an audit is disabled; pay it manually if you want to catch up`,
+      });
+      continue;
+    }
     // JIT always pays exactly one epoch — one day (targetEpoch * base) — which
     // advances the citizen a single epoch regardless of how far behind it is.
     const value = preBoundaryTaxWei(lastEpochPaid, targetEpoch, 1, BASE_TAX_RATE_WEI);
@@ -326,6 +351,30 @@ async function firePreBoundaryPay(): Promise<void> {
 
 /** Queue the coinbase bid into the open batch if configured. Shared by the payment
  *  and combined fires. No-op unless coinbaseBidEth > 0 and a payer is set. */
+/**
+ * Drop citizens the user has excluded from ALL automatic payment. Every payment path
+ * funnels through here so "unchecked" means the same thing everywhere — defense,
+ * proactive-pay and both JIT paths — rather than only scoping a single JIT arm (the
+ * behaviour that previously paid a citizen the user had unchecked).
+ *
+ * A malformed entry is logged once per pass rather than silently ignored: a typo that
+ * failed to match would pay a citizen the user meant to abandon.
+ */
+function applyExclusions(ids: bigint[], context: string): bigint[] {
+  const s = runtime.strategy;
+  if (s.excludedTokenIds.length === 0) return ids;
+  const { set, invalid } = excludedTokenSet(s.excludedTokenIds);
+  if (invalid.length > 0) {
+    logger.warn(`${context}: ignoring unparseable excluded token id(s): ${invalid.join(", ")}`);
+  }
+  const kept = ids.filter((id) => !set.has(id.toString()));
+  const dropped = ids.length - kept.length;
+  if (dropped > 0) {
+    logger.debug(`${context}: skipped ${dropped} excluded citizen(s)`);
+  }
+  return kept;
+}
+
 async function maybeQueueCoinbaseBid(): Promise<void> {
   const s = runtime.strategy;
   if (s.coinbaseBidEth > 0 && s.coinbasePayerAddress) {
@@ -831,7 +880,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
   // instead of each re-reading the block for the base fee.
   const [snap, balance, latest] = await Promise.all([
     getGameSnapshot(),
-    publicClient.getBalance({ address }),
+    getBalanceCached(address),
     getLatestBlockCached(),
   ]);
   runtime.gameState = snap.state;
@@ -952,6 +1001,9 @@ async function act(
       return result;
     }
     runtime.recordSpend(result.valueWei + result.gasWei);
+    // The cached balance now predates a spend — drop it so the next tick's
+    // min-balance check reads the real post-spend balance rather than stale headroom.
+    invalidateBalanceCache();
     // Count it against this tick's budget so later canSpend checks in the same
     // tick see the reduced headroom.
     committedThisTickWei += result.valueWei + result.gasWei;
@@ -991,71 +1043,46 @@ async function act(
   }
 }
 
-async function defensePass(
+// Exported for tests: the guarantee that an audited citizen is never auto-paid is a
+// money-safety property, so it's asserted directly rather than through a whole tick.
+export async function defensePass(
   ownedIds: bigint[],
   currentEpoch: bigint,
   nowSec: bigint,
 ): Promise<void> {
   const s = runtime.strategy;
-  // Cap how many epochs a single auto payment covers (the on-chain estimate is
-  // read for this many). Default cap 1 = pay one day to clear, as before.
-  const epochs = cappedAutoPayEpochs(s.prepayEpochs, s.maxAutoPayEpochs);
-  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, epochs);
+  // An audited citizen is NEVER paid automatically — catching up after an audit is a
+  // deliberate, user-initiated decision (the "Pay to current" button on the token row).
+  // The only thing defense may still do is spend an already-held bribe, and only when
+  // the user opted into that explicitly. With autoUseBribe off there is nothing for
+  // this pass to do, so skip the status read entirely rather than polling for nothing.
+  if (!s.autoUseBribe) return;
+
+  const excluded = excludedTokenSet(s.excludedTokenIds).set;
+  const eligible = ownedIds.filter((id) => !excluded.has(id.toString()));
+  if (eligible.length === 0) return;
+
+  const statuses = await batchGetOwnedStatuses(eligible, currentEpoch, nowSec, 1);
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const underAudit = st.auditDueTimestamp !== "0";
     const bribes = BigInt(st.bribeBalance);
+    if (!underAudit || (st.secondsUntilKillable ?? 0) > s.auditSafetyBufferSeconds) continue;
+    if (bribes === 0n) continue; // nothing free to spend; leave it to the user
 
-    // 1) Under audit and within safety buffer -> clear it.
-    if (underAudit && (st.secondsUntilKillable ?? 0) <= s.auditSafetyBufferSeconds) {
-      // Only spend a bribe if the user opted in — a bribe clears the audit for free
-      // but is consumed and leaves the token delinquent (re-auditable), so by
-      // default we pay taxes to clear instead and never auto-consume bribes.
-      if (s.autoUseBribe && bribes > 0n) {
-        // Bribe is free (value 0) but still costs gas — apply the same guardrail
-        // as the pay-to-clear path below so the base-fee cap holds consistently.
-        const guard = await canSpend(0n, false);
-        if (!guard.ok) {
-          activity.add({ kind: "use-bribe", status: "skipped", tokenId: st.tokenId, message: `Defer bribe clear #${st.tokenId}: ${guard.reason}` });
-          continue;
-        }
-        await act(
-          { to: appConfig.gameAddress, data: encodeUseBribe(tokenId), value: 0n },
-          "use-bribe",
-          { tokenId: st.tokenId, message: `Clear audit on #${st.tokenId} with bribe` },
-        );
-        continue;
-      }
-      const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
-      // Auto-Pay Limit as a SPEND cap. The contract force-settles every delinquent
-      // epoch, so a token N behind is quoted Nx even at n=1 — clamping `epochs`
-      // alone can't hold the limit. Decline instead of overspending; the token is
-      // left delinquent (and killable once its audit expires), which is the
-      // deliberate trade-off of setting a limit at all.
-      if (!withinAutoPayCap(value, s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI)) {
-        const cap = autoPayCapWei(s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI);
-        activity.add({
-          kind: "pay-taxes",
-          status: "skipped",
-          tokenId: st.tokenId,
-          message:
-            `Skip audit-clearing pay #${st.tokenId}: ${formatEther(value)} ETH exceeds Auto-Pay Limit ` +
-            `(${s.maxAutoPayEpochs} epoch = ${formatEther(cap)} ETH) — token is ${Number(currentEpoch - BigInt(st.lastEpochPaid))} epoch(s) behind and stays delinquent`,
-        });
-        continue;
-      }
-      const guard = await canSpend(value, false);
-      if (!guard.ok) {
-        activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer pay #${st.tokenId}: ${guard.reason}` });
-        continue;
-      }
-      await act(
-        { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, epochs), value },
-        "pay-taxes",
-        { tokenId: st.tokenId, message: `Pay taxes on audited #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
-      );
+    // A bribe clears the AUDIT without paying tax — the citizen stays delinquent and
+    // is immediately re-auditable. It costs gas only, but still honours the base-fee
+    // guardrail so it can't fire into a fee spike.
+    const guard = await canSpend(0n, false);
+    if (!guard.ok) {
+      activity.add({ kind: "use-bribe", status: "skipped", tokenId: st.tokenId, message: `Defer bribe clear #${st.tokenId}: ${guard.reason}` });
       continue;
     }
+    await act(
+      { to: appConfig.gameAddress, data: encodeUseBribe(tokenId), value: 0n },
+      "use-bribe",
+      { tokenId: st.tokenId, message: `Clear audit on #${st.tokenId} with bribe (still delinquent afterwards)` },
+    );
   }
 }
 
@@ -1078,7 +1105,9 @@ async function proactivePayPass(
   // Cap how many epochs a single auto payment covers (so it can't spend a large
   // multi-day catch-up in one shot); the on-chain estimate is read for that many.
   const epochs = cappedAutoPayEpochs(s.prepayEpochs, s.maxAutoPayEpochs);
-  const statuses = await batchGetOwnedStatuses(ownedIds, currentEpoch, nowSec, epochs);
+  const payable = applyExclusions(ownedIds, "proactive pay");
+  if (payable.length === 0) return;
+  const statuses = await batchGetOwnedStatuses(payable, currentEpoch, nowSec, epochs);
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const key = st.tokenId;
@@ -1121,7 +1150,9 @@ async function proactivePayPass(
  * one epoch for each selected token the moment the chain reaches that epoch, then
  * auto-disarms. Reads the exact owed amount on-chain so the value is always correct.
  */
-async function jitPass(
+// Exported for tests alongside defensePass: "never auto-pay an audited citizen" has to
+// hold on the JIT path too, since that's the path that pays a CHECKED citizen.
+export async function jitPass(
   ownedIds: bigint[],
   currentEpoch: bigint,
   nowSec: bigint,
@@ -1137,7 +1168,10 @@ async function jitPass(
     jitSubmittedTarget = target;
   }
 
-  const selected = s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds;
+  const selected = applyExclusions(
+    s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds,
+    "JIT pay",
+  );
   if (selected.length === 0) return; // nothing owned yet — stay armed
 
   const statuses = await batchGetOwnedStatuses(selected, currentEpoch, nowSec, 1);
@@ -1148,6 +1182,19 @@ async function jitPass(
 
     if (BigInt(st.lastEpochPaid) >= currentEpoch) {
       jitSubmitted.add(key); // already current for this epoch
+      continue;
+    }
+    // Never pay a citizen that is already under audit — on ANY path. Recovering an
+    // audited citizen is a deliberate user action (manual "Pay to current"), so mark it
+    // handled and leave it alone rather than retrying every tick.
+    if (st.auditDueTimestamp !== "0") {
+      jitSubmitted.add(key);
+      activity.add({
+        kind: "pay-taxes",
+        status: "skipped",
+        tokenId: key,
+        message: `Skip JIT pay #${key}: under audit — automatic payment after an audit is disabled; pay it manually if you want to catch up`,
+      });
       continue;
     }
     // JIT pays exactly one epoch — one day — which advances the citizen a single

@@ -112,6 +112,36 @@ export function preBoundaryTaxWei(
 }
 
 /**
+ * The set of citizens the bot must never pay, normalized through BigInt so "0206",
+ * "206" and "0xce" all compare equal to the canonical "206".
+ *
+ * The same normalization bug already bit the offense pin list (a pin that didn't
+ * string-match its canonical form was silently skipped). Here the failure mode is
+ * worse than a missed audit: an exclusion that fails to match would pay a citizen the
+ * user explicitly abandoned. Unparseable entries are dropped rather than poisoning the
+ * whole set — but the caller logs them so a typo can't hide.
+ */
+export function excludedTokenSet(ids: string[]): { set: Set<string>; invalid: string[] } {
+  const set = new Set<string>();
+  const invalid: string[] = [];
+  for (const raw of ids) {
+    const trimmed = raw.trim();
+    // BigInt("") is 0n, not an error — so a blank entry would silently exclude token
+    // #0 rather than being reported. Reject blanks explicitly.
+    if (trimmed === "") {
+      invalid.push(raw);
+      continue;
+    }
+    try {
+      set.add(BigInt(trimmed).toString());
+    } catch {
+      invalid.push(raw);
+    }
+  }
+  return { set, invalid };
+}
+
+/**
  * How many epochs a single automatic payTaxes should request: the requested count,
  * clamped to the global `maxAutoPayEpochs` cap and to at least 1.
  *

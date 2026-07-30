@@ -9,6 +9,7 @@
   "jitEnabled": false,
   "jitTargetEpoch": null,
   "jitTokenIds": [],
+  "excludedTokenIds": [],
   "preBoundaryPay": true,
   "preBoundaryLeadMs": 3000,
   "preBoundaryLeadMainnetMs": 5000,
