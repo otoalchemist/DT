@@ -117,7 +117,7 @@ const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tok
 const { filterLiveTokenIds, batchGetTargetStatuses, batchGetOwnedStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle } =
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, resetJitState } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -555,6 +555,9 @@ describe("audited citizens are never auto-paid", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // jitSubmitted is module-level and persists across tests at the same target epoch,
+    // so clear it or a citizen marked by an earlier test leaks in and skews the disarm.
+    resetJitState();
     runtime.account = { address: ADDR } as unknown as PrivateKeyAccount;
     runtime.running = true;
     runtime.gameState = 1;
@@ -639,6 +642,37 @@ describe("audited citizens are never auto-paid", () => {
     const { jitPass } = await import("./strategy.js");
     await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xBRIBE")).toHaveLength(0);
+  });
+
+  it("a failed JIT payment is NOT marked covered, so it retries and does not disarm", async () => {
+    // Regression: act() returns the failed result object (truthy) on a submission
+    // failure, and `if (res) jitSubmitted.add(key)` marked the citizen covered anyway.
+    // Because the one-shot disarm fires once every selected citizen is marked, a single
+    // failure ended the whole JIT session with that citizen unpaid — with several
+    // citizens, one silently gets dropped.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
+    };
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([
+      {
+        tokenId: "1", lastEpochPaid: "149", currentEpoch: "150",
+        auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+        hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+      },
+    ]);
+    // Submission fails (e.g. sim revert): ok:false, but still a non-null result.
+    vi.mocked(submitTx).mockResolvedValueOnce({
+      ok: false, simulated: true, error: "sim revert", nonce: 0, valueWei: 0n, gasWei: 0n,
+    } as never);
+    const { jitPass } = await import("./strategy.js");
+    const saveSpy = vi.spyOn(runtime, "saveStrategy");
+    await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    // Must NOT have disarmed — the citizen still needs paying.
+    const disarmed = saveSpy.mock.calls.some(([patch]) => (patch as any).jitEnabled === false);
+    expect(disarmed).toBe(false);
+    saveSpy.mockRestore();
   });
 
   it("skips an excluded citizen on the JIT path", async () => {

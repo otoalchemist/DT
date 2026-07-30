@@ -377,9 +377,19 @@ function applyExclusions(ids: bigint[], context: string): bigint[] {
 
 async function maybeQueueCoinbaseBid(): Promise<void> {
   const s = runtime.strategy;
-  if (s.coinbaseBidEth > 0 && s.coinbasePayerAddress) {
-    await queueCoinbaseBid(s.coinbasePayerAddress as Address, parseEther(String(s.coinbaseBidEth)));
-  }
+  if (s.coinbaseBidEth <= 0 || !s.coinbasePayerAddress) return;
+  const bidWei = parseEther(String(s.coinbaseBidEth));
+  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei);
+  if (!queued) return;
+  // The bid is real ETH but it does NOT go through act(), so it was invisible to every
+  // spend accounting path: "spent this epoch" under-reported it, the cumulative
+  // min-balance check for the rest of the tick didn't see it, and the cached balance
+  // stayed pre-bid. At one bid per boundary that silently understated spend every day
+  // and could let a later payment slip under the floor. Account for it the same way
+  // act() does.
+  runtime.recordSpend(bidWei);
+  committedThisTickWei += bidWei;
+  invalidateBalanceCache();
 }
 
 /** Whether the combined pay+audit fire should actually fuse the two into one bundle.
@@ -1089,7 +1099,8 @@ async function proactivePayPass(
 
     const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
     if (value === 0n) continue;
-    // Auto-Pay Limit as a SPEND cap — see the matching check in defensePass.
+    // Auto-Pay Limit as a SPEND cap: the contract force-settles every delinquent epoch,
+    // so a token N behind is quoted Nx even at n=1 and cannot be partially paid.
     if (!withinAutoPayCap(value, s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI)) {
       const cap = autoPayCapWei(s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI);
       activity.add({
@@ -1121,8 +1132,8 @@ async function proactivePayPass(
  * one epoch for each selected token the moment the chain reaches that epoch, then
  * auto-disarms. Reads the exact owed amount on-chain so the value is always correct.
  */
-// Exported for tests alongside defensePass: "never auto-pay an audited citizen" has to
-// hold on the JIT path too, since that's the path that pays a CHECKED citizen.
+// Exported for tests: "never auto-pay an audited citizen" has to hold on the JIT path,
+// since that is the path that pays a CHECKED citizen.
 export async function jitPass(
   ownedIds: bigint[],
   currentEpoch: bigint,
@@ -1188,10 +1199,17 @@ export async function jitPass(
       "pay-taxes",
       { tokenId: key, message: `JIT pay #${key} for epoch ${currentEpoch} = ${formatEther(value)} ETH` },
     );
-    if (res) jitSubmitted.add(key);
+    // Only a SUCCESSFUL submission counts as covered. act() returns the failed result
+    // object (truthy) when submission/simulation fails, so `if (res)` marked a citizen
+    // done even though nothing was sent — and because the disarm below fires once every
+    // selected token is marked, one failure ended the whole JIT session with that
+    // citizen unpaid and no retry. With several citizens that silently loses one of
+    // them. A pre-submission failure consumes no nonce and no gas, so retrying next
+    // tick is free and matches the canSpend guard above ("do not mark submitted").
+    if (res?.ok) jitSubmitted.add(key);
   }
 
-  // One-shot: disarm once every selected token has been submitted/covered.
+  // One-shot: disarm once every selected token has actually been paid/covered.
   if (selected.every((t) => jitSubmitted.has(t.toString()))) {
     runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
     activity.add({ kind: "info", status: "info", message: `JIT payment complete for epoch ${target}; disarmed.` });
