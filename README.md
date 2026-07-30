@@ -126,13 +126,13 @@ ZIP* button always gives `DT-<branch>.zip` (a branch has no version). To get a
 version in the filename, push a tag:
 
 ```bash
-git tag -a v0.4.0 -m "v0.4.0"
-git push origin v0.4.0
+git tag -a v0.5.0 -m "v0.5.0"
+git push origin v0.5.0
 ```
 
-GitHub then serves the tagged source archive as **`DT-0.4.0.zip`** (leading `v`
+GitHub then serves the tagged source archive as **`DT-0.5.0.zip`** (leading `v`
 stripped) from the repo's **Tags**/**Releases** page and at
-`https://github.com/<owner>/DT/archive/refs/tags/v0.4.0.zip`. For a published
+`https://github.com/<owner>/DT/archive/refs/tags/v0.5.0.zip`. For a published
 **Release** with the nicer `death-and-taxes-bot-v<VERSION>.zip` name, draft a
 release on that tag and upload the `npm run package` artifact as an asset (via the
 web UI or `gh release create`).
@@ -140,7 +140,7 @@ web UI or `gh release create`).
 Any archive also carries a stamped top-level **`VERSION`** file (filled in at
 download time via `git archive` `export-subst`), so even the unversioned
 `DT-master.zip` from the green button is identifiable — it reads e.g.
-`v0.4.0-3-g<sha>`.
+`v0.5.0-3-g<sha>`.
 
 #### `DEFAULTS_VERSION` — pushing new defaults to existing users
 
