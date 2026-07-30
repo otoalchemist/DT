@@ -226,26 +226,14 @@ export function JitPanel({
 
       {config && (
         <div style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>AUTO-PAY LIMIT</div>
-          <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5 }}>
-            The most a single <b>automatic</b> payment may spend, measured in epochs of tax at the current
-            rate (N × epoch × 0.00069 ETH). <b>Default 1</b> = at most one day's taxes per auto payment.
-            <b> A payment that would cost more is skipped, not trimmed</b> — the contract force-settles every
-            delinquent epoch, so a token 2 behind is quoted 2× even for a 1-epoch request and cannot be
-            partially paid. <b>Such a token is left delinquent</b>, which keeps it auditable and eventually
-            killable: this is a spend guardrail, not a safety net. Raise it to let the bot buy its way out of
-            a multi-day catch-up. <b>The JIT single-epoch payment always fires</b> and is never capped.
-          </p>
-          <label className="field" style={{ maxWidth: 220 }}>
-            Max epochs per auto payment
-            <input
-              type="number" min={1} step={1}
-              value={config.maxAutoPayEpochs}
-              onChange={(e) => gasField("maxAutoPayEpochs", Math.max(1, Math.floor(Number(e.target.value) || 1)))}
-            />
-          </label>
+          {/* AUTO-PAY LIMIT (maxAutoPayEpochs) is intentionally not rendered — the
+              default of 1 is the value you want and there's little reason to change it:
+              it caps a single automatic payment at one day's tax, and a payment that
+              would cost more is skipped rather than trimmed (the contract force-settles
+              every delinquent epoch, so a citizen 2 behind is quoted 2x even for a
+              1-epoch request). It still applies and stays editable in data/config.json. */}
 
-          <div className="muted" style={{ fontSize: 11, margin: "12px 0 4px 0", borderTop: "1px solid var(--border)", paddingTop: 12 }}>PAYMENT GAS</div>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PAYMENT GAS</div>
           <p className="muted" style={{ fontSize: 11, margin: "0 0 10px 0", lineHeight: 1.5 }}>
             Applied to every tax payment, including the boundary-timed pay above. Raise the priority tip
             (or enable the dynamic tip) so your payment out-orders a batch-audit tx landing in the same
@@ -286,48 +274,10 @@ export function JitPanel({
               disabled={!config.dynamicTipEnabled}
             />
           </label>
-          <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={config.preBoundaryPay}
-                onChange={(e) => gasField("preBoundaryPay", e.target.checked)}
-              />
-              ⚠ Race into the boundary block (advanced)
-            </label>
-            <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-              Pre-submits the armed JIT payment just before the epoch boundary so it can land in the
-              <b> first block of the epoch</b>, ahead of a batch-auditor — matching the fastest rivals.
-              The amount is computed off-chain for the next epoch and <b>validated by simulating at the
-              boundary instant</b>, so a wrong value is caught before spending gas. Pair with a high tip
-              above. The normal boundary-timed pay still runs as a fallback.
-            </p>
-            <div className="row wrap" style={{ gap: 12, alignItems: "flex-end", marginLeft: 24 }}>
-              <label className="field" style={{ flex: "1 1 140px" }}>
-                Lead — public mode (ms)
-                <input
-                  type="number" min={250} max={8000} step={250}
-                  value={config.preBoundaryLeadMs}
-                  onChange={(e) => gasField("preBoundaryLeadMs", Number(e.target.value))}
-                  disabled={!config.preBoundaryPay}
-                />
-              </label>
-              <label className="field" style={{ flex: "1 1 140px" }}>
-                Lead — mainnet bundles (ms)
-                <input
-                  type="number" min={250} max={11000} step={250}
-                  value={config.preBoundaryLeadMainnetMs}
-                  onChange={(e) => gasField("preBoundaryLeadMainnetMs", Number(e.target.value))}
-                  disabled={!config.preBoundaryPay}
-                />
-              </label>
-            </div>
-            <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-              The bot uses whichever matches your submission mode. Bundles name their target block, so
-              they can't land early and are dropped (not mined) if they'd revert — pre-submitting earlier
-              is free and gives builders more time, hence the larger mainnet default. Keep it under 12s.
-            </p>
-          </div>
+          {/* "Race into the boundary block" (preBoundaryPay + lead times) is
+              intentionally not rendered — it's ON by default so the armed JIT payment can
+              land in the first block of the epoch ahead of a batch-auditor, and we don't
+              want it toggled off by accident. Still editable in data/config.json. */}
 
           <div
             style={{
@@ -358,8 +308,7 @@ export function JitPanel({
               to bid it to the <b>top of the boundary block</b> — independent of tip. This is the lever
               sophisticated batch-auditors use to guarantee position. <b>Default 0 (off).</b> It only spends
               if the bundle wins the slot (it rides the bundle, allowed-to-revert), and never mirrors to the
-              mempool. Requires a one-time deploy of <code>contracts/CoinbasePayer.sol</code> — paste its
-              address below.
+              mempool. It forwards through the shared, on-chain-verified <code>CoinbasePayer</code> contract.
             </p>
             <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
               <label className="field" style={{ flex: "1 1 130px" }}>
@@ -372,49 +321,37 @@ export function JitPanel({
                 />
               </label>
               <label className="field" style={{ flex: "2 1 260px" }}>
-                CoinbasePayer address
+                CoinbasePayer address (fixed)
                 <input
-                  type="text" placeholder="0x… (deploy CoinbasePayer.sol)"
+                  type="text"
                   value={config.coinbasePayerAddress}
-                  onChange={(e) => gasField("coinbasePayerAddress", e.target.value.trim() as never)}
+                  readOnly
+                  title="Shared CoinbasePayer forwarder, verified on-chain to forward 100% to block.coinbase. Editable only via data/config.json."
+                  style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, opacity: 0.7, cursor: "not-allowed" }}
                 />
               </label>
             </div>
             {config.coinbaseBidEth > 0 && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
               <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
-                Set a valid CoinbasePayer address, or the bid won't fire.
+                No CoinbasePayer address configured, so the bid won't fire. Set it in data/config.json.
               </p>
             )}
           </div>
 
-          <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>⚠ COMBINED BOUNDARY BUNDLE (advanced, mainnet)</div>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={config.combinedBoundaryBundle}
-                onChange={(e) => gasField("combinedBoundaryBundle", e.target.checked)}
-              />
-              Combine payment + audit into one atomic bundle
-            </label>
-            <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 24px", lineHeight: 1.5 }}>
-              At a boundary, sends your pre-boundary <b>payment and audit as one bundle</b> (sequential nonces)
-              instead of two — so they land consecutively top-of-block, share a single coinbase bid, and can't
-              demote each other. <b>Self-guarding:</b> it only fuses them <b>when a coinbase bid is set</b> above.
-              Without a bid it's a no-op — the bot sends separate bundles so audits keep their mempool fallback —
-              so it's safe to leave on. Payment is always mempool-mirrored either way and is never dropped.
+          {/* COMBINED BOUNDARY BUNDLE (combinedBoundaryBundle) is intentionally not
+              rendered — it's ON by default and should stay on. It fuses the pre-boundary
+              payment and audit into one bundle (sequential nonces) so they land
+              consecutively top-of-block, share a single coinbase bid, and can't demote
+              each other. It is self-guarding: it only fuses when a coinbase bid is set,
+              and without one it's a no-op (separate bundles, so audits keep their mempool
+              fallback). Payment is mempool-mirrored either way and is never dropped.
+              Still editable in data/config.json. The status line below reports whether it
+              is actually fusing, since that depends on the bid above. */}
+          {config.combinedBoundaryBundle && config.coinbaseBidEth > 0 && (
+            <p className="hint" style={{ fontSize: 11, margin: "8px 0 0 0", color: "var(--accent)" }}>
+              Payment + audit will fuse into one atomic bundle, sharing this single {config.coinbaseBidEth} ETH bid.
             </p>
-            {config.combinedBoundaryBundle && config.coinbaseBidEth <= 0 && (
-              <p className="hint" style={{ fontSize: 11, margin: "4px 0 0 24px" }}>
-                Inactive until you set a coinbase bid above — until then, payment and audit fire as separate bundles.
-              </p>
-            )}
-            {config.combinedBoundaryBundle && config.coinbaseBidEth > 0 && (
-              <p className="hint" style={{ fontSize: 11, margin: "4px 0 0 24px", color: "var(--accent)" }}>
-                Active — payment + audit will fuse into one bundle with a single {config.coinbaseBidEth} ETH bid.
-              </p>
-            )}
-          </div>
+          )}
 
           <div className="save-bar" style={{ marginTop: 12 }}>
             <button

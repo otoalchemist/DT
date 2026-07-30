@@ -2,29 +2,10 @@ import { useEffect, useState } from "react";
 import type { StrategyConfig } from "@dat-bot/shared";
 import { api } from "./api.js";
 
-const MODE_TIPS: Record<"public" | "mainnet", string> = {
-  public:
-    "Fastest path — transaction goes directly to the public mempool and every block builder sees it immediately. " +
-    "Recommended for this game since you're racing a clock, not a MEV searcher. " +
-    "Anyone can see the tx before it lands, but frontrunning tax payments isn't a meaningful risk here.",
-  mainnet:
-    "Sends your transaction privately to the Flashbots relay as a bundle. " +
-    "Nobody sees it until it lands in a block, so it can't be frontrun. " +
-    "Adds ~100–200 ms relay round-trip overhead and submits to the next two blocks for inclusion odds. " +
-    "Only useful if you have a specific reason to hide the transaction.",
-};
-
-function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" }) {
+function AlchemyKeySection() {
   const [key, setKey] = useState("");
-  const [mode, setMode] = useState<"mainnet" | "public">(initialMode);
   const [busyKey, setBusyKey] = useState(false);
-  const [busyMode, setBusyMode] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
-
-  // useState's initial value is only read on mount, so when the parent loads the
-  // real mode from the backend (GET /api/settings) after this component has already
-  // mounted, reflect it here — otherwise the buttons stay stuck on the seed value.
-  useEffect(() => setMode(initialMode), [initialMode]);
 
   const saveKey = async () => {
     if (!key.trim()) return;
@@ -41,51 +22,15 @@ function AlchemyKeySection({ initialMode }: { initialMode: "mainnet" | "public" 
     }
   };
 
-  const switchMode = async (next: "mainnet" | "public") => {
-    setMode(next);
-    setBusyMode(true);
-    setMsg(null);
-    try {
-      await api.saveMode(next);
-      setMsg(`Mode switched to ${next}.`);
-    } catch (e) {
-      setMsg(`Error: ${(e as Error).message}`);
-      setMode(mode); // revert on failure
-    } finally {
-      setBusyMode(false);
-    }
-  };
-
   return (
     <>
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>RPC / ALCHEMY</div>
 
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Submission mode</div>
-        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-          {(["public", "mainnet"] as const).map((m) => (
-            <button
-              key={m}
-              onClick={() => switchMode(m)}
-              disabled={busyMode || mode === m}
-              style={{
-                padding: "4px 14px",
-                borderRadius: 6,
-                border: mode === m ? "2px solid var(--accent, #6c7)" : "1px solid #555",
-                fontWeight: mode === m ? 700 : 400,
-                opacity: busyMode ? 0.6 : 1,
-                cursor: mode === m ? "default" : "pointer",
-              }}
-            >
-              {m}
-            </button>
-          ))}
-        </div>
-        <p style={{ fontSize: 12, color: "#aaa", margin: 0, lineHeight: 1.5 }}>
-          {MODE_TIPS[mode]}
-        </p>
-      </div>
+      {/* Submission mode (public / mainnet) is intentionally not rendered — mainnet
+          (private Flashbots bundles) is the default and the one we want, and switching it
+          by accident would change how every tx is submitted. Still switchable via the
+          MODE env var / data settings. */}
 
       <label className="field">
         Update Alchemy API key
@@ -140,9 +85,6 @@ export function Config({
   // True when any strategy-owned field differs from what's persisted on the backend.
   const dirty =
     !!savedCfg && STRATEGY_FIELDS.some((k) => JSON.stringify(cfg[k]) !== JSON.stringify(savedCfg[k]));
-  // Seed with the actual shipped default (mainnet) so the panel doesn't briefly
-  // misreport before GET /api/settings resolves; corrected on load if it differs.
-  const [currentMode, setCurrentMode] = useState<"mainnet" | "public">("mainnet");
   // The curated rival list shipped in git, fetched so "reset to default" can
   // restore it after the user edits their offense targets.
   const [defaultRivals, setDefaultRivals] = useState<string[]>([]);
@@ -151,7 +93,6 @@ export function Config({
   const [skippers, setSkippers] = useState<string[]>([]);
 
   useEffect(() => {
-    api.getSettings().then((s) => setCurrentMode(s.mode)).catch(() => {});
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
     api.rivalSkippers().then((r) => setSkippers(r.tokenIds)).catch(() => {});
   }, []);
@@ -219,30 +160,14 @@ export function Config({
         <input type="checkbox" checked={cfg.autoKill} onChange={chk("autoKill")} disabled={!cfg.offenseEnabled} />
         Auto-kill expired-audit tokens (free, gas only)
       </label>
-      <label className="check">
-        <input type="checkbox" checked={cfg.preBoundaryAudit} onChange={chk("preBoundaryAudit")} disabled={!cfg.offenseEnabled || !cfg.autoAudit} />
-        ⚠ Race audits into the boundary block (advanced)
-      </label>
-      <label className="check">
-        <input type="checkbox" checked={cfg.preBoundaryKill} onChange={chk("preBoundaryKill")} disabled={!cfg.offenseEnabled || !cfg.autoKill} />
-        ⚠ Race kills into the first block after expiry (advanced)
-      </label>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-        Pre-submit audits/kills ~{cfg.preBoundaryLeadMs}ms before the deadline so they land in the first
-        eligible block ahead of rivals, instead of the block after. Each is validated by simulating at the
-        boundary/expiry instant, so an invalid one is skipped before spending gas. Lead is shared with the
-        JIT boundary race. Note: at the boundary, block position is decided by builder orderflow more than
-        tip — a defender who pre-pays can still beat your audit.
-      </p>
-      <label className="field">
-        Only run offense when supply is within N of 69 winners (blank = always)
-        <input
-          type="number" min={0}
-          value={cfg.endgameOnlyWithin ?? ""}
-          onChange={(e) => set("endgameOnlyWithin", e.target.value === "" ? null : Number(e.target.value))}
-        />
-      </label>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+      {/* Race audits/kills into the boundary block (preBoundaryAudit / preBoundaryKill)
+          are intentionally not rendered — we always want them ON so offense competes in
+          the first eligible block instead of the block after. They stay on and remain
+          editable in data/config.json. preBoundaryKill is a no-op unless Auto-kill above
+          is enabled. The "Only run offense when supply is within N of 69" gate
+          (endgameOnlyWithin) is likewise hidden so its "always run" default can't be
+          changed by accident. */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, marginBottom: 4, flexWrap: "wrap" }}>
         <button
           type="button"
           onClick={() => set("offenseTargetTokenIds", [...defaultRivals])}
@@ -341,21 +266,10 @@ export function Config({
         />
       </label>
 
-      <div className="spacer" />
-      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>LATENCY (offense)</div>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={cfg.racePublicMempool}
-          onChange={chk("racePublicMempool")}
-          disabled={!cfg.offenseEnabled}
-        />
-        Race public mempool (mainnet mode)
-      </label>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-        Also broadcasts time-critical offense txs to the public mempool alongside the Flashbots bundle,
-        so any builder can include them next block. Trades bundle privacy for speed. No effect in public mode.
-      </p>
+      {/* LATENCY (offense) — racePublicMempool — is intentionally not rendered. It's ON
+          by default (mirror time-critical offense txs to the public mempool alongside the
+          bundle so any builder can include them next block) and stays that way; still
+          editable in data/config.json. */}
 
       {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
           JIT payment enables it automatically. The remaining values stay editable in
@@ -385,7 +299,7 @@ export function Config({
 
       {saveBar}
 
-      <AlchemyKeySection initialMode={currentMode} />
+      <AlchemyKeySection />
     </div>
   );
 }

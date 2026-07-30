@@ -65,7 +65,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadRivalSkippers(),
   preBoundaryAudit: true,
-  preBoundaryKill: false, // opt-in: race kills into the first block after audit expiry
+  preBoundaryKill: true, // race kills into the first block after audit expiry (no-op unless autoKill is on)
   // On by default, but self-guarding: it only fuses payment + audit into one bundle
   // when a coinbase bid is set (coinbaseBidEth > 0). Without a bid it's a no-op — the
   // bot sends separate bundles so audits keep their mempool fallback — so leaving it
@@ -108,7 +108,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
  * Tied to this constant rather than VERSION so an unrelated release doesn't reset
  * anyone's tuning.
  */
-export const DEFAULTS_VERSION = 3;
+export const DEFAULTS_VERSION = 4;
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT

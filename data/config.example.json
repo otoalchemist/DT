@@ -1,5 +1,5 @@
 {
-  "defaultsVersion": 3,
+  "defaultsVersion": 4,
   "enabled": false,
   "proactivePay": true,
   "prepayEpochs": 1,
@@ -42,7 +42,7 @@
     "6749"
   ],
   "preBoundaryAudit": true,
-  "preBoundaryKill": false,
+  "preBoundaryKill": true,
   "combinedBoundaryBundle": true,
   "maxBaseFeeGwei": 69.1,
   "priorityFeeGwei": 20.1,
