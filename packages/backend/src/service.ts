@@ -10,9 +10,15 @@ import { logger } from "./logger.js";
 
 // Read-only helpers used by the API for the dashboard (independent of the engine loop).
 
+// The dashboard polls /api/tokens and /api/targets together every 20s, and the engine
+// tick reads the same snapshot every block. Letting these read a snapshot up to 5s old
+// collapses three identical multicalls per poll cycle into one, without affecting the
+// engine (which always reads fresh — see getGameSnapshot).
+const SNAPSHOT_TTL_MS = 5_000;
+
 export async function readOwnedStatuses(): Promise<OwnedTokenStatus[]> {
   if (!runtime.account) return [];
-  const snap = await getGameSnapshot();
+  const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const ids = await fetchOwnedTokenIds(snap.citizensAddress, runtime.account.address);
   // ONE multicall for every owned token's status, not a serial per-token round-trip.
@@ -49,7 +55,7 @@ async function getLiveCandidates(citizens: Address): Promise<{ id: bigint; owner
  *  dashboard load doesn't pay the ~15s cold enumeration. Needs no unlocked wallet. */
 export async function prewarmTargets(): Promise<void> {
   try {
-    const snap = await getGameSnapshot();
+    const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
     await getLiveCandidates(snap.citizensAddress);
     logger.debug("target cache prewarmed");
   } catch (err) {
@@ -84,7 +90,7 @@ function actionableRank(t: TargetTokenStatus): number {
  * survivors, and was quietly truncating ~12 of 62 delinquent rivals.
  */
 export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[]> {
-  const snap = await getGameSnapshot();
+  const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
 
   const pinnedSet = new Set(runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x).toString()));
@@ -181,7 +187,7 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
  * actionability ranking that would reshuffle rows on every poll.
  */
 export async function readEmigrated(): Promise<TargetTokenStatus[]> {
-  const snap = await getGameSnapshot();
+  const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const live = await getLiveCandidates(snap.citizensAddress);
   const emigrants = live.filter((t) => isEmigrated(t.owner));

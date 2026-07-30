@@ -160,10 +160,20 @@ export function Dashboard({
     }
   }, []);
 
+  // Poll on-chain views only while the tab is actually being looked at. Each cycle
+  // costs several RPC round-trips per endpoint, so a dashboard left open in a
+  // background tab was burning provider quota around the clock for a page nobody was
+  // reading (the single biggest source of idle RPC usage). Refresh immediately on
+  // becoming visible so returning to the tab still shows current data.
   useEffect(() => {
-    void refresh();
-    const id = setInterval(refresh, 20000);
-    return () => clearInterval(id);
+    const tick = () => { if (!document.hidden) void refresh(); };
+    tick();
+    const id = setInterval(tick, 20000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", tick);
+    };
   }, [refresh]);
 
   const running = status?.running ?? false;

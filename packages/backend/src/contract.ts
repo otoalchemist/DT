@@ -32,7 +32,21 @@ export async function resolveCitizensAddress(): Promise<Address> {
   return addr;
 }
 
-export async function getGameSnapshot(): Promise<GameSnapshot> {
+// Short-lived snapshot cache. The snapshot is a 4-call multicall and was being read
+// independently by the engine tick, /api/tokens AND /api/targets — so a dashboard poll
+// landing near a tick fired three identical multicalls within a second.
+//
+// The cache is OPT-IN via `maxAgeMs`: the engine calls getGameSnapshot() with no
+// argument and always reads fresh, because boundary races key off currentEpoch and
+// must never act on a stale epoch. Only the read-only dashboard paths pass a TTL.
+// Engine reads still REFRESH this cache, so dashboard polls usually ride along on a
+// snapshot the tick just fetched.
+let cachedSnapshot: { at: number; snap: GameSnapshot } | null = null;
+
+export async function getGameSnapshot(maxAgeMs = 0): Promise<GameSnapshot> {
+  if (maxAgeMs > 0 && cachedSnapshot && Date.now() - cachedSnapshot.at <= maxAgeMs) {
+    return cachedSnapshot.snap;
+  }
   const citizensAddress = await resolveCitizensAddress();
   const [state, currentEpoch, startTime, citizenSupply] =
     await publicClient.multicall({
@@ -48,13 +62,15 @@ export async function getGameSnapshot(): Promise<GameSnapshot> {
         },
       ],
     });
-  return {
+  const snap: GameSnapshot = {
     state: Number(state),
     currentEpoch: currentEpoch as bigint,
     startTime: startTime as bigint,
     citizensAddress,
     citizenSupply: citizenSupply as bigint,
   };
+  cachedSnapshot = { at: Date.now(), snap };
+  return snap;
 }
 
 /** Full status for a token the wallet owns. */
