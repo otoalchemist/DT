@@ -1043,48 +1043,19 @@ async function act(
   }
 }
 
-// Exported for tests: the guarantee that an audited citizen is never auto-paid is a
-// money-safety property, so it's asserted directly rather than through a whole tick.
-export async function defensePass(
-  ownedIds: bigint[],
-  currentEpoch: bigint,
-  nowSec: bigint,
-): Promise<void> {
-  const s = runtime.strategy;
-  // An audited citizen is NEVER paid automatically — catching up after an audit is a
-  // deliberate, user-initiated decision (the "Pay to current" button on the token row).
-  // The only thing defense may still do is spend an already-held bribe, and only when
-  // the user opted into that explicitly. With autoUseBribe off there is nothing for
-  // this pass to do, so skip the status read entirely rather than polling for nothing.
-  if (!s.autoUseBribe) return;
-
-  const excluded = excludedTokenSet(s.excludedTokenIds).set;
-  const eligible = ownedIds.filter((id) => !excluded.has(id.toString()));
-  if (eligible.length === 0) return;
-
-  const statuses = await batchGetOwnedStatuses(eligible, currentEpoch, nowSec, 1);
-  for (const st of statuses) {
-    const tokenId = BigInt(st.tokenId);
-    const underAudit = st.auditDueTimestamp !== "0";
-    const bribes = BigInt(st.bribeBalance);
-    if (!underAudit || (st.secondsUntilKillable ?? 0) > s.auditSafetyBufferSeconds) continue;
-    if (bribes === 0n) continue; // nothing free to spend; leave it to the user
-
-    // A bribe clears the AUDIT without paying tax — the citizen stays delinquent and
-    // is immediately re-auditable. It costs gas only, but still honours the base-fee
-    // guardrail so it can't fire into a fee spike.
-    const guard = await canSpend(0n, false);
-    if (!guard.ok) {
-      activity.add({ kind: "use-bribe", status: "skipped", tokenId: st.tokenId, message: `Defer bribe clear #${st.tokenId}: ${guard.reason}` });
-      continue;
-    }
-    await act(
-      { to: appConfig.gameAddress, data: encodeUseBribe(tokenId), value: 0n },
-      "use-bribe",
-      { tokenId: st.tokenId, message: `Clear audit on #${st.tokenId} with bribe (still delinquent afterwards)` },
-    );
-  }
-}
+// There is deliberately NO defense pass.
+//
+// The bot takes ZERO automatic action once one of your citizens is audited — it will not
+// pay taxes to clear the audit, and it will not spend a held bribe. Recovering an audited
+// citizen is entirely the user's decision, via the manual "Pay to current" / "Clear audit
+// (bribe)" buttons on the token row (see manualPayToCurrent / manualUseBribe).
+//
+// What remains automatic is only PRE-audit protection: proactivePayPass and the JIT
+// payment keep a citizen current so it never becomes auditable in the first place. Both
+// skip any citizen that is already under audit, and both honour `excludedTokenIds`.
+//
+// Consequence, stated plainly: an audited citizen you do not pay yourself will be
+// killable when its 24h audit expires, and nothing here will stop that.
 
 /**
  * Pay delinquent-but-not-yet-audited citizens. Only invoked from the
@@ -1502,7 +1473,8 @@ async function tick(fireProactivePay = false): Promise<void> {
     const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
 
     if (runtime.strategy.enabled) {
-      await defensePass(ownedIds, currentEpoch, nowSec);
+      // No defense pass: an audited citizen gets no automatic response at all. Only
+      // pre-audit protection runs here (see the note above proactivePayPass).
       if (fireProactivePay && runtime.strategy.proactivePay) {
         await proactivePayPass(ownedIds, currentEpoch, nowSec);
       }

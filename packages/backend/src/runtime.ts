@@ -43,10 +43,8 @@ export function loadRivalSkippers(): string[] {
 
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
-  auditSafetyBufferSeconds: 3 * 60 * 60, // clear audits with >=3h to spare
   proactivePay: true,
   prepayEpochs: 1,
-  autoUseBribe: false, // never auto-spend bribes; pay taxes to clear audits instead
   maxAutoPayEpochs: 1, // auto-payments cover at most 1 epoch (1 day) each; JIT always fires
   jitEnabled: false,
   jitTargetEpoch: null,
@@ -120,7 +118,7 @@ export const DEFAULTS_VERSION = 3;
  * maxPaymentEth), and JIT session (jitEnabled, jitTargetEpoch, jitTokenIds).
  */
 const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
-  "auditSafetyBufferSeconds", "proactivePay", "prepayEpochs", "autoUseBribe", "maxAutoPayEpochs",
+  "proactivePay", "prepayEpochs", "maxAutoPayEpochs",
   "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
   "autoAudit", "autoKill", "preBoundaryAudit", "preBoundaryKill", "combinedBoundaryBundle",
   "maxBaseFeeGwei", "priorityFeeGwei",

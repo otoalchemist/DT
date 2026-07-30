@@ -117,7 +117,7 @@ const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tok
 const { filterLiveTokenIds, batchGetTargetStatuses, batchGetOwnedStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, defensePass } =
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -534,7 +534,7 @@ describe("combined boundary bundle with multiple citizens", () => {
 
 // An audited citizen must NEVER be paid automatically — catching up after an audit is
 // the user's decision (the manual "Pay to current" button). Regression guard: this used
-// to auto-pay any audited owned token within auditSafetyBufferSeconds, ignoring the JIT
+// to auto-pay any audited owned token within a safety buffer, ignoring the JIT
 // checkboxes entirely, which paid a citizen the user had unchecked.
 describe("audited citizens are never auto-paid", () => {
   const ADDR = "0x1111111111111111111111111111111111111111" as const;
@@ -587,37 +587,21 @@ describe("audited citizens are never auto-paid", () => {
     );
   });
 
-  it("submits nothing for an audited citizen with autoUseBribe off (the default)", async () => {
-    runtime.strategy = { ...DEFAULT_STRATEGY, enabled: true, autoUseBribe: false, offenseEnabled: false };
-    await defensePass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
-    expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
-    // ...and it doesn't even read status: with no action available the pass is a no-op.
-    expect(vi.mocked(batchGetOwnedStatuses)).not.toHaveBeenCalled();
+  it("there is no defense pass at all — nothing responds to an audit automatically", async () => {
+    // Structural guarantee: re-introducing any automatic audit response would mean
+    // exporting a defense pass again. If this fails, someone added one back.
+    const strategy = await import("./strategy.js");
+    expect("defensePass" in strategy).toBe(false);
+    // ...and no bribe-spending flag exists to re-enable one via config.
+    expect("autoUseBribe" in DEFAULT_STRATEGY).toBe(false);
   });
 
-  it("spends a held bribe only when autoUseBribe is explicitly on — never a payment", async () => {
-    runtime.strategy = { ...DEFAULT_STRATEGY, enabled: true, autoUseBribe: true, offenseEnabled: false };
-    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([
-      {
-        tokenId: "1", lastEpochPaid: "148", currentEpoch: "150",
-        auditDueTimestamp: String(Math.floor(Date.now() / 1000) + 600),
-        secondsUntilKillable: 600, bribeBalance: "1", hasLifeInsurance: false,
-        risk: "at-risk", estimatedPayWei: "1000000000000000",
-      },
-    ]);
-    await defensePass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
-    const calls = vi.mocked(submitTx).mock.calls;
-    expect(calls.filter(([i]) => i.data === "0xPAYTAXES")).toHaveLength(0); // never pays
-    expect(calls.filter(([i]) => i.data === "0xBRIBE")).toHaveLength(1);
-  });
-
-  it("JIT does not pay an audited citizen either, even when checked and armed", async () => {
-    // The JIT path is the one that pays a CHECKED citizen at the boundary. It must also
-    // refuse once that citizen is under audit — otherwise "no automatic payment after an
-    // audit" would only hold for defense.
+  it("JIT does not pay an audited citizen, even when checked and armed", async () => {
+    // JIT is the path that pays a CHECKED citizen at the boundary, so it carries the
+    // guarantee for citizens the user did NOT opt out of.
     runtime.strategy = {
       ...DEFAULT_STRATEGY,
-      enabled: true, offenseEnabled: false, autoUseBribe: false,
+      enabled: true, offenseEnabled: false,
       jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
     };
     const { jitPass } = await import("./strategy.js");
@@ -625,14 +609,32 @@ describe("audited citizens are never auto-paid", () => {
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xPAYTAXES")).toHaveLength(0);
   });
 
-  it("skips an excluded citizen even on the bribe path", async () => {
+  it("never spends a bribe automatically, for any citizen", async () => {
     runtime.strategy = {
-      ...DEFAULT_STRATEGY, enabled: true, autoUseBribe: true, offenseEnabled: false,
-      excludedTokenIds: ["1"],
+      ...DEFAULT_STRATEGY, enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150,
     };
-    await defensePass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([
+      {
+        tokenId: "1", lastEpochPaid: "148", currentEpoch: "150",
+        auditDueTimestamp: String(Math.floor(Date.now() / 1000) + 600),
+        secondsUntilKillable: 600, bribeBalance: "5", hasLifeInsurance: false,
+        risk: "at-risk", estimatedPayWei: "1000000000000000",
+      },
+    ]);
+    const { jitPass } = await import("./strategy.js");
+    await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
+    expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xBRIBE")).toHaveLength(0);
+  });
+
+  it("skips an excluded citizen on the JIT path", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150, excludedTokenIds: ["1"],
+    };
+    const { jitPass } = await import("./strategy.js");
+    await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
     expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
-    expect(vi.mocked(batchGetOwnedStatuses)).not.toHaveBeenCalled();
   });
 });
 

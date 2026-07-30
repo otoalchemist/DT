@@ -72,17 +72,15 @@ export interface StrategyConfig {
   /** Master switch: when false, the engine observes but never submits. */
   enabled: boolean;
 
-  // --- Defense ---
-  /** Clear an audit when it will expire within this many seconds. */
-  auditSafetyBufferSeconds: number;
+  // --- Defense (pre-audit only) ---
+  //
+  // There is no automatic response to an audit: the bot never pays to clear one and
+  // never spends a held bribe. Both are manual actions on the token row. The settings
+  // below only govern keeping a citizen current BEFORE it can be audited.
   /** Proactively pay before becoming delinquent (don't wait to be audited). */
   proactivePay: boolean;
   /** Epochs to prepay per payTaxes call (1-7) to lock the current rate. */
   prepayEpochs: number;
-  /** Spend a held bribe to clear an audit (free, but consumes the bribe and leaves
-   *  the token still delinquent). OFF by default — the bot pays taxes to clear
-   *  instead, so bribes are never auto-consumed unless you opt in. */
-  autoUseBribe: boolean;
   /** Global cap on how many epochs a single AUTOMATIC payment may cover. On-chain,
    *  payTaxes(tokenId, n) costs n * currentEpoch * base and advances the token n
    *  epochs — so this caps the ETH spent per auto payment. Applies to proactive-pay

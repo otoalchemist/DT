@@ -358,12 +358,11 @@ export function Config({
       </p>
 
       {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
-          JIT payment enables it automatically. The values still apply and remain
-          editable in data/config.json (enabled, proactivePay,
-          auditSafetyBufferSeconds, prepayEpochs, autoUseBribe). autoUseBribe is OFF
-          by default (pay taxes to clear audits, never auto-spend a bribe). The
-          per-payment epoch cap (maxAutoPayEpochs) is edited in the Just-in-time
-          panel. */}
+          JIT payment enables it automatically. The remaining values stay editable in
+          data/config.json (enabled, proactivePay, prepayEpochs), and cover PRE-AUDIT
+          protection only: there is no automatic response to an audit at all, so there
+          is no safety-buffer or auto-bribe setting to expose. Per-citizen opt-out and
+          the per-payment epoch cap live in the Just-in-time panel. */}
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>

@@ -1,10 +1,8 @@
 {
   "defaultsVersion": 3,
   "enabled": false,
-  "auditSafetyBufferSeconds": 10800,
   "proactivePay": true,
   "prepayEpochs": 1,
-  "autoUseBribe": false,
   "maxAutoPayEpochs": 1,
   "jitEnabled": false,
   "jitTargetEpoch": null,

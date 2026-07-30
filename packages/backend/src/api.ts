@@ -24,10 +24,8 @@ import { runPostMortem } from "./postmortem.js";
 const strategyPatch = z
   .object({
     enabled: z.boolean(),
-    auditSafetyBufferSeconds: z.number().int().min(0),
     proactivePay: z.boolean(),
     prepayEpochs: z.number().int().min(1).max(7),
-    autoUseBribe: z.boolean(),
     maxAutoPayEpochs: z.number().int().min(1),
     jitEnabled: z.boolean(),
     jitTargetEpoch: z.number().int().min(1).nullable(),
