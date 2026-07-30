@@ -178,15 +178,30 @@ export function JitPanel({
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {tokens.map((t) => {
               const on = selected.has(t.tokenId);
+              // State from the same on-chain fields the token table uses.
+              const behind = Number(BigInt(t.currentEpoch) - BigInt(t.lastEpochPaid));
+              const underAudit = t.auditDueTimestamp !== "0";
+              const killable = underAudit && (t.secondsUntilKillable ?? 1) <= 0;
+              // Matches classifyRisk: only 2+ behind is "delinquent" (auditable); 1 behind
+              // is still in the grace epoch and not yet auditable.
+              const state = killable
+                ? { label: "killable", color: "var(--red)" }
+                : underAudit
+                  ? { label: "under audit", color: "var(--red)" }
+                  : behind <= 0
+                    ? { label: "current", color: "var(--green)" }
+                    : behind === 1
+                      ? { label: "1 behind (grace)", color: "var(--amber)" }
+                      : { label: `delinquent · ${behind} behind`, color: "var(--amber)" };
               return (
               <label
                 key={t.tokenId}
                 title={on
-                  ? `#${t.tokenId} is covered by automatic payments`
-                  : `#${t.tokenId} is EXCLUDED — the bot will never pay it`}
+                  ? `#${t.tokenId} — ${state.label}. Covered by automatic payments.`
+                  : `#${t.tokenId} — ${state.label}. EXCLUDED — the bot will never pay it.`}
                 style={{
-                  display: "flex", alignItems: "center", gap: 5,
-                  padding: "3px 10px", borderRadius: 6,
+                  display: "flex", alignItems: "center", gap: 6,
+                  padding: "4px 10px", borderRadius: 6,
                   cursor: excludeBusy ? "wait" : "pointer",
                   opacity: excludeBusy === t.tokenId ? 0.5 : 1,
                   border: `1px solid ${on ? "var(--accent)" : "var(--red)"}`,
@@ -201,7 +216,12 @@ export function JitPanel({
                   onChange={() => void toggleToken(t.tokenId)}
                   disabled={excludeBusy !== null}
                 />
-                #{t.tokenId}
+                <span style={{ display: "flex", flexDirection: "column", lineHeight: 1.25 }}>
+                  <span>#{t.tokenId}</span>
+                  <span style={{ fontSize: 10, color: state.color, fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
+                    {state.label}
+                  </span>
+                </span>
               </label>
               );
             })}
