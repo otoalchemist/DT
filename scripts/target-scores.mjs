@@ -237,6 +237,14 @@ async function main() {
   console.log(header); skippers.forEach((r) => console.log(fmt(r)));
   console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list, ${scope} ===`);
   console.log(header); others.forEach((r) => console.log(fmt(r)));
+
+  // Paste-ready target lists: catchable only (score > 0, drops uncatchable/under-audit),
+  // ranked best-first, comma-separated for the offense target box.
+  const ids = (list) => list.filter((r) => r.score > 0).map((r) => r.token).join(",");
+  console.log(`\n--- paste (ranked, catchable only) ---`);
+  console.log(`skippers    : ${ids(skippers) || "(none)"}`);
+  console.log(`non-skippers: ${ids(others) || "(none)"}`);
+
   if (auditableNext) {
     const best = pool.filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
     console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
