@@ -23,6 +23,7 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
             <th style={cell} title="Can the owner afford the next-boundary catch-up?">Afford</th>
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
+            <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments). A bid buys top-of-block, so a bidder is near-unauditable however strapped it looks. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = uncatchable or under audit">Score</th>
@@ -46,6 +47,10 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
               <td style={cell}>{r.maxTip.toFixed(1)}gw/{r.bestIdx ?? "—"}</td>
               <td style={cell} title={r.payBlkMin === null ? "no payment seen in window" : undefined}>
                 {r.payBlkMin === null ? "—" : `${r.payBlkMin}/${r.payBlkMed}`}
+              </td>
+              <td style={{ ...cell, color: r.bidEth ? "var(--red)" : undefined, fontWeight: r.bidEth ? 600 : 400 }}
+                  title={r.bidEth == null ? "RPC has no tracing — unknown" : r.bidEth > 0 ? `${r.bidEth} ETH across ${r.bidPays} bid-backed payment(s) in the last 2 epochs` : "no coinbase bid in the last 2 epochs"}>
+                {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
               </td>
               <td style={cell}>{r.bribes || ""}</td>
               <td style={cell}>{r.audited || ""}</td>
@@ -167,8 +172,9 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>
             Beh 1 = auditable next boundary · Skip = boundaries entered 2+ behind / sampled ·
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
-            (fastest / median; 0 = pays in the boundary block) · greyed rows are uncatchable
-            or already under audit.
+            (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
+            the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-
+            unauditable) · greyed rows are uncatchable or already under audit.
           </p>
         </>
       )}

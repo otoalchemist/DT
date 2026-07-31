@@ -370,7 +370,7 @@ export function Dashboard({
         <div className="grid cols-2">
           {config && <Config cfg={config} savedCfg={savedConfig} onChange={setConfig} onSaved={onConfigSaved} />}
 
-          <div className="panel">
+          <div className="panel fill">
             <h2>Activity</h2>
             <div className="log">
               {activity.length === 0 && <p className="muted">No activity yet.</p>}

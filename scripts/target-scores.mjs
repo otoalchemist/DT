@@ -21,6 +21,10 @@
 //   tip/idx   defense strength from payment history: best (max) tip gwei, best (lowest)
 //             tx index reached. idx 0 + never-audited = tops the block, ~uncatchable
 //   aud       times ANY player successfully audited it in the window (proven catchable)
+//   bid       coinbase bid over the LAST 2 EPOCHS, as ETH x number of bid-backed payments.
+//             A bid buys transaction position outright, so a bidder cures at index 0 and is
+//             near-unauditable however strapped it looks. Shared when one operator co-pays
+//             several citizens in a block. "?" = RPC has no trace_block.
 //   score     composite audit-attractiveness (higher = better target). 0 = effectively
 //             uncatchable (always tops the block, never audited) or already under audit.
 //
@@ -151,7 +155,7 @@ async function main() {
     const slice = txs.slice(i, i + 60); const rq = [];
     slice.forEach((t, k) => { rq.push({ jsonrpc: "2.0", id: (i + k) * 2 + 1, method: "eth_getTransactionReceipt", params: [t] }); rq.push({ jsonrpc: "2.0", id: (i + k) * 2 + 2, method: "eth_getTransactionByHash", params: [t] }); });
     const m2 = new Map((await batch(rq)).map((r) => [r.id, r]));
-    slice.forEach((t, k) => { const rc = m2.get((i + k) * 2 + 1)?.result; if (rc) meta.set(t, { gasUsed: BigInt(rc.gasUsed), eff: BigInt(rc.effectiveGasPrice), idx: Number(BigInt(rc.transactionIndex)), blk: BigInt(rc.blockNumber) }); });
+    slice.forEach((t, k) => { const rc = m2.get((i + k) * 2 + 1)?.result; if (rc) meta.set(t, { gasUsed: BigInt(rc.gasUsed), eff: BigInt(rc.effectiveGasPrice), idx: Number(BigInt(rc.transactionIndex)), blk: BigInt(rc.blockNumber), from: (rc.from || "").toLowerCase() }); });
   }
   const blks = [...new Set([...meta.values()].map((m) => m.blk.toString()))];
   const bf = new Map();
@@ -185,6 +189,59 @@ async function main() {
     if (off !== null && off >= 0) (payOff[tok] ??= []).push(off);
   }
   const median = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); const h = s.length >> 1; return s.length % 2 ? s[h] : Math.round((s[h - 1] + s[h]) / 2); };
+
+  // Coinbase bids over the LAST 2 EPOCHS. A bid is an internal ETH transfer to
+  // block.coinbase riding the payment's bundle — it buys transaction position outright,
+  // so a rival that bids can cure at index 0 and is effectively unauditable regardless of
+  // how strapped it looks. Deliberately a short window: current behaviour is what matters
+  // for the upcoming boundary, and tracing is the expensive part of this scan.
+  //
+  // Attribution is by (block, top-level sender), so a bid paid by a bundle-mate tx counts
+  // for its sender. When one operator pays several citizens in a single block the bid is
+  // SHARED — each co-paid token reports the same operator spend, not a per-token cost.
+  //
+  // Degrades to null (shown "?") if the RPC has no trace_block: this scan backs the
+  // dashboard, so a missing premium method must not fail the whole run.
+  const bidEpochStart = ce - 1n > firstEpoch ? ce - 1n : firstEpoch;
+  const bidWindowStart = epochFirstBlock.get(bidEpochStart.toString()) ?? latest;
+  const recentPays = payLogs.filter((l) => BigInt(l.blockNumber) >= bidWindowStart);
+  const bidBlocks = [...new Set(recentPays.map((l) => BigInt(l.blockNumber).toString()))].map(BigInt);
+  const bidByToken = {}; // token -> { wei, pays }
+  let tracingOk = true;
+  if (bidBlocks.length > 0) {
+    const minerOf = new Map();
+    for (let i = 0; i < bidBlocks.length; i += 60) {
+      const slice = bidBlocks.slice(i, i + 60);
+      const m = new Map((await batch(slice.map((b, k) => ({ jsonrpc: "2.0", id: i + k, method: "eth_getBlockByNumber", params: [hb(b), false] })))).map((r) => [r.id, r]));
+      slice.forEach((b, k) => { const bl = m.get(i + k)?.result; if (bl) minerOf.set(b.toString(), bl.miner.toLowerCase()); });
+    }
+    const cbByBlockSender = new Map();
+    for (const b of bidBlocks) {
+      const miner = minerOf.get(b.toString()); if (!miner) continue;
+      let traces;
+      try { traces = await rpc("trace_block", [hb(b)]); }
+      catch { tracingOk = false; break; } // no tracing on this RPC — report unknown
+      const senderOfTx = new Map();
+      for (const tr of traces) if (tr.type === "call" && (tr.traceAddress?.length ?? 0) === 0 && tr.transactionHash) senderOfTx.set(tr.transactionHash, (tr.action?.from || "").toLowerCase());
+      for (const tr of traces) {
+        if (tr.type !== "call" || !tr.transactionHash) continue;
+        const to = (tr.action?.to || "").toLowerCase(); const val = tr.action?.value ? BigInt(tr.action.value) : 0n;
+        if (to !== miner || val <= 0n) continue;
+        const s = senderOfTx.get(tr.transactionHash) || (tr.action?.from || "").toLowerCase();
+        const k = `${b}:${s}`;
+        cbByBlockSender.set(k, (cbByBlockSender.get(k) ?? 0n) + val);
+      }
+    }
+    if (tracingOk) {
+      for (const l of recentPays) {
+        const tok = BigInt(l.topics[1]).toString(); const m = meta.get(l.transactionHash); if (!m) continue;
+        const wei = cbByBlockSender.get(`${m.blk}:${m.from}`) ?? 0n;
+        if (wei <= 0n) continue;
+        const e = (bidByToken[tok] ??= { wei: 0n, pays: 0 });
+        e.wei += wei; e.pays++;
+      }
+    }
+  }
 
   // Score each live, non-emigrated rival.
   const rows = [];
@@ -228,6 +285,9 @@ async function main() {
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
       payBlkMin, payBlkMed, audited: aud, uncatchable, score: +score.toFixed(2),
+      // Coinbase bidding over the last 2 epochs. null = RPC has no tracing (unknown).
+      bidEth: tracingOk ? +eth(bidByToken[t]?.wei ?? 0n).toFixed(6) : null,
+      bidPays: tracingOk ? (bidByToken[t]?.pays ?? 0) : null,
     });
   }
 
@@ -235,11 +295,12 @@ async function main() {
   if (asJson) { console.log(JSON.stringify({ epoch: Number(ce), hoursToNextBoundary: +hoursToBoundary.toFixed(1), epochTaxEth: eth(epochTax), rows }, null, 2)); return; }
 
   const payBlkCol = (r) => (r.payBlkMin === null ? "-" : `${r.payBlkMin}/${r.payBlkMed}`).padStart(9);
+  const bidCol = (r) => (r.bidEth === null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "-").padStart(8);
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"}  ${String(r.crossings)}/${String(r.sampled).padEnd(2)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
-    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
-  const header = "tok    beh A  x/N  br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk aud  score";
+    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${bidCol(r)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
+  const header = "tok    beh A  x/N  br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk      bid aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
   // --auditable-next keeps only rows that will be auditable when the epoch rolls: 1+
@@ -269,6 +330,7 @@ async function main() {
     console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
     console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
+    console.log("bid = coinbase bid over the LAST 2 EPOCHS (ETH x bid-backed payments) — buys top-of-block, so a bidder is near-unauditable; shared when one operator co-pays several citizens; '?' = RPC has no tracing");
   }
 
   if (!auditableNext) {

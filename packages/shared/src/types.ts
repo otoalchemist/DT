@@ -89,6 +89,14 @@ export interface TargetScoreRow {
   /** Blocks after the boundary it paid: fastest / median. 0 = pays in the boundary block. */
   payBlkMin: number | null;
   payBlkMed: number | null;
+  /**
+   * Coinbase bid over the LAST 2 EPOCHS: total ETH, and how many of its payments were
+   * bid-backed. A bid buys transaction position outright, so a bidder cures at index 0
+   * and is near-unauditable however strapped it looks. Shared when one operator co-pays
+   * several citizens in one block. null = the RPC has no tracing, so it's unknown.
+   */
+  bidEth: number | null;
+  bidPays: number | null;
   audited: number;
   uncatchable: boolean;
   score: number;
