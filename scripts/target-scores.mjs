@@ -29,9 +29,10 @@
 // save the target, so "strapped" is a probability, not a guarantee.
 //
 // Usage:
-//   node scripts/target-scores.mjs                # score, ranked table
-//   node scripts/target-scores.mjs --epochs 20    # widen the cadence look-back
-//   node scripts/target-scores.mjs --json         # machine-readable dump
+//   node scripts/target-scores.mjs                    # score every rival, ranked table
+//   node scripts/target-scores.mjs --auditable-next   # only weak links auditable next boundary
+//   node scripts/target-scores.mjs --epochs 20        # widen the cadence look-back
+//   node scripts/target-scores.mjs --json             # machine-readable dump (full set)
 //   RPC_HTTP_URL=... node scripts/target-scores.mjs
 //
 // RPC URL resolves from: RPC_HTTP_URL env, ALCHEMY_API_KEY env, then data/settings.json
@@ -59,6 +60,11 @@ const SEL = {
 
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
+// --auditable-next: restrict to weak-link candidates that become auditable at the NEXT
+// boundary — currently 1+ epoch behind and not already under audit, so they hit 2+
+// behind (auditable) when the epoch rolls. Ranked by weak-link score, split skipper /
+// non-skipper. Filtering happens after scoring, so --json still emits the full set.
+const auditableNext = args.includes("--auditable-next");
 const epochsArg = (() => { const i = args.indexOf("--epochs"); return i >= 0 && args[i + 1] ? BigInt(args[i + 1]) : 10n; })();
 
 function resolveRpc() {
@@ -215,17 +221,32 @@ async function main() {
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
     `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
   const header = "tok    beh A  x/N  br ins  ownerBal cit runway  owesNxt afrd  tip  idx aud  score";
+  // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
-  const skippers = rows.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
-  const others = rows.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
+  // --auditable-next keeps only rows that will be auditable when the epoch rolls: 1+
+  // behind and not already under audit. behind 1 -> 2 behind next -> newly auditable;
+  // behind 2+ (and not under audit) is already auditable and stays so.
+  const pool = auditableNext ? rows.filter((r) => r.behind >= 1 && !r.under) : rows;
+  const skippers = pool.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
+  const others = pool.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
+  const scope = auditableNext
+    ? `weak-link candidates becoming auditable at epoch ${ce + 1n}`
+    : `ranked by audit-attractiveness`;
   console.log(`epoch ${ce} · next boundary in ${hoursToBoundary.toFixed(1)}h · one epoch of tax = ${eth(epochTax).toFixed(5)} ETH · window ${firstEpoch}..${ce}\n`);
-  console.log(`=== RIVAL SKIPPERS (${skippers.length}) — ranked by audit-attractiveness ===`);
+  console.log(`=== RIVAL SKIPPERS (${skippers.length}) — ${scope} ===`);
   console.log(header); skippers.forEach((r) => console.log(fmt(r)));
-  console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list ===`);
+  console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list, ${scope} ===`);
   console.log(header); others.forEach((r) => console.log(fmt(r)));
+  if (auditableNext) {
+    const best = pool.filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
+    console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
+    console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
+  }
 
-  const best = [...rows].filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);
-  console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
-  console.log("A = under audit · x/N = boundaries crossed delinquent / sampled · score 0 = uncatchable or under audit");
+  if (!auditableNext) {
+    const best = [...rows].filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);
+    console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
+    console.log("A = under audit · x/N = boundaries crossed delinquent / sampled · score 0 = uncatchable or under audit");
+  }
 }
 main().catch((e) => { console.error("target-scores failed:", e.message); process.exit(1); });
