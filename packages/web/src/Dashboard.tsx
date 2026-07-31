@@ -13,6 +13,7 @@ import { api } from "./api.js";
 import { Config } from "./Config.js";
 import { JitPanel } from "./JitPanel.js";
 import { PostMortem } from "./PostMortem.js";
+import { TargetScores } from "./TargetScores.js";
 import { weiToEth, shortAddr, countdown, timeAgo, gameStateLabel } from "./util.js";
 
 const riskBadge: Record<string, string> = {
@@ -400,6 +401,9 @@ export function Dashboard({
             </div>
           </div>
         </div>
+
+        <div className="spacer" />
+        <TargetScores currentEpoch={status?.currentEpoch ?? null} />
 
         <div className="spacer" />
         <PostMortem />

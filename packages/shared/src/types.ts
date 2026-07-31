@@ -61,6 +61,53 @@ export interface EmigratedTokenStatus {
   killable: boolean;
 }
 
+/**
+ * One rival's audit-attractiveness scoring, produced by scripts/target-scores.mjs and
+ * surfaced in the dashboard's "Analyze targets" panel. Field meanings are documented in
+ * that script's header — keep the two in sync.
+ */
+export interface TargetScoreRow {
+  token: string;
+  /** On the curated rival-skippers list (vs a plain rival). */
+  skipper: boolean;
+  /** Epochs behind now: 1 = becomes auditable next boundary, 2+ = auditable already. */
+  behind: number;
+  under: boolean;
+  killable: boolean;
+  /** Boundaries entered 2+ behind / boundaries sampled — how consistently it skips. */
+  crossings: number;
+  sampled: number;
+  bribes: number;
+  ins: boolean;
+  ownerBalEth: number;
+  cits: number;
+  runwayEpochs: number | null;
+  owesNextEth: number;
+  affordNext: boolean;
+  maxTip: number;
+  bestIdx: number | null;
+  /** Blocks after the boundary it paid: fastest / median. 0 = pays in the boundary block. */
+  payBlkMin: number | null;
+  payBlkMed: number | null;
+  audited: number;
+  uncatchable: boolean;
+  score: number;
+}
+
+/** State of the on-demand rival scan behind the dashboard's "Analyze targets" button. */
+export interface TargetScoresState {
+  running: boolean;
+  /** Epoch the scan was computed against; null until one completes. */
+  computedAtEpoch: number | null;
+  computedAt: number | null;
+  hoursToNextBoundary: number | null;
+  epochTaxEth: number | null;
+  rows: TargetScoreRow[] | null;
+  error: string | null;
+  /** True once the epoch rolled since the scan — every "behind" count has shifted. */
+  stale: boolean;
+}
+
 export type ActivityKind =
   | "pay-taxes"
   | "use-bribe"

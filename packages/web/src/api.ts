@@ -6,6 +6,7 @@ import type {
   TargetTokenStatus,
   EmigratedTokenStatus,
   PostMortemResult,
+  TargetScoresState,
 } from "@dat-bot/shared";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -40,6 +41,9 @@ export const api = {
   jit: (body: { enable: boolean; targetEpoch?: number; tokenIds?: string[] }) =>
     req<BotStatus>("/api/jit", { method: "POST", body: JSON.stringify(body) }),
   tokens: () => req<OwnedTokenStatus[]>("/api/tokens"),
+  // On-demand rival scoring. POST starts a background scan; GET polls for the result.
+  targetScores: () => req<TargetScoresState>("/api/target-scores"),
+  runTargetScores: () => req<TargetScoresState>("/api/target-scores", { method: "POST" }),
   // Manual per-token actions — normal network gas at press time, not the race tips.
   payToken: (tokenId: string) =>
     req<{ ok: boolean; message: string; txHash?: string; valueWei?: string }>("/api/token/pay", {

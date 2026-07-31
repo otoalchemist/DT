@@ -19,6 +19,7 @@ import { getGameSnapshot } from "./contract.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated } from "./service.js";
+import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 
 const strategyPatch = z
@@ -102,6 +103,11 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/rival-skippers", async () => ({
     tokenIds: loadRivalSkippers(),
   }));
+
+  // --- on-demand rival scoring (dashboard "Analyze targets") ---
+  // The scan takes minutes, so POST starts it in the background and the UI polls GET.
+  app.get("/api/target-scores", async () => getTargetScores());
+  app.post("/api/target-scores", async () => startTargetScores());
 
   app.post("/api/config", async (req, reply) => {
     const parsed = strategyPatch.safeParse(req.body);
