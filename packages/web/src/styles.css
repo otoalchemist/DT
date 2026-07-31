@@ -118,12 +118,15 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
 
 .log { max-height: 340px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-/* A panel that should fill its grid cell rather than sit at content height. Used by
-   Activity, which shares a row with the much taller Config panel: without this the log
-   stopped at its 340px cap and left a large dead area below it. min-height keeps it
-   usable when the row is short (single-column layout on narrow screens). */
-.panel.fill { display: flex; flex-direction: column; }
-.panel.fill .log { flex: 1 1 auto; max-height: none; min-height: 340px; }
+/* A panel that fills its grid cell without DRIVING the row height. Used by Activity,
+   which shares a row with the taller Strategy panel: it should stretch down to match
+   Strategy, not grow to its own content length (hundreds of log rows) and drag Strategy
+   with it. The two min-height:0 declarations are what make that work — a grid item and
+   a flex child both default to min-height:auto, which refuses to shrink below content,
+   so without them the log's full height becomes the row height. flex-basis 0 plus
+   overflow:hidden then lets the log take exactly the leftover space and scroll. */
+.panel.fill { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.panel.fill .log { flex: 1 1 0; min-height: 0; max-height: none; }
 .log-row { display: grid; grid-template-columns: 72px 90px 1fr; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 12px; }
 .log-row:hover { background: var(--panel-2); }
 .log-row .time { color: var(--muted); font-variant-numeric: tabular-nums; }
