@@ -62,15 +62,24 @@ const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cad
  * never auditable in practice, and pinning them wastes a scarce auditor slot (one owned
  * token audits at most `auditLimit` times per epoch) on a race that cannot be won.
  *
- * The five below are one operator: a batch-payer contract
+ * 1575/1661/4650/4957/6737 are one operator: a batch-payer contract
  * (0x5c50b6dc6a42c9fe6993b0801ef7a2a3fe8ea676, senders 0x28ead8f1…/0x08a24cdd…) that pays
  * all five citizens in a single tx and pays the block builder directly in that same tx.
  * Measured over epochs 137-146: an escalating coinbase bid (0.010 -> 0.015 -> 0.005 ->
  * 0.030 -> 0.080 ETH) buying transaction index 0, and ZERO successful audits against any
  * of the five by ANY player across the whole window. Re-check with
  * scripts/rival-builder-bids-style tracing before removing an entry from this list.
+ *
+ * 272/711/909/4335 belong to 0x91bAec4D1Bc7D17D6de74499075A8A64604a52Fd (7 citizens,
+ * ~73 ETH, ~100-epoch runway), excluded by operator decision. They defended at 80-112
+ * gwei and cured in the boundary block itself (payBlk 0/0), so they were unwinnable in
+ * practice regardless. Verified with ownerOf at epoch 151; that wallet also holds
+ * #75/#274/#796, which were never on either list.
  */
-const EXCLUDED = new Set(["1575", "1661", "4650", "4957", "6737"]);
+const EXCLUDED = new Set([
+  "1575", "1661", "4650", "4957", "6737",
+  "272", "711", "909", "4335",
+]);
 
 // --- args ---
 const args = process.argv.slice(2);
