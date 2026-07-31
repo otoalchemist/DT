@@ -39,6 +39,13 @@ drops out of the owned set by itself. They still count toward the supply that en
 game (they leave it only when somebody else kills them), so the endgame gate
 (`endgameOnlyWithin`) still reads the raw on-chain Citizen supply.
 
+The **Emigrated citizens** panel is the full history, read from the contract's `Emigrated`
+event log rather than from who currently holds what. An emigrant that has already been
+killed is burned and disappears from every ownership index, so an ownership-based list
+would keep shrinking as they die — it read 5 when 13 had emigrated. Killed emigrants stay
+on the list, dimmed and marked `killed`, with the header splitting the count into still
+held / killed / slots left.
+
 ---
 
 ## Architecture

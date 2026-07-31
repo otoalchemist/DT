@@ -23,6 +23,11 @@ export const GAME_CONTRACT_ADDRESS = "0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F
  */
 export const EMIGRATION_CONTRACT_ADDRESS = "0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C" as const;
 
+/** Block the Emigration contract was deployed in (tx 0xb42bf57c…67a8, 2026-07-29
+ *  20:30 UTC). Lower bound for the `Emigrated` log scan — there can be no event
+ *  before it, so scanning from genesis would be wasted range. */
+export const EMIGRATION_DEPLOY_BLOCK = 25_640_893n;
+
 /** True when `owner` is the Emigration contract, i.e. the citizen has emigrated.
  *  Case-insensitive: indexers return owners in varying casings (Alchemy's owner
  *  index is lowercase, `ownerOf` returns checksummed), so never compare raw. */

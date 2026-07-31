@@ -1,8 +1,15 @@
 import type { Address } from "viem";
-import { isEmigrated, type OwnedTokenStatus, type TargetTokenStatus } from "@dat-bot/shared";
+import {
+  isEmigrated,
+  EMIGRATION_CONTRACT_ADDRESS,
+  type OwnedTokenStatus,
+  type TargetTokenStatus,
+  type EmigratedTokenStatus,
+} from "@dat-bot/shared";
 import { runtime } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
+import { fetchEmigrationRoster } from "./emigration.js";
 import { makeIdCache } from "./id-cache.js";
 import { loadKeystore } from "./keystore.js";
 import { appConfig } from "./config.js";
@@ -174,24 +181,57 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
 }
 
 /**
- * Citizens that have emigrated — currently owned by the Emigration contract.
+ * Every citizen that has emigrated, in emigration order.
  *
- * These are excluded from `readTargets` and from every offense sweep, so this is the
- * only place they surface. They're still live ERC-721s and still accrue delinquency, so
- * the same status fields apply and the panel can show how far behind each one is; the
- * difference is that nothing will ever be done about it by us or by them. The contract
- * has no way to pay taxes or spend a bribe, so an emigrant's `epochsBehind` only grows
- * until somebody else kills it.
+ * The roster comes from the `Emigrated` event log, NOT from current ownership. An
+ * emigrated citizen is held by the Emigration contract only until somebody kills it, and
+ * the kill burns the ERC-721 — so it drops out of every ownership index. Filtering the
+ * live set by owner therefore answers "how many emigrants are still alive" (5) when the
+ * question is "who has emigrated" (13, with 8 already killed), and the list silently
+ * shrinks over time, which reads as a bug. The log never shrinks.
  *
- * Sorted by token ID: this is a roster, not a work queue, so a stable order beats an
- * actionability ranking that would reshuffle rows on every poll.
+ * Liveness is layered on top from the live-citizen set we already cache, so a killed
+ * emigrant stays listed with `alive: false`. Only the living ones get a status read —
+ * the game contract has nothing meaningful to say about a burned token.
  */
-export async function readEmigrated(): Promise<TargetTokenStatus[]> {
+export async function readEmigrated(): Promise<EmigratedTokenStatus[]> {
+  const records = await fetchEmigrationRoster();
+  if (records.length === 0) return [];
+
   const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
+
+  // Liveness for free: the cached live set is keyed on current ownership, so an emigrant
+  // present in it still exists. This also covers the owner rescuing one back out
+  // (rescueERC721) — it stays on the roster as history, while the owner change drops it
+  // from the offense filter on its own, putting it back in play as a normal rival.
   const live = await getLiveCandidates(snap.citizensAddress);
-  const emigrants = live.filter((t) => isEmigrated(t.owner));
-  if (emigrants.length === 0) return [];
-  const statuses = await batchGetTargetStatuses(emigrants, snap.currentEpoch, nowSec);
-  return statuses.sort((a, b) => (BigInt(a.tokenId) < BigInt(b.tokenId) ? -1 : 1));
+  const liveIds = new Set(live.map((t) => t.id.toString()));
+
+  const aliveRecords = records.filter((r) => liveIds.has(r.tokenId.toString()));
+  const statuses = await batchGetTargetStatuses(
+    aliveRecords.map((r) => ({ id: r.tokenId, owner: EMIGRATION_CONTRACT_ADDRESS as Address })),
+    snap.currentEpoch,
+    nowSec,
+  );
+  const statusById = new Map(statuses.map((s) => [s.tokenId, s]));
+
+  logger.debug(
+    `readEmigrated: ${records.length} emigrated (${aliveRecords.length} alive, ` +
+      `${records.length - aliveRecords.length} already killed)`,
+  );
+
+  return records.map((r, index) => {
+    const key = r.tokenId.toString();
+    const s = statusById.get(key);
+    return {
+      tokenId: key,
+      emigratedBy: r.emigratedBy,
+      index,
+      alive: liveIds.has(key),
+      epochsBehind: s?.epochsBehind ?? 0,
+      auditDueTimestamp: s?.auditDueTimestamp ?? "0",
+      killable: s?.killable ?? false,
+    };
+  });
 }

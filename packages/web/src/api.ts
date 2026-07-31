@@ -4,6 +4,7 @@ import type {
   ActivityEntry,
   OwnedTokenStatus,
   TargetTokenStatus,
+  EmigratedTokenStatus,
   PostMortemResult,
 } from "@dat-bot/shared";
 
@@ -51,8 +52,9 @@ export const api = {
       body: JSON.stringify({ tokenId }),
     }),
   targets: () => req<TargetTokenStatus[]>("/api/targets"),
-  // Citizens that left the game via the Emigration contract — never in `targets`.
-  emigrated: () => req<TargetTokenStatus[]>("/api/emigrated"),
+  // Full emigration history from the contract's event log — never in `targets`.
+  // Includes emigrants already killed (alive: false), so the count doesn't shrink.
+  emigrated: () => req<EmigratedTokenStatus[]>("/api/emigrated"),
   activity: (limit = 200) => req<ActivityEntry[]>(`/api/activity?limit=${limit}`),
   getSettings: () => req<{ alchemyKeySet: boolean; mode: "mainnet" | "public" }>("/api/settings"),
   saveAlchemyKey: (alchemyApiKey: string) =>

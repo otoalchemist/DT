@@ -7,6 +7,7 @@ import {
   type ActivityEntry,
   type OwnedTokenStatus,
   type TargetTokenStatus,
+  type EmigratedTokenStatus,
 } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { Config } from "./Config.js";
@@ -64,10 +65,14 @@ function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: strin
  * Citizens that emigrated: sent to the Emigration contract, swapped for a Governor NFT,
  * and held there permanently. They're out of the main game — we never pay, audit or kill
  * them — so this table deliberately carries no action affordance and mutes every badge.
- * The status is shown anyway because it's the only clue to WHEN a given emigrant will
- * finally be killed by someone else and drop out of the supply that ends the game.
+ *
+ * The roster is the full emigration history, so it includes emigrants that have ALREADY
+ * been killed (rows go dim). Listing only the ones still held would shrink the count as
+ * they die — the panel would have read 5 when 13 had emigrated. The live rows still show
+ * a status because it's the only clue to when each remaining emigrant gets killed by
+ * someone else and drops out of the supply that ends the game.
  */
-function EmigratedTable({ rows }: { rows: TargetTokenStatus[] }) {
+function EmigratedTable({ rows }: { rows: EmigratedTokenStatus[] }) {
   if (rows.length === 0) {
     return <p className="muted" style={{ fontSize: 12 }}>No citizens have emigrated yet.</p>;
   }
@@ -76,16 +81,18 @@ function EmigratedTable({ rows }: { rows: TargetTokenStatus[] }) {
       <thead><tr><th>Token</th><th>Behind</th><th>Fate</th></tr></thead>
       <tbody>
         {rows.map((t) => (
-          <tr key={t.tokenId}>
+          <tr key={t.tokenId} style={t.alive ? undefined : { opacity: 0.55 }}>
             <td className="mono">#{t.tokenId}</td>
-            <td>{t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
+            <td>{t.alive && t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
             <td>
               <span className="badge off">
-                {t.killable
-                  ? "awaiting kill"
-                  : t.auditDueTimestamp !== "0"
-                    ? `dies in ${countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}`
-                    : "unaudited"}
+                {!t.alive
+                  ? "killed"
+                  : t.killable
+                    ? "awaiting kill"
+                    : t.auditDueTimestamp !== "0"
+                      ? `dies in ${countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}`
+                      : "unaudited"}
               </span>
             </td>
           </tr>
@@ -119,7 +126,7 @@ export function Dashboard({
   const [savedConfig, setSavedConfig] = useState<StrategyConfig | null>(null);
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
-  const [emigrated, setEmigrated] = useState<TargetTokenStatus[]>([]);
+  const [emigrated, setEmigrated] = useState<EmigratedTokenStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -180,6 +187,10 @@ export function Dashboard({
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
+
+  // Emigrants still held by the contract. The rest of the roster is already dead — kept
+  // on the list because emigrating is what put them there, and the count is the history.
+  const emigratedAlive = emigrated.filter((e) => e.alive).length;
 
   const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
@@ -414,16 +425,20 @@ export function Dashboard({
 
         <div className="panel">
           <h2>Emigrated citizens ({emigrated.length})</h2>
+          <div className="muted" style={{ ...sectionLabel, marginBottom: 6 }}>
+            {emigratedAlive} still held · {emigrated.length - emigratedAlive} killed · {36 - emigrated.length} slots left
+          </div>
           <EmigratedTable rows={emigrated} />
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.5 }}>
             Traded to the{" "}
             {explorerBase
               ? <a href={`${explorerBase}/address/${EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">Emigration contract</a>
               : "Emigration contract"}{" "}
-            for a Governor NFT. They've left the main game: the bot never audits or kills
-            them, and they're excluded from Rival targets. The contract can't pay taxes or
-            spend a bribe, so each one falls further behind until someone else kills it —
-            which still counts toward the {status?.citizenSupply ?? "—"} → 69 endgame.
+            for a Governor NFT (36 total, first come). They've left the main game: the bot
+            never audits or kills them, and they're excluded from Rival targets. The
+            contract can't pay taxes or spend a bribe, so each one falls further behind
+            until someone else kills it — which still counts toward the{" "}
+            {status?.citizenSupply ?? "—"} → 69 endgame, so killed emigrants stay listed.
           </p>
         </div>
       </div>

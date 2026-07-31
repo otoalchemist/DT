@@ -36,6 +36,31 @@ export interface TargetTokenStatus {
   killable: boolean;
 }
 
+/**
+ * A citizen that emigrated — traded to the Emigration contract for a Governor NFT.
+ *
+ * Sourced from the contract's `Emigrated` event log, NOT from current ownership, so the
+ * roster is permanent: an emigrant that has since been killed (ERC-721 burned, so it
+ * vanishes from every ownership index) still appears, marked `alive: false`. Ownership
+ * alone would silently shrink the list as emigrants die, which reads as a bug.
+ */
+export interface EmigratedTokenStatus {
+  tokenId: string;
+  /** Address the Governor NFT was minted to — the wallet that emigrated this citizen. */
+  emigratedBy: string;
+  /** Emigration order, 0-based. Also the Governor's metadata index at mint time. */
+  index: number;
+  /** False once the citizen has been killed and burned. Its tax/audit fields are
+   *  then frozen at "—": there is no live token left to read a status from. */
+  alive: boolean;
+  /** How many epochs behind on taxes. 0 when not alive. */
+  epochsBehind: number;
+  /** 0 if not under audit; else the unix ts after which kill() succeeds. */
+  auditDueTimestamp: string;
+  /** True if under audit and already expired -> anyone can kill it now. */
+  killable: boolean;
+}
+
 export type ActivityKind =
   | "pay-taxes"
   | "use-bribe"
