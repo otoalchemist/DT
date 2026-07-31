@@ -163,13 +163,28 @@ async function main() {
   // as rival-skippers.mjs). crossings = boundaries the token was 2+ behind entering.
   const firstEpoch = ce - epochsArg + 1n > 2n ? ce - epochsArg + 1n : 2n;
   const crossings = {}; const sampled = {}; for (const t of rivals) { crossings[t] = 0; sampled[t] = 0; }
+  const epochFirstBlock = new Map(); // epoch -> first block of that epoch
   for (let E = firstEpoch; E <= ce; E++) {
     const bts = startTime + (E - 1n) * EPOCH_DURATION;
     const lastB = await lastBlockBefore(bts, latest - 100000n > 1n ? latest - 100000n : 1n, latest);
+    epochFirstBlock.set(E.toString(), lastB + 1n); // first block of epoch E = block after the last of E-1
     const rq = rivals.map((t, i) => ({ jsonrpc: "2.0", id: i + 1, method: "eth_call", params: [{ to: GAME, data: SEL.lastEpochPaid + enc(t) }, hb(lastB)] }));
     const m2 = new Map((await batch(rq)).map((r) => [r.id, r]));
     rivals.forEach((t, i) => { const r = m2.get(i + 1); if (r && r.result && r.result !== "0x") { sampled[t]++; if (BigInt(r.result) + 2n <= E) crossings[t]++; } });
   }
+
+  // Payment timing: for each tax payment, how many blocks AFTER that epoch's boundary it
+  // landed (offset 0 = paid in the boundary block itself). This is the audit window — a
+  // rival that always pays at +0/+1 can only be caught in the boundary block; one that
+  // pays 30+ blocks in is catchable comfortably mid-epoch. Reported as fastest / median.
+  const payOff = {}; // token -> [offsets]
+  for (const l of payLogs) {
+    const tok = BigInt(l.topics[1]).toString(); const m = meta.get(l.transactionHash); if (!m) continue;
+    let off = null;
+    for (let E = ce; E >= firstEpoch; E--) { const fb = epochFirstBlock.get(E.toString()); if (fb !== undefined && m.blk >= fb) { off = Number(m.blk - fb); break; } }
+    if (off !== null && off >= 0) (payOff[tok] ??= []).push(off);
+  }
+  const median = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); const h = s.length >> 1; return s.length % 2 ? s[h] : Math.round((s[h - 1] + s[h]) / 2); };
 
   // Score each live, non-emigrated rival.
   const rows = [];
@@ -204,23 +219,27 @@ async function main() {
       if (bribes > 0) score -= 1;                                   // free escape
       score = Math.max(0, score);
     }
+    const offs = payOff[t] ?? [];
+    const payBlkMin = offs.length ? Math.min(...offs) : null; // fastest cure after a boundary
+    const payBlkMed = median(offs);                            // typical audit window
     rows.push({
       token: t, skipper: skipperSet.has(t), behind, under, killable: under && due <= nowSec,
       crossings: crossings[t], sampled: sampled[t], bribes, ins,
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
-      owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx, audited: aud,
-      uncatchable, score: +score.toFixed(2),
+      owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
+      payBlkMin, payBlkMed, audited: aud, uncatchable, score: +score.toFixed(2),
     });
   }
 
   const hoursToBoundary = Number(nextBoundary - nowSec) / 3600;
   if (asJson) { console.log(JSON.stringify({ epoch: Number(ce), hoursToNextBoundary: +hoursToBoundary.toFixed(1), epochTaxEth: eth(epochTax), rows }, null, 2)); return; }
 
+  const payBlkCol = (r) => (r.payBlkMin === null ? "-" : `${r.payBlkMin}/${r.payBlkMed}`).padStart(9);
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"}  ${String(r.crossings)}/${String(r.sampled).padEnd(2)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
-    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
-  const header = "tok    beh A  x/N  br ins  ownerBal cit runway  owesNxt afrd  tip  idx aud  score";
+    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
+  const header = "tok    beh A  x/N  br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
   // --auditable-next keeps only rows that will be auditable when the epoch rolls: 1+
@@ -249,6 +268,7 @@ async function main() {
     const best = pool.filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
     console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
+    console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
   }
 
   if (!auditableNext) {
