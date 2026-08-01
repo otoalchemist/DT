@@ -198,6 +198,26 @@ export function Dashboard({
   }, [refresh, awayMode]);
 
   const running = status?.running ?? false;
+
+  // 1s clock so the "Bot starting in …" countdown actually counts. Purely local — it
+  // re-renders from the already-known wake timestamp and costs no RPC. Only runs while a
+  // countdown is on screen.
+  const [, setNowTick] = useState(0);
+  const awayWakeSec = status?.awayNextWakeSec ?? null;
+  const countingDown = awayMode && !running && awayWakeSec !== null;
+  useEffect(() => {
+    if (!countingDown) return;
+    const id = setInterval(() => setNowTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [countingDown]);
+
+  const awaySecsToWake = awayWakeSec === null ? 0 : awayWakeSec - Math.floor(Date.now() / 1000);
+  // A wake is actually scheduled: away mode owns starting the bot, so Start is disabled.
+  const awayScheduled = countingDown;
+  // Away mode on but nothing armed to wake for — no schedule exists, so leave Start
+  // clickable rather than locking the user out of running the bot at all.
+  const awayIdleNoWork = awayMode && !running && awayWakeSec === null;
+
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
@@ -285,29 +305,47 @@ export function Dashboard({
           </div>
           <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>
             <span className={`badge status-lg ${running ? "on" : "off"}`}>{running ? "● RUNNING" : "PAUSED"}</span>
-            {config?.awayMode && (
+            {awayMode && (
+              // The countdown itself lives on the Start button, so this badge just states
+              // the mode — two countdowns side by side would be noise.
               <span
                 className="badge warn"
                 title={
-                  status?.awayNextWakeSec
-                    ? `Away mode: engine idle (no RPC polling). Wakes ${config.awayLeadMinutes} min before the boundary, runs through it, then stops 5 min after.`
-                    : "Away mode on, but nothing is armed to wake for — arm a JIT payment or enable offense."
+                  awayScheduled
+                    ? `Away mode: engine idle, no RPC polling. Starts itself ${config?.awayLeadMinutes ?? 15} min before the boundary, runs through it, then idles again 5 min after.`
+                    : awayIdleNoWork
+                      ? "Away mode on, but nothing is armed to wake for — arm a JIT payment or enable offense."
+                      : "Away mode: this is the boundary window, so the engine is running. It will idle again shortly after the boundary."
                 }
               >
-                AWAY{status?.awayNextWakeSec
-                  ? ` · wakes in ${countdown(status.awayNextWakeSec - Math.floor(Date.now() / 1000))}`
-                  : " · idle"}
+                AWAY{awayIdleNoWork ? " · nothing armed" : ""}
               </span>
             )}
             <button className="ghost" onClick={() => void refresh(true)} title="Read on-chain data once, now — useful in away mode where nothing polls.">
               Refresh data
             </button>
             <button
-              className={`start-cta ${running ? "danger" : "primary attention"}`}
+              className={`start-cta ${running ? "danger" : awayScheduled ? "" : "primary attention"}`}
               onClick={toggleRun}
-              disabled={toggling}
+              // With a wake scheduled the bot starts itself, so Start is not the user's
+              // job — showing it live would invite a press that fights the schedule.
+              // Pause stays live: stopping a running bot is always the user's call.
+              disabled={toggling || awayScheduled}
+              title={
+                awayScheduled
+                  ? `Away mode is managing the bot. It starts itself ${config?.awayLeadMinutes ?? 15} min before the epoch boundary, runs through it, then idles again 5 min after.`
+                  : awayIdleNoWork
+                    ? "Away mode is on but nothing is armed to wake for — arm a JIT payment or enable offense. You can still start manually."
+                    : undefined
+              }
             >
-              {toggling ? "…" : running ? "Pause bot" : "▶ Start bot"}
+              {toggling
+                ? "…"
+                : running
+                  ? "Pause bot"
+                  : awayScheduled
+                    ? `Bot starting in ${countdown(awaySecsToWake)}`
+                    : "▶ Start bot"}
             </button>
             {toggleErr && <span className="err" style={{ fontSize: 12 }}>{toggleErr}</span>}
           </div>
