@@ -17,7 +17,7 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
           <tr>
             <th style={cell} title="Token ID">Token</th>
             <th style={cell} title="Epochs behind: 1 = auditable next boundary, 2+ = auditable now">Beh</th>
-            <th style={cell} title="Boundaries entered 2+ behind / boundaries sampled">Skip</th>
+            <th style={cell} title="Outcome of its skips. A skip is a boundary entered 2+ behind, which leaves the token auditable until it cures — so it either slips through (clean, green) or draws an audit that epoch (caught, amber), out of skips attempted. All-clean = a proven-safe cadence and a hard target; often caught = a soft one, cheap to punish again. — = never crossed delinquent in the window.">Skip clean/caught</th>
             <th style={cell} title="Owner ETH balance">Owner</th>
             <th style={cell} title="Epochs the owner's balance covers across all their citizens">Runway</th>
             <th style={cell} title="Can the owner afford the next-boundary catch-up?">Afford</th>
@@ -38,7 +38,24 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
                   ? <span className="badge warn" style={{ fontSize: 10 }}>audit</span>
                   : <span style={{ color: r.behind >= 2 ? "var(--amber)" : undefined }}>{r.behind}</span>}
               </td>
-              <td style={cell}>{r.crossings}/{r.sampled}</td>
+              <td style={cell}>
+                {r.crossings === 0 ? (
+                  <span className="muted">—</span>
+                ) : r.skipClean === undefined || r.skipCaught === undefined ? (
+                  // Rows cached from a scan that predates this column — show the plain
+                  // cadence rather than a half-empty outcome. Re-run to populate it.
+                  <span className="muted" title="Re-run Analyze targets to see skip outcomes">
+                    {r.crossings}/{r.sampled}
+                  </span>
+                ) : (
+                  <>
+                    <span style={{ color: "var(--green)" }}>{r.skipClean}</span>
+                    <span className="muted">/</span>
+                    <span style={{ color: r.skipCaught > 0 ? "var(--amber)" : undefined }}>{r.skipCaught}</span>
+                    <span className="muted"> of {r.crossings}</span>
+                  </>
+                )}
+              </td>
               <td style={cell}>{r.ownerBalEth.toFixed(3)}{r.cits > 1 ? <span className="muted"> ×{r.cits}</span> : null}</td>
               <td style={cell}>{r.runwayEpochs === null ? "∞" : r.runwayEpochs.toFixed(1)}</td>
               <td style={{ ...cell, color: r.affordNext ? undefined : "var(--red)", fontWeight: r.affordNext ? 400 : 600 }}>
@@ -170,7 +187,8 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
           </div>
 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>
-            Beh 1 = auditable next boundary · Skip = boundaries entered 2+ behind / sampled ·
+            Beh 1 = auditable next boundary · Skip = skips survived / skips that drew an audit,
+            out of attempted (a skip = a boundary entered 2+ behind) ·
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
             the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-

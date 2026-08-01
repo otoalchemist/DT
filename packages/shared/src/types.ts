@@ -77,6 +77,18 @@ export interface TargetScoreRow {
   /** Boundaries entered 2+ behind / boundaries sampled — how consistently it skips. */
   crossings: number;
   sampled: number;
+  /**
+   * Outcome of those crossings. A skip leaves the token auditable until it cures, so it
+   * either slips through (`skipClean`) or draws an audit that epoch (`skipCaught`).
+   * `skipClean + skipCaught === crossings`. All-clean = a proven-safe cadence and a hard
+   * target; frequently caught = a soft one that is cheap to punish again.
+   *
+   * Optional because the scan result is cached in memory: a backend still holding rows
+   * from a scan that ran before this column existed will not have them, and the UI falls
+   * back to the plain crossings/sampled cadence for those.
+   */
+  skipCaught?: number;
+  skipClean?: number;
   bribes: number;
   ins: boolean;
   ownerBalEth: number;
