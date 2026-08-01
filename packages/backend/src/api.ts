@@ -276,6 +276,9 @@ export async function buildServer(): Promise<FastifyInstance> {
       runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
       scheduleJitBoundary();
       schedulePreBoundaryPay();
+      // Disarming changes what there is to wake for, exactly as arming does — re-evaluate
+      // rather than leaving a wake armed for a JIT that no longer exists.
+      if (runtime.strategy.awayMode) scheduleAwayWake();
       return runtime.status();
     }
 

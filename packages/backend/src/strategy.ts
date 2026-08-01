@@ -238,10 +238,23 @@ function nextBoundarySec(startTime: bigint, nowSec: bigint): bigint {
   return startTime + (elapsed / EPOCH_DURATION_SECONDS + 1n) * EPOCH_DURATION_SECONDS;
 }
 
-/** Whether there is anything worth waking up for: an armed JIT payment, or offense. */
+/**
+ * Whether there is anything worth waking up for.
+ *
+ * This must mirror what a RUNNING engine would actually do at a boundary (see tick()),
+ * or away mode silently disables work the user still has switched on. The three boundary
+ * actions and their gates:
+ *   - proactive pay  : enabled && proactivePay      (pre-audit defense of owned citizens)
+ *   - JIT payment    : enabled && jitEnabled && a target epoch
+ *   - offense        : offenseEnabled
+ * `enabled` stays true after a JIT arm is released, which is deliberate: proactive pay is
+ * the standing defense and should keep waking us even with nothing else armed.
+ */
 function awayHasWork(): boolean {
   const s = runtime.strategy;
-  return (s.jitEnabled && s.jitTargetEpoch !== null) || s.offenseEnabled;
+  const jitArmed = s.enabled && s.jitEnabled && s.jitTargetEpoch !== null;
+  const proactive = s.enabled && s.proactivePay;
+  return jitArmed || proactive || s.offenseEnabled;
 }
 
 export function awayNextWake(): number | null {
@@ -343,6 +356,41 @@ function awayWake(): void {
   const s = runtime.strategy;
   if (!s.awayMode || !runtime.unlocked || !awayHasWork()) { scheduleAwayWake(); return; }
 
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const graceSec = BigInt(AWAY_STOP_GRACE_MS / 1000);
+  const leadSec = BigInt(Math.max(1, s.awayLeadMinutes)) * 60n;
+  const boundary = runtime.startTime !== null ? nextBoundarySec(runtime.startTime, nowSec) : nowSec;
+  const prevBoundary = boundary - EPOCH_DURATION_SECONDS;
+
+  // A wake can fire LATE: a suspended machine runs no timers, so by the time the event
+  // loop resumes the boundary this wake was armed for may already be behind us. Decide
+  // which window we are actually in before arming the stop — nextBoundarySec(now) rolls
+  // to TOMORROW's boundary the moment `now` passes one, so using it unconditionally
+  // would hold the engine open for a full epoch at ~22 req/min.
+  let stopAt: bigint;
+  if (nowSec <= prevBoundary + graceSec) {
+    // Late, but still inside the window the previous boundary opened — honour what's
+    // left of it (a JIT payment for that epoch can still land) and close on schedule.
+    stopAt = prevBoundary + graceSec;
+  } else if (nowSec >= boundary - leadSec) {
+    // The normal case: we are in the lead-up to the next boundary.
+    stopAt = boundary + graceSec;
+  } else {
+    // Too late to be useful and too early for the next boundary. Idling is the whole
+    // point of away mode, so go back to sleep instead of running until tomorrow.
+    logger.warn(
+      `away mode: wake fired ${((Number(nowSec - prevBoundary)) / 60).toFixed(1)} min after the ` +
+        `boundary, past the ${AWAY_STOP_GRACE_MS / 60000} min window — idling until the next one`,
+    );
+    activity.add({
+      kind: "info",
+      status: "info",
+      message: "Away mode: missed the boundary window (machine asleep?) — idling until the next epoch",
+    });
+    awaySleep();
+    return;
+  }
+
   if (!runtime.running) {
     awayStartedEngine = true;
     activity.add({
@@ -352,12 +400,7 @@ function awayWake(): void {
     });
     startEngine();
   }
-
-  // Stop once the boundary is `AWAY_STOP_GRACE_MS` behind us. Recomputed from the clock
-  // rather than the lead, so a late wake still gets the full post-boundary grace.
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const boundary = runtime.startTime !== null ? nextBoundarySec(runtime.startTime, nowSec) : nowSec;
-  armAwayStop(boundary + BigInt(AWAY_STOP_GRACE_MS / 1000), nowSec);
+  armAwayStop(stopAt, nowSec);
 }
 
 /** End the away window: stop the engine (only if away mode started it) and re-arm. */

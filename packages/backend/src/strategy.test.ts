@@ -799,10 +799,35 @@ describe("away mode arming", () => {
     expect(runtime.awayNextWakeSec).toBeNull();
   });
 
+  // POST /api/jit sets `enabled` alongside jitEnabled, so that pairing is the real armed
+  // state — and it has to be, since jitPass itself is gated on `enabled`.
   it("arms for an armed JIT payment even with offense off", () => {
-    runtime.strategy = { ...runtime.strategy, offenseEnabled: false, jitEnabled: true, jitTargetEpoch: 151 };
+    runtime.strategy = { ...runtime.strategy, offenseEnabled: false, enabled: true, jitEnabled: true, jitTargetEpoch: 151, proactivePay: false };
     scheduleAwayWake();
     expect(runtime.awayNextWakeSec).not.toBeNull();
+  });
+
+  // Away mode must wake for anything a RUNNING engine would do at the boundary. Proactive
+  // pay is the standing pre-audit defense of owned citizens and survives a JIT disarm, so
+  // missing it here would silently stop paying them the moment offense was switched off.
+  it("arms for proactive pay alone — no JIT armed, offense off", () => {
+    runtime.strategy = {
+      ...runtime.strategy,
+      offenseEnabled: false, jitEnabled: false, jitTargetEpoch: null,
+      enabled: true, proactivePay: true,
+    };
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBe(Number(START + EPOCH * 151n) - 15 * 60);
+  });
+
+  it("stays dark when payment is off entirely", () => {
+    runtime.strategy = {
+      ...runtime.strategy,
+      offenseEnabled: false, jitEnabled: false, jitTargetEpoch: null,
+      enabled: false, proactivePay: true,
+    };
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBeNull();
   });
 
   it("does not arm while the wallet is locked — it could not submit anything anyway", () => {
@@ -869,6 +894,102 @@ describe("away mode arming", () => {
     vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000); // 1 min before boundary
     scheduleAwayWake();
     expect(runtime.awayNextWakeSec).toBe(Number(START + EPOCH * 151n - 60n)); // = now
+  });
+});
+
+// The arming tests above prove away mode SCHEDULES correctly. These prove it actually
+// runs the window: wakes early, stays up across the boundary, stops shortly after, and
+// re-arms for the next epoch. A regression here is invisible on the dashboard — the
+// badge still counts down — but either misses every boundary or never idles again.
+describe("away mode run window (wake -> run -> stop)", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const START = 0n;
+  const EPOCH = 86_400n;
+  const BOUNDARY = START + EPOCH * 151n; // the boundary that starts epoch 152
+  const LEAD = 15n * 60n;
+  const GRACE = 5n * 60n;
+  const at = (sec: bigint) => vi.setSystemTime(Number(sec) * 1000);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    runtime.account = { address: ADDR } as unknown as PrivateKeyAccount;
+    runtime.startTime = START;
+    runtime.running = false;
+    runtime.awayNextWakeSec = null;
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      awayMode: true,
+      awayLeadMinutes: 15,
+      offenseEnabled: true,
+      jitEnabled: false,
+    };
+  });
+
+  afterEach(() => {
+    clearAwayTimers();
+    stopEngine();
+    vi.useRealTimers();
+    runtime.account = null;
+    runtime.running = false;
+  });
+
+  it("wakes at lead, stays up across the boundary, stops after the grace, re-arms", async () => {
+    at(BOUNDARY - 20n * 60n);
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBe(Number(BOUNDARY - LEAD));
+    expect(runtime.running).toBe(false);
+
+    // 5 more minutes -> the wake fires at boundary - 15 min.
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    expect(runtime.running).toBe(true);
+    // Running, so the badge shows the window, not a countdown to a wake already past.
+    expect(runtime.awayNextWakeSec).toBeNull();
+
+    // Across the boundary itself and into the grace: must still be up.
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000); // now = boundary
+    expect(runtime.running).toBe(true);
+    await vi.advanceTimersByTimeAsync(4 * 60 * 1000); // boundary + 4 min
+    expect(runtime.running).toBe(true);
+
+    // Past boundary + 5 min: the window closes and the next one is armed.
+    await vi.advanceTimersByTimeAsync(90 * 1000);
+    expect(runtime.running).toBe(false);
+    expect(runtime.awayNextWakeSec).toBe(Number(BOUNDARY + EPOCH - LEAD));
+  });
+
+  it("does not hold the engine open for a whole epoch when the wake fires late", async () => {
+    at(BOUNDARY - 20n * 60n);
+    scheduleAwayWake();
+
+    // The machine suspends. setTimeout does not fire while suspended, so by the time the
+    // event loop runs again the boundary is already behind us and the grace has expired.
+    at(BOUNDARY + GRACE + 2n * 60n);
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+    // The boundary work is missed either way — but the engine must not sit up burning
+    // ~22 req/min until the NEXT boundary 24h away.
+    expect(runtime.running).toBe(false);
+    expect(runtime.awayNextWakeSec).toBe(Number(BOUNDARY + EPOCH - LEAD));
+  });
+
+  it("honours what is left of the window when the wake fires just after the boundary", async () => {
+    at(BOUNDARY - 20n * 60n);
+    scheduleAwayWake();
+
+    // Suspended through the lead, resuming 2 min PAST the boundary — still inside the
+    // grace, so the window is real: a JIT payment for the new epoch can still land.
+    at(BOUNDARY - 3n * 60n);
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000); // fires at boundary + 2 min
+    expect(runtime.running).toBe(true);
+
+    // It ends at boundary + 5 min as always — not 5 min from the late wake, which would
+    // stretch the window every time a wake slipped.
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000); // boundary + 4 min
+    expect(runtime.running).toBe(true);
+    await vi.advanceTimersByTimeAsync(90 * 1000); // boundary + 5.5 min
+    expect(runtime.running).toBe(false);
+    expect(runtime.awayNextWakeSec).toBe(Number(BOUNDARY + EPOCH - LEAD));
   });
 });
 
