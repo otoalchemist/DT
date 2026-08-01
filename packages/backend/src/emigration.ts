@@ -115,3 +115,8 @@ export function resetEmigrationRoster(): void {
   roster.clear();
   lastScannedBlock = null;
 }
+
+/** Drop the cached emigration roster (manual refresh). */
+export function invalidateEmigrationRoster(): void {
+  rosterCache.invalidate();
+}

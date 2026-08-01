@@ -3,7 +3,7 @@ import websocket from "@fastify/websocket";
 import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
-import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId } from "./chain.js";
+import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId, getBalanceCached, invalidateBalanceCache, getLatestBlockCached } from "./chain.js";
 import { runtime, loadRivalSkippers, loadDefaultRivalTargets } from "./runtime.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
@@ -16,9 +16,11 @@ import {
   normalizePrivateKey,
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
+import { invalidateTokenCaches } from "./index-tokens.js";
+import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
-import { readOwnedStatuses, readTargets, readEmigrated, readAllies } from "./service.js";
+import { readOwnedStatuses, readTargets, readEmigrated, readAllies, invalidateLiveCandidates } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -395,6 +397,44 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/allies", async (_req, reply) => {
     try {
       return await readAllies();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Manual "Refresh data" — force a genuinely fresh read.
+   *
+   * Two things the ordinary GETs can't do:
+   *  1. The header stats (epoch, balance, citizens left, block, spend) live on `runtime`
+   *     and are only written by refreshSnapshot() inside a TICK. With the engine stopped
+   *     — which is the normal state in away mode — they never update, so the dashboard
+   *     would show whatever was true when the engine last ran.
+   *  2. Ownership/enumeration sets are stale-while-revalidate, so a zero TTL still hands
+   *     back the old value. They're invalidated here so the follow-up GETs refetch.
+   */
+  app.post("/api/refresh", async (_req, reply) => {
+    try {
+      invalidateTokenCaches();
+      invalidateLiveCandidates();
+      invalidateEmigrationRoster();
+      // getGameSnapshot() with no TTL argument always reads the chain.
+      const snap = await getGameSnapshot();
+      runtime.currentEpoch = snap.currentEpoch;
+      runtime.startTime = snap.startTime;
+      runtime.gameState = snap.state;
+      runtime.citizenSupply = snap.citizenSupply;
+      runtime.citizensAddress = snap.citizensAddress;
+      if (runtime.account) {
+        invalidateBalanceCache(); // the 30s cache would otherwise answer this
+        runtime.balanceWei = await getBalanceCached(runtime.account.address, 0);
+      }
+      const block = await getLatestBlockCached(0);
+      runtime.lastBlock = block.number;
+      runtime.emitStatus();
+      // The epoch may have rolled while idle, which changes when the next wake is due.
+      if (runtime.strategy.awayMode) scheduleAwayWake();
+      return runtime.status();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
     }

@@ -44,11 +44,18 @@ export function makeIdCache<T>(opts: IdCacheOptions = {}) {
     return p;
   };
 
-  return (key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> => {
+  const read = (key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> => {
     if (entry && entry.key === key) {
       if (clock() - entry.at >= ttlMs) void refresh(key, fetcher).catch(() => {}); // background
       return Promise.resolve(entry.value);
     }
     return refresh(key, fetcher);
   };
+
+  // Drop the cached value so the next read fetches synchronously instead of serving
+  // stale-while-revalidate. Needed by the dashboard's manual "Refresh data": a zero TTL
+  // is NOT enough — SWR still returns the old value and only refreshes in the background,
+  // so the user would see the same data they just asked to have re-read.
+  read.invalidate = (): void => { entry = null; };
+  return read;
 }

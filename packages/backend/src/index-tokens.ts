@@ -133,3 +133,10 @@ export async function fetchCandidateTokenIds(
     fetchCandidatesFromApi(citizens),
   ).catch(() => []);
 }
+
+/** Drop cached ownership/enumeration sets so the next read hits the API. Used by the
+ *  dashboard's manual "Refresh data" — otherwise SWR would serve the same stale set. */
+export function invalidateTokenCaches(): void {
+  ownedCache.invalidate();
+  candidateCache.invalidate();
+}

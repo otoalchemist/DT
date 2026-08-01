@@ -57,6 +57,10 @@ export const api = {
     }),
   targets: () => req<TargetTokenStatus[]>("/api/targets"),
   allies: () => req<TargetTokenStatus[]>("/api/allies"),
+  // Force-refresh chain state: re-reads snapshot/balance/block into runtime (which
+  // otherwise only updates inside an engine tick, so it never moves in away mode) and
+  // drops the ownership caches so follow-up GETs refetch instead of serving SWR-stale.
+  refreshChain: () => req<BotStatus>("/api/refresh", { method: "POST" }),
   // Full emigration history from the contract's event log — never in `targets`.
   // Includes emigrants already killed (alive: false), so the count doesn't shrink.
   emigrated: () => req<EmigratedTokenStatus[]>("/api/emigrated"),

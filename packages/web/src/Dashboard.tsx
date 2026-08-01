@@ -153,8 +153,15 @@ export function Dashboard({
     setSavedConfig(next);
   }, [config, savedConfig]);
 
-  const refresh = useCallback(async () => {
+  // `force` is the manual "Refresh data" press: re-read chain state into runtime and drop
+  // the ownership caches BEFORE the GETs, so what comes back is genuinely fresh rather
+  // than stale-while-revalidate. The background 20s poll passes force=false.
+  const refresh = useCallback(async (force = false) => {
     try {
+      if (force) {
+        const s = await api.refreshChain().catch(() => null);
+        if (s) pushStatus(s);
+      }
       const [t, g, e, a] = await Promise.all([
         api.tokens().catch(() => []),
         api.targets().catch(() => []),
@@ -169,16 +176,14 @@ export function Dashboard({
     } catch (e) {
       setErr((e as Error).message);
     }
-  }, []);
+  }, [pushStatus]);
 
-  // Poll on-chain views only while the tab is actually being looked at. Each cycle
-  // costs several RPC round-trips per endpoint, so a dashboard left open in a
-  // background tab was burning provider quota around the clock for a page nobody was
-  // reading (the single biggest source of idle RPC usage). Refresh immediately on
-  // becoming visible so returning to the tab still shows current data.
-  // In away mode the dashboard stops polling entirely — that's the point of the mode, and
-  // these views cost several RPC round-trips per cycle. One read on mount so the page
-  // isn't blank, then nothing until "Refresh data" is pressed.
+  // Poll on-chain views only while the tab is actually being looked at. Each cycle costs
+  // several RPC round-trips per endpoint, so a dashboard left open in a background tab
+  // was burning provider quota around the clock for a page nobody was reading.
+  //
+  // In away mode it stops polling entirely — that's the point of the mode. One read on
+  // mount so the page isn't blank, then nothing until "Refresh data" is pressed.
   const awayMode = config?.awayMode ?? false;
   useEffect(() => {
     const tick = () => { if (!document.hidden) void refresh(); };
@@ -294,7 +299,7 @@ export function Dashboard({
                   : " · idle"}
               </span>
             )}
-            <button className="ghost" onClick={() => void refresh()} title="Read on-chain data once, now — useful in away mode where nothing polls.">
+            <button className="ghost" onClick={() => void refresh(true)} title="Read on-chain data once, now — useful in away mode where nothing polls.">
               Refresh data
             </button>
             <button

@@ -269,3 +269,8 @@ export async function readEmigrated(): Promise<EmigratedTokenStatus[]> {
     };
   });
 }
+
+/** Drop the cached live-citizen set (manual refresh). */
+export function invalidateLiveCandidates(): void {
+  liveCandidatesCache.invalidate();
+}
