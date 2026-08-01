@@ -831,6 +831,29 @@ describe("away mode arming", () => {
     expect(runtime.running).toBe(true);
   });
 
+  // The core promise of away mode: a STOPPED engine must actually start when the wake
+  // fires. If this regressed, the bot would sleep straight through every boundary while
+  // the dashboard cheerfully showed an AWAY badge counting down to a wake that does
+  // nothing — a silent, total failure of the feature.
+  it("STARTS a stopped engine when the wake fires", async () => {
+    runtime.running = false;
+    vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000); // inside the lead window
+    scheduleAwayWake();
+    expect(runtime.running).toBe(false); // armed, not yet fired
+    await vi.advanceTimersByTimeAsync(50);
+    expect(runtime.running).toBe(true);
+    stopEngine();
+  });
+
+  it("does NOT start when the wallet was locked before the wake fired", async () => {
+    runtime.running = false;
+    vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000);
+    scheduleAwayWake();     // armed while unlocked
+    runtime.account = null; // locked in the meantime — nothing could be submitted anyway
+    await vi.advanceTimersByTimeAsync(50);
+    expect(runtime.running).toBe(false);
+  });
+
   it("wakes immediately when already inside the lead window", () => {
     vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000); // 1 min before boundary
     scheduleAwayWake();
