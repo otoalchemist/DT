@@ -91,7 +91,11 @@ async function flushBatch(): Promise<void> {
       txHash: r.txHash,
       bundleHash: r.bundleHash,
     });
+    // Flip submitted -> included/reverted once it lands. A bundle-only tx (a revertible
+    // audit riding a payment bundle) was never broadcast so it has no `txHash`, but its
+    // hash is derivable from the signed tx — poll that instead of leaving it stuck.
     if (r.txHash) void trackReceipt(entryId, r.txHash);
+    else if (r.predictedTxHash) void trackReceipt(entryId, r.predictedTxHash, false);
   }
 }
 
@@ -1141,7 +1145,20 @@ const RECEIPT_TIMEOUT_MS = 3 * 60_000;
  * never awaited by the tick loop, and swallows errors/timeouts so a stuck poll
  * can't wedge the engine.
  */
-async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<void> {
+/**
+ * Poll for `txHash`'s receipt and flip the activity entry submitted -> included/reverted.
+ *
+ * `broadcast` is false for a bundle-only tx, whose hash we derived locally (keccak of the
+ * signed tx) rather than getting back from a broadcast. That hash is still the real one IF
+ * the bundle lands — but if no builder wins the slot it never exists on chain, so we only
+ * write it onto the entry once a receipt actually comes back. That keeps the "tx ↗" link
+ * from ever pointing at a tx that was never mined.
+ */
+async function trackReceipt(
+  entryId: string,
+  txHash: `0x${string}`,
+  broadcast = true,
+): Promise<void> {
   try {
     const receipt = await publicClient.waitForTransactionReceipt({
       hash: txHash,
@@ -1151,6 +1168,7 @@ async function trackReceipt(entryId: string, txHash: `0x${string}`): Promise<voi
     activity.update(entryId, {
       status: receipt.status === "success" ? "included" : "reverted",
       targetBlock: block,
+      ...(broadcast ? {} : { txHash }),
     });
   } catch (err) {
     // Timed out or RPC error — leave the entry as "submitted".
@@ -1219,10 +1237,11 @@ async function act(
       batchEntries.push({ entryId: entry.id, nonce: result.nonce });
       return result;
     }
-    // Watch for the receipt so the entry flips submitted -> included/reverted.
-    // Only public-mempool submissions expose a tx hash; pure Flashbots bundles
-    // (bundleHash only) stay "submitted" since there's nothing to poll.
+    // Watch for the receipt so the entry flips submitted -> included/reverted. A pure
+    // Flashbots submission has no broadcast txHash, but the hash it will have if it lands
+    // is just keccak of the signed tx — poll that so bundle-only sends resolve too.
     if (result.txHash) void trackReceipt(entry.id, result.txHash);
+    else if (result.predictedTxHash) void trackReceipt(entry.id, result.predictedTxHash, false);
     return result;
   } catch (err) {
     activity.add({

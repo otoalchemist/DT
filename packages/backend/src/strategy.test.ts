@@ -21,6 +21,7 @@ vi.mock("./chain.js", () => ({
     getBlock: vi.fn(async () => ({ baseFeePerGas: 10_000_000_000n })), // 10 gwei
     getBalance: vi.fn(async () => 10_000_000_000_000_000_000n), // 10 ETH
     getBlockNumber: vi.fn(async () => 100n),
+    waitForTransactionReceipt: vi.fn(async () => ({ status: "success", blockNumber: 101n })),
     // Used by findPreBoundaryAuditors (lastEpochPaid + auditLimit per owned token).
     // Default: every owned token is well-paid (lastEpochPaid huge, so never itself
     // auditable at any realistic targetEpoch) with auditLimit 1 — i.e. an eligible
@@ -53,9 +54,17 @@ vi.mock("./config.js", () => ({
   deriveUrlsFromKey: vi.fn(),
 }));
 
-vi.mock("./activity.js", () => ({
-  activity: { add: vi.fn(() => ({})) },
-}));
+vi.mock("./activity.js", () => {
+  // add() must return an entry with a stable id: flushBatch keys its status updates
+  // (submitted -> included/reverted) off entry.id.
+  let n = 0;
+  return {
+    activity: {
+      add: vi.fn(() => ({ id: `entry-${++n}` })),
+      update: vi.fn(),
+    },
+  };
+});
 
 vi.mock("./nonce.js", () => ({
   nonceManager: { sync: vi.fn(async () => {}), reset: vi.fn() },
@@ -112,10 +121,12 @@ vi.mock("./contract.js", () => ({
   gameContract: { address: "0x000000000000000000000000000000000000aa", abi: [] },
 }));
 
-const { submitTx, queueCoinbaseBid, beginBundle } = await import("./flashbots.js");
+const { submitTx, queueCoinbaseBid, beginBundle, flushBundle } = await import("./flashbots.js");
 const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tokens.js");
 const { filterLiveTokenIds, batchGetTargetStatuses, batchGetOwnedStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
+const { appConfig } = await import("./config.js");
+const { activity } = await import("./activity.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
@@ -858,5 +869,185 @@ describe("away mode arming", () => {
     vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000); // 1 min before boundary
     scheduleAwayWake();
     expect(runtime.awayNextWakeSec).toBe(Number(START + EPOCH * 151n - 60n)); // = now
+  });
+});
+
+// Regression: a bundle-only tx sat on "submitted" in the activity log forever, even
+// after it demonstrably landed on-chain. Payments mirror to the public mempool so they
+// come back with a broadcast txHash and get receipt-tracked; a revertible audit riding
+// the combined bundle is never broadcast, so it had no hash and nothing was polled.
+// The hash is derivable without broadcasting (keccak of the signed tx — flushBundle
+// already computes exactly that for revertingTxHashes), so both kinds must now resolve.
+describe("bundle-only txs still resolve submitted -> included", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const TARGET_EPOCH = 200n;
+  const PAYER = "0x00000000000000000000000000000000000000b1";
+  const MIRRORED_HASH = "0xbroadcast" as const;
+  const PREDICTED_HASH = "0xpredicted" as const;
+
+  let priorMode: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    priorMode = (appConfig as { mode?: string }).mode;
+    // flushBatch is a no-op outside mainnet — batching (and thus bundle-only txs)
+    // only exists there.
+    (appConfig as { mode?: string }).mode = "mainnet";
+
+    runtime.account = { address: ADDR } as unknown as PrivateKeyAccount;
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.balanceWei = 100_000_000_000_000_000_000n;
+    runtime.citizenSupply = 500n;
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true,
+      autoAudit: true,
+      preBoundaryAudit: true,
+      preBoundaryPay: true,
+      jitEnabled: true,
+      jitTargetEpoch: Number(TARGET_EPOCH),
+      jitTokenIds: [],
+      minBalanceEth: 0,
+      maxPaymentEth: 0,
+      maxBaseFeeGwei: 1000,
+      endgameOnlyWithin: null,
+      combinedBoundaryBundle: true,
+      coinbaseBidEth: 0.02,
+      coinbasePayerAddress: PAYER,
+      offenseTargetTokenIds: ["501"],
+    };
+
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n
+          : TARGET_EPOCH - 1n,
+      })) ) as never);
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
+    );
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "501",
+        owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(),
+        delinquent: true,
+        epochsBehind: 2,
+        auditable: true,
+        auditDueTimestamp: "0",
+        killable: false,
+      },
+    ]);
+
+    // Every tx defers into the batch, each on its own nonce.
+    let nonce = 0;
+    vi.mocked(submitTx).mockImplementation((async (intent: { value: bigint }) => ({
+      ok: true, simulated: false, queued: true, nonce: nonce++, valueWei: intent.value, gasWei: 0n,
+    })) as never);
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    (appConfig as { mode?: string }).mode = priorMode;
+    runtime.account = null;
+    runtime.running = false;
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([]);
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([]);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(false);
+    vi.mocked(publicClient.waitForTransactionReceipt).mockResolvedValue({ status: "success", blockNumber: 101n } as never);
+    vi.mocked(submitTx).mockImplementation((async (intent: { value: bigint }) => ({
+      ok: true, simulated: false, txHash: "0xhash", nonce: 0, valueWei: intent.value, gasWei: 0n,
+    })) as never);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+      })) ) as never);
+  });
+
+  // Let the fire-and-forget trackReceipt promises settle.
+  const settle = () => new Promise((r) => setImmediate(r));
+
+  it("polls the locally-derived hash for a tx that was never broadcast", async () => {
+    // nonce 0 mirrored (a payment), nonce 1 bundle-only (the audit): no txHash, but a
+    // predictedTxHash is always present.
+    vi.mocked(flushBundle).mockResolvedValue(
+      new Map<number, any>([
+        [0, { ok: true, txHash: MIRRORED_HASH, predictedTxHash: MIRRORED_HASH, bundleHash: "0xbundle" }],
+        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+      ]) as never,
+    );
+
+    await firePreBoundaryBundle();
+    await settle();
+
+    const polled = vi.mocked(publicClient.waitForTransactionReceipt).mock.calls.map(([a]: any) => a.hash);
+    expect(polled).toContain(MIRRORED_HASH);
+    // The regression: this used to be absent, so the entry never left "submitted".
+    expect(polled).toContain(PREDICTED_HASH);
+  });
+
+  it("flips the bundle-only entry to included and only then attaches its tx hash", async () => {
+    vi.mocked(flushBundle).mockResolvedValue(
+      new Map<number, any>([
+        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+      ]) as never,
+    );
+
+    await firePreBoundaryBundle();
+    await settle();
+
+    const patches = vi.mocked(activity.update).mock.calls.map(([, p]) => p);
+
+    // The first patch marks it submitted and carries NO txHash — the derived hash is
+    // only a prediction until a builder wins the slot, so linking it that early would
+    // point at a tx that may never exist.
+    const submitted = patches.find((p) => p.status === "submitted");
+    expect(submitted).toBeDefined();
+    expect(submitted?.txHash).toBeUndefined();
+
+    // Once the receipt confirms it landed, the hash is real and gets attached.
+    expect(patches.at(-1)).toMatchObject({ status: "included", txHash: PREDICTED_HASH, targetBlock: "101" });
+  });
+
+  it("marks it reverted when the receipt says the tx failed", async () => {
+    vi.mocked(flushBundle).mockResolvedValue(
+      new Map<number, any>([
+        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+      ]) as never,
+    );
+    vi.mocked(publicClient.waitForTransactionReceipt).mockResolvedValue({ status: "reverted", blockNumber: 101n } as never);
+
+    await firePreBoundaryBundle();
+    await settle();
+
+    expect(vi.mocked(activity.update).mock.calls.at(-1)?.[1]).toMatchObject({ status: "reverted" });
+  });
+
+  it("leaves the entry submitted when the bundle never lands (receipt times out)", async () => {
+    vi.mocked(flushBundle).mockResolvedValue(
+      new Map<number, any>([
+        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+      ]) as never,
+    );
+    vi.mocked(publicClient.waitForTransactionReceipt).mockRejectedValue(new Error("timed out"));
+
+    await firePreBoundaryBundle();
+    await settle();
+
+    // No status past "submitted" — and crucially no txHash was ever attached, so the UI
+    // cannot link to a tx that was never mined.
+    for (const [, patch] of vi.mocked(activity.update).mock.calls) {
+      expect(patch.status).not.toBe("included");
+      expect(patch.txHash).toBeUndefined();
+    }
   });
 });

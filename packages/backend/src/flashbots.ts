@@ -35,6 +35,9 @@ export interface SubmitResult {
   /** mainnet only: the tx was prepared + queued into an open bundle batch rather
    *  than sent immediately. txHash/bundleHash are filled in later by flushBundle. */
   queued?: boolean;
+  /** keccak256 of the signed tx — the hash it will have if it lands. Known even for a
+   *  bundle-only tx that was never broadcast, so its receipt can still be polled. */
+  predictedTxHash?: Hex;
 }
 
 // --- Flashbots reputation signer (identity only; holds no funds) ---
@@ -262,6 +265,16 @@ export interface BundleTxResult {
   txHash?: Hex;
   bundleHash?: string;
   error?: string;
+  /**
+   * The hash this tx WILL have if it lands — keccak256 of the signed tx, so it's known
+   * without broadcasting. Set for every queued tx, including bundle-only ones that are
+   * never mirrored to the mempool (a revertible audit riding a payment bundle).
+   *
+   * Those have no `txHash` because nothing was broadcast, which used to mean no receipt
+   * could be polled and the activity entry sat on "submitted" forever even after the
+   * bundle landed. Polling this hash resolves them.
+   */
+  predictedTxHash?: Hex;
 }
 
 /**
@@ -338,6 +351,8 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     out.set(q.nonce, {
       ok: bundleOk || txHash !== undefined,
       txHash,
+      // Known for every tx whether or not it was broadcast — see BundleTxResult.
+      predictedTxHash: keccak256(q.signed),
       bundleHash,
       error: !bundleOk && txHash === undefined ? "no bundle accepted" : undefined,
     });
@@ -570,6 +585,7 @@ export async function submitTx(
     ok: bundleHashes.length > 0 || txHash !== undefined,
     bundleHash: bundleHashes[0],
     txHash,
+    predictedTxHash: keccak256(signed),
     targetBlock,
     error: bundleHashes.length === 0 && txHash === undefined ? "no bundle accepted" : undefined,
   };

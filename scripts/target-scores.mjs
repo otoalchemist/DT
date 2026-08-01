@@ -2,9 +2,11 @@
 //
 // The strongest audit target is a rival whose owner can't afford to catch it up (so an
 // audit may lead to a kill), that defends weakly (so you can actually land the audit),
-// and that isn't shielded by a bribe. This scores every rival in data/rival-targets.json
-// on those axes and ranks them — splitting the curated skippers (data/rival-skippers.json)
-// from the rest, since you asked to see the non-skippers too.
+// and that isn't shielded by a bribe. This scores EVERY LIVE RIVAL on those axes and ranks
+// them — the full citizen set minus emigrants and minus allies, not just the curated
+// data/rival-targets.json the bot pins for offense. Results are split into the known
+// skippers (data/rival-skippers.json) and everyone else, so the non-skipper side shows
+// every delinquent rival rather than only the handful that made the curated list.
 //
 // Columns:
 //   beh       epochs behind now (2+ = auditable this instant; 1 = grace)
@@ -36,6 +38,7 @@
 //   node scripts/target-scores.mjs                    # score every rival, ranked table
 //   node scripts/target-scores.mjs --auditable-next   # only weak links auditable next boundary
 //   node scripts/target-scores.mjs --epochs 20        # widen the cadence look-back
+//   node scripts/target-scores.mjs --curated          # only data/rival-targets.json (old scope)
 //   node scripts/target-scores.mjs --json             # machine-readable dump (full set)
 //   RPC_HTTP_URL=... node scripts/target-scores.mjs
 //
@@ -69,6 +72,8 @@ const asJson = args.includes("--json");
 // behind (auditable) when the epoch rolls. Ranked by weak-link score, split skipper /
 // non-skipper. Filtering happens after scoring, so --json still emits the full set.
 const auditableNext = args.includes("--auditable-next");
+// --curated: score only data/rival-targets.json instead of the full live rival set.
+const curatedOnly = args.includes("--curated");
 const epochsArg = (() => { const i = args.indexOf("--epochs"); return i >= 0 && args[i + 1] ? BigInt(args[i + 1]) : 10n; })();
 
 function resolveRpc() {
@@ -111,8 +116,9 @@ async function lastBlockBefore(ts, lo, hi) { while (lo < hi) { const mid = (lo +
 
 async function main() {
   if (!NFT) { console.error("This script needs the Alchemy NFT API for ownership — set ALCHEMY_API_KEY, not just RPC_HTTP_URL."); process.exit(1); }
-  const rivals = JSON.parse(fs.readFileSync(path.join(dataDir, "rival-targets.json"), "utf8")).map(String);
   const skipperSet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "rival-skippers.json"), "utf8")).map(String));
+  const allySet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "ally-tokens.json"), "utf8")).map(String));
+  const curatedSet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "rival-targets.json"), "utf8")).map(String));
 
   const ce = BigInt(await call(SEL.currentEpoch, 0n).then((x) => x));
   const startTime = BigInt(await rpc("eth_call", [{ to: GAME, data: SEL.startTime }, "latest"]));
@@ -128,6 +134,19 @@ async function main() {
   for (const o of d.owners ?? []) {
     const a = o.ownerAddress.toLowerCase();
     for (const b of o.tokenBalances ?? []) { ownerOf.set(BigInt(b.tokenId).toString(), a); portfolio.set(a, (portfolio.get(a) ?? 0) + 1); }
+  }
+
+  // The scan universe is EVERY live rival — the whole citizen set minus emigrants (they've
+  // left the game) and minus allies. It is deliberately NOT data/rival-targets.json: that
+  // list is a curated subset the bot pins for offense, so scoring only it made the analysis
+  // blind to any delinquent rival outside it (and, since most of the curated list is on the
+  // skippers roster, made "non-skippers" look far smaller than it is). --curated restores
+  // the old narrow behaviour.
+  const universe = [...ownerOf.keys()].filter((t) => ownerOf.get(t) !== EMIGRATION.toLowerCase() && !allySet.has(t));
+  const rivals = (curatedOnly ? universe.filter((t) => curatedSet.has(t)) : universe).sort((a, b) => Number(a) - Number(b));
+  if (!asJson) {
+    const extra = rivals.filter((t) => !curatedSet.has(t)).length;
+    console.log(`Scanning ${rivals.length} live rivals (${ownerOf.size} citizens − emigrants − allies)${extra ? `, ${extra} beyond the curated rival list` : ""}.\n`);
   }
 
   // Per-token state, batched.
