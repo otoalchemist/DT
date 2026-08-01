@@ -56,6 +56,7 @@ export const api = {
       body: JSON.stringify({ tokenId }),
     }),
   targets: () => req<TargetTokenStatus[]>("/api/targets"),
+  allies: () => req<TargetTokenStatus[]>("/api/allies"),
   // Full emigration history from the contract's event log — never in `targets`.
   // Includes emigrants already killed (alive: false), so the count doesn't shrink.
   emigrated: () => req<EmigratedTokenStatus[]>("/api/emigrated"),

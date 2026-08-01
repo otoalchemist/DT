@@ -2,7 +2,7 @@ import { parseEther, formatEther, type Address } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
-import { runtime } from "./runtime.js";
+import { runtime, loadAllyTokens } from "./runtime.js";
 import { activity } from "./activity.js";
 import { nonceManager } from "./nonce.js";
 import {
@@ -478,16 +478,25 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
       ? pinnedIds
       : await fetchCandidateTokenIds(citizens);
   const liveRaw = await filterLiveTokenIds(citizens, ids);
+  // Allies are never offense candidates. The rival lists shouldn't contain one, but this
+  // is the last line of defence: a stale pin, a hand-edited target list or a regenerated
+  // skippers file must never get us auditing or killing a teammate's citizen.
+  const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
   const emigrated = new Set<string>();
   const inGame: { id: bigint; owner: Address }[] = [];
+  let allySkipped = 0;
   for (const t of liveRaw) {
     if (isEmigrated(t.owner)) emigrated.add(t.id.toString());
+    else if (allySet.has(t.id.toString())) allySkipped++;
     else inGame.push(t);
   }
   if (emigrated.size > 0) {
     logger.debug(
       `offense candidates: skipped ${emigrated.size} emigrated citizen(s) — out of the main game`,
     );
+  }
+  if (allySkipped > 0) {
+    logger.warn(`offense candidates: skipped ${allySkipped} ALLIED citizen(s) — check your target list`);
   }
   return { candidates: orderBySalt(inGame, (t) => t.id.toString(), engineSalt), emigrated };
 }

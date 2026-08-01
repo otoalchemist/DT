@@ -75,11 +75,30 @@ const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cad
  * gwei and cured in the boundary block itself (payBlk 0/0), so they were unwinnable in
  * practice regardless. Verified with ownerOf at epoch 151; that wallet also holds
  * #75/#274/#796, which were never on either list.
+ *
+ * Allies (data/ally-tokens.json) are excluded automatically below — they're teammates,
+ * never targets — so they don't need listing here.
  */
 const EXCLUDED = new Set([
   "1575", "1661", "4650", "4957", "6737",
   "272", "711", "909", "4335",
 ]);
+
+/** Allied citizens must never be emitted as skippers. Read from the shared roster so
+ *  adding an ally in one place is enough — no second list to keep in sync. */
+function loadAllies() {
+  try {
+    const p = path.join(dataDir, "ally-tokens.json");
+    if (fs.existsSync(p)) {
+      const ids = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (Array.isArray(ids)) return new Set(ids.map((x) => BigInt(x).toString()));
+    }
+  } catch (err) {
+    console.error("Could not read ally-tokens.json:", err.message);
+  }
+  return new Set();
+}
+const ALLIES = loadAllies();
 
 // --- args ---
 const args = process.argv.slice(2);
@@ -231,9 +250,10 @@ async function main() {
     const qualifies =
       total >= MIN_CROSSINGS || streak >= MIN_PARITY_STREAK || total >= STRONG_CROSSINGS;
     if (!qualifies) continue;
-    // Matched the cadence but is a known top-of-block self-curer (see EXCLUDED).
-    if (EXCLUDED.has(token)) {
-      excluded.push({ token, total, streak });
+    // Matched the cadence but is a known top-of-block self-curer (EXCLUDED), or is an
+    // ally — a teammate's citizen is never a target however delinquent it looks.
+    if (EXCLUDED.has(token) || ALLIES.has(token)) {
+      excluded.push({ token, total, streak, ally: ALLIES.has(token) });
       continue;
     }
     skippers.push(BigInt(token));
@@ -245,7 +265,7 @@ async function main() {
     );
     excluded
       .sort((a, b) => Number(a.token) - Number(b.token))
-      .forEach((d) => console.error(`  #${d.token}: ${d.total}x, parity ${d.streak}  [EXCLUDED]`));
+      .forEach((d) => console.error(`  #${d.token}: ${d.total}x, parity ${d.streak}  [${d.ally ? "ALLY" : "EXCLUDED"}]`));
   }
   skippers.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const out = skippers.map((x) => x.toString());

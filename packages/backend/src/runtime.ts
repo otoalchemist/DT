@@ -41,6 +41,16 @@ export function loadRivalSkippers(): string[] {
   return loadRivalIdFile("rival-skippers.json", "rival skippers");
 }
 
+/**
+ * Allied citizens (data/ally-tokens.json) — tokens played by people we're cooperating
+ * with. They are NOT rivals: the offense engine must never audit or kill them, and they
+ * get their own dashboard panel rather than appearing under "Rival targets", where a
+ * delinquent ally reads as a kill candidate.
+ */
+export function loadAllyTokens(): string[] {
+  return loadRivalIdFile("ally-tokens.json", "ally tokens");
+}
+
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
   proactivePay: true,

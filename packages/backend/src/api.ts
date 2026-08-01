@@ -18,7 +18,7 @@ import {
 import { getGameSnapshot } from "./contract.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe } from "./strategy.js";
-import { readOwnedStatuses, readTargets, readEmigrated } from "./service.js";
+import { readOwnedStatuses, readTargets, readEmigrated, readAllies } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -373,6 +373,16 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/emigrated", async (_req, reply) => {
     try {
       return await readEmigrated();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  // Allied citizens (data/ally-tokens.json) — teammates' tokens, listed in their own
+  // panel and excluded from every rival/offense path.
+  app.get("/api/allies", async (_req, reply) => {
+    try {
+      return await readAllies();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
     }

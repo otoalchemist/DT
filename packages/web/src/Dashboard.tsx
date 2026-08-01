@@ -128,6 +128,7 @@ export function Dashboard({
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
   const [emigrated, setEmigrated] = useState<EmigratedTokenStatus[]>([]);
+  const [allies, setAllies] = useState<TargetTokenStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -154,14 +155,16 @@ export function Dashboard({
 
   const refresh = useCallback(async () => {
     try {
-      const [t, g, e] = await Promise.all([
+      const [t, g, e, a] = await Promise.all([
         api.tokens().catch(() => []),
         api.targets().catch(() => []),
         api.emigrated().catch(() => []),
+        api.allies().catch(() => []),
       ]);
       setTokens(t);
       setTargets(g);
       setEmigrated(e);
+      setAllies(a);
       setErr(null);
     } catch (e) {
       setErr((e as Error).message);
@@ -192,6 +195,9 @@ export function Dashboard({
   // Emigrants still held by the contract. The rest of the roster is already dead — kept
   // on the list because emigrating is what put them there, and the count is the history.
   const emigratedAlive = emigrated.filter((e) => e.alive).length;
+  // "At risk" = anything an opponent could act on: already under audit, killable, or
+  // auditable right now. Merely 1 behind is still in the grace epoch.
+  const alliesAtRisk = allies.filter((a) => a.killable || a.auditDueTimestamp !== "0" || a.auditable).length;
 
   const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
@@ -423,6 +429,24 @@ export function Dashboard({
           <div className="spacer" />
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
           <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
+        </div>
+
+        <div className="spacer" />
+
+        <div className="panel">
+          <h2>Allied citizens ({allies.length})</h2>
+          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>
+            {alliesAtRisk > 0
+              ? `${alliesAtRisk} at risk · ${allies.length - alliesAtRisk} safe`
+              : "all safe"}
+          </div>
+          <TargetsTable rows={allies} empty="No allied citizens found (see data/ally-tokens.json)." />
+          <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.5 }}>
+            Teammates' citizens, from <code>data/ally-tokens.json</code>. They are <b>never</b>{" "}
+            audited or killed by the bot and are excluded from Rival targets — a delinquent
+            ally there would read as a kill candidate. Listed whatever their state, most at
+            risk first, so you can spot an ally in trouble.
+          </p>
         </div>
 
         <div className="spacer" />

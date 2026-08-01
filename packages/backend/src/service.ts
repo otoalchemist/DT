@@ -6,7 +6,7 @@ import {
   type TargetTokenStatus,
   type EmigratedTokenStatus,
 } from "@dat-bot/shared";
-import { runtime } from "./runtime.js";
+import { runtime, loadAllyTokens } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { fetchEmigrationRoster } from "./emigration.js";
@@ -101,6 +101,8 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
 
   const pinnedSet = new Set(runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x).toString()));
+  // Normalised the same way pins are, so "0084" and "84" both match (see excludedTokenSet).
+  const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
 
   // The cached live set already contains EVERY live token (Alchemy owner index), so a
   // live pinned rival is included by definition — no separate pin liveness check needed.
@@ -140,6 +142,7 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   const actionable: TargetTokenStatus[] = [];
   let ownedSkipped = 0;
   let emigratedSkipped = 0;
+  let allySkipped = 0;
   for (const t of allStatuses) {
     if (isOurs(t)) {
       ownedSkipped++;
@@ -151,6 +154,13 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
     // self-owned tokens are: a stale pin on an emigrant is dead weight, not a target.
     if (isEmigrated(t.owner)) {
       emigratedSkipped++;
+      continue;
+    }
+    // Allies aren't rivals. They get their own panel (readAllies) — listing a delinquent
+    // ally here would read as a kill candidate. Filtered ahead of the pin check so a
+    // stale pin on an ally can't drag it back into the rival list either.
+    if (allySet.has(t.tokenId)) {
+      allySkipped++;
       continue;
     }
     if (pinnedSet.has(t.tokenId)) {
@@ -165,6 +175,9 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   if (emigratedSkipped > 0) {
     logger.debug(`readTargets: excluded ${emigratedSkipped} emigrated citizen(s) from the rival list`);
   }
+  if (allySkipped > 0) {
+    logger.debug(`readTargets: excluded ${allySkipped} allied citizen(s) from the rival list`);
+  }
 
   // Pinned rivals always appear in full; the most actionable non-pinned tokens fill
   // the remaining slots. Sort BEFORE slicing so the cap sheds the least interesting
@@ -178,6 +191,27 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
     );
   }
   return [...pinned, ...actionable.slice(0, room)];
+}
+
+/**
+ * Allied citizens (data/ally-tokens.json) with live status, for their own dashboard
+ * panel. Deliberately separate from readTargets: an ally is not a target, and a
+ * delinquent one showing up under "Rival targets" reads as a kill candidate.
+ *
+ * Unlike rivals these are listed whatever their state — the point is to watch allies at
+ * risk, so a healthy ally shouldn't vanish from the list. Sorted most-at-risk first
+ * (killable > under audit > auditable > behind), so trouble surfaces at the top.
+ * Allies that are dead/burned or have emigrated simply aren't in the live set.
+ */
+export async function readAllies(): Promise<TargetTokenStatus[]> {
+  const ids = loadAllyTokens();
+  if (ids.length === 0) return [];
+  const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const want = new Set(ids.map((x) => BigInt(x).toString()));
+  const live = (await getLiveCandidates(snap.citizensAddress)).filter((t) => want.has(t.id.toString()));
+  const rows = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
+  return rows.sort((a, b) => actionableRank(a) - actionableRank(b) || b.epochsBehind - a.epochsBehind);
 }
 
 /**
