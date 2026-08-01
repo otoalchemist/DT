@@ -17,7 +17,7 @@ import {
 } from "./keystore.js";
 import { getGameSnapshot } from "./contract.js";
 import { resolveJitTarget } from "./logic.js";
-import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
@@ -35,6 +35,8 @@ const strategyPatch = z
     preBoundaryPay: z.boolean(),
     preBoundaryLeadMs: z.number().int().min(250).max(8000),
     preBoundaryLeadMainnetMs: z.number().int().min(250).max(11000),
+    awayMode: z.boolean(),
+    awayLeadMinutes: z.number().int().min(1).max(720),
     offenseEnabled: z.boolean(),
     autoAudit: z.boolean(),
     autoKill: z.boolean(),
@@ -119,6 +121,10 @@ export async function buildServer(): Promise<FastifyInstance> {
     // bid, gas, payment strategy) before going live. We still auto-STOP in the safe
     // direction: if every strategy flag is now off, a running engine has nothing to do.
     if (!nowActive && runtime.running) stopEngine();
+    // Away mode owns when the engine runs, so any config change re-evaluates it: turning
+    // it on arms the wake timer, turning it off cancels, and arming/disarming JIT or
+    // offense changes whether there is anything to wake FOR.
+    if (next.awayMode) scheduleAwayWake(); else clearAwayTimers();
     scheduleDefenseBoundary();
     schedulePreBoundaryPay();
     schedulePreBoundaryAudit();
@@ -192,6 +198,9 @@ export async function buildServer(): Promise<FastifyInstance> {
         runtime.citizenSupply = snap.citizenSupply;
         runtime.citizensAddress = snap.citizensAddress;
         runtime.emitStatus();
+        // Away mode can only arm once the wallet is unlocked and the epoch grid is
+        // known — both are true right here.
+        if (runtime.strategy.awayMode) scheduleAwayWake();
       }).catch(() => {});
       // Fetch the wallet balance up front too — otherwise it stays blank until
       // the engine is started (balance is otherwise only read inside tick()).
@@ -302,7 +311,10 @@ export async function buildServer(): Promise<FastifyInstance> {
       enabled: true,
     });
     resetJitState(); // clear any prior submission bookkeeping for this epoch
-    if (!runtime.running) startEngine();
+    // Away mode owns the run window: arming gives it something to wake for, but the
+    // engine stays idle until the lead timer fires rather than polling until then.
+    if (runtime.strategy.awayMode) scheduleAwayWake();
+    else if (!runtime.running) startEngine();
     scheduleJitBoundary();
     schedulePreBoundaryPay();
     return runtime.status();

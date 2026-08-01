@@ -66,6 +66,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   preBoundaryPay: true,
   preBoundaryLeadMs: 3000,
   preBoundaryLeadMainnetMs: 5000,
+  // Away mode is a run-mode choice like `enabled`, so it is NOT a RECOMMENDED_FIELD —
+  // a defaults bump must never silently put the engine back on 24/7 polling.
+  awayMode: false,
+  awayLeadMinutes: 15,
   // Offense is ON by default, focused on the curated "skippers" list (rivals that
   // reliably fall 2+ epochs behind, so they're auditable at every boundary). The
   // supporting settings below are pre-armed so it works out of the box.
@@ -155,6 +159,9 @@ class Runtime {
   citizensAddress: string | null = null;
   lastBlock: bigint | null = null;
   startTime: bigint | null = null;
+  /** Next away-mode wake (unix seconds); set by the away scheduler in strategy.ts.
+   *  Held here rather than imported to avoid a runtime <-> strategy import cycle. */
+  awayNextWakeSec: number | null = null;
 
   // spend tracking
   private spentThisEpoch = 0n;
@@ -266,6 +273,7 @@ class Runtime {
       citizenSupply: this.citizenSupply?.toString() ?? null,
       citizensAddress: this.citizensAddress,
       lastBlock: this.lastBlock?.toString() ?? null,
+      awayNextWakeSec: this.awayNextWakeSec,
       spentThisEpochWei: this.spentThisEpochWei().toString(),
       startTime: this.startTime?.toString() ?? null,
       jitEnabled: this.strategy.jitEnabled,

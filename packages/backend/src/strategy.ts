@@ -35,6 +35,14 @@ let defenseBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryTimer: NodeJS.Timeout | null = null;
 let preBoundaryAuditTimer: NodeJS.Timeout | null = null;
 let preBoundaryKillTimer: NodeJS.Timeout | null = null;
+// Away mode: a wake timer (start the engine before a boundary) and a stop timer (shut it
+// down once the boundary work is done). Both are plain setTimeouts — no polling.
+let awayWakeTimer: NodeJS.Timeout | null = null;
+let awayStopTimer: NodeJS.Timeout | null = null;
+let awayNextWakeSec: bigint | null = null;
+// True only when AWAY MODE started the engine. A manual Start must never be cut short by
+// the away stop timer — the user asked for the engine, so they decide when it stops.
+let awayStartedEngine = false;
 let preBoundaryBundleTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
@@ -202,6 +210,137 @@ export function stopEngine(): void {
   runtime.running = false;
   runtime.emitStatus();
   activity.add({ kind: "info", status: "info", message: "Engine paused" });
+}
+
+// --- away mode ---------------------------------------------------------------
+//
+// The engine costs ~22 provider requests/minute while running, but every automatic
+// action (proactive pay, JIT, pre-boundary audit) fires only AT an epoch boundary. Away
+// mode therefore keeps the engine stopped and wakes it just before each boundary.
+//
+// Idling costs ZERO requests: boundaries are startTime + N * EPOCH_DURATION, so the next
+// one is arithmetic on the wall clock, not a poll. startTime is a contract constant read
+// once and cached on runtime.
+
+/** Engine runs this long past the boundary before away mode stops it again — enough for
+ *  the boundary tick, the JIT/audit submissions and their receipts to settle. */
+const AWAY_STOP_GRACE_MS = 5 * 60_000;
+
+/** Unix seconds of the first epoch boundary strictly after `nowSec`. Pure arithmetic —
+ *  independent of runtime.currentEpoch, so it stays correct after a long idle. */
+function nextBoundarySec(startTime: bigint, nowSec: bigint): bigint {
+  if (nowSec < startTime) return startTime;
+  const elapsed = nowSec - startTime;
+  return startTime + (elapsed / EPOCH_DURATION_SECONDS + 1n) * EPOCH_DURATION_SECONDS;
+}
+
+/** Whether there is anything worth waking up for: an armed JIT payment, or offense. */
+function awayHasWork(): boolean {
+  const s = runtime.strategy;
+  return (s.jitEnabled && s.jitTargetEpoch !== null) || s.offenseEnabled;
+}
+
+export function awayNextWake(): number | null {
+  return awayNextWakeSec === null ? null : Number(awayNextWakeSec);
+}
+
+/**
+ * (Re)arm the away-mode wake timer. Safe to call repeatedly — every call clears and
+ * recomputes, so a config change or an epoch roll just re-schedules.
+ *
+ * Needs startTime, which is normally already cached from a previous tick. When it isn't
+ * (fresh boot straight into away mode) we pay for exactly ONE snapshot read to learn it,
+ * then never poll again.
+ */
+export function scheduleAwayWake(): void {
+  if (awayWakeTimer) { clearTimeout(awayWakeTimer); awayWakeTimer = null; }
+  awayNextWakeSec = null;
+  runtime.awayNextWakeSec = null;
+
+  const s = runtime.strategy;
+  if (!s.awayMode || !runtime.unlocked) { runtime.emitStatus(); return; }
+  if (!awayHasWork()) {
+    // Nothing armed. Stay dark rather than waking to do nothing; re-arms as soon as JIT
+    // is armed or offense is switched on (both call back into here).
+    runtime.emitStatus();
+    return;
+  }
+
+  if (runtime.startTime === null) {
+    // One-off read to learn the epoch grid, then schedule offline from here on.
+    void getGameSnapshot()
+      .then((snap) => {
+        runtime.startTime = snap.startTime;
+        runtime.currentEpoch = snap.currentEpoch;
+        scheduleAwayWake();
+      })
+      .catch((err) => logger.warn(`away mode: could not read startTime: ${(err as Error).message}`));
+    return;
+  }
+
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const boundary = nextBoundarySec(runtime.startTime, nowSec);
+  const leadSec = BigInt(Math.max(1, s.awayLeadMinutes)) * 60n;
+  let wakeAt = boundary - leadSec;
+  // Already inside the lead window (or past the boundary): wake now.
+  if (wakeAt <= nowSec) wakeAt = nowSec;
+  awayNextWakeSec = wakeAt;
+  runtime.awayNextWakeSec = Number(wakeAt);
+
+  const delayMs = Number(wakeAt - nowSec) * 1000;
+  awayWakeTimer = setTimeout(() => void awayWake(), Math.min(Math.max(delayMs, 0), 2_000_000_000));
+  logger.info(
+    `away mode: idle until ${new Date(Number(wakeAt) * 1000).toISOString()} ` +
+      `(${(delayMs / 60000).toFixed(1)} min), then running through boundary + ${AWAY_STOP_GRACE_MS / 60000} min`,
+  );
+  runtime.emitStatus();
+}
+
+/** Start the engine for this boundary and arm the stop that ends the window. */
+function awayWake(): void {
+  awayWakeTimer = null;
+  const s = runtime.strategy;
+  if (!s.awayMode || !runtime.unlocked || !awayHasWork()) { scheduleAwayWake(); return; }
+
+  if (!runtime.running) {
+    awayStartedEngine = true;
+    activity.add({
+      kind: "info",
+      status: "info",
+      message: `Away mode: waking ${s.awayLeadMinutes} min before the epoch boundary`,
+    });
+    startEngine();
+  }
+
+  // Stop once the boundary is `AWAY_STOP_GRACE_MS` behind us. Recomputed from the clock
+  // rather than the lead, so a late wake still gets the full post-boundary grace.
+  if (awayStopTimer) clearTimeout(awayStopTimer);
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const boundary = runtime.startTime !== null ? nextBoundarySec(runtime.startTime, nowSec) : nowSec;
+  const stopDelayMs = Math.max(0, Number(boundary - nowSec) * 1000) + AWAY_STOP_GRACE_MS;
+  awayStopTimer = setTimeout(() => awaySleep(), Math.min(stopDelayMs, 2_000_000_000));
+}
+
+/** End the away window: stop the engine (only if away mode started it) and re-arm. */
+function awaySleep(): void {
+  awayStopTimer = null;
+  if (!runtime.strategy.awayMode) { awayStartedEngine = false; return; }
+  if (runtime.running && awayStartedEngine) {
+    activity.add({ kind: "info", status: "info", message: "Away mode: boundary done, going idle" });
+    stopEngine();
+  }
+  awayStartedEngine = false;
+  scheduleAwayWake();
+}
+
+/** Cancel away timers — used when away mode is switched off. */
+export function clearAwayTimers(): void {
+  if (awayWakeTimer) { clearTimeout(awayWakeTimer); awayWakeTimer = null; }
+  if (awayStopTimer) { clearTimeout(awayStopTimer); awayStopTimer = null; }
+  awayNextWakeSec = null;
+  runtime.awayNextWakeSec = null;
+  awayStartedEngine = false;
+  runtime.emitStatus();
 }
 
 /** Fire an extra tick precisely at the armed epoch's boundary (near-instant JIT pay). */

@@ -117,7 +117,7 @@ const { fetchOwnedTokenIds, fetchCandidateTokenIds } = await import("./index-tok
 const { filterLiveTokenIds, batchGetTargetStatuses, batchGetOwnedStatuses, encodeAudit, encodePayTaxes } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, resetJitState } =
+const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -740,5 +740,75 @@ describe("proactive pay only fires at the epoch boundary, never on generic tick 
     expect(submitTx).toHaveBeenCalledTimes(1);
     const [intent] = vi.mocked(submitTx).mock.calls[0]!;
     expect(intent.data).toBe("0xPAYTAXES");
+  });
+});
+
+
+// Away mode keeps the engine stopped between epochs and wakes it on a timer, so the
+// arming decision IS the feature: arm when there is boundary work, stay dark otherwise.
+// Getting this wrong means either sleeping through a boundary or defeating the point.
+describe("away mode arming", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const START = 0n;                    // matches START_TIME in this file's mocks
+  const EPOCH = 86_400n;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    // 1h into epoch 151 -> next boundary is START + 151*EPOCH.
+    vi.setSystemTime(Number(START + EPOCH * 150n + 3600n) * 1000);
+    runtime.account = { address: ADDR } as unknown as PrivateKeyAccount;
+    runtime.startTime = START;
+    runtime.running = false;
+    runtime.awayNextWakeSec = null;
+    runtime.strategy = { ...DEFAULT_STRATEGY, awayMode: true, awayLeadMinutes: 15, offenseEnabled: true, jitEnabled: false };
+  });
+
+  afterEach(() => {
+    clearAwayTimers();
+    vi.useRealTimers();
+    runtime.account = null;
+  });
+
+  it("arms exactly lead-minutes before the next boundary", () => {
+    scheduleAwayWake();
+    const boundary = Number(START + EPOCH * 151n);
+    expect(runtime.awayNextWakeSec).toBe(boundary - 15 * 60);
+  });
+
+  it("respects a custom lead", () => {
+    runtime.strategy = { ...runtime.strategy, awayLeadMinutes: 45 };
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBe(Number(START + EPOCH * 151n) - 45 * 60);
+  });
+
+  it("stays dark when there is nothing to wake for (no JIT armed, offense off)", () => {
+    runtime.strategy = { ...runtime.strategy, offenseEnabled: false, jitEnabled: false };
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBeNull();
+  });
+
+  it("arms for an armed JIT payment even with offense off", () => {
+    runtime.strategy = { ...runtime.strategy, offenseEnabled: false, jitEnabled: true, jitTargetEpoch: 151 };
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).not.toBeNull();
+  });
+
+  it("does not arm while the wallet is locked — it could not submit anything anyway", () => {
+    runtime.account = null;
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBeNull();
+  });
+
+  it("does not arm when away mode is off", () => {
+    runtime.strategy = { ...runtime.strategy, awayMode: false };
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBeNull();
+  });
+
+  it("wakes immediately when already inside the lead window", () => {
+    vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000); // 1 min before boundary
+    scheduleAwayWake();
+    expect(runtime.awayNextWakeSec).toBe(Number(START + EPOCH * 151n - 60n)); // = now
   });
 });

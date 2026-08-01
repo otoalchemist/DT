@@ -176,16 +176,21 @@ export function Dashboard({
   // background tab was burning provider quota around the clock for a page nobody was
   // reading (the single biggest source of idle RPC usage). Refresh immediately on
   // becoming visible so returning to the tab still shows current data.
+  // In away mode the dashboard stops polling entirely — that's the point of the mode, and
+  // these views cost several RPC round-trips per cycle. One read on mount so the page
+  // isn't blank, then nothing until "Refresh data" is pressed.
+  const awayMode = config?.awayMode ?? false;
   useEffect(() => {
     const tick = () => { if (!document.hidden) void refresh(); };
     tick();
+    if (awayMode) return;
     const id = setInterval(tick, 20000);
     document.addEventListener("visibilitychange", tick);
     return () => {
       clearInterval(id);
       document.removeEventListener("visibilitychange", tick);
     };
-  }, [refresh]);
+  }, [refresh, awayMode]);
 
   const running = status?.running ?? false;
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
@@ -275,6 +280,23 @@ export function Dashboard({
           </div>
           <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>
             <span className={`badge status-lg ${running ? "on" : "off"}`}>{running ? "● RUNNING" : "PAUSED"}</span>
+            {config?.awayMode && (
+              <span
+                className="badge warn"
+                title={
+                  status?.awayNextWakeSec
+                    ? `Away mode: engine idle (no RPC polling). Wakes ${config.awayLeadMinutes} min before the boundary, runs through it, then stops 5 min after.`
+                    : "Away mode on, but nothing is armed to wake for — arm a JIT payment or enable offense."
+                }
+              >
+                AWAY{status?.awayNextWakeSec
+                  ? ` · wakes in ${countdown(status.awayNextWakeSec - Math.floor(Date.now() / 1000))}`
+                  : " · idle"}
+              </span>
+            )}
+            <button className="ghost" onClick={() => void refresh()} title="Read on-chain data once, now — useful in away mode where nothing polls.">
+              Refresh data
+            </button>
             <button
               className={`start-cta ${running ? "danger" : "primary attention"}`}
               onClick={toggleRun}

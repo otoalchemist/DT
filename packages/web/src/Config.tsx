@@ -66,6 +66,7 @@ const STRATEGY_FIELDS: (keyof StrategyConfig)[] = [
   "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
   "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
   "racePublicMempool", "minBalanceEth", "maxPaymentEth",
+  "awayMode", "awayLeadMinutes",
 ];
 
 export function Config({
@@ -147,6 +148,30 @@ export function Config({
       <h2>Strategy</h2>
       <div style={{ marginBottom: 16 }}>{saveBar}</div>
 
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>AWAY MODE (RPC saver)</div>
+      <label className="check">
+        <input type="checkbox" checked={cfg.awayMode} onChange={chk("awayMode")} />
+        Away mode — keep the engine idle between epochs
+      </label>
+      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+        The engine costs ~22 provider requests/minute while running, but every automatic
+        action fires <b>at the epoch boundary</b>. Away mode idles at <b>zero requests</b>
+        (boundaries are arithmetic, not a poll), wakes the lead time below, runs through the
+        boundary, and stops 5 minutes after. The dashboard also stops its 20s polling — use
+        <b> Refresh data</b> in the top bar to read on demand.
+        <br />
+        It only wakes when there is something to do: a JIT payment armed, or offense enabled.
+        <b> Mid-epoch work is missed</b> — kill deadlines fall 24h after an audit, not on a
+        boundary, and a rival that becomes auditable mid-epoch won&apos;t be caught.
+      </p>
+      <label className="field" style={{ maxWidth: 260 }}>
+        Wake this many minutes before the boundary
+        <input type="number" min={1} max={720} step={1} value={cfg.awayLeadMinutes}
+          onChange={(e) => set("awayLeadMinutes", Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+          disabled={!cfg.awayMode} />
+      </label>
+
+      <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
       <label className="check">
         <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />

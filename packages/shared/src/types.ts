@@ -212,6 +212,29 @@ export interface StrategyConfig {
    *  target block resolves to the boundary block. */
   preBoundaryLeadMainnetMs: number;
 
+  // --- Away mode (RPC saver) ---
+  /**
+   * Keep the engine STOPPED between epochs, waking it only around the boundary.
+   *
+   * The engine costs ~22 provider requests/minute while running (one tick per block),
+   * but proactive-pay, the JIT payment and the pre-boundary audit all fire only AT the
+   * boundary — so running around the clock buys very little. Away mode idles at ZERO
+   * requests: epoch boundaries are deterministic (startTime + N * 86400), so the wake-up
+   * is a plain timer, not a poll.
+   *
+   * It wakes `awayLeadMinutes` before each boundary, but only when there's something to
+   * do — a JIT payment armed for that epoch, or offense enabled — and stops again
+   * AWAY_STOP_GRACE_MS after the boundary passes.
+   *
+   * Trade-off: mid-epoch work is missed. Kill deadlines fall 24h after an audit rather
+   * than on a boundary, and a rival that becomes auditable mid-epoch won't be caught.
+   */
+  awayMode: boolean;
+  /** Minutes before the boundary to wake the engine in away mode. 15 is generous: the
+   *  cold candidate enumeration is ~15s and the first tick a second or two, so this is
+   *  mostly slack for an RPC hiccup or timer drift. */
+  awayLeadMinutes: number;
+
   // --- Offense (optional) ---
   offenseEnabled: boolean;
   /** Automatically audit delinquent rival tokens. */
@@ -350,6 +373,9 @@ export interface BotStatus {
   citizenSupply: string | null;
   citizensAddress: string | null;
   lastBlock: string | null;
+  /** Away mode: unix seconds of the next scheduled wake-up, or null when away mode is
+   *  off / nothing is armed to wake for. Lets the dashboard count down without polling. */
+  awayNextWakeSec: number | null;
   spentThisEpochWei: string;
   /** Game start time (unix seconds) — lets the UI compute epoch boundaries. */
   startTime: string | null;
