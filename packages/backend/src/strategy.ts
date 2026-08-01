@@ -281,6 +281,31 @@ export function scheduleAwayWake(): void {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundary = nextBoundarySec(runtime.startTime, nowSec);
   const leadSec = BigInt(Math.max(1, s.awayLeadMinutes)) * 60n;
+  const graceSec = BigInt(AWAY_STOP_GRACE_MS / 1000);
+  const prevBoundary = boundary - EPOCH_DURATION_SECONDS;
+
+  // Turning away mode ON while the engine is already running (e.g. Arm payment started
+  // it) hands the run window over to away mode — otherwise the engine would keep polling
+  // forever and away mode would be silently inert.
+  if (runtime.running) {
+    // Inside a boundary window? Then this IS the window away mode would have created:
+    // keep running and just arm the stop. Otherwise idle now and wait for the next one.
+    const inLead = nowSec >= boundary - leadSec;
+    const inGrace = nowSec <= prevBoundary + graceSec;
+    if (inLead || inGrace) {
+      awayStartedEngine = true; // away mode now owns this window, so it may end it
+      armAwayStop((inGrace ? prevBoundary : boundary) + graceSec, nowSec);
+      runtime.emitStatus();
+      return;
+    }
+    activity.add({
+      kind: "info",
+      status: "info",
+      message: "Away mode enabled — going idle until the next boundary window",
+    });
+    stopEngine();
+  }
+
   let wakeAt = boundary - leadSec;
   // Already inside the lead window (or past the boundary): wake now.
   if (wakeAt <= nowSec) wakeAt = nowSec;
@@ -294,6 +319,18 @@ export function scheduleAwayWake(): void {
       `(${(delayMs / 60000).toFixed(1)} min), then running through boundary + ${AWAY_STOP_GRACE_MS / 60000} min`,
   );
   runtime.emitStatus();
+}
+
+/** Arm the timer that ends the current away window at `stopAtSec`. */
+function armAwayStop(stopAtSec: bigint, nowSec: bigint): void {
+  if (awayStopTimer) clearTimeout(awayStopTimer);
+  // While the window is open there is no pending wake — the badge should read "running",
+  // not count down to a wake that already happened.
+  awayNextWakeSec = null;
+  runtime.awayNextWakeSec = null;
+  const delayMs = Math.max(0, Number(stopAtSec - nowSec) * 1000);
+  awayStopTimer = setTimeout(() => awaySleep(), Math.min(delayMs, 2_000_000_000));
+  logger.info(`away mode: running until ${new Date(Number(stopAtSec) * 1000).toISOString()}`);
 }
 
 /** Start the engine for this boundary and arm the stop that ends the window. */
@@ -314,11 +351,9 @@ function awayWake(): void {
 
   // Stop once the boundary is `AWAY_STOP_GRACE_MS` behind us. Recomputed from the clock
   // rather than the lead, so a late wake still gets the full post-boundary grace.
-  if (awayStopTimer) clearTimeout(awayStopTimer);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundary = runtime.startTime !== null ? nextBoundarySec(runtime.startTime, nowSec) : nowSec;
-  const stopDelayMs = Math.max(0, Number(boundary - nowSec) * 1000) + AWAY_STOP_GRACE_MS;
-  awayStopTimer = setTimeout(() => awaySleep(), Math.min(stopDelayMs, 2_000_000_000));
+  armAwayStop(boundary + BigInt(AWAY_STOP_GRACE_MS / 1000), nowSec);
 }
 
 /** End the away window: stop the engine (only if away mode started it) and re-arm. */

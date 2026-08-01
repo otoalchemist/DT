@@ -806,6 +806,31 @@ describe("away mode arming", () => {
     expect(runtime.awayNextWakeSec).toBeNull();
   });
 
+  // Turning away mode ON while the engine is already running (the "Arm payment started
+  // the bot, then I enabled away mode" flow). Away mode must take over the run window —
+  // otherwise the engine polls forever and away mode is silently inert.
+  it("stops a running engine when enabled OUTSIDE a boundary window", () => {
+    runtime.running = true; // as if Arm payment had started it
+    scheduleAwayWake();
+    expect(runtime.running).toBe(false);
+    expect(runtime.awayNextWakeSec).toBe(Number(START + EPOCH * 151n) - 15 * 60);
+  });
+
+  it("keeps a running engine when enabled INSIDE the lead window, and arms the stop", () => {
+    vi.setSystemTime(Number(START + EPOCH * 151n - 5n * 60n) * 1000); // 5 min before boundary
+    runtime.running = true;
+    scheduleAwayWake();
+    expect(runtime.running).toBe(true);          // still in the window it would have created
+    expect(runtime.awayNextWakeSec).toBeNull();  // running, not counting down to a wake
+  });
+
+  it("keeps a running engine when enabled inside the post-boundary grace", () => {
+    vi.setSystemTime(Number(START + EPOCH * 150n + 60n) * 1000); // 1 min after a boundary
+    runtime.running = true;
+    scheduleAwayWake();
+    expect(runtime.running).toBe(true);
+  });
+
   it("wakes immediately when already inside the lead window", () => {
     vi.setSystemTime(Number(START + EPOCH * 151n - 60n) * 1000); // 1 min before boundary
     scheduleAwayWake();
