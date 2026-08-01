@@ -218,6 +218,11 @@ export function Dashboard({
   // clickable rather than locking the user out of running the bot at all.
   const awayIdleNoWork = awayMode && !running && awayWakeSec === null;
 
+  // The only state where every view updates on its own: the 20s dashboard poll (which
+  // runs whenever away mode is off) covers the lists, and the engine tick covers the
+  // header stats. Manual refresh adds nothing, so the button is disabled.
+  const selfRefreshing = running && !awayMode;
+
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
@@ -321,7 +326,21 @@ export function Dashboard({
                 AWAY{awayIdleNoWork ? " · nothing armed" : ""}
               </span>
             )}
-            <button className="ghost" onClick={() => void refresh(true)} title="Read on-chain data once, now — useful in away mode where nothing polls.">
+            <button
+              className="ghost"
+              onClick={() => void refresh(true)}
+              // Redundant ONLY when both halves are already self-updating: the dashboard
+              // polls every 20s whenever away mode is off, and the engine tick rewrites
+              // the header stats (epoch, balance, block) every block while running. With
+              // the engine stopped those stats go stale even though the lists keep
+              // polling, so the button stays live there.
+              disabled={selfRefreshing}
+              title={
+                selfRefreshing
+                  ? "Already refreshing: the dashboard polls every 20s and the running engine updates epoch/balance each block."
+                  : "Read on-chain data once, now — the header stats only update while the engine runs."
+              }
+            >
               Refresh data
             </button>
             <button
