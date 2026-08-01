@@ -223,6 +223,38 @@ export function Dashboard({
   // header stats. Manual refresh adds nothing, so the button is disabled.
   const selfRefreshing = running && !awayMode;
 
+  // Away mode is an INSTANT-APPLY control, like Start bot — pressing it persists straight
+  // away rather than staging an edit for "Save strategy". It changes whether the engine
+  // runs at all, so a state that looked armed but wasn't saved would silently miss a
+  // boundary. The backend re-arms/cancels the wake timer on every config POST.
+  const [awayBusy, setAwayBusy] = useState(false);
+  const [awayErr, setAwayErr] = useState<string | null>(null);
+  const persistAway = async (patch: Partial<StrategyConfig>) => {
+    setAwayBusy(true);
+    setAwayErr(null);
+    try {
+      // onConfigSaved keeps any edits still pending in the Strategy/Payment panels, so
+      // toggling away mode never clobbers (or silently commits) their unsaved work.
+      onConfigSaved(await api.setConfig(patch));
+    } catch (e) {
+      setAwayErr((e as Error).message);
+    } finally {
+      setAwayBusy(false);
+    }
+  };
+
+  // The lead-minutes box is typed into, so it can't persist per keystroke. Hold a draft
+  // while focused and commit on blur/Enter; `null` means "no draft, show the live value".
+  const [leadDraft, setLeadDraft] = useState<string | null>(null);
+  const leadMinutes = config?.awayLeadMinutes ?? 15;
+  const commitLead = () => {
+    const draft = leadDraft;
+    setLeadDraft(null);
+    if (draft === null) return;
+    const n = Math.min(720, Math.max(1, Math.floor(Number(draft) || leadMinutes)));
+    if (n !== leadMinutes) void persistAway({ awayLeadMinutes: n });
+  };
+
   // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
@@ -368,8 +400,37 @@ export function Dashboard({
             </button>
             {toggleErr && <span className="err" style={{ fontSize: 12 }}>{toggleErr}</span>}
           </div>
-          <div className="row" style={{ flex: "1 1 0", justifyContent: "flex-end" }}>
+          <div className="topbar-right" style={{ flex: "1 1 0" }}>
             <button className="ghost" onClick={() => api.lock().then(() => location.reload())}>Lock</button>
+            <div className="row" style={{ gap: 6 }}>
+              <button
+                className={`away-cta${awayMode ? " on" : ""}`}
+                onClick={() => void persistAway({ awayMode: !awayMode })}
+                disabled={awayBusy || config === null}
+                title={
+                  awayMode
+                    ? `Away mode ON — the engine idles at zero RPC between epochs, starts itself ${leadMinutes} min before the boundary, runs through it, then stops 5 min after. The dashboard also stops its 20s polling; use Refresh data to read on demand. Mid-epoch work is missed: kill deadlines fall 24h after an audit, not on a boundary. Click to turn off.`
+                    : "Away mode OFF — the engine runs continuously (~22 provider requests/minute) and the dashboard polls every 20s. Click to idle between epochs and wake only for the boundary. Applies immediately; no save needed."
+                }
+              >
+                {awayBusy ? "…" : awayMode ? "◐ Away mode ON" : "Away mode off"}
+              </button>
+              <input
+                className="away-lead"
+                type="number"
+                min={1}
+                max={720}
+                step={1}
+                value={leadDraft ?? String(leadMinutes)}
+                disabled={awayBusy || config === null}
+                onChange={(e) => setLeadDraft(e.target.value)}
+                onBlur={commitLead}
+                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                title="Wake this many minutes before the epoch boundary. Saves when you press Enter or click away."
+              />
+              <span className="muted" style={{ fontSize: 11 }}>min lead</span>
+            </div>
+            {awayErr && <span className="err" style={{ fontSize: 12 }}>{awayErr}</span>}
           </div>
         </div>
 

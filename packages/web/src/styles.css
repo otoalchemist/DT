@@ -100,6 +100,20 @@ button.save-cta.unsaved:hover { border-color: var(--amber); }
   50%      { box-shadow: 0 0 0 5px rgba(240,180,41,0.10); }
 }
 @media (prefers-reduced-motion: reduce) { button.save-cta.unsaved { animation: none; } }
+/* Top-bar right stack: Lock, then the away-mode control beneath it. */
+.topbar-right {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+}
+/* Away mode is instant-apply (like Start bot), so it reads as a stateful toggle rather
+   than a form field — lit amber while on, since it means the engine is deliberately not
+   running most of the time. */
+button.away-cta { font-size: 12px; font-weight: 600; padding: 6px 12px; white-space: nowrap; }
+button.away-cta.on {
+  background: var(--amber); border-color: var(--amber); color: #2a1f02;
+}
+button.away-cta.on:hover { border-color: var(--amber); }
+.away-lead { width: 58px; padding: 5px 6px; font-size: 12px; text-align: right; }
+
 .save-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .save-bar .unsaved-note { color: var(--amber); font-size: 12px; font-weight: 600; }
 .save-bar .saved-note { color: var(--green); font-size: 12px; font-weight: 600; }
