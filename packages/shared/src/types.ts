@@ -113,21 +113,27 @@ export interface TargetScoreRow {
   payBlkMed: number | null;
   /**
    * Coinbase bid over the LAST 2 EPOCHS: total ETH, and how many of its payments were
-   * bid-backed. A bid buys transaction position outright, so a bidder cures at index 0
-   * and is near-unauditable however strapped it looks. Shared when one operator co-pays
-   * several citizens in one block. null = the RPC has no tracing, so it's unknown.
+   * bid-backed. The "are they bidding right now" signal, deliberately narrower than the
+   * window `beatBidEth` is priced against. Shared when one operator co-pays several
+   * citizens in one block. null = the RPC has no tracing, so it's unknown.
    */
   bidEth: number | null;
   bidPays: number | null;
+  /** Same, over the WHOLE window — the bidding `beatBidEth` is actually priced against. */
+  bidWindowEth?: number | null;
+  bidWindowPays?: number | null;
   audited: number;
   /**
-   * Coinbase bid (ETH) needed to out-rank this rival's best observed DEFENSE DENSITY, for
-   * a one-payment + one-audit bundle at our default 20.1 gwei tip.
+   * Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole
+   * window, for a one-payment + one-audit bundle at our default 20.1 gwei tip.
    *
    * Density — (coinbase bid + priority tips) / gas — is what a builder sorts on, so it,
    * not the tip, is the bar. A bidder's tip can be near zero while the bid puts it
-   * hundreds of gwei/gas ahead. 0 = its defense is already at or below our tip.
-   * Optional: absent on rows cached before this was added.
+   * hundreds of gwei/gas ahead. Peak rather than recent, because what you must clear is
+   * the strongest defense it has actually mounted: #5347 bid its way to 192 gwei/gas six
+   * epochs ago while reading "no bid needed" off a 2-epoch window, and sat 6th in the
+   * recommended targets. A ceiling, not a forecast. 0 = peak defense already at or below
+   * our tip. Optional: absent on rows cached before this was added.
    */
   beatBidEth?: number;
   /** The density beatBidEth is priced against, gwei/gas: max(maxTip, observed bid density). */

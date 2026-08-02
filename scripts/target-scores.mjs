@@ -27,15 +27,21 @@
 //   tip/idx   defense strength from payment history: best (max) tip gwei, best (lowest)
 //             tx index reached. Reaching idx 0 on TIP ALONE is expensive, not unbeatable
 //             — see beatBid. Only a bid-backed idx 0 is genuinely out of reach.
-//   beatBid   coinbase bid (ETH) needed to out-rank this rival's best observed DEFENSE
-//             DENSITY — (coinbase bid + priority tips) / gas, the value-per-gas a builder
-//             actually sorts on. Priced for a 1-payment + 1-audit bundle at our 20.1 gwei
-//             tip. Density matters rather than the tip: #6749 tips 0.5 gwei but bid
-//             0.0226 ETH, putting it at ~104 gwei/gas — pricing off the tip said it was
-//             free to beat. A shared bid is spread over the whole bundle it bought
-//             position for. "-" = its defense is already at or below our tip.
+//   beatBid   coinbase bid (ETH) needed to out-rank this rival's PEAK defense density
+//             over the whole window — (coinbase bid + priority tips) / gas, the
+//             value-per-gas a builder actually sorts on. Priced for a 1-payment +
+//             1-audit bundle at our 20.1 gwei tip.
+//             Peak, not recent: what you must clear is the strongest defense it has
+//             actually mounted, since it can mount that again. Density, not tip: #6749
+//             tips 0.5 gwei but bids, putting it at ~149 gwei/gas. A shared bid is spread
+//             over the whole bundle it bought position for.
+//             "-" = its peak defense is already at or below our tip. "?" = it reaches
+//             top-of-block anyway, so something unobservable is buying that position.
+//             A ceiling, not a forecast — a peak from 8 epochs ago may not be repeated,
+//             and off-chain builder deals are invisible at any window length.
 //   aud       times ANY player successfully audited it in the window (proven catchable)
-//   bid       coinbase bid over the LAST 2 EPOCHS, as ETH x number of bid-backed payments.
+//   bid       coinbase bid over the LAST 2 EPOCHS only — the "bidding right now" signal,
+//             deliberately narrower than beatBid's window. ETH x bid-backed payments.
 //             A bid buys transaction position outright, so a bidder cures at index 0 and is
 //             near-unauditable however strapped it looks. Shared when one operator co-pays
 //             several citizens in a block. "?" = RPC has no trace_block.
@@ -273,11 +279,17 @@ async function main() {
   }
   const median = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); const h = s.length >> 1; return s.length % 2 ? s[h] : Math.round((s[h - 1] + s[h]) / 2); };
 
-  // Coinbase bids over the LAST 2 EPOCHS. A bid is an internal ETH transfer to
-  // block.coinbase riding the payment's bundle — it buys transaction position outright,
-  // so a rival that bids can cure at index 0 and is effectively unauditable regardless of
-  // how strapped it looks. Deliberately a short window: current behaviour is what matters
-  // for the upcoming boundary, and tracing is the expensive part of this scan.
+  // Coinbase bids. A bid is an internal ETH transfer to block.coinbase riding the
+  // payment's bundle — it buys transaction position outright, independent of the priority
+  // fee, so it is the thing you actually have to outspend.
+  //
+  // Traced over the FULL window, not the last 2 epochs. The short window was chosen
+  // because tracing is the expensive part of this scan, but it made the headline number
+  // wrong in the dangerous direction: #5347 bid its way to 192 gwei/gas six epochs ago and
+  // read "no bid needed" here, while sitting 6th in the recommended-targets list. Pricing
+  // a live bid off a figure that misses most bidding loses the race and the slot. So the
+  // peak over the whole window drives beatBid, and the last 2 epochs are kept separately
+  // as the "are they bidding right now" signal (the Bid 2ep column).
   //
   // Attribution is by (block, top-level sender), so a bid paid by a bundle-mate tx counts
   // for its sender. When one operator pays several citizens in a single block the bid is
@@ -288,8 +300,11 @@ async function main() {
   const bidEpochStart = ce - 1n > firstEpoch ? ce - 1n : firstEpoch;
   const bidWindowStart = epochFirstBlock.get(bidEpochStart.toString()) ?? latest;
   const recentPays = payLogs.filter((l) => BigInt(l.blockNumber) >= bidWindowStart);
-  const bidBlocks = [...new Set(recentPays.map((l) => BigInt(l.blockNumber).toString()))].map(BigInt);
-  const bidByToken = {}; // token -> { wei, pays }
+  const bidBlocks = [...new Set(payLogs.map((l) => BigInt(l.blockNumber).toString()))].map(BigInt);
+  if (!asJson && bidBlocks.length > 0) {
+    console.error(`tracing ${bidBlocks.length} payment blocks for coinbase bids…`);
+  }
+  const bidByToken = {}; // token -> { wei, pays } over the RECENT 2 epochs
   // Hoisted: the density calculation below needs the per-(block, sender) coinbase totals,
   // not just the per-token sums.
   const cbByBlockSender = new Map();
@@ -340,10 +355,11 @@ async function main() {
   // Gas is summed per (block, sender) so a shared bid is spread over the whole bundle it
   // actually bought position for, matching how the bid itself is attributed. A batch
   // payment emits one TaxesPaid per citizen from ONE tx, so gas is counted once per tx.
-  const bidDensity = {}; // token -> max gwei/gas observed on a bid-backed payment
+  const bidDensity = {}; // token -> PEAK gwei/gas over the whole window
+  const bidWindow = {};  // token -> { wei, pays } over the whole window
   if (tracingOk) {
     const group = new Map(); // "blk:sender" -> { gas, tips, txs }
-    for (const l of recentPays) {
+    for (const l of payLogs) {
       const m = meta.get(l.transactionHash);
       if (!m) continue;
       const k = `${m.blk}:${m.from}`;
@@ -355,7 +371,9 @@ async function main() {
       }
       group.set(k, g);
     }
-    for (const l of recentPays) {
+    // Peak, not average: what you must clear is the strongest defense it has actually
+    // mounted, since that is what it can mount again.
+    for (const l of payLogs) {
       const tok = BigInt(l.topics[1]).toString();
       const m = meta.get(l.transactionHash);
       if (!m) continue;
@@ -365,6 +383,9 @@ async function main() {
       if (bidWei <= 0n || !g || g.gas === 0n) continue;
       const gweiPerGas = Number(((bidWei + g.tips) * 1000n) / g.gas) / 1000 / 1e9;
       bidDensity[tok] = Math.max(bidDensity[tok] ?? 0, gweiPerGas);
+      const w = (bidWindow[tok] ??= { wei: 0n, pays: 0 });
+      w.wei += bidWei;
+      w.pays++;
     }
   }
 
@@ -458,9 +479,13 @@ async function main() {
       defenseGwei: +defenseGwei.toFixed(1),
       doNotTarget, dntReason, dntOwner, uncatchable,
       score: +score.toFixed(2),
-      // Coinbase bidding over the last 2 epochs. null = RPC has no tracing (unknown).
+      // Coinbase bidding over the last 2 epochs — the "are they bidding right now"
+      // signal. null = RPC has no tracing (unknown).
       bidEth: tracingOk ? +eth(bidByToken[t]?.wei ?? 0n).toFixed(6) : null,
       bidPays: tracingOk ? (bidByToken[t]?.pays ?? 0) : null,
+      // ...and over the WHOLE window, which is what beatBid is priced against.
+      bidWindowEth: tracingOk ? +eth(bidWindow[t]?.wei ?? 0n).toFixed(6) : null,
+      bidWindowPays: tracingOk ? (bidWindow[t]?.pays ?? 0) : null,
     });
   }
 
