@@ -43,6 +43,7 @@
 //   node scripts/target-scores.mjs --auditable-next   # only weak links auditable next boundary
 //   node scripts/target-scores.mjs --epochs 20        # widen the cadence look-back
 //   node scripts/target-scores.mjs --curated          # only data/rival-targets.json (old scope)
+//   node scripts/target-scores.mjs --promote          # add newly-observed skippers to the list
 //   node scripts/target-scores.mjs --json             # machine-readable dump (full set)
 //   RPC_HTTP_URL=... node scripts/target-scores.mjs
 //
@@ -59,6 +60,11 @@ const dataDir = path.join(root, "data");
 const GAME = "0xa448c7f618087dda1a3b128cad8a424fbae4b71f";
 const EMIGRATION = "0xe56d011262d4738dc8307fb8a4ae48b2bfc20e7c"; // citizens here have left the game
 const EPOCH_DURATION = 86400n;
+// Our own bundle shape, for pricing what it costs to out-rank a rival's defense.
+// Gas measured from real on-chain game txs: payTaxes ~82,875, audit ~130,409, plus the
+// fixed 60,000 for the CoinbasePayer tx.
+const OUR_BUNDLE_GAS = 82_875 + 130_409 + 60_000;
+const OUR_TIP_GWEI = 20.1; // DEFAULT_STRATEGY.offensePriorityFeeGwei
 const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI, 0.00069 ETH
 const TAXES_PAID = "0xa13146c03f92fd93f0bccebeff87928581da5e13079c83238adc89e466ebfaca";
 const AUDITED = "0xee1e30708b892ceb30b2a542bccb9a10c605f220dd821cc582226d1fbeea4f6f";
@@ -78,6 +84,10 @@ const asJson = args.includes("--json");
 const auditableNext = args.includes("--auditable-next");
 // --curated: score only data/rival-targets.json instead of the full live rival set.
 const curatedOnly = args.includes("--curated");
+// --promote: persist newly-observed skippers into data/rival-skippers.json. The scan is
+// otherwise strictly read-only, and that file feeds the bot's default target list, so
+// writing it stays an explicit opt-in rather than a side effect of looking at the data.
+const promote = args.includes("--promote");
 const epochsArg = (() => { const i = args.indexOf("--epochs"); return i >= 0 && args[i + 1] ? BigInt(args[i + 1]) : 10n; })();
 
 function resolveRpc() {
@@ -332,7 +342,14 @@ async function main() {
     // net — several listed tokens land at index 2-15 and HAVE been audited, so evidence
     // alone would never have flagged them.
     const dntOwner = dntOwnerOf.get(t) ?? null;
-    const uncatchable = bestIdx !== null && bestIdx <= 1 && aud === 0; // evidence-based
+    // Evidence-based "can't catch it": tops the block, never been audited, AND buys that
+    // position with a coinbase bid. The bid clause matters — a token that reaches index 0
+    // on PRIORITY FEE alone is not uncatchable, just expensive: builders order by value
+    // per gas, so a coinbase bid outranks any tip you care to name. Flagging those hid
+    // genuinely reachable targets (#2711 defends at 90 gwei with no bid — about 0.019 ETH
+    // of bid beats it). Only a rival already paying for position is out of reach.
+    const bidBacked = (bidByToken[t]?.pays ?? 0) > 0;
+    const uncatchable = bestIdx !== null && bestIdx <= 1 && aud === 0 && bidBacked;
     const doNotTarget = dntOwner !== null || uncatchable;
     const dntReason = dntOwner !== null ? "listed" : uncatchable ? "evidence" : null;
 
@@ -346,18 +363,35 @@ async function main() {
       if (bribes > 0) score -= 1;                                   // free escape
       score = Math.max(0, score);
     }
+    // What a coinbase bid would have to cover to beat this token's best observed defense.
+    // Builders sort on total value per gas, so matching its max tip is the bar; the bid
+    // makes up whatever our own tip doesn't. Sized for one payment + one audit + the
+    // payer tx (measured on-chain: 82,875 + 130,409 + 60,000 gas) at the default 20.1
+    // gwei tip. Rough by nature — it can't see off-chain builder deals.
+    const beatBidEth = dd.maxTip > OUR_TIP_GWEI
+      ? +(((dd.maxTip - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4)
+      : 0;
     const offs = payOff[t] ?? [];
     const payBlkMin = offs.length ? Math.min(...offs) : null; // fastest cure after a boundary
     const payBlkMed = median(offs);                            // typical audit window
     rows.push({
-      token: t, skipper: skipperSet.has(t), behind, under, killable: under && due <= nowSec,
+      token: t,
+      // A skipper is anything that has ATTEMPTED a skip in the window — crossed a
+      // boundary 2+ behind, whether or not it got away with it. Derived from the scan
+      // rather than read from data/rival-skippers.json, so a rival that started skipping
+      // yesterday is classified correctly the moment anyone runs this, with no list to
+      // regenerate and no per-user setup. The file still counts (a token may have skipped
+      // outside this window), so it's a union, and `skipperSource` says which.
+      skipper: skipperSet.has(t) || crossings[t] > 0,
+      skipperSource: crossings[t] > 0 ? (skipperSet.has(t) ? "both" : "observed") : "listed",
+      behind, under, killable: under && due <= nowSec,
       crossings: crossings[t], sampled: sampled[t],
       // Outcome of those crossings: caught = a skip that drew an audit that same epoch.
       skipCaught: skipCaught[t], skipClean: crossings[t] - skipCaught[t],
       bribes, ins,
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
-      payBlkMin, payBlkMed, audited: aud,
+      payBlkMin, payBlkMed, audited: aud, beatBidEth,
       doNotTarget, dntReason, dntOwner, uncatchable,
       score: +score.toFixed(2),
       // Coinbase bidding over the last 2 epochs. null = RPC has no tracing (unknown).
@@ -374,12 +408,14 @@ async function main() {
   const skipCol = (r) =>
     (r.crossings === 0 ? "-" : `${r.skipClean}/${r.skipCaught} of ${r.crossings}`).padStart(11);
   const payBlkCol = (r) => (r.payBlkMin === null ? "-" : `${r.payBlkMin}/${r.payBlkMed}`).padStart(9);
+  // What a coinbase bid must cover to out-rank this rival's best observed defense.
+  const beatCol = (r) => (r.beatBidEth > 0 ? r.beatBidEth.toFixed(4) : "-").padStart(7);
   const bidCol = (r) => (r.bidEth === null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "-").padStart(8);
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"} ${skipCol(r)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
-    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${bidCol(r)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
-  const header = "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk      bid aud  score";
+    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${bidCol(r)} ${beatCol(r)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
+  const header = "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk      bid beatBid aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
   // --auditable-next keeps only rows that will be auditable when the epoch rolls: 1+
@@ -416,19 +452,46 @@ async function main() {
     for (const r of listed) console.log(`${r.dntOwner.padEnd(12)} ` + fmt(r));
   }
 
+  // Rivals this scan saw skipping that the saved list doesn't know about yet. The list is
+  // a snapshot — only as current as the last regeneration — so a rival that started
+  // skipping recently sits in the wrong section until someone notices. Surface them every
+  // run, and let --promote write them in.
+  const newlyObserved = rows
+    .filter((r) => r.skipperSource === "observed" && r.dntOwner === null)
+    .sort((a, b) => b.crossings - a.crossings || Number(a.token) - Number(b.token));
+  if (newlyObserved.length > 0) {
+    console.log(`\n--- newly observed skippers (${newlyObserved.length}) — attempted a skip, not yet on data/rival-skippers.json ---`);
+    for (const r of newlyObserved) {
+      console.log(`  #${r.token.padEnd(5)} ${r.skipClean}/${r.skipCaught} of ${r.crossings} skips · score ${r.score.toFixed(2)}`);
+    }
+    if (promote) {
+      const merged = [...new Set([...skipperSet, ...newlyObserved.map((r) => r.token)])]
+        .filter((t) => !dntOwnerOf.has(t) && !allySet.has(t))
+        .sort((a, b) => Number(a) - Number(b));
+      fs.writeFileSync(path.join(dataDir, "rival-skippers.json"), JSON.stringify(merged, null, 2) + "\n");
+      console.log(`  -> promoted ${newlyObserved.length}; data/rival-skippers.json now holds ${merged.length}`);
+    } else {
+      console.log(`  (re-run with --promote to add them to data/rival-skippers.json)`);
+    }
+  }
+
   // Paste-ready target lists: catchable only (score > 0, drops uncatchable/under-audit),
   // ranked best-first, comma-separated for the offense target box.
   const ids = (list) => list.filter((r) => r.score > 0).map((r) => r.token).join(",");
   console.log(`\n--- paste (ranked, catchable only) ---`);
   console.log(`skippers    : ${ids(skippers) || "(none)"}`);
   console.log(`non-skippers: ${ids(others) || "(none)"}`);
-  console.log(`do-not-target (excluded): ${listed.map((r) => r.token).join(",") || "(none)"}`);
+  // Big boys as a paste too. Not a target list — it's there so the roster can be dropped
+  // into the targets box deliberately (the roster is advice, and a pin overrides it), or
+  // just copied out to compare against data/do-not-target.json.
+  console.log(`big boys   : ${listed.map((r) => r.token).join(",") || "(none)"}`);
 
   if (auditableNext) {
     const best = pool.filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
     console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
     console.log("clean/caught of N = skips (boundaries crossed 2+ behind) survived / caught by an audit, out of attempted — all-clean = proven-safe cadence, caught often = soft target");
+    console.log("beatBid = coinbase bid (ETH) needed to out-rank its best observed tip, for a 1-pay + 1-audit bundle at our 20.1 gwei tip — a tip-only defender is expensive, not unbeatable");
     console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
     console.log("bid = coinbase bid over the LAST 2 EPOCHS (ETH x bid-backed payments) — buys top-of-block, so a bidder is near-unauditable; shared when one operator co-pays several citizens; '?' = RPC has no tracing");
   }

@@ -43,13 +43,15 @@ const SEL_OWNER_OF = "0x6352211e";        // ownerOf(uint256)
 
 // --- tunable thresholds ---
 // A rival qualifies if it crossed delinquent >= MIN_CROSSINGS times in the window.
-// Set to 2 so the mixed-signal tier (rivals that skipped on 2-3 boundaries) folds in
-// alongside the strong 4-5x cadence payers — a single crossing is treated as noise,
-// two or more as an intentional pattern worth targeting. MIN_PARITY_STREAK /
-// STRONG_CROSSINGS remain as the ORed "clean-cadence" and "frequent" shortcuts, but
-// with MIN_CROSSINGS at 2 they no longer gate anything extra; kept for easy tightening.
+// Set to 1: ANY attempted skip counts, whether it got away with it or was audited for it.
+// A crossing is not an accident — it means the owner let the token sit auditable through a
+// boundary — and treating a single one as noise hid genuinely soft targets. #1000 and #831
+// each skipped once and were audited for it, which is the strongest possible evidence that
+// a skip there is punishable, yet the old threshold of 2 filed them under non-skippers.
+// MIN_PARITY_STREAK / STRONG_CROSSINGS remain as ORed shortcuts; at 1 they gate nothing
+// extra, and are kept so the threshold can be tightened again without losing them.
 const DEFAULT_EPOCHS = 10;   // how many recent boundaries to inspect
-const MIN_CROSSINGS = 2;     // must cross this many times in the window to qualify
+const MIN_CROSSINGS = 1;     // must cross this many times in the window to qualify
 const MIN_PARITY_STREAK = 4; // ...OR cross this many times on one parity (clean 2-epoch cadence)
 const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cadence allowed to wobble)
 

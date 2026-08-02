@@ -31,6 +31,7 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments). A bid buys top-of-block, so a bidder is near-unauditable however strapped it looks. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
+            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's best observed priority tip, for a 1-payment + 1-audit bundle at our 20.1 gwei tip. Builders order by value per gas, so a tip-only defender is expensive to beat, not impossible. — = its tip is already at or below ours.">BeatBid</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
@@ -86,6 +87,9 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
               <td style={{ ...cell, color: r.bidEth ? "var(--red)" : undefined, fontWeight: r.bidEth ? 600 : 400 }}
                   title={r.bidEth == null ? "RPC has no tracing — unknown" : r.bidEth > 0 ? `${r.bidEth} ETH across ${r.bidPays} bid-backed payment(s) in the last 2 epochs` : "no coinbase bid in the last 2 epochs"}>
                 {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
+              </td>
+              <td style={cell} title={r.beatBidEth ? "Set coinbaseBidEth to at least this to out-rank its defense" : undefined}>
+                {r.beatBidEth ? r.beatBidEth.toFixed(4) : <span className="muted">—</span>}
               </td>
               <td style={cell}>{r.bribes || ""}</td>
               <td style={cell}>{r.audited || ""}</td>
@@ -146,7 +150,10 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
     : [];
   const skippers = targetable ? targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score) : [];
   const others = targetable ? targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score) : [];
-  const pasteIds = (list: TargetScoreRow[]) => list.filter((r) => r.score > 0).map((r) => r.token).join(",");
+  // Reachable, not "score > 0": a 0.00 can now mean catchable-but-not-weak (rich, defends
+  // hard, never yet audited), which belongs at the bottom of the list rather than off it.
+  const pasteIds = (list: TargetScoreRow[]) =>
+    list.filter((r) => !r.under && !dnt(r)).map((r) => r.token).join(",");
 
   return (
     <div className="panel">
@@ -214,17 +221,28 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
           )}
 
           <div style={{ marginTop: 10, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
-            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PASTE (ranked, catchable only)</div>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PASTE (ranked, reachable only)</div>
             <label className="field" style={{ marginBottom: 6 }}>
               skippers
               <input readOnly value={pasteIds(skippers)} onFocus={(e) => e.currentTarget.select()}
                 style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }} />
             </label>
-            <label className="field">
+            <label className="field" style={{ marginBottom: listed.length > 0 ? 6 : 0 }}>
               non-skippers
               <input readOnly value={pasteIds(others)} onFocus={(e) => e.currentTarget.select()}
                 style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }} />
             </label>
+            {listed.length > 0 && (
+              <label className="field">
+                big boys
+                {/* Deliberately NOT filtered by score — every big boy scores 0 by
+                    definition, so the catchable-only rule would empty this. It isn't a
+                    ranked target list; it's the roster, ready to paste when you mean to
+                    override it. */}
+                <input readOnly value={listed.map((r) => r.token).join(",")} onFocus={(e) => e.currentTarget.select()}
+                  style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }} />
+              </label>
+            )}
           </div>
 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>

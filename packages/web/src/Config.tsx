@@ -94,10 +94,14 @@ export function Config({
   // The "skippers" subset — rivals that pay on a ~2-epoch cadence — offered as a
   // one-click focused target list.
   const [skippers, setSkippers] = useState<string[]>([]);
+  // The "big boys" roster (data/do-not-target.json). Offered as a template because the
+  // roster is advice, not a block: pinning one is how you deliberately go after it.
+  const [bigBoys, setBigBoys] = useState<string[]>([]);
 
   useEffect(() => {
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
     api.rivalSkippers().then((r) => setSkippers(r.tokenIds)).catch(() => {});
+    api.doNotTarget().then((rows) => setBigBoys(rows.map((r) => r.tokenId))).catch(() => {});
   }, []);
 
   // True when the current target list already equals `list` (same ids, same order).
@@ -189,9 +193,19 @@ export function Config({
         >
           Rival Skippers
         </button>
+        <button
+          type="button"
+          onClick={() => set("offenseTargetTokenIds", [...bigBoys])}
+          disabled={!cfg.offenseEnabled || bigBoys.length === 0 || targetsEqual(bigBoys)}
+          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
+          title="Target the Do Not Target roster (data/do-not-target.json). These are normally excluded because they cure at the top of the boundary block — pinning them here is the deliberate override that makes the bot audit them anyway."
+        >
+          Big Boys
+        </button>
         {defaultRivals.length > 0 && (
           <span className="muted" style={{ fontSize: 11 }}>
             {defaultRivals.length} default{skippers.length > 0 ? ` · ${skippers.length} skippers` : ""}
+            {bigBoys.length > 0 ? ` · ${bigBoys.length} big boys` : ""}
           </span>
         )}
       </div>

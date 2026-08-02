@@ -121,6 +121,18 @@ export interface TargetScoreRow {
   bidPays: number | null;
   audited: number;
   /**
+   * Coinbase bid (ETH) needed to out-rank this rival's best observed priority tip, for a
+   * one-payment + one-audit bundle at our default 20.1 gwei tip. Builders order by value
+   * per gas, so a tip-only defender is expensive to beat, never impossible. 0 = its tip is
+   * already at or below ours. Optional: absent on rows cached before this was added.
+   */
+  beatBidEth?: number;
+  /**
+   * Which section the scan put it in. "observed" = it attempted a skip during the window
+   * but is not yet in data/rival-skippers.json, so the saved list is behind the data.
+   */
+  skipperSource?: "listed" | "observed" | "both";
+  /**
    * Do not target: an audit slot spent here is wasted, so the row is greyed and scored 0.
    * Two independent reasons, distinguished by `dntReason`:
    *  - "listed"   — on the curated big-boy roster (data/do-not-target.json). A standing
