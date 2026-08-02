@@ -4,9 +4,10 @@ import {
   EMIGRATION_CONTRACT_ADDRESS,
   type OwnedTokenStatus,
   type TargetTokenStatus,
+  type DoNotTargetStatus,
   type EmigratedTokenStatus,
 } from "@dat-bot/shared";
-import { runtime, loadAllyTokens } from "./runtime.js";
+import { runtime, loadAllyTokens, loadDoNotTarget } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { fetchEmigrationRoster } from "./emigration.js";
@@ -212,6 +213,30 @@ export async function readAllies(): Promise<TargetTokenStatus[]> {
   const live = (await getLiveCandidates(snap.citizensAddress)).filter((t) => want.has(t.id.toString()));
   const rows = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
   return rows.sort((a, b) => actionableRank(a) - actionableRank(b) || b.epochsBehind - a.epochsBehind);
+}
+
+/**
+ * The "do not target" roster (data/do-not-target.json), each row tagged with the operator
+ * who runs it. Same live-status read as the rivals panel — these ARE rivals, we just never
+ * attack them — so the panel can still show how delinquent a big boy is getting without
+ * inviting an audit that would only waste a slot.
+ */
+export async function readDoNotTarget(): Promise<DoNotTargetStatus[]> {
+  const { tokenIds, owners } = loadDoNotTarget();
+  if (tokenIds.length === 0) return [];
+  const operatorOf = new Map<string, string>();
+  for (const [name, ids] of Object.entries(owners)) {
+    for (const id of ids) operatorOf.set(BigInt(id).toString(), name);
+  }
+  const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const want = new Set(tokenIds.map((x) => BigInt(x).toString()));
+  const live = (await getLiveCandidates(snap.citizensAddress)).filter((t) => want.has(t.id.toString()));
+  const rows = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
+  return rows
+    .map((r) => ({ ...r, operator: operatorOf.get(BigInt(r.tokenId).toString()) ?? "?" }))
+    // Group by operator, then most-delinquent first within each group.
+    .sort((a, b) => a.operator.localeCompare(b.operator) || b.epochsBehind - a.epochsBehind);
 }
 
 /**

@@ -7,6 +7,13 @@ import { api } from "./api.js";
  * kicks off a background run on the backend and this polls until it lands. Results are
  * cached backend-side, so the table survives a page reload without re-scanning.
  */
+/**
+ * Do Not Target: either the curated big-boy roster or the evidence heuristic (tops the
+ * block, never audited). Falls back to `uncatchable`, the pre-rename field, so rows still
+ * cached by an older backend keep greying correctly instead of silently going live.
+ */
+const dnt = (r: TargetScoreRow): boolean => r.doNotTarget ?? r.uncatchable ?? false;
+
 function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) {
   if (rows.length === 0) return <p className="muted" style={{ fontSize: 12 }}>{empty}</p>;
   const cell: React.CSSProperties = { padding: "5px 10px", fontSize: 12, whiteSpace: "nowrap" };
@@ -26,13 +33,24 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments). A bid buys top-of-block, so a bidder is near-unauditable however strapped it looks. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
-            <th style={cell} title="Weak-link score, higher is a better target. 0 = uncatchable or under audit">Score</th>
+            <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={r.token} style={r.uncatchable || r.under ? { opacity: 0.45 } : undefined}>
-              <td style={{ ...cell, fontFamily: "monospace" }}>#{r.token}</td>
+            <tr key={r.token} style={dnt(r) || r.under ? { opacity: 0.45 } : undefined}>
+              <td style={{ ...cell, fontFamily: "monospace" }}>
+                #{r.token}
+                {r.dntOwner ? (
+                  <span
+                    className="badge"
+                    style={{ fontSize: 9, marginLeft: 6, fontFamily: "inherit" }}
+                    title={`Do Not Target — run by ${r.dntOwner}. Excluded from auto-discovery; pin it in the Strategy targets box to audit it anyway.`}
+                  >
+                    {r.dntOwner}
+                  </span>
+                ) : null}
+              </td>
               <td style={cell}>
                 {r.under
                   ? <span className="badge warn" style={{ fontSize: 10 }}>audit</span>
@@ -117,8 +135,17 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
   const pool = rows
     ? (onlyAuditableNext ? rows.filter((r) => r.behind >= 1 && !r.under) : rows)
     : null;
-  const skippers = pool ? pool.filter((r) => r.skipper).sort((a, b) => b.score - a.score) : [];
-  const others = pool ? pool.filter((r) => !r.skipper).sort((a, b) => b.score - a.score) : [];
+  // Listed do-not-target rivals are pulled out of the two candidate sections entirely —
+  // ranking a non-candidate among candidates only invites a misread. Their own section is
+  // built from the FULL row set, not the auditable-next pool, because it's a reference
+  // roster: a big boy that isn't delinquent today should still be listed.
+  const targetable = pool ? pool.filter((r) => !r.dntOwner) : null;
+  const listed = rows
+    ? rows.filter((r) => !!r.dntOwner)
+        .sort((a, b) => a.dntOwner!.localeCompare(b.dntOwner!) || Number(a.token) - Number(b.token))
+    : [];
+  const skippers = targetable ? targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score) : [];
+  const others = targetable ? targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score) : [];
   const pasteIds = (list: TargetScoreRow[]) => list.filter((r) => r.score > 0).map((r) => r.token).join(",");
 
   return (
@@ -172,6 +199,20 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
           </div>
           <ScoreTable rows={others} empty="No non-skippers match." />
 
+          {listed.length > 0 && (
+            <>
+              <div className="spacer" />
+              <div
+                className="muted"
+                style={{ fontSize: 11, marginBottom: 4 }}
+                title="Curated in data/do-not-target.json. Kept out of auto-discovery because these operators cure at the top of the boundary block, so an audit slot spent here is normally wasted. Shown in full regardless of the filter above, since a big boy drifting delinquent is worth seeing."
+              >
+                DO NOT TARGET ({listed.length}) · big boys — excluded from the lists above
+              </div>
+              <ScoreTable rows={listed} empty="None listed." />
+            </>
+          )}
+
           <div style={{ marginTop: 10, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
             <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PASTE (ranked, catchable only)</div>
             <label className="field" style={{ marginBottom: 6 }}>
@@ -192,7 +233,8 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
             the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-
-            unauditable) · greyed rows are uncatchable or already under audit.
+            unauditable) · greyed rows are Do Not Target or already under audit. DNT is
+            advice, not a veto: pin one in the Strategy targets box and it still gets audited.
           </p>
         </>
       )}

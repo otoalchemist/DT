@@ -51,6 +51,45 @@ export function loadAllyTokens(): string[] {
   return loadRivalIdFile("ally-tokens.json", "ally tokens");
 }
 
+/**
+ * "Do not target" (data/do-not-target.json) — rival citizens we deliberately never audit,
+ * grouped by the operator who runs them.
+ *
+ * These are still RIVALS (unlike allies): they're just not worth attacking. An operator
+ * with deep reserves and a standing builder relationship cures at the top of the boundary
+ * block regardless of how delinquent it looks, so an audit aimed at one burns a scarce
+ * auditor slot on a race that cannot be won. The list is curated rather than derived —
+ * the evidence heuristic in the target analysis catches only the ones that have already
+ * demonstrated top-of-block cures, which is a strict subset.
+ *
+ * Returns the flat id list plus the owner grouping, so the UI can tag each id with who
+ * runs it.
+ */
+export function loadDoNotTarget(): { tokenIds: string[]; owners: Record<string, string[]> } {
+  try {
+    const file = path.join(appConfig.dataDir, "do-not-target.json");
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { owners?: Record<string, unknown> };
+    const owners: Record<string, string[]> = {};
+    for (const [name, ids] of Object.entries(raw.owners ?? {})) {
+      if (!Array.isArray(ids)) continue;
+      owners[name] = ids.map(String).filter((id) => /^\d+$/.test(id));
+    }
+    // De-duplicated across owners: a token listed twice must not be counted twice.
+    const tokenIds = [...new Set(Object.values(owners).flat())];
+    return { tokenIds, owners };
+  } catch {
+    return { tokenIds: [], owners: {} };
+  }
+}
+
+/** Flat lookup of tokenId -> operator name, for tagging rows in the UI. */
+export function doNotTargetOwnerOf(): Record<string, string> {
+  const { owners } = loadDoNotTarget();
+  const map: Record<string, string> = {};
+  for (const [name, ids] of Object.entries(owners)) for (const id of ids) map[id] = name;
+  return map;
+}
+
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
   proactivePay: true,

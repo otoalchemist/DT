@@ -20,7 +20,8 @@ import { invalidateTokenCaches } from "./index-tokens.js";
 import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
-import { readOwnedStatuses, readTargets, readEmigrated, readAllies, invalidateLiveCandidates } from "./service.js";
+import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
+  readDoNotTarget, invalidateLiveCandidates } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -400,6 +401,17 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/allies", async (_req, reply) => {
     try {
       return await readAllies();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  // "Do not target" rivals (data/do-not-target.json) — big-boy operators we never audit.
+  // Still rivals, so they keep a live status read; they just get their own panel and are
+  // excluded from every offense path.
+  app.get("/api/do-not-target", async (_req, reply) => {
+    try {
+      return await readDoNotTarget();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
     }

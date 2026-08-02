@@ -8,6 +8,7 @@ import {
   type OwnedTokenStatus,
   type TargetTokenStatus,
   type EmigratedTokenStatus,
+  type DoNotTargetStatus,
 } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { Config } from "./Config.js";
@@ -103,6 +104,39 @@ function EmigratedTable({ rows }: { rows: EmigratedTokenStatus[] }) {
   );
 }
 
+/**
+ * The "do not target" roster, grouped under the operator who runs each citizen. Same
+ * status columns as the rivals table — these ARE rivals, and a big boy drifting delinquent
+ * is worth seeing — but the operator tag is the point: it's what turns a list of bare ids
+ * into "that's Graveyard's, leave it".
+ */
+function DoNotTargetTable({ rows }: { rows: DoNotTargetStatus[] }) {
+  if (rows.length === 0) {
+    return <p className="muted" style={{ fontSize: 12 }}>None listed (see data/do-not-target.json).</p>;
+  }
+  const byOperator = new Map<string, DoNotTargetStatus[]>();
+  for (const r of rows) {
+    const list = byOperator.get(r.operator) ?? [];
+    list.push(r);
+    byOperator.set(r.operator, list);
+  }
+  return (
+    <>
+      {[...byOperator.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([operator, list]) => (
+          <div key={operator} style={{ marginBottom: 8 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
+              <span className="badge" style={{ fontSize: 9 }}>{operator}</span>{" "}
+              {list.length} citizen{list.length === 1 ? "" : "s"}
+            </div>
+            <TargetsTable rows={list} empty="" />
+          </div>
+        ))}
+    </>
+  );
+}
+
 const sectionLabel: React.CSSProperties = {
   fontSize: 11,
   textTransform: "uppercase",
@@ -129,6 +163,7 @@ export function Dashboard({
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
   const [emigrated, setEmigrated] = useState<EmigratedTokenStatus[]>([]);
   const [allies, setAllies] = useState<TargetTokenStatus[]>([]);
+  const [doNotTarget, setDoNotTarget] = useState<DoNotTargetStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -162,16 +197,18 @@ export function Dashboard({
         const s = await api.refreshChain().catch(() => null);
         if (s) pushStatus(s);
       }
-      const [t, g, e, a] = await Promise.all([
+      const [t, g, e, a, dnt] = await Promise.all([
         api.tokens().catch(() => []),
         api.targets().catch(() => []),
         api.emigrated().catch(() => []),
         api.allies().catch(() => []),
+        api.doNotTarget().catch(() => []),
       ]);
       setTokens(t);
       setTargets(g);
       setEmigrated(e);
       setAllies(a);
+      setDoNotTarget(dnt);
       setErr(null);
     } catch (e) {
       setErr((e as Error).message);
@@ -574,6 +611,19 @@ export function Dashboard({
           <div className="spacer" />
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
           <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
+
+          <div className="spacer" />
+          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>
+            Do Not Target · big boys ({doNotTarget.length})
+          </div>
+          <DoNotTargetTable rows={doNotTarget} />
+          <p className="muted" style={{ fontSize: 11, margin: "6px 0 0 0", lineHeight: 1.5 }}>
+            From <code>data/do-not-target.json</code>, tagged with the operator who runs
+            them. These cure at the top of the boundary block, so an audit slot spent here
+            is normally wasted — they're kept out of auto-discovery and out of the target
+            analysis rankings. Unlike allies this is <b>advice, not a block</b>: pin one in
+            the Strategy targets box and the bot will still audit it.
+          </p>
         </div>
 
         <div className="spacer" />

@@ -123,6 +123,13 @@ async function main() {
   const skipperSet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "rival-skippers.json"), "utf8")).map(String));
   const allySet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "ally-tokens.json"), "utf8")).map(String));
   const curatedSet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "rival-targets.json"), "utf8")).map(String));
+  // "Do not target" — big-boy operators we never audit, grouped by who runs them.
+  const dntOwners = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, "do-not-target.json"), "utf8")).owners ?? {}; }
+    catch { return {}; }
+  })();
+  const dntOwnerOf = new Map();
+  for (const [name, ids] of Object.entries(dntOwners)) for (const id of ids) dntOwnerOf.set(String(id), name);
 
   const ce = BigInt(await call(SEL.currentEpoch, 0n).then((x) => x));
   const startTime = BigInt(await rpc("eth_call", [{ to: GAME, data: SEL.startTime }, "latest"]));
@@ -319,11 +326,18 @@ async function main() {
     const dd = defense[t] ?? { maxTip: 0, bestIdx: Infinity, pays: 0 };
     const bestIdx = dd.bestIdx === Infinity ? null : dd.bestIdx;
     const aud = auditedCount[t] ?? 0;
-    // Effectively uncatchable: reaches top-of-block and no one has ever audited it.
-    const uncatchable = bestIdx !== null && bestIdx <= 1 && aud === 0;
+    // DO NOT TARGET. Two independent reasons, both meaning an audit slot spent here is
+    // wasted: it is on the curated roster of big-boy operators, or the history shows it
+    // reaches top-of-block and nobody has ever audited it. The curated list is the wider
+    // net — several listed tokens land at index 2-15 and HAVE been audited, so evidence
+    // alone would never have flagged them.
+    const dntOwner = dntOwnerOf.get(t) ?? null;
+    const uncatchable = bestIdx !== null && bestIdx <= 1 && aud === 0; // evidence-based
+    const doNotTarget = dntOwner !== null || uncatchable;
+    const dntReason = dntOwner !== null ? "listed" : uncatchable ? "evidence" : null;
 
     let score = 0;
-    if (!under && !uncatchable) {
+    if (!under && !doNotTarget) {
       if (!affordNext) score += 3;                                  // can't cover next catch-up
       score += Math.max(0, Math.min(1, (10 - runway) / 10)) * 2;    // low runway
       score += Math.max(0, Math.min(1, (30 - dd.maxTip) / 30)) * 1.5; // weak tip
@@ -343,7 +357,9 @@ async function main() {
       bribes, ins,
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
-      payBlkMin, payBlkMed, audited: aud, uncatchable, score: +score.toFixed(2),
+      payBlkMin, payBlkMed, audited: aud,
+      doNotTarget, dntReason, dntOwner, uncatchable,
+      score: +score.toFixed(2),
       // Coinbase bidding over the last 2 epochs. null = RPC has no tracing (unknown).
       bidEth: tracingOk ? +eth(bidByToken[t]?.wei ?? 0n).toFixed(6) : null,
       bidPays: tracingOk ? (bidByToken[t]?.pays ?? 0) : null,
@@ -370,8 +386,17 @@ async function main() {
   // behind and not already under audit. behind 1 -> 2 behind next -> newly auditable;
   // behind 2+ (and not under audit) is already auditable and stays so.
   const pool = auditableNext ? rows.filter((r) => r.behind >= 1 && !r.under) : rows;
-  const skippers = pool.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
-  const others = pool.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
+  // Listed "do not target" rivals get their own section and are removed from the two
+  // target sections entirely — they are not candidates, so ranking them among candidates
+  // only invites a misread. Evidence-flagged rows STAY in place (greyed by a 0 score):
+  // that flag is a judgement the data might revise, not a standing instruction.
+  // Deliberately built from `rows`, not `pool`: this section is a reference roster, so
+  // --auditable-next must not hide the big boys that happen not to be delinquent today.
+  const listed = rows.filter((r) => r.dntOwner !== null)
+    .sort((a, b) => a.dntOwner.localeCompare(b.dntOwner) || Number(a.token) - Number(b.token));
+  const targetable = pool.filter((r) => r.dntOwner === null);
+  const skippers = targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
+  const others = targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
   const scope = auditableNext
     ? `weak-link candidates becoming auditable at epoch ${ce + 1n}`
     : `ranked by audit-attractiveness`;
@@ -381,12 +406,23 @@ async function main() {
   console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list, ${scope} ===`);
   console.log(header); others.forEach((r) => console.log(fmt(r)));
 
+  // DO NOT TARGET — the curated big-boy roster, always shown in full. Their live state
+  // still matters (a big boy drifting delinquent is worth knowing about), they are just
+  // never offered as candidates. Pinning one by hand in the Strategy targets box still
+  // audits it: the roster keeps them out of auto-discovery, it does not veto the user.
+  if (listed.length > 0) {
+    console.log(`\n=== DO NOT TARGET (${listed.length}) — big boys, excluded from the sections above ===`);
+    console.log("operator     " + header);
+    for (const r of listed) console.log(`${r.dntOwner.padEnd(12)} ` + fmt(r));
+  }
+
   // Paste-ready target lists: catchable only (score > 0, drops uncatchable/under-audit),
   // ranked best-first, comma-separated for the offense target box.
   const ids = (list) => list.filter((r) => r.score > 0).map((r) => r.token).join(",");
   console.log(`\n--- paste (ranked, catchable only) ---`);
   console.log(`skippers    : ${ids(skippers) || "(none)"}`);
   console.log(`non-skippers: ${ids(others) || "(none)"}`);
+  console.log(`do-not-target (excluded): ${listed.map((r) => r.token).join(",") || "(none)"}`);
 
   if (auditableNext) {
     const best = pool.filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);

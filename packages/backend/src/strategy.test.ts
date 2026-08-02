@@ -223,6 +223,80 @@ describe("fetchOffenseCandidates: pinned targets bypass the enumeration cap", ()
   });
 });
 
+// The "do not target" roster (data/do-not-target.json) is ADVICE, not a prohibition — the
+// opposite of the ally list. It keeps big-boy operators out of auto-discovery, where an
+// audit slot would be wasted on a target that cures at index 0, but an explicit pin in the
+// Strategy targets box has to override it: deciding a big boy is worth attacking today is
+// the user's call, and the roster can't make it. Getting this backwards would silently
+// swallow a deliberate order.
+describe("fetchOffenseCandidates: do-not-target is advice, pins override it", () => {
+  const RIVAL = "0x00000000000000000000000000000000000000dd" as `0x${string}`;
+  const LISTED = "4335";   // Graveyard
+  const UNLISTED = "1612";
+  let tmpDir: string;
+  let priorDataDir: string;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const nodePath = await import("node:path");
+    tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "dat-dnt-"));
+    fs.writeFileSync(
+      nodePath.join(tmpDir, "do-not-target.json"),
+      JSON.stringify({ owners: { Graveyard: [LISTED, "909"] } }),
+    );
+    priorDataDir = (appConfig as { dataDir: string }).dataDir;
+    (appConfig as { dataDir: string }).dataDir = tmpDir;
+
+    runtime.account = { address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.strategy = { ...DEFAULT_STRATEGY, offenseEnabled: true, offenseTargetTokenIds: [] };
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: RIVAL })),
+    );
+  });
+
+  afterEach(async () => {
+    const fs = await import("node:fs");
+    (appConfig as { dataDir: string }).dataDir = priorDataDir;
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    runtime.account = null;
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([]);
+    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([]);
+  });
+
+  it("drops a listed rival that only turns up through auto-discovery", async () => {
+    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([BigInt(LISTED), BigInt(UNLISTED)]);
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString())).toEqual([UNLISTED]);
+  });
+
+  it("KEEPS a listed rival that the user pinned by hand", async () => {
+    runtime.strategy.offenseTargetTokenIds = [LISTED];
+    const out = await fetchOffenseCandidates();
+    // The whole point: an explicit pin still gets audited.
+    expect(out.map((t) => t.id.toString())).toEqual([LISTED]);
+  });
+
+  it("keeps pinned listed rivals alongside unlisted ones", async () => {
+    runtime.strategy.offenseTargetTokenIds = [LISTED, UNLISTED];
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString()).sort()).toEqual([UNLISTED, LISTED].sort());
+  });
+
+  it("still drops an ALLY even when pinned — that block is absolute", async () => {
+    // Contrast with the roster: attacking a teammate is never an intended instruction, so
+    // a pin must not be able to authorise it.
+    const fs = await import("node:fs");
+    const nodePath = await import("node:path");
+    fs.writeFileSync(nodePath.join(tmpDir, "ally-tokens.json"), JSON.stringify([UNLISTED]));
+    runtime.strategy.offenseTargetTokenIds = [UNLISTED, LISTED];
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString())).toEqual([LISTED]);
+  });
+});
+
 // Emigrated citizens (owner == the Emigration contract) have left the main game: they
 // were swapped for a Governor NFT and the holding contract has no payTaxes/useBribe path,
 // so they can neither defend nor act. Auditing one spends the 0.00069 ETH fee for nothing.

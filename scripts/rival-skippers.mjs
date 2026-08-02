@@ -78,11 +78,21 @@ const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cad
  *
  * Allies (data/ally-tokens.json) are excluded automatically below — they're teammates,
  * never targets — so they don't need listing here.
+ *
+ * The roster itself now lives in data/do-not-target.json, grouped by operator, so the
+ * dashboard, the target analysis and this generator all read ONE list. It previously
+ * lived here as a hardcoded set, which meant a token removed from targeting in the UI
+ * could be silently re-emitted as a skipper by the next regeneration.
  */
-const EXCLUDED = new Set([
-  "1575", "1661", "4650", "4957", "6737",
-  "272", "711", "909", "4335",
-]);
+function loadDoNotTarget() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dataDir, "do-not-target.json"), "utf8"));
+    return new Set(Object.values(raw.owners ?? {}).flat().map((x) => BigInt(x).toString()));
+  } catch {
+    return new Set();
+  }
+}
+const EXCLUDED = loadDoNotTarget();
 
 /** Allied citizens must never be emitted as skippers. Read from the shared roster so
  *  adding an ally in one place is enough — no second list to keep in sync. */
