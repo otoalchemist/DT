@@ -139,6 +139,14 @@ export interface TargetScoreRow {
   /** The density beatBidEth is priced against, gwei/gas: max(maxTip, observed bid density). */
   defenseGwei?: number;
   /**
+   * The same price, but against only the LAST 2 EPOCHS — the likely cost at the next
+   * boundary, where beatBidEth is the ceiling it could escalate to. Read together: equal
+   * means a steady defender, a gap means it escalates. null when it made no payment in
+   * that span, which is a different statement from "it defends weakly".
+   */
+  beatBidRecentEth?: number | null;
+  defenseRecentGwei?: number | null;
+  /**
    * True when beatBidEth is 0 but the rival still reached tx index <= 1 — it topped the
    * block while measuring below our own tip, which cannot happen on merit. Something is
    * buying that position outside what we can observe (a bid older than the 2-epoch trace

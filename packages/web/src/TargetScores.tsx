@@ -31,7 +31,8 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments) — the 'are they bidding right now' signal, deliberately narrower than the window BeatBid is priced against. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
-            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for a 1-payment + 1-audit bundle at our 20.1 gwei tip. Peak, not recent: what you must clear is the strongest defense it has actually mounted. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A ceiling, not a forecast — off-chain builder deals stay invisible. — = peak defense already at or below our tip.">BeatBid</th>
+            <th style={cell} title="Coinbase bid (ETH) to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to BeatMax: equal means a steady defender and this number is reliable; a gap means it escalates. — = nothing needed, our 20.1 gwei tip already out-ranks it. · = it made no payment in the last 2 epochs.">Beat2ep</th>
+            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for a 1-payment + 1-audit bundle at our 20.1 gwei tip. Peak, not recent: what you must clear is the strongest defense it has actually mounted. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A ceiling, not a forecast — off-chain builder deals stay invisible. — = peak defense already at or below our tip.">BeatMax</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
@@ -88,7 +89,18 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
                   title={r.bidEth == null ? "RPC has no tracing — unknown" : r.bidEth > 0 ? `${r.bidEth} ETH across ${r.bidPays} bid-backed payment(s) in the last 2 epochs` : "no coinbase bid in the last 2 epochs"}>
                 {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
               </td>
-              <td style={cell} title={r.beatBidEth ? "Set coinbaseBidEth to at least this to out-rank its defense" : undefined}>
+              <td style={cell}>
+                {r.beatBidRecentEth === undefined || r.beatBidRecentEth === null ? (
+                  <span className="muted" title="No payment observed in the last 2 epochs — nothing recent to price against.">·</span>
+                ) : r.beatBidRecentEth > 0 ? (
+                  <span title={r.defenseRecentGwei ? `defended at ~${r.defenseRecentGwei} gwei/gas in the last 2 epochs` : undefined}>
+                    {r.beatBidRecentEth.toFixed(4)}
+                  </span>
+                ) : (
+                  <span className="muted" title={`Defended at ~${r.defenseRecentGwei} gwei/gas lately — our 20.1 gwei tip already out-ranks that.`}>—</span>
+                )}
+              </td>
+              <td style={cell} title={r.beatBidEth ? "Set coinbaseBidEth to at least this to out-rank the strongest defense it has mounted" : undefined}>
                 {r.beatBidEth ? (
                   <span title={r.defenseGwei ? `defends at ~${r.defenseGwei} gwei/gas` : undefined}>
                     {r.beatBidEth.toFixed(4)}
@@ -260,7 +272,8 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
           </div>
 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>
-            Beh 1 = auditable next boundary · Skip = skips survived / skips that drew an audit,
+            Beat2ep / BeatMax = bid needed to out-rank its defense recently vs at its peak
+            (a gap means it escalates) · Beh 1 = auditable next boundary · Skip = skips survived / skips that drew an audit,
             out of attempted (a skip = a boundary entered 2+ behind) ·
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
