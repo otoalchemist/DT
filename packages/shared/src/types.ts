@@ -133,6 +133,14 @@ export interface TargetScoreRow {
   /** The density beatBidEth is priced against, gwei/gas: max(maxTip, observed bid density). */
   defenseGwei?: number;
   /**
+   * True when beatBidEth is 0 but the rival still reached tx index <= 1 — it topped the
+   * block while measuring below our own tip, which cannot happen on merit. Something is
+   * buying that position outside what we can observe (a bid older than the 2-epoch trace
+   * window, or an off-chain builder deal), so "no bid needed" would be wrong and the UI
+   * shows unknown instead.
+   */
+  defenseUnexplained?: boolean;
+  /**
    * Which section the scan put it in. "observed" = it attempted a skip during the window
    * but is not yet in data/rival-skippers.json, so the saved list is behind the data.
    */

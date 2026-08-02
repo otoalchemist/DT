@@ -89,9 +89,21 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
                 {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
               </td>
               <td style={cell} title={r.beatBidEth ? "Set coinbaseBidEth to at least this to out-rank its defense" : undefined}>
-                {r.beatBidEth
-                  ? <span title={r.defenseGwei ? `defends at ~${r.defenseGwei} gwei/gas` : undefined}>{r.beatBidEth.toFixed(4)}</span>
-                  : <span className="muted">—</span>}
+                {r.beatBidEth ? (
+                  <span title={r.defenseGwei ? `defends at ~${r.defenseGwei} gwei/gas` : undefined}>
+                    {r.beatBidEth.toFixed(4)}
+                  </span>
+                ) : r.beatBidEth === undefined ? (
+                  // Cached from a scan before this column existed — unknown, not zero.
+                  <span className="muted" title="Re-run Analyze targets to price this">·</span>
+                ) : r.defenseUnexplained ? (
+                  <span
+                    style={{ color: "var(--amber)" }}
+                    title={`Measures only ~${r.defenseGwei} gwei/gas, below our own tip — yet it reaches tx index ${r.bestIdx}. Something is buying that position where we cannot see it: a bid older than the 2-epoch trace window, or an off-chain builder deal. Treat "no bid needed" as unproven.`}
+                  >?</span>
+                ) : (
+                  <span className="muted" title={`Defends at ~${r.defenseGwei} gwei/gas — our 20.1 gwei tip already out-ranks that, so no bid is needed.`}>—</span>
+                )}
               </td>
               <td style={cell}>{r.bribes || ""}</td>
               <td style={cell}>{r.audited || ""}</td>

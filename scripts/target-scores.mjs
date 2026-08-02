@@ -426,6 +426,13 @@ async function main() {
     const beatBidEth = defenseGwei > OUR_TIP_GWEI
       ? +(((defenseGwei - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4)
       : 0;
+    // The measurement is contradicted by the outcome: it reached the top of the block
+    // while measuring BELOW our own tip, which cannot happen on merit. Something bought
+    // that position where we can't see it — a bid older than the 2-epoch trace window
+    // (the roster's 0.08 ETH bidders read 3.1 gwei here for exactly that reason), or an
+    // off-chain builder deal. Reporting "no bid needed" for these would be a lie, so the
+    // column says unknown instead.
+    const defenseUnexplained = bestIdx !== null && bestIdx <= 1 && beatBidEth === 0;
     const offs = payOff[t] ?? [];
     const payBlkMin = offs.length ? Math.min(...offs) : null; // fastest cure after a boundary
     const payBlkMed = median(offs);                            // typical audit window
@@ -446,7 +453,7 @@ async function main() {
       bribes, ins,
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
-      payBlkMin, payBlkMed, audited: aud, beatBidEth,
+      payBlkMin, payBlkMed, audited: aud, beatBidEth, defenseUnexplained,
       // The density that beatBidEth is priced against, in gwei/gas — max(tip, bid density).
       defenseGwei: +defenseGwei.toFixed(1),
       doNotTarget, dntReason, dntOwner, uncatchable,
@@ -466,7 +473,8 @@ async function main() {
     (r.crossings === 0 ? "-" : `${r.skipClean}/${r.skipCaught} of ${r.crossings}`).padStart(11);
   const payBlkCol = (r) => (r.payBlkMin === null ? "-" : `${r.payBlkMin}/${r.payBlkMed}`).padStart(9);
   // What a coinbase bid must cover to out-rank this rival's best observed defense.
-  const beatCol = (r) => (r.beatBidEth > 0 ? r.beatBidEth.toFixed(4) : "-").padStart(7);
+  const beatCol = (r) =>
+    (r.beatBidEth > 0 ? r.beatBidEth.toFixed(4) : r.defenseUnexplained ? "?" : "-").padStart(7);
   const bidCol = (r) => (r.bidEth === null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "-").padStart(8);
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"} ${skipCol(r)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
@@ -548,6 +556,7 @@ async function main() {
     console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
     console.log("clean/caught of N = skips (boundaries crossed 2+ behind) survived / caught by an audit, out of attempted — all-clean = proven-safe cadence, caught often = soft target");
+    console.log("beatBid '-' = no bid needed, our 20.1 gwei tip already out-ranks its observed defense · '?' = it reaches top-of-block anyway, so something we cannot see is buying that position");
     console.log("beatBid = coinbase bid (ETH) to out-rank its best observed DENSITY ((bid + tips)/gas, what builders sort on) for a 1-pay + 1-audit bundle at our 20.1 gwei tip — a bidder's tip can be ~0 while its density is hundreds of gwei/gas");
     console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
     console.log("bid = coinbase bid over the LAST 2 EPOCHS (ETH x bid-backed payments) — buys top-of-block, so a bidder is near-unauditable; shared when one operator co-pays several citizens; '?' = RPC has no tracing");
