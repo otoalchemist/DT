@@ -31,7 +31,7 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments). A bid buys top-of-block, so a bidder is near-unauditable however strapped it looks. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
-            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's best observed priority tip, for a 1-payment + 1-audit bundle at our 20.1 gwei tip. Builders order by value per gas, so a tip-only defender is expensive to beat, not impossible. — = its tip is already at or below ours.">BeatBid</th>
+            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's best observed DEFENSE DENSITY — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for a 1-payment + 1-audit bundle at our 20.1 gwei tip. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A shared bid is spread over the whole bundle it bought position for. — = its defense is already at or below our tip.">BeatBid</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
@@ -89,7 +89,9 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
                 {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
               </td>
               <td style={cell} title={r.beatBidEth ? "Set coinbaseBidEth to at least this to out-rank its defense" : undefined}>
-                {r.beatBidEth ? r.beatBidEth.toFixed(4) : <span className="muted">—</span>}
+                {r.beatBidEth
+                  ? <span title={r.defenseGwei ? `defends at ~${r.defenseGwei} gwei/gas` : undefined}>{r.beatBidEth.toFixed(4)}</span>
+                  : <span className="muted">—</span>}
               </td>
               <td style={cell}>{r.bribes || ""}</td>
               <td style={cell}>{r.audited || ""}</td>

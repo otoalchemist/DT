@@ -25,14 +25,24 @@
 //   owesNext  what THIS token owes to catch up at the NEXT boundary
 //   afford    can the owner cover owesNext right now?
 //   tip/idx   defense strength from payment history: best (max) tip gwei, best (lowest)
-//             tx index reached. idx 0 + never-audited = tops the block, ~uncatchable
+//             tx index reached. Reaching idx 0 on TIP ALONE is expensive, not unbeatable
+//             — see beatBid. Only a bid-backed idx 0 is genuinely out of reach.
+//   beatBid   coinbase bid (ETH) needed to out-rank this rival's best observed DEFENSE
+//             DENSITY — (coinbase bid + priority tips) / gas, the value-per-gas a builder
+//             actually sorts on. Priced for a 1-payment + 1-audit bundle at our 20.1 gwei
+//             tip. Density matters rather than the tip: #6749 tips 0.5 gwei but bid
+//             0.0226 ETH, putting it at ~104 gwei/gas — pricing off the tip said it was
+//             free to beat. A shared bid is spread over the whole bundle it bought
+//             position for. "-" = its defense is already at or below our tip.
 //   aud       times ANY player successfully audited it in the window (proven catchable)
 //   bid       coinbase bid over the LAST 2 EPOCHS, as ETH x number of bid-backed payments.
 //             A bid buys transaction position outright, so a bidder cures at index 0 and is
 //             near-unauditable however strapped it looks. Shared when one operator co-pays
 //             several citizens in a block. "?" = RPC has no trace_block.
-//   score     composite audit-attractiveness (higher = better target). 0 = effectively
-//             uncatchable (always tops the block, never audited) or already under audit.
+//   score     composite audit-attractiveness (higher = better target). 0 = under audit,
+//             on the do-not-target roster, or bid-backed top-of-block. NOTE a 0 can also
+//             mean simply "catchable but not weak" (rich, defends hard, never yet
+//             audited) — those stay in the paste lists, ranked last.
 //
 // Detection is on-chain only; it cannot see off-chain builder deals or pending mempool
 // payments. An audit only STARTS a 24h timer — a bailout or a late payment can still
@@ -280,6 +290,9 @@ async function main() {
   const recentPays = payLogs.filter((l) => BigInt(l.blockNumber) >= bidWindowStart);
   const bidBlocks = [...new Set(recentPays.map((l) => BigInt(l.blockNumber).toString()))].map(BigInt);
   const bidByToken = {}; // token -> { wei, pays }
+  // Hoisted: the density calculation below needs the per-(block, sender) coinbase totals,
+  // not just the per-token sums.
+  const cbByBlockSender = new Map();
   let tracingOk = true;
   if (bidBlocks.length > 0) {
     const minerOf = new Map();
@@ -288,7 +301,6 @@ async function main() {
       const m = new Map((await batch(slice.map((b, k) => ({ jsonrpc: "2.0", id: i + k, method: "eth_getBlockByNumber", params: [hb(b), false] })))).map((r) => [r.id, r]));
       slice.forEach((b, k) => { const bl = m.get(i + k)?.result; if (bl) minerOf.set(b.toString(), bl.miner.toLowerCase()); });
     }
-    const cbByBlockSender = new Map();
     for (const b of bidBlocks) {
       const miner = minerOf.get(b.toString()); if (!miner) continue;
       let traces;
@@ -313,6 +325,46 @@ async function main() {
         const e = (bidByToken[tok] ??= { wei: 0n, pays: 0 });
         e.wei += wei; e.pays++;
       }
+    }
+  }
+
+  // Defense DENSITY in gwei per gas — the number a builder actually sorts on, and so the
+  // real bar to clear.
+  //
+  // For a tip-only payer this is simply its priority tip (tips / gas === tip). For a
+  // BIDDER it is (coinbase bid + priority tips) / gas, which can be orders of magnitude
+  // higher: #6749 tips 0.5 gwei but paid a 0.0226 ETH bid on one ~83k-gas payment, i.e.
+  // ~270 gwei/gas. Pricing off the tip alone said that rival was free to out-rank, which
+  // is the opposite of the truth — the bid is precisely what makes it hard.
+  //
+  // Gas is summed per (block, sender) so a shared bid is spread over the whole bundle it
+  // actually bought position for, matching how the bid itself is attributed. A batch
+  // payment emits one TaxesPaid per citizen from ONE tx, so gas is counted once per tx.
+  const bidDensity = {}; // token -> max gwei/gas observed on a bid-backed payment
+  if (tracingOk) {
+    const group = new Map(); // "blk:sender" -> { gas, tips, txs }
+    for (const l of recentPays) {
+      const m = meta.get(l.transactionHash);
+      if (!m) continue;
+      const k = `${m.blk}:${m.from}`;
+      const g = group.get(k) ?? { gas: 0n, tips: 0n, txs: new Set() };
+      if (!g.txs.has(l.transactionHash)) {
+        g.txs.add(l.transactionHash);
+        g.gas += m.gasUsed;
+        g.tips += (m.eff - (bf.get(m.blk.toString()) ?? 0n)) * m.gasUsed;
+      }
+      group.set(k, g);
+    }
+    for (const l of recentPays) {
+      const tok = BigInt(l.topics[1]).toString();
+      const m = meta.get(l.transactionHash);
+      if (!m) continue;
+      const k = `${m.blk}:${m.from}`;
+      const bidWei = cbByBlockSender.get(k) ?? 0n;
+      const g = group.get(k);
+      if (bidWei <= 0n || !g || g.gas === 0n) continue;
+      const gweiPerGas = Number(((bidWei + g.tips) * 1000n) / g.gas) / 1000 / 1e9;
+      bidDensity[tok] = Math.max(bidDensity[tok] ?? 0, gweiPerGas);
     }
   }
 
@@ -363,13 +415,16 @@ async function main() {
       if (bribes > 0) score -= 1;                                   // free escape
       score = Math.max(0, score);
     }
-    // What a coinbase bid would have to cover to beat this token's best observed defense.
-    // Builders sort on total value per gas, so matching its max tip is the bar; the bid
-    // makes up whatever our own tip doesn't. Sized for one payment + one audit + the
-    // payer tx (measured on-chain: 82,875 + 130,409 + 60,000 gas) at the default 20.1
-    // gwei tip. Rough by nature — it can't see off-chain builder deals.
-    const beatBidEth = dd.maxTip > OUR_TIP_GWEI
-      ? +(((dd.maxTip - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4)
+    // What a coinbase bid would have to cover to out-rank this token's best observed
+    // defense. The bar is its DENSITY, not its tip: a bidder's tip can be near zero while
+    // the bid puts it hundreds of gwei/gas ahead. Take the stronger of the two signals,
+    // then let our own tip cover what it can. Sized for one payment + one audit + the
+    // payer tx (measured on-chain: 82,875 + 130,409 + 60,000 gas) at the default 20.1 gwei
+    // tip. Rough by nature — it cannot see off-chain builder deals, and a bid observed in
+    // the 2-epoch window may not be repeated.
+    const defenseGwei = Math.max(dd.maxTip, bidDensity[t] ?? 0);
+    const beatBidEth = defenseGwei > OUR_TIP_GWEI
+      ? +(((defenseGwei - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4)
       : 0;
     const offs = payOff[t] ?? [];
     const payBlkMin = offs.length ? Math.min(...offs) : null; // fastest cure after a boundary
@@ -392,6 +447,8 @@ async function main() {
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
       payBlkMin, payBlkMed, audited: aud, beatBidEth,
+      // The density that beatBidEth is priced against, in gwei/gas — max(tip, bid density).
+      defenseGwei: +defenseGwei.toFixed(1),
       doNotTarget, dntReason, dntOwner, uncatchable,
       score: +score.toFixed(2),
       // Coinbase bidding over the last 2 epochs. null = RPC has no tracing (unknown).
@@ -491,7 +548,7 @@ async function main() {
     console.log(`\nTop weak links for epoch ${ce + 1n}: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none catchable"}`);
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
     console.log("clean/caught of N = skips (boundaries crossed 2+ behind) survived / caught by an audit, out of attempted — all-clean = proven-safe cadence, caught often = soft target");
-    console.log("beatBid = coinbase bid (ETH) needed to out-rank its best observed tip, for a 1-pay + 1-audit bundle at our 20.1 gwei tip — a tip-only defender is expensive, not unbeatable");
+    console.log("beatBid = coinbase bid (ETH) to out-rank its best observed DENSITY ((bid + tips)/gas, what builders sort on) for a 1-pay + 1-audit bundle at our 20.1 gwei tip — a bidder's tip can be ~0 while its density is hundreds of gwei/gas");
     console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
     console.log("bid = coinbase bid over the LAST 2 EPOCHS (ETH x bid-backed payments) — buys top-of-block, so a bidder is near-unauditable; shared when one operator co-pays several citizens; '?' = RPC has no tracing");
   }

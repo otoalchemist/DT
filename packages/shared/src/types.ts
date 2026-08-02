@@ -121,12 +121,17 @@ export interface TargetScoreRow {
   bidPays: number | null;
   audited: number;
   /**
-   * Coinbase bid (ETH) needed to out-rank this rival's best observed priority tip, for a
-   * one-payment + one-audit bundle at our default 20.1 gwei tip. Builders order by value
-   * per gas, so a tip-only defender is expensive to beat, never impossible. 0 = its tip is
-   * already at or below ours. Optional: absent on rows cached before this was added.
+   * Coinbase bid (ETH) needed to out-rank this rival's best observed DEFENSE DENSITY, for
+   * a one-payment + one-audit bundle at our default 20.1 gwei tip.
+   *
+   * Density — (coinbase bid + priority tips) / gas — is what a builder sorts on, so it,
+   * not the tip, is the bar. A bidder's tip can be near zero while the bid puts it
+   * hundreds of gwei/gas ahead. 0 = its defense is already at or below our tip.
+   * Optional: absent on rows cached before this was added.
    */
   beatBidEth?: number;
+  /** The density beatBidEth is priced against, gwei/gas: max(maxTip, observed bid density). */
+  defenseGwei?: number;
   /**
    * Which section the scan put it in. "observed" = it attempted a skip during the window
    * but is not yet in data/rival-skippers.json, so the saved list is behind the data.
