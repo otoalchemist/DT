@@ -109,6 +109,14 @@ export function Config({
     cfg.offenseTargetTokenIds.length === list.length &&
     cfg.offenseTargetTokenIds.every((id, i) => id === list[i]);
 
+  // Non-skippers = the curated default list minus the skippers subset, derived here
+  // rather than shipped as its own file: skippers is already a strict subset of the
+  // defaults, so the complement is exact with no extra data to keep in sync. Preserves
+  // the default list's order. Compared by canonical BigInt string so a formatting
+  // difference between the two files can't leak a skipper back into this set.
+  const skipperSet = new Set(skippers.map((x) => BigInt(x).toString()));
+  const nonSkippers = defaultRivals.filter((id) => !skipperSet.has(BigInt(id).toString()));
+
   const set = <K extends keyof StrategyConfig>(k: K, v: StrategyConfig[K]) => {
     onChange({ ...cfg, [k]: v });
   };
@@ -195,6 +203,15 @@ export function Config({
         </button>
         <button
           type="button"
+          onClick={() => set("offenseTargetTokenIds", [...nonSkippers])}
+          disabled={!cfg.offenseEnabled || nonSkippers.length === 0 || targetsEqual(nonSkippers)}
+          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
+          title="Target the curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)"
+        >
+          Non-skippers
+        </button>
+        <button
+          type="button"
           onClick={() => set("offenseTargetTokenIds", [...bigBoys])}
           disabled={!cfg.offenseEnabled || bigBoys.length === 0 || targetsEqual(bigBoys)}
           style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
@@ -205,6 +222,7 @@ export function Config({
         {defaultRivals.length > 0 && (
           <span className="muted" style={{ fontSize: 11 }}>
             {defaultRivals.length} default{skippers.length > 0 ? ` · ${skippers.length} skippers` : ""}
+            {nonSkippers.length > 0 ? ` · ${nonSkippers.length} non-skippers` : ""}
             {bigBoys.length > 0 ? ` · ${bigBoys.length} big boys` : ""}
           </span>
         )}
