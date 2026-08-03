@@ -434,16 +434,17 @@ async function main() {
     // net — several listed tokens land at index 2-15 and HAVE been audited, so evidence
     // alone would never have flagged them.
     const dntOwner = dntOwnerOf.get(t) ?? null;
-    // Evidence-based "can't catch it": tops the block, never been audited, AND buys that
-    // position with a coinbase bid. The bid clause matters — a token that reaches index 0
-    // on PRIORITY FEE alone is not uncatchable, just expensive: builders order by value
-    // per gas, so a coinbase bid outranks any tip you care to name. Flagging those hid
-    // genuinely reachable targets (#2711 defends at 90 gwei with no bid — about 0.019 ETH
-    // of bid beats it). Only a rival already paying for position is out of reach.
-    const bidBacked = (bidByToken[t]?.pays ?? 0) > 0;
-    const uncatchable = bestIdx !== null && bestIdx <= 1 && aud === 0 && bidBacked;
-    const doNotTarget = dntOwner !== null || uncatchable;
-    const dntReason = dntOwner !== null ? "listed" : uncatchable ? "evidence" : null;
+    // The evidence-based "can't catch it" veto (tops the block + never audited + bid-backed)
+    // has been RETIRED. It grayed out genuinely reachable rivals: a coinbase bid outranks a
+    // tip, but the BeatMax column already prices the exact bid that beats a rival's peak
+    // defense — so "bid-backed and topping the block" is a cost to out-bid, not a wall.
+    // #6749 is the case in point: flagged uncatchable while BeatMax said 0.0353 ETH beats it.
+    // Only the CURATED roster (data/do-not-target.json) now grays a row; everything else stays
+    // a live, scored target, and the operator decides with BeatMax/Beat2ep whether it's worth
+    // the bid. `uncatchable` is kept (always false) only for the shared-type / older-cache shape.
+    const uncatchable = false;
+    const doNotTarget = dntOwner !== null;
+    const dntReason = dntOwner !== null ? "listed" : null;
 
     let score = 0;
     if (!under && !doNotTarget) {
