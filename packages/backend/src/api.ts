@@ -3,8 +3,9 @@ import websocket from "@fastify/websocket";
 import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
-import { publicClient, reinitClients, accountFromPrivateKey, makeWalletClient, getChainId, getBalanceCached, invalidateBalanceCache, getLatestBlockCached } from "./chain.js";
+import { publicClient, reinitClients, accountFromPrivateKey, getChainId, getBalanceCached, invalidateBalanceCache, getLatestBlockCached } from "./chain.js";
 import { runtime, loadRivalSkippers, loadDefaultRivalTargets } from "./runtime.js";
+import { nonces } from "./nonce.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
 import {
@@ -12,6 +13,9 @@ import {
   decryptPrivateKey,
   saveKeystore,
   loadKeystore,
+  loadWallets,
+  saveWallets,
+  passphraseMatches,
   keystoreExists,
   normalizePrivateKey,
 } from "./keystore.js";
@@ -137,8 +141,116 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   // --- keystore lifecycle ---
   app.get("/api/keystore", async () => {
-    const file = loadKeystore(appConfig.dataDir);
-    return { exists: keystoreExists(appConfig.dataDir), address: file?.address ?? null };
+    const files = loadWallets(appConfig.dataDir);
+    return {
+      exists: keystoreExists(appConfig.dataDir),
+      address: files[0]?.address ?? null,
+      // Addresses and labels only — never any key material, and safe while locked.
+      wallets: files.map((f, i) => ({
+        address: f.address,
+        label: f.label ?? (i === 0 ? "primary" : `wallet-${i + 1}`),
+      })),
+    };
+  });
+
+  /**
+   * Add another wallet to the keystore.
+   *
+   * Every entry is encrypted under the SAME passphrase, so the passphrase is verified
+   * against an existing entry first — otherwise the keystore would end up in a state no
+   * single passphrase can fully unlock, and the stranded wallet's citizens would silently
+   * stop being managed.
+   */
+  app.post("/api/wallets", async (req, reply) => {
+    const schema = z.object({
+      mode: z.enum(["import", "generate"]),
+      privateKey: z.string().optional(),
+      passphrase: z.string().min(8),
+      label: z.string().max(40).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const { mode, passphrase, label } = parsed.data;
+
+    if (!keystoreExists(appConfig.dataDir)) {
+      return reply.code(400).send({ error: "Create the first wallet before adding more" });
+    }
+    if (!passphraseMatches(appConfig.dataDir, passphrase)) {
+      return reply.code(401).send({
+        error: "Passphrase does not match the existing keystore — every wallet shares one passphrase",
+      });
+    }
+
+    let pk: `0x${string}`;
+    if (mode === "generate") {
+      pk = generatePrivateKey();
+    } else {
+      const normalized = normalizePrivateKey(parsed.data.privateKey ?? "");
+      if (!normalized) {
+        return reply.code(400).send({ error: "Invalid private key (expected 64 hex characters, with or without a 0x prefix)" });
+      }
+      pk = normalized;
+    }
+    const account = accountFromPrivateKey(pk);
+    const existing = loadWallets(appConfig.dataDir);
+    if (existing.some((w) => w.address.toLowerCase() === account.address.toLowerCase())) {
+      return reply.code(409).send({ error: `Wallet ${account.address} is already in the keystore` });
+    }
+    const entry = encryptPrivateKey(pk, passphrase, account.address);
+    entry.label = label?.trim() || `wallet-${existing.length + 1}`;
+    saveWallets(appConfig.dataDir, [...existing, entry]);
+
+    // Adopt it immediately if we're already unlocked, so its citizens are managed from
+    // this tick rather than only after a lock/unlock cycle.
+    if (runtime.unlocked) {
+      runtime.setWallets([
+        ...runtime.wallets,
+        { account, label: entry.label, balanceWei: null },
+      ]);
+      nonces.retain(runtime.addresses as `0x${string}`[]);
+      invalidateTokenCaches();
+      publicClient
+        .getBalance({ address: account.address })
+        .then((bal) => { runtime.setBalance(account.address, bal); runtime.emitStatus(); })
+        .catch(() => {});
+      runtime.emitStatus();
+    }
+    logger.info(`Wallet added: ${account.address} (${entry.label})`);
+    return { address: account.address, label: entry.label, generated: mode === "generate" };
+  });
+
+  /**
+   * Remove a wallet. The key is permanently discarded, so this refuses unless the caller
+   * repeats the address — a mis-click here loses access to whatever that wallet holds.
+   */
+  app.delete("/api/wallets/:address", async (req, reply) => {
+    const params = z.object({ address: z.string() }).safeParse(req.params);
+    const body = z.object({ confirmAddress: z.string() }).safeParse(req.body);
+    if (!params.success || !body.success) {
+      return reply.code(400).send({ error: "address and confirmAddress are required" });
+    }
+    const target = params.data.address.toLowerCase();
+    if (body.data.confirmAddress.toLowerCase() !== target) {
+      return reply.code(400).send({ error: "confirmAddress does not match the wallet being removed" });
+    }
+    const existing = loadWallets(appConfig.dataDir);
+    if (!existing.some((w) => w.address.toLowerCase() === target)) {
+      return reply.code(404).send({ error: "No such wallet in the keystore" });
+    }
+    if (existing.length === 1) {
+      return reply.code(400).send({ error: "Cannot remove the last wallet — the bot would have no key" });
+    }
+    saveWallets(appConfig.dataDir, existing.filter((w) => w.address.toLowerCase() !== target));
+    if (runtime.unlocked) {
+      runtime.setWallets(runtime.wallets.filter((w) => w.account.address.toLowerCase() !== target));
+      // Drop its nonce state too, so re-adding the wallet later starts from chain truth
+      // rather than a stale reservation held from this session.
+      nonces.retain(runtime.addresses as `0x${string}`[]);
+      invalidateTokenCaches();
+      runtime.emitStatus();
+    }
+    logger.warn(`Wallet removed from keystore: ${target}`);
+    return { ok: true, remaining: existing.length - 1 };
   });
 
   app.post("/api/keystore", async (req, reply) => {
@@ -182,16 +294,22 @@ export async function buildServer(): Promise<FastifyInstance> {
     const schema = z.object({ passphrase: z.string() });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    const file = loadKeystore(appConfig.dataDir);
-    if (!file) return reply.code(400).send({ error: "No keystore found" });
+    const files = loadWallets(appConfig.dataDir);
+    if (files.length === 0) return reply.code(400).send({ error: "No keystore found" });
     try {
-      const pk = decryptPrivateKey(file, parsed.data.passphrase);
-      const account = accountFromPrivateKey(pk);
-      runtime.account = account;
-      runtime.walletClient = makeWalletClient(account);
+      // Every wallet is encrypted under the same passphrase, so one unlock opens them
+      // all. If any single entry fails to decrypt the whole unlock fails rather than
+      // half-unlocking — a silently-missing wallet would look like its citizens simply
+      // stopped being managed.
+      const wallets = files.map((f, i) => {
+        const account = accountFromPrivateKey(decryptPrivateKey(f, parsed.data.passphrase));
+        return { account, label: f.label ?? (i === 0 ? "primary" : `wallet-${i + 1}`), balanceWei: null };
+      });
+      runtime.setWallets(wallets);
+      nonces.retain(runtime.addresses as `0x${string}`[]);
       runtime.chainId = await getChainId();
       runtime.emitStatus();
-      logger.info(`Wallet unlocked: ${account.address}`);
+      logger.info(`Unlocked ${wallets.length} wallet(s): ${wallets.map((w) => w.account.address).join(", ")}`);
       // Populate chain state immediately so the UI can show epoch/countdown even
       // when the engine is paused.
       getGameSnapshot().then((snap) => {
@@ -207,10 +325,13 @@ export async function buildServer(): Promise<FastifyInstance> {
       }).catch(() => {});
       // Fetch the wallet balance up front too — otherwise it stays blank until
       // the engine is started (balance is otherwise only read inside tick()).
-      publicClient.getBalance({ address: account.address }).then((bal) => {
-        runtime.balanceWei = bal;
-        runtime.emitStatus();
-      }).catch(() => {});
+      // Balances up front, per wallet — otherwise they stay blank until the engine runs.
+      void Promise.all(
+        runtime.wallets.map(async (w) => {
+          try { runtime.setBalance(w.account.address, await publicClient.getBalance({ address: w.account.address })); }
+          catch { /* a single wallet's balance read must not fail the unlock */ }
+        }),
+      ).then(() => runtime.emitStatus());
       // Engine stays paused on unlock — user must press Start manually.
       return runtime.status();
     } catch {
@@ -440,9 +561,13 @@ export async function buildServer(): Promise<FastifyInstance> {
       runtime.gameState = snap.state;
       runtime.citizenSupply = snap.citizenSupply;
       runtime.citizensAddress = snap.citizensAddress;
-      if (runtime.account) {
+      if (runtime.unlocked) {
         invalidateBalanceCache(); // the 30s cache would otherwise answer this
-        runtime.balanceWei = await getBalanceCached(runtime.account.address, 0);
+        await Promise.all(
+          runtime.wallets.map(async (w) =>
+            runtime.setBalance(w.account.address, await getBalanceCached(w.account.address as `0x${string}`, 0)),
+          ),
+        );
       }
       const block = await getLatestBlockCached(0);
       runtime.lastBlock = block.number;

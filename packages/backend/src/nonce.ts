@@ -67,4 +67,49 @@ export class NonceManager {
   }
 }
 
-export const nonceManager = new NonceManager();
+/**
+ * One NonceManager per wallet address.
+ *
+ * Nonces are strictly per-account, so a single shared manager across several wallets
+ * would hand wallet B a nonce derived from wallet A's chain state — the resulting tx is
+ * either rejected outright or, worse, silently replaces one of A's pending bundle txs.
+ * That failure is invisible until a payment or audit quietly doesn't land, which is why
+ * this registry exists rather than a lazily-shared singleton.
+ *
+ * Keyed on the lowercased address so a checksummed and non-checksummed spelling of the
+ * same wallet can never end up with two independent nonce counters.
+ */
+class NonceRegistry {
+  private byAddress = new Map<string, NonceManager>();
+
+  for(address: Address): NonceManager {
+    const key = address.toLowerCase();
+    let m = this.byAddress.get(key);
+    if (!m) {
+      m = new NonceManager();
+      this.byAddress.set(key, m);
+    }
+    return m;
+  }
+
+  /** Re-sync every wallet we're about to submit from, in parallel. */
+  async syncAll(addresses: Address[], mode: SubmitMode): Promise<void> {
+    await Promise.all(addresses.map((a) => this.for(a).sync(a, mode)));
+  }
+
+  /** End-of-tick reset across every wallet. */
+  resetAll(): void {
+    for (const m of this.byAddress.values()) m.reset();
+  }
+
+  /** Drop state for wallets that are no longer unlocked, so a re-added wallet starts
+   *  from chain truth rather than a stale reservation. */
+  retain(addresses: Address[]): void {
+    const keep = new Set(addresses.map((a) => a.toLowerCase()));
+    for (const key of [...this.byAddress.keys()]) {
+      if (!keep.has(key)) this.byAddress.delete(key);
+    }
+  }
+}
+
+export const nonces = new NonceRegistry();

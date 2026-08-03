@@ -10,7 +10,7 @@ import { mainnet } from "viem/chains";
 import { publicClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
-import { nonceManager } from "./nonce.js";
+import { nonces } from "./nonce.js";
 import { effectiveTipGwei, resolveGas } from "./logic.js";
 import { logger } from "./logger.js";
 
@@ -375,12 +375,14 @@ const COINBASE_BID_GAS = 60_000n;
  */
 export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<boolean> {
   if (bundleQueue === null || appConfig.mode !== "mainnet" || bidWei <= 0n) return false;
-  const account = runtime.account;
+  // One bid buys position for the WHOLE bundle however many wallets contributed txs to
+  // it, so it comes from the primary wallet rather than being split or duplicated.
+  const account = runtime.primary?.account;
   if (!account) return false;
   try {
     const latest = await getLatestBlockCached();
     const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(false, latest);
-    const nonce = nonceManager.reserve();
+    const nonce = nonces.for(account.address).reserve();
     const signed = await signTx(
       account,
       { to: payer, data: "0x", value: bidWei },
@@ -418,10 +420,15 @@ export async function submitTx(
     /** Price with the node's current suggested fee instead of the configured
      *  race/offense tips. For manual, user-initiated actions (see normalFees). */
     normalGas?: boolean;
+    /** Wallet that must sign. payTaxes/audit/kill/useBribe are owner-only on-chain, so
+     *  this has to be the wallet holding the citizen involved — not simply "the" wallet.
+     *  Defaults to the primary for wallet-agnostic sends (e.g. the coinbase bid). */
+    account?: PrivateKeyAccount;
   },
 ): Promise<SubmitResult> {
-  const account = runtime.account;
+  const account = opts.account ?? runtime.primary?.account;
   if (!account) throw new Error("Wallet locked");
+  const nonceManager = nonces.for(account.address);
 
   // Independent pre-submission reads — run together (viem batches them, and the
   // block is usually already cached from the pass's canSpend), instead of three

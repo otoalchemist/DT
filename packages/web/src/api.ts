@@ -26,7 +26,20 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   status: () => req<BotStatus>("/api/status"),
-  keystore: () => req<{ exists: boolean; address: string | null }>("/api/keystore"),
+  keystore: () =>
+    req<{ exists: boolean; address: string | null; wallets: { address: string; label: string }[] }>("/api/keystore"),
+  // Extra hot wallets. Citizens can only be acted on by the wallet that owns them, so
+  // each wallet needs its own key here. All share one passphrase.
+  addWallet: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string; label?: string }) =>
+    req<{ address: string; label: string; generated: boolean }>("/api/wallets", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  removeWallet: (address: string) =>
+    req<{ ok: boolean; remaining: number }>(`/api/wallets/${address}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirmAddress: address }),
+    }),
   createKeystore: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string }) =>
     req<{ address: string }>("/api/keystore", { method: "POST", body: JSON.stringify(body) }),
   unlock: (passphrase: string) =>

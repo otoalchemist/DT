@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { WalletClient } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
 import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
@@ -182,16 +181,38 @@ const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
   "offenseTargetTokenIds",
 ];
 
+/**
+ * One unlocked hot wallet.
+ *
+ * No WalletClient here: every submission path signs with `account.signTransaction` and
+ * sends the raw tx (or bundles it), so the viem wallet client was write-only state even
+ * in the single-wallet design. Carrying one per wallet would just multiply dead weight.
+ */
+export interface Wallet {
+  account: PrivateKeyAccount;
+  /** Human name from the keystore, e.g. "cold-1". */
+  label: string;
+  /** Last-read on-chain balance. Per-wallet because the min-balance floor is
+   *  per-wallet — each wallet pays its own gas. */
+  balanceWei: bigint | null;
+}
+
 class Runtime {
-  account: PrivateKeyAccount | null = null;
-  walletClient: WalletClient | null = null;
+  /**
+   * Every unlocked wallet, in keystore order. `wallets[0]` is the PRIMARY: it funds the
+   * coinbase bid, since one bid buys position for the whole bundle regardless of how many
+   * wallets contributed txs to it.
+   *
+   * payTaxes/audit/kill/useBribe are all owner-only on-chain (verified by simulation), so
+   * an action on a citizen must be signed by the wallet that holds it — see walletFor().
+   */
+  wallets: Wallet[] = [];
   strategy: StrategyConfig = { ...DEFAULT_STRATEGY };
 
   running = false;
 
   // status fields
   chainId: number | null = null;
-  balanceWei: bigint | null = null;
   currentEpoch: bigint | null = null;
   gameState: number | null = null;
   citizenSupply: bigint | null = null;
@@ -213,7 +234,58 @@ class Runtime {
   }
 
   get unlocked(): boolean {
-    return this.account !== null;
+    return this.wallets.length > 0;
+  }
+
+  /** The primary wallet — bid payer, and the single identity the UI shows. */
+  get primary(): Wallet | null {
+    return this.wallets[0] ?? null;
+  }
+
+  /** Back-compat alias: the primary account. Only for paths that genuinely want ONE
+   *  wallet (the bid payer, the header address). Anything acting on a citizen must use
+   *  walletFor() instead, or it will sign with the wrong wallet and revert. */
+  get account(): PrivateKeyAccount | null {
+    return this.primary?.account ?? null;
+  }
+
+  /** Total across every unlocked wallet — what the header "Balance" stat means now. */
+  get balanceWei(): bigint | null {
+    if (this.wallets.length === 0) return null;
+    let total = 0n;
+    let seen = false;
+    for (const w of this.wallets) {
+      if (w.balanceWei === null) continue;
+      total += w.balanceWei;
+      seen = true;
+    }
+    return seen ? total : null;
+  }
+
+  /** The wallet holding `owner`, or null if we don't hold that address. */
+  walletFor(owner: string): Wallet | null {
+    const want = owner.toLowerCase();
+    return this.wallets.find((w) => w.account.address.toLowerCase() === want) ?? null;
+  }
+
+  /** True if `addr` is one of ours — used to keep our own citizens out of target lists. */
+  ownsAddress(addr: string): boolean {
+    return this.walletFor(addr) !== null;
+  }
+
+  get addresses(): string[] {
+    return this.wallets.map((w) => w.account.address);
+  }
+
+  /** Replace the unlocked set (unlock, or a wallet added/removed while unlocked). */
+  setWallets(wallets: Wallet[]): void {
+    this.wallets = wallets;
+  }
+
+  /** Record a freshly-read balance for one wallet. No-op for an address we don't hold. */
+  setBalance(address: string, wei: bigint): void {
+    const w = this.walletFor(address);
+    if (w) w.balanceWei = wei;
   }
 
   private configPath(): string {
@@ -304,8 +376,15 @@ class Runtime {
       version: VERSION,
       running: this.running,
       unlocked: this.unlocked,
+      // The primary address stays the single headline identity; `wallets` carries the
+      // full roster so the dashboard can show each one's balance separately.
       address: this.account?.address ?? null,
       balanceWei: this.balanceWei?.toString() ?? null,
+      wallets: this.wallets.map((w) => ({
+        address: w.account.address,
+        label: w.label,
+        balanceWei: w.balanceWei?.toString() ?? null,
+      })),
       chainId: this.chainId,
       currentEpoch: this.currentEpoch?.toString() ?? null,
       gameState: this.gameState,
@@ -338,8 +417,7 @@ class Runtime {
   }
 
   lock(): void {
-    this.account = null;
-    this.walletClient = null;
+    this.wallets = [];
     this.running = false;
     this.emitStatus();
   }

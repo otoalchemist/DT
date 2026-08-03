@@ -12,7 +12,7 @@ import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterL
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { fetchEmigrationRoster } from "./emigration.js";
 import { makeIdCache } from "./id-cache.js";
-import { loadKeystore } from "./keystore.js";
+import { loadWallets } from "./keystore.js";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 
@@ -25,12 +25,34 @@ import { logger } from "./logger.js";
 const SNAPSHOT_TTL_MS = 5_000;
 
 export async function readOwnedStatuses(): Promise<OwnedTokenStatus[]> {
-  if (!runtime.account) return [];
+  if (!runtime.unlocked) return [];
   const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const ids = await fetchOwnedTokenIds(snap.citizensAddress, runtime.account.address);
+  // Union across every unlocked wallet, tagged with the one holding each citizen so the
+  // dashboard can group them and the user can see which wallet needs funding.
+  const per = await Promise.all(
+    runtime.wallets.map(async (w) => ({
+      w,
+      ids: await fetchOwnedTokenIds(snap.citizensAddress, w.account.address as `0x${string}`),
+    })),
+  );
+  const holder = new Map<string, { address: string; label: string }>();
+  const ids: bigint[] = [];
+  for (const { w, ids: list } of per) {
+    for (const id of list) {
+      const key = id.toString();
+      if (holder.has(key)) continue;
+      holder.set(key, { address: w.account.address, label: w.label });
+      ids.push(id);
+    }
+  }
   // ONE multicall for every owned token's status, not a serial per-token round-trip.
-  return batchGetOwnedStatuses(ids, snap.currentEpoch, nowSec, runtime.strategy.prepayEpochs);
+  const rows = await batchGetOwnedStatuses(ids, snap.currentEpoch, nowSec, runtime.strategy.prepayEpochs);
+  return rows.map((r) => ({
+    ...r,
+    walletAddress: holder.get(r.tokenId)?.address ?? null,
+    walletLabel: holder.get(r.tokenId)?.label ?? null,
+  }));
 }
 
 // The live-citizen set changes only when a citizen is killed/burned, so cache it (SWR,
@@ -136,8 +158,16 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   // Falls back to the keystore's address when the wallet is locked — it's stored in
   // plaintext there (only the key is encrypted), so the panel doesn't change shape
   // the moment you unlock.
-  const self = (runtime.account?.address ?? loadKeystore(appConfig.dataDir)?.address ?? null)?.toLowerCase() ?? null;
-  const isOurs = (t: TargetTokenStatus) => self !== null && t.owner.toLowerCase() === self;
+  // Every wallet we hold, so a citizen in ANY of them is filtered out of the rival list.
+  // Falls back to the keystore's addresses when locked — they're stored in plaintext
+  // there (only the keys are encrypted), so the panel doesn't change shape on unlock.
+  const selfSet = new Set(
+    (runtime.unlocked
+      ? runtime.addresses
+      : loadWallets(appConfig.dataDir).map((w) => w.address)
+    ).map((a) => a.toLowerCase()),
+  );
+  const isOurs = (t: TargetTokenStatus) => selfSet.has(t.owner.toLowerCase());
 
   const pinned: TargetTokenStatus[] = [];
   const actionable: TargetTokenStatus[] = [];

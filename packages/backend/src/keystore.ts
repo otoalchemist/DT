@@ -8,9 +8,18 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 
-// Encrypted keystore for the bot's hot-wallet private key.
-// Format v1: scrypt(passphrase) -> 32-byte AES key; AES-256-GCM.
-// The plaintext private key NEVER touches disk.
+// Encrypted keystore for the bot's hot-wallet private keys.
+//
+// Format v1: a single key, the whole file. Format v2: `{ version: 2, wallets: [...] }`,
+// each entry the same v1 blob shape with its own salt and IV. Every entry is encrypted
+// under the SAME passphrase — the keys all live on this machine anyway, so per-wallet
+// passphrases would buy little and make unlocking N wallets painful — but each is
+// encrypted independently, so a single blob leak exposes one key, not all of them.
+//
+// v1 files are read as a one-wallet v2 and only rewritten when a wallet is added or
+// removed, so an existing install keeps working untouched.
+//
+// The plaintext private keys NEVER touch disk.
 
 export interface KeystoreFileV1 {
   version: 1;
@@ -21,6 +30,14 @@ export interface KeystoreFileV1 {
   authTag: string;
   ciphertext: string;
   address: string; // convenience only; not sensitive
+  /** Human name for the wallet, e.g. "cold-1". Never sensitive. */
+  label?: string;
+}
+
+/** Multi-wallet keystore. Each entry is an independently-encrypted v1 blob. */
+export interface KeystoreFileV2 {
+  version: 2;
+  wallets: KeystoreFileV1[];
 }
 
 const SCRYPT = { N: 1 << 15, r: 8, p: 1, keyLen: 32 };
@@ -101,16 +118,52 @@ export function keystoreExists(dataDir: string): boolean {
 }
 
 export function saveKeystore(dataDir: string, file: KeystoreFileV1): void {
+  saveWallets(dataDir, [file]);
+}
+
+/** Every wallet in the keystore, in order. A v1 file reads as a single wallet. */
+export function loadWallets(dataDir: string): KeystoreFileV1[] {
+  const p = keystorePath(dataDir);
+  if (!fs.existsSync(p)) return [];
+  const raw = JSON.parse(fs.readFileSync(p, "utf8")) as KeystoreFileV1 | KeystoreFileV2;
+  if ((raw as KeystoreFileV2).version === 2) {
+    return (raw as KeystoreFileV2).wallets ?? [];
+  }
+  return [raw as KeystoreFileV1];
+}
+
+export function saveWallets(dataDir: string, wallets: KeystoreFileV1[]): void {
   fs.mkdirSync(dataDir, { recursive: true });
+  const file: KeystoreFileV2 = { version: 2, wallets };
   fs.writeFileSync(keystorePath(dataDir), JSON.stringify(file, null, 2), {
     mode: 0o600,
   });
 }
 
+/**
+ * The first wallet — the "primary". It funds the coinbase bid (one bid buys position for
+ * the whole bundle, so it comes from one wallet) and is the address shown when the app
+ * needs a single identity. Kept for the call sites that legitimately want just one.
+ */
 export function loadKeystore(dataDir: string): KeystoreFileV1 | null {
-  const p = keystorePath(dataDir);
-  if (!fs.existsSync(p)) return null;
-  return JSON.parse(fs.readFileSync(p, "utf8")) as KeystoreFileV1;
+  return loadWallets(dataDir)[0] ?? null;
+}
+
+/**
+ * Check a passphrase against the existing keystore by actually decrypting the first
+ * wallet. Adding a wallet has to verify this: entries are independently encrypted, so a
+ * mismatched passphrase would silently produce a keystore that no single passphrase can
+ * fully unlock — discovered only at the next unlock, with a wallet stranded.
+ */
+export function passphraseMatches(dataDir: string, passphrase: string): boolean {
+  const first = loadWallets(dataDir)[0];
+  if (!first) return true; // nothing to match yet
+  try {
+    decryptPrivateKey(first, passphrase);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Constant-time compare helper for confirmation checks. */

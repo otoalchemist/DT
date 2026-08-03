@@ -1,12 +1,10 @@
 import {
   createPublicClient,
-  createWalletClient,
   http,
   webSocket,
   type Address,
   type Block,
   type PublicClient,
-  type WalletClient,
   type Transport,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
@@ -33,7 +31,7 @@ export function reinitClients(httpUrl: string, wsUrl?: string | null): void {
   publicClient = createPublicClient({ chain: mainnet, transport: makeHttpTransport(httpUrl) });
   wsClient = wsUrl ? createPublicClient({ chain: mainnet, transport: webSocket(wsUrl) }) : null;
   cachedBlock = null; // drop any block cached against the old client
-  cachedBalance = null; // ...and any balance read through it
+  cachedBalances.clear(); // ...and any balances read through it
   logger.info(`RPC clients reinitialized (${httpUrl.slice(0, 40)}…)`);
 }
 
@@ -70,33 +68,30 @@ export function primeBlockCache(block: Block): void {
 // is safe for the min-balance floor check — and any successful submission invalidates
 // it (see invalidateBalanceCache) so the floor is never evaluated against a balance
 // that predates our own spend. Previously re-read every tick (~7.2k/day).
-let cachedBalance: { at: number; address: string; wei: bigint } | null = null;
+// Keyed by address: the bot can hold several wallets, and a single-slot cache thrashed
+// to a 0% hit rate once there was more than one — every read for wallet B evicted
+// wallet A's entry, so each tick paid a fresh getBalance per wallet and the cache did
+// nothing but add a lookup.
+const cachedBalances = new Map<string, { at: number; wei: bigint }>();
 const BALANCE_CACHE_MS = 30_000;
 
 export async function getBalanceCached(address: Address, maxAgeMs = BALANCE_CACHE_MS): Promise<bigint> {
   const key = address.toLowerCase();
   const now = Date.now();
-  if (cachedBalance && cachedBalance.address === key && now - cachedBalance.at <= maxAgeMs) {
-    return cachedBalance.wei;
-  }
+  const hit = cachedBalances.get(key);
+  if (hit && now - hit.at <= maxAgeMs) return hit.wei;
   const wei = await publicClient.getBalance({ address });
-  cachedBalance = { at: now, address: key, wei };
+  cachedBalances.set(key, { at: now, wei });
   return wei;
 }
 
-/** Drop the cached balance — call after anything that spends, so the next guardrail
- *  check reads the real post-spend balance instead of a stale pre-spend one. */
-export function invalidateBalanceCache(): void {
-  cachedBalance = null;
-}
-
-/** Build a wallet client bound to an unlocked account for signing. */
-export function makeWalletClient(account: PrivateKeyAccount): WalletClient {
-  return createWalletClient({
-    account,
-    chain: mainnet,
-    transport: makeHttpTransport(appConfig.httpUrl),
-  });
+/** Drop cached balances — call after anything that spends, so the next guardrail check
+ *  reads the real post-spend balance instead of a stale pre-spend one. Clears every
+ *  wallet by default: one bundle can spend from several, so invalidating only the payer
+ *  would leave the others' floors evaluated against pre-spend numbers. */
+export function invalidateBalanceCache(address?: Address): void {
+  if (address) cachedBalances.delete(address.toLowerCase());
+  else cachedBalances.clear();
 }
 
 export function accountFromPrivateKey(pk: `0x${string}`): PrivateKeyAccount {

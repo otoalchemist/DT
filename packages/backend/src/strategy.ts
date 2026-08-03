@@ -2,9 +2,9 @@ import { parseEther, formatEther, type Address } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
-import { runtime, loadAllyTokens, loadDoNotTarget } from "./runtime.js";
+import { runtime, loadAllyTokens, loadDoNotTarget, type Wallet } from "./runtime.js";
 import { activity } from "./activity.js";
-import { nonceManager } from "./nonce.js";
+import { nonces } from "./nonce.js";
 import {
   getGameSnapshot,
   batchGetOwnedStatuses,
@@ -56,7 +56,60 @@ let engineSalt = 0;
 // Total wei committed to spend so far in the current tick (value + gas of each
 // submitted tx). Reset at the top of every tick; consulted by canSpend so the
 // min-balance floor holds across all spends in a tick, not just each in isolation.
-let committedThisTickWei = 0n;
+// Keyed by lowercased wallet address: each wallet pays its own gas from its own balance,
+// so one wallet's spending must not consume another's headroom.
+let committedThisTickWei = new Map<string, bigint>();
+const committedFor = (addr: string): bigint => committedThisTickWei.get(addr.toLowerCase()) ?? 0n;
+const commitFor = (addr: string, wei: bigint): void => {
+  const k = addr.toLowerCase();
+  committedThisTickWei.set(k, (committedThisTickWei.get(k) ?? 0n) + wei);
+};
+
+/**
+ * Which wallet holds each owned citizen, refreshed every time owned tokens are fetched.
+ *
+ * payTaxes / audit / useBribe are owner-only on-chain (confirmed by simulating each from
+ * a funded non-owner: all revert, while the same call from the owner succeeds), so an
+ * action has to be signed by the wallet that holds the citizen involved. Signing with the
+ * wrong wallet doesn't fail loudly — it reverts on-chain after burning the gas and losing
+ * the boundary race — so routing is resolved here, once, rather than at each call site.
+ */
+let ownedBy = new Map<string, Wallet>();
+
+/** The wallet holding `tokenId`, or null if none of ours does. */
+function walletForToken(tokenId: bigint | string): Wallet | null {
+  return ownedBy.get(tokenId.toString()) ?? null;
+}
+
+/**
+ * Owned citizens across EVERY unlocked wallet, and the wallet holding each.
+ *
+ * Replaces the single `fetchOwnedTokenIds(citizens, address)`: with several wallets the
+ * owned set is their union, and every downstream pass needs to know which wallet a token
+ * came from in order to sign for it.
+ */
+async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint[]> {
+  const per = await Promise.all(
+    runtime.wallets.map(async (w) => ({
+      w,
+      ids: await fetchOwnedTokenIds(citizens, w.account.address as Address),
+    })),
+  );
+  const next = new Map<string, Wallet>();
+  const ids: bigint[] = [];
+  for (const { w, ids: list } of per) {
+    for (const id of list) {
+      const key = id.toString();
+      // A token can only be in one wallet; if the index is momentarily stale during a
+      // transfer, first-seen wins rather than the entry silently flipping mid-tick.
+      if (next.has(key)) continue;
+      next.set(key, w);
+      ids.push(id);
+    }
+  }
+  ownedBy = next;
+  return ids;
+}
 
 // Activity entries whose tx was queued into the current bundle batch (mainnet).
 // flushBatch fills in each one's txHash/bundleHash and starts receipt tracking
@@ -485,10 +538,13 @@ const PRE_BOUNDARY_GAS = 120_000n;
  * audit executes, so it can serve as an audit "from" token even though the chain
  * still reads it as behind (see `paidInBundle` in findPreBoundaryAuditors).
  */
-async function queuePreBoundaryPayments(address: Address, targetEpoch: bigint, boundaryTs: bigint): Promise<Set<string>> {
+// No address parameter: payments are queued for every owned citizen across every wallet,
+// each signed by its holder. A single address here read as "which wallet pays", which is
+// not a choice that exists — payTaxes is owner-only.
+async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint): Promise<Set<string>> {
   const s = runtime.strategy;
   const paid = new Set<string>();
-  const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+  const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
   const selected = applyExclusions(
     s.jitTokenIds.length > 0 ? s.jitTokenIds.map((x) => BigInt(x)) : ownedIds,
     "pre-boundary pay",
@@ -526,7 +582,7 @@ async function queuePreBoundaryPayments(address: Address, targetEpoch: bigint, b
     // advances the citizen a single epoch regardless of how far behind it is.
     const value = preBoundaryTaxWei(lastEpochPaid, targetEpoch, 1, BASE_TAX_RATE_WEI);
     if (value === 0n) continue;
-    const guard = await canSpend(value, false); // enforces max-base-fee, floor, max-payment caps
+    const guard = await canSpend(value, false, walletForToken(key)); // max-base-fee, floor, max-payment caps
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
       continue;
@@ -544,28 +600,27 @@ async function queuePreBoundaryPayments(address: Address, targetEpoch: bigint, b
 /** Fire the opt-in pre-boundary JIT payment as its own bundle (+ optional coinbase
  *  bid). Used when combinedBoundaryBundle is OFF; the combined fire uses the helper
  *  directly. Best-effort — the ordinary post-boundary JIT tick remains the fallback. */
-async function firePreBoundaryPay(): Promise<void> {
+export async function firePreBoundaryPay(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
   if (ticking) { setTimeout(() => void firePreBoundaryPay(), 150); return; } // don't overlap nonce use
   ticking = true;
-  committedThisTickWei = 0n;
+  committedThisTickWei = new Map();
   beginBatch();
-  const address = runtime.account.address;
   const targetEpoch = BigInt(s.jitTargetEpoch);
   const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
   try {
-    await nonceManager.sync(address, appConfig.mode);
-    const paid = await queuePreBoundaryPayments(address, targetEpoch, boundaryTs);
+    await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
+    const paid = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
     if (paid.size > 0) await maybeQueueCoinbaseBid();
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
   } finally {
     await flushBatch();
-    nonceManager.reset();
+    nonces.resetAll();
     ticking = false;
   }
 }
@@ -609,7 +664,8 @@ async function maybeQueueCoinbaseBid(): Promise<void> {
   // and could let a later payment slip under the floor. Account for it the same way
   // act() does.
   runtime.recordSpend(bidWei);
-  committedThisTickWei += bidWei;
+  // The bid is paid by the primary wallet, so it consumes that wallet's headroom.
+  if (runtime.primary) commitFor(runtime.primary.account.address, bidWei);
   invalidateBalanceCache();
 }
 
@@ -832,14 +888,13 @@ export function schedulePreBoundaryAudit(): void {
 // Exported for tests: this is the audit-queue unit that a boundary miss like
 // token 1612 flows through, so an integration test drives it directly.
 export async function queuePreBoundaryAudits(
-  address: Address,
   targetEpoch: bigint,
   nowSec: bigint,
   boundaryTs: bigint,
   opts: { revertible: boolean; paidInBundle?: Set<string> },
 ): Promise<boolean> {
   const s = runtime.strategy;
-  const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+  const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
   const { auditors, needsPayment } = await findPreBoundaryAuditors(ownedIds, targetEpoch, opts.paidInBundle);
 
   const { candidates: live, emigrated } = await fetchOffenseCandidatesWithSkips();
@@ -888,9 +943,11 @@ export async function queuePreBoundaryAudits(
   let queued = 0;
   for (const t of auditable) {
     if (idx >= auditors.length) break; // out of auditor capacity this epoch
-    const guard = await canSpend(AUDIT_COST_WEI, true);
-    if (!guard.ok) continue;
+    // Pick the auditor first: the audit is signed by whichever wallet holds it, so the
+    // affordability check has to be against THAT wallet's balance, not the primary's.
     const from = auditors[idx]!;
+    const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(from));
+    if (!guard.ok) continue;
     // An auditor that only qualifies via a payment earlier in THIS bundle can't be
     // simulated: the sim runs the audit alone against pre-payment state and would
     // wrongly revert. Send it unsimulated — it rides allowed-to-revert, so the worst
@@ -934,15 +991,14 @@ async function firePreBoundaryAudit(): Promise<void> {
   if (ticking) { setTimeout(() => void firePreBoundaryAudit(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
-  committedThisTickWei = 0n;
+  committedThisTickWei = new Map();
   beginBatch();
-  const address = runtime.account.address;
   const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
-    await nonceManager.sync(address, appConfig.mode);
-    const queuedAudit = await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, { revertible: false });
+    await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
+    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, { revertible: false });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
     if (queuedAudit) await maybeQueueCoinbaseBid();
   } catch (err) {
@@ -950,7 +1006,7 @@ async function firePreBoundaryAudit(): Promise<void> {
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
   } finally {
     await flushBatch();
-    nonceManager.reset();
+    nonces.resetAll();
     ticking = false;
   }
 }
@@ -973,21 +1029,20 @@ export async function firePreBoundaryBundle(): Promise<void> {
   if (runtime.gameState !== 1) return;
   if (ticking) { setTimeout(() => void firePreBoundaryBundle(), 150); return; }
   ticking = true;
-  committedThisTickWei = 0n;
+  committedThisTickWei = new Map();
   beginBatch();
-  const address = runtime.account.address;
   const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n; // the boundary we're racing into
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
-    await nonceManager.sync(address, appConfig.mode);
+    await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     let paidInBundle = new Set<string>();
     let auditQueued = false;
     // Payment first (lowest nonces): its amount is only valid top-of-block, and a
     // just-paid auditor token is current before it audits. Only if JIT is armed for
     // THIS boundary (jitTargetEpoch === currentEpoch + 1).
     if (s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) === targetEpoch) {
-      paidInBundle = await queuePreBoundaryPayments(address, targetEpoch, boundaryTs);
+      paidInBundle = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
     }
     // Audits next (higher nonces). They ride allowed-to-revert (bundle-only, no mempool
     // mirror) ONLY when a payment shares the bundle — so a reverting audit can't drop the
@@ -999,7 +1054,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
       s.preBoundaryAudit && s.offenseEnabled && s.autoAudit &&
       !(s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin))
     ) {
-      auditQueued = await queuePreBoundaryAudits(address, targetEpoch, nowSec, boundaryTs, {
+      auditQueued = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
         revertible: paidInBundle.size > 0,
         // Tokens paid above are current by the time the audit executes, so they can
         // serve as audit "from" tokens even though the chain still reads them behind.
@@ -1015,7 +1070,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary bundle error: ${(err as Error).message}` });
   } finally {
     await flushBatch();
-    nonceManager.reset();
+    nonces.resetAll();
     ticking = false;
   }
 }
@@ -1065,16 +1120,15 @@ async function firePreBoundaryKill(): Promise<void> {
   if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
-  committedThisTickWei = 0n;
+  committedThisTickWei = new Map();
   beginBatch();
-  const address = runtime.account.address;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
   const windowSec = BigInt(Math.ceil(effectiveLeadMs() / 1000) + 12);
   let queuedKill = false;
   try {
-    await nonceManager.sync(address, appConfig.mode);
-    const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+    await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
+    const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
     const live = await fetchOffenseCandidates();
     const owned = new Set(ownedIds.map((x) => x.toString()));
     const pinned = pinnedTargetSet(s);
@@ -1102,7 +1156,7 @@ async function firePreBoundaryKill(): Promise<void> {
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary kill error: ${(err as Error).message}` });
   } finally {
     await flushBatch();
-    nonceManager.reset();
+    nonces.resetAll();
     ticking = false;
   }
 }
@@ -1140,13 +1194,26 @@ export function scheduleDefenseBoundary(): void {
   defenseBoundaryTimer = setTimeout(() => fireBoundaryTick(true), delayMs);
 }
 
-async function refreshSnapshot(address: Address): Promise<void> {
+/** Refresh chain state and every wallet's balance. Takes no address: it covers the whole
+ *  wallet set, and a single-address parameter was exactly the assumption that left
+ *  non-primary balances frozen at their unlock-time value. */
+async function refreshSnapshot(): Promise<void> {
   // Fetch the full latest block (not just its number) so it warms the shared
   // block cache: every canSpend/computeFees later in this tick then reuses it
   // instead of each re-reading the block for the base fee.
-  const [snap, balance, latest] = await Promise.all([
+  // Balances for EVERY wallet, not just the primary: each wallet's floor is checked
+  // against its own balance, so a wallet whose balance never refreshed would keep
+  // passing the floor on a number that predates all of its own spending.
+  // getBalanceCached is per-address and 30s-lived, so this is one read per wallet per
+  // 30s, not per tick.
+  const [snap, balances, latest] = await Promise.all([
     getGameSnapshot(),
-    getBalanceCached(address),
+    Promise.all(
+      runtime.wallets.map(async (w) => ({
+        address: w.account.address,
+        wei: await getBalanceCached(w.account.address as Address),
+      })),
+    ),
     getLatestBlockCached(),
   ]);
   runtime.gameState = snap.state;
@@ -1154,7 +1221,7 @@ async function refreshSnapshot(address: Address): Promise<void> {
   runtime.citizenSupply = snap.citizenSupply;
   runtime.citizensAddress = snap.citizensAddress;
   runtime.startTime = snap.startTime;
-  runtime.balanceWei = balance;
+  for (const b of balances) runtime.setBalance(b.address, b.wei);
   runtime.lastBlock = latest.number;
   runtime.emitStatus();
   scheduleJitBoundary();
@@ -1167,7 +1234,14 @@ async function refreshSnapshot(address: Address): Promise<void> {
 /** Pre-flight guardrail: can we afford this spend without breaching caps/floors?
  *  `offense` selects the audit/kill gas profile so the base-fee cap and gas
  *  estimate match what `submitTx` will actually bid. */
-async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boolean; reason?: string }> {
+async function canSpend(
+  valueWei: bigint,
+  offense: boolean,
+  // The wallet that will actually pay. The floor is per-wallet because each wallet funds
+  // its own gas: checking a shared total would let a rich wallet mask an empty one and
+  // send a tx that cannot pay for itself.
+  wallet: Wallet | null = runtime.primary,
+): Promise<{ ok: boolean; reason?: string }> {
   const s = runtime.strategy;
   const gas = resolveGas(s, offense);
   const block = await getLatestBlockCached();
@@ -1191,13 +1265,17 @@ async function canSpend(valueWei: bigint, offense: boolean): Promise<{ ok: boole
 
   const gasWei = GAS_GUESS * (baseFee * 2n + BigInt(Math.round(gas.priorityFeeGwei * 1e9)));
 
-  const bal = runtime.balanceWei ?? 0n;
+  if (!wallet) return { ok: false, reason: "wallet locked" };
+  const bal = wallet.balanceWei ?? 0n;
   const floor = parseEther(String(s.minBalanceEth));
   // Account for spend already committed earlier in this tick — the on-chain
   // balance is read once per tick and doesn't yet reflect those payments, so
   // without this several payments in one tick could cumulatively breach the floor.
-  if (!canAffordSpend(bal, committedThisTickWei, valueWei, gasWei, floor)) {
-    return { ok: false, reason: "would breach min-balance floor" };
+  if (!canAffordSpend(bal, committedFor(wallet.account.address), valueWei, gasWei, floor)) {
+    return {
+      ok: false,
+      reason: `would breach min-balance floor on ${wallet.label} (${wallet.account.address.slice(0, 10)}…)`,
+    };
   }
 
   return { ok: true };
@@ -1248,11 +1326,32 @@ async function trackReceipt(
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean; normalGas?: boolean },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean; normalGas?: boolean; wallet?: Wallet },
 ): Promise<SubmitResult | null> {
   const offense = kind === "audit" || kind === "kill";
+  // Which wallet signs. `ctx.tokenId` is always the citizen WE own in the action — the one
+  // being paid, or the auditor doing the auditing — so its holder is the required signer.
+  // kill() takes no owned token and is callable by anyone, so it falls back to the primary.
+  // Fail closed for owner-only calls. payTaxes / useBribe / audit all revert unless
+  // msg.sender owns the citizen named in ctx.tokenId, so falling back to the primary
+  // when we can't resolve the holder isn't a graceful degradation — it's a guaranteed
+  // revert that still costs gas and still loses the boundary race. kill() names no owned
+  // token (ctx.tokenId is unset) and is callable by anyone, so it keeps the fallback.
+  const resolved = ctx.wallet ?? (ctx.tokenId ? walletForToken(ctx.tokenId) : runtime.primary);
+  const signer = resolved ?? (ctx.tokenId ? null : runtime.primary);
+  if (!signer) {
+    activity.add({
+      kind: "error",
+      status: "skipped",
+      tokenId: ctx.tokenId,
+      targetTokenId: ctx.targetTokenId,
+      message: `${ctx.message} — skipped: no unlocked wallet holds #${ctx.tokenId ?? "?"}`,
+    });
+    return null;
+  }
   try {
     const result = await submitTx(intent, {
+      account: signer.account,
       // In mainnet mode a bundle only lands if a builder we sent it to wins the
       // slot — so PAYMENTS always mirror to the public mempool as a fallback: one
       // that never lands can cost a citizen, and a tax payment isn't meaningfully
@@ -1286,7 +1385,7 @@ async function act(
     invalidateBalanceCache();
     // Count it against this tick's budget so later canSpend checks in the same
     // tick see the reduced headroom.
-    committedThisTickWei += result.valueWei + result.gasWei;
+    commitFor(signer.account.address, result.valueWei + result.gasWei);
     const entry = activity.add({
       kind,
       status: "submitted",
@@ -1590,9 +1689,10 @@ async function offensePass(
 
     if (s.autoAudit && t.auditable) {
       if (auditorIdx >= auditors.length) { noAuditorSkips++; continue; } // out of usable auditor tokens
-      const guard = await canSpend(AUDIT_COST_WEI, true);
-      if (!guard.ok) continue;
+      // Auditor first, then afford-check against the wallet that actually holds it.
       const auditFrom = auditors[auditorIdx]!;
+      const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(auditFrom));
+      if (!guard.ok) continue;
       const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },
         "audit",
@@ -1652,26 +1752,43 @@ async function runManualAction(
   if (runtime.gameState !== 1) return { ok: false, message: "Game is not live" };
   if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment" };
 
-  const address = runtime.account.address;
   ticking = true;
-  committedThisTickWei = 0n;
+  committedThisTickWei = new Map();
   beginBatch();
   try {
-    await Promise.all([refreshSnapshot(address), nonceManager.sync(address, appConfig.mode)]);
+    await Promise.all([
+      refreshSnapshot(),
+      nonces.syncAll(runtime.addresses as Address[], appConfig.mode),
+      // Resolve ownership BEFORE acting. A manual press can be the first thing that
+      // happens after unlock, with the engine never having ticked — the owner map would
+      // then be empty, act() would fall back to the primary, and an owner-only call
+      // signed by the wrong wallet reverts on-chain after paying gas.
+      fetchOwnedAcrossWallets(runtime.citizensAddress as Address),
+    ]);
     const built = await build();
     if ("error" in built) return { ok: false, message: built.error };
 
-    // Min-balance floor still applies (gas is estimated generously here).
-    const bal = runtime.balanceWei ?? 0n;
+    const holder = walletForToken(tokenId);
+    if (!holder) {
+      return { ok: false, message: `No unlocked wallet holds #${tokenId} — add its key to act on it` };
+    }
+    // Min-balance floor applies to the wallet that will actually pay, not the total
+    // across wallets: a funded wallet must not let an empty one send a tx it cannot
+    // cover. (gas is estimated generously here)
+    const bal = holder.balanceWei ?? 0n;
     const floor = parseEther(String(runtime.strategy.minBalanceEth));
     const latest = await getLatestBlockCached();
     const gasWei = GAS_GUESS * ((latest.baseFeePerGas ?? 0n) * 2n + 2_000_000_000n);
     if (!canAffordSpend(bal, 0n, built.intent.value, gasWei, floor)) {
-      return { ok: false, message: `Would breach the ${runtime.strategy.minBalanceEth} ETH min-balance floor` };
+      return {
+        ok: false,
+        message: `${holder.label} would breach the ${runtime.strategy.minBalanceEth} ETH min-balance floor`,
+      };
     }
 
     const res = await act(built.intent, kind, {
       tokenId: tokenId.toString(),
+      wallet: holder, // owner-only call — sign with the wallet that holds it
       message: built.message,
       race: true, // mirror to the mempool so a manual action lands even if no builder wins
       normalGas: true,
@@ -1689,7 +1806,7 @@ async function runManualAction(
     return { ok: false, message };
   } finally {
     await flushBatch();
-    nonceManager.reset();
+    nonces.resetAll();
     ticking = false;
   }
 }
@@ -1741,15 +1858,14 @@ async function tick(fireProactivePay = false): Promise<void> {
   if (ticking) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   ticking = true;
-  committedThisTickWei = 0n; // fresh spend budget for this tick
+  committedThisTickWei = new Map(); // fresh spend budget for this tick
   beginBatch();
-  const address = runtime.account.address;
   try {
     // Snapshot + nonce sync are independent RPC reads — run them together so the
     // boundary tick shaves a round-trip before it can submit anything.
     await Promise.all([
-      refreshSnapshot(address),
-      nonceManager.sync(address, appConfig.mode),
+      refreshSnapshot(),
+      nonces.syncAll(runtime.addresses as Address[], appConfig.mode),
     ]);
 
     if (runtime.gameState !== 1) {
@@ -1759,7 +1875,7 @@ async function tick(fireProactivePay = false): Promise<void> {
     const nowSec = BigInt(Math.floor(Date.now() / 1000));
     const currentEpoch = runtime.currentEpoch ?? 0n;
 
-    const ownedIds = await fetchOwnedTokenIds(runtime.citizensAddress as Address, address);
+    const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
 
     if (runtime.strategy.enabled) {
       // No defense pass: an audited citizen gets no automatic response at all. Only
@@ -1775,7 +1891,7 @@ async function tick(fireProactivePay = false): Promise<void> {
     activity.add({ kind: "error", status: "skipped", message: `Tick error: ${(err as Error).message}` });
   } finally {
     await flushBatch();
-    nonceManager.reset();
+    nonces.resetAll();
     ticking = false;
   }
 }

@@ -17,6 +17,11 @@ export interface OwnedTokenStatus {
   risk: TokenRisk;
   /** Estimated wei to pay to become current / clear an audit (1 epoch). */
   estimatedPayWei: string;
+  /** Which unlocked wallet holds this citizen. Actions on it are owner-only on-chain, so
+   *  this is the wallet that must sign — and the one that needs the gas. null if unknown
+   *  (e.g. read while locked). */
+  walletAddress?: string | null;
+  walletLabel?: string | null;
 }
 
 /** A token owned by someone else that the bot could audit or kill. */
@@ -438,13 +443,31 @@ export interface PostMortemResult {
   mode: string;
 }
 
+/** One unlocked hot wallet in the keystore. */
+export interface WalletStatus {
+  address: string;
+  /** Human name, e.g. "cold-1". Never sensitive. */
+  label: string;
+  /** null until a balance has been read for it. */
+  balanceWei: string | null;
+}
+
 export interface BotStatus {
   /** The bot's release version (see VERSION in constants). */
   version: string;
   running: boolean;
   unlocked: boolean;
+  /** The PRIMARY wallet's address — the single headline identity, and the wallet that
+   *  funds the coinbase bid. See `wallets` for the full roster. */
   address: string | null;
+  /** Total across every unlocked wallet, not just the primary. */
   balanceWei: string | null;
+  /**
+   * Every unlocked wallet. Citizens can only be acted on by the wallet that owns them
+   * (payTaxes/audit/kill are owner-only on-chain), so the bot holds one key per wallet
+   * and each has its own balance and min-balance floor.
+   */
+  wallets: WalletStatus[];
   chainId: number | null;
   currentEpoch: string | null;
   gameState: number | null;
