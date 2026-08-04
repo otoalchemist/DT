@@ -19,7 +19,22 @@ async function main(): Promise<void> {
 
   // Warm the rival-target caches in the background so the first dashboard load is fast
   // (the cold full-collection enumeration is ~15s). Best-effort; needs the NFT API.
-  if (appConfig.nftUrl) void prewarmTargets();
+  //
+  // On a fresh install there is no key yet, so this is skipped — POST /api/settings warms
+  // them when the key arrives instead. Without that, the first dashboard load after setup
+  // paid the whole cold enumeration against a blank screen, which reads as "blockchain
+  // data isn't loading".
+  if (appConfig.nftUrl) {
+    void prewarmTargets();
+  } else {
+    // Say so loudly: with no key the RPC client falls back to viem's default PUBLIC
+    // mainnet endpoint, so the bot appears connected while ownership enumeration (which
+    // needs the Alchemy NFT API) silently returns nothing.
+    logger.warn(
+      "No Alchemy API key configured — using the default public RPC and NO NFT API. " +
+        "Token/target lists stay empty until a key is saved in the UI.",
+    );
+  }
 
   const shutdown = async () => {
     logger.info("Shutting down...");

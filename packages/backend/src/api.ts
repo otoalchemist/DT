@@ -25,7 +25,7 @@ import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
-  readDoNotTarget, invalidateLiveCandidates } from "./service.js";
+  readDoNotTarget, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 
@@ -322,7 +322,19 @@ export async function buildServer(): Promise<FastifyInstance> {
         // Away mode can only arm once the wallet is unlocked and the epoch grid is
         // known — both are true right here.
         if (runtime.strategy.awayMode) scheduleAwayWake();
-      }).catch(() => {});
+      }).catch((err: unknown) => {
+        // Header stats (epoch, supply, citizens left) are only repopulated by an engine
+        // tick or "Refresh data", so swallowing this left them blank indefinitely with no
+        // clue why — indistinguishable from a bad key. Surface it where the user is
+        // already looking.
+        const msg = (err as Error).message;
+        logger.warn("Unlock-time chain read failed:", msg);
+        activity.add({
+          kind: "error",
+          status: "skipped",
+          message: `Could not read chain state on unlock (${msg}) — check the Alchemy key, then press Refresh data`,
+        });
+      });
       // Fetch the wallet balance up front too — otherwise it stays blank until
       // the engine is started (balance is otherwise only read inside tick()).
       // Balances up front, per wallet — otherwise they stay blank until the engine runs.
@@ -477,7 +489,21 @@ export async function buildServer(): Promise<FastifyInstance> {
       appConfig.wsUrl = urls.wsUrl;
       appConfig.nftUrl = urls.nftUrl;
       reinitClients(urls.httpUrl, urls.wsUrl);
-      logger.info("Alchemy API key saved and RPC clients reinitialized.");
+      // Everything read before this point came from either no key or the wrong one, so it
+      // has to be thrown away. reinitClients only drops the block and balance caches; the
+      // ownership, live-candidate and emigration caches survive it, and makeIdCache is
+      // stale-while-revalidate — it serves the cached value immediately even when expired
+      // and refreshes behind you. So without this, the first reads after fixing the key
+      // still return the empty results cached while it was missing, and the UI only heals
+      // a poll or two later. That is what made "re-enter the same key" look like a fix.
+      invalidateTokenCaches();
+      invalidateLiveCandidates();
+      invalidateEmigrationRoster();
+      // Warm them again. main.ts only prewarms when a key exists AT BOOT, which is never
+      // true on a fresh install — so the first dashboard load after setup paid the full
+      // ~15s cold collection enumeration against a blank screen.
+      void prewarmTargets();
+      logger.info("Alchemy API key saved; RPC clients reinitialized and caches rebuilt.");
     }
 
     if (mode) {
