@@ -145,7 +145,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -1462,5 +1462,113 @@ describe("multi-wallet: manual actions resolve the owning wallet before signing"
     expect(res.ok).toBe(false);
     expect(res.message).toMatch(/B would breach/);
     expect(submitTx).not.toHaveBeenCalled();
+  });
+});
+
+// The standalone (audit-only) pre-boundary fire, and the flag that decides how it fails.
+//
+// `revertible` does double duty: it marks the audit allowed-to-revert in the bundle AND
+// makes it bundle-only (act() sets race:false for revertible txs). So the two settings
+// are two different failure modes, and picking the wrong one cost a real epoch of audits:
+// with a 0.022 ETH bid configured, ONE doomed audit invalidated the all-or-nothing
+// bundle, the builder dropped it, the bundle-only coinbase bid died with it, and the
+// audits trickled out through the mempool naked — landing at tx index 40 instead of 0 and
+// every one reverting with AuditAlreadyActive.
+describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bid", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const PAYER = "0x00000000000000000000000000000000000000b1";
+  const CURRENT = 200n;
+
+  const base = {
+    ...DEFAULT_STRATEGY,
+    offenseEnabled: true,
+    autoAudit: true,
+    preBoundaryAudit: true,
+    racePublicMempool: true,
+    minBalanceEth: 0,
+    maxBaseFeeGwei: 1000,
+    endgameOnlyWithin: null,
+    offenseTargetTokenIds: ["501"],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useWallet({ address: ADDR }, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.citizenSupply = 500n;
+    runtime.currentEpoch = CURRENT;
+    runtime.startTime = 0n;
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n
+          : CURRENT, // auditor is current -> eligible
+      })) ) as never);
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
+    );
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (CURRENT - 1n).toString(), delinquent: true, epochsBehind: 1,
+        auditable: false, auditDueTimestamp: "0", killable: false,
+      },
+    ]);
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.running = false;
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([]);
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([]);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+      })) ) as never);
+  });
+
+  const auditOpts = () =>
+    vi.mocked(submitTx).mock.calls
+      .filter(([i]) => (i as { data: string }).data === "0xAUDIT")
+      .map(([, o]) => o as { revertible?: boolean; race?: boolean });
+
+  it("is a no-op predicate without a payer, however large the bid", () => {
+    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: "" })).toBe(false);
+    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0, coinbasePayerAddress: PAYER })).toBe(false);
+    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: PAYER })).toBe(true);
+  });
+
+  it("WITH a bid: audits are revert-tolerant so one stale target can't drop the bundle", async () => {
+    runtime.strategy = { ...base, coinbaseBidEth: 0.022, coinbasePayerAddress: PAYER };
+    await firePreBoundaryAudit();
+    const opts = auditOpts();
+    expect(opts.length).toBeGreaterThan(0);
+    // revertible => it survives a doomed sibling, and the bid it rode with survives too.
+    for (const o of opts) expect(o.revertible).toBe(true);
+  });
+
+  it("WITHOUT a bid: audits stay all-or-nothing and keep the mempool mirror", async () => {
+    // No bid means the bundle is unlikely to win top-of-block at all, so the mirror is
+    // the only copy that will realistically land — losing it would be strictly worse.
+    runtime.strategy = { ...base, coinbaseBidEth: 0, coinbasePayerAddress: PAYER };
+    await firePreBoundaryAudit();
+    const opts = auditOpts();
+    expect(opts.length).toBeGreaterThan(0);
+    for (const o of opts) expect(o.revertible).toBe(false);
+  });
+
+  it("a bid amount with no payer configured does NOT switch to bundle-only", async () => {
+    // maybeQueueCoinbaseBid is a no-op without a payer, so treating this as "bidding"
+    // would drop the mempool mirror while buying no position whatsoever.
+    runtime.strategy = { ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: "" };
+    await firePreBoundaryAudit();
+    for (const o of auditOpts()) expect(o.revertible).toBe(false);
   });
 });

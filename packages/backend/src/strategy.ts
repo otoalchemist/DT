@@ -675,8 +675,15 @@ async function maybeQueueCoinbaseBid(): Promise<void> {
  *  slot, so we fall back to SEPARATE bundles (where the audit keeps its mirror).
  *  The toggle is thus a no-op — behaviourally identical to separate — until a bid
  *  is set, which makes it safe to leave on by default. */
+/** Whether a coinbase bid will actually fire: an amount to pay AND a payer to route it
+ *  through. Without both, `maybeQueueCoinbaseBid` is a no-op and a bundle competes on
+ *  priority fee alone — which decides whether bundle-only submission is safe. */
+export function coinbaseBidActive(s: StrategyConfig): boolean {
+  return s.coinbaseBidEth > 0 && !!s.coinbasePayerAddress;
+}
+
 export function combinedBundleActive(s: StrategyConfig): boolean {
-  return s.combinedBoundaryBundle && s.coinbaseBidEth > 0 && !!s.coinbasePayerAddress;
+  return s.combinedBoundaryBundle && coinbaseBidActive(s);
 }
 
 // Generous fixed gas for an unsimulated offense pre-submit (real audits used
@@ -880,10 +887,15 @@ export function schedulePreBoundaryAudit(): void {
 /**
  * Queue pre-boundary audits into the CURRENTLY OPEN batch (caller opened beginBatch
  * and synced the nonce). Targets rivals auditable in the first block of `targetEpoch`,
- * one per eligible auditor token. `opts.revertible` marks each audit allowed-to-revert
- * and bundle-only (never mirrored) — used when riding a payment bundle in combined
- * mode so a defended target can never drop the payment. When not revertible (the
- * standalone fire) audits mirror per racePublicMempool. Returns whether any queued.
+ * one per eligible auditor token.
+ *
+ * `opts.revertible` marks each audit allowed-to-revert AND bundle-only (never mirrored —
+ * see act()). Set it when a coinbase bid will fire: the bid buys the bundle its position,
+ * and revert-tolerance stops one stale target (already audited, auditor out of capacity)
+ * from invalidating the whole bundle and taking the bid down with it. Leave it off when
+ * no bid fires — the bundle is then unlikely to win top-of-block, so the mempool mirror
+ * is the only copy likely to land at all. In combined mode it is also what stops a
+ * defended target from dropping the payment. Returns whether any queued.
  */
 // Exported for tests: this is the audit-queue unit that a boundary miss like
 // token 1612 flows through, so an integration test drives it directly.
@@ -983,7 +995,7 @@ export async function queuePreBoundaryAudits(
 }
 
 /** Standalone pre-boundary audit bundle. Used when combinedBoundaryBundle is OFF. */
-async function firePreBoundaryAudit(): Promise<void> {
+export async function firePreBoundaryAudit(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
@@ -998,7 +1010,25 @@ async function firePreBoundaryAudit(): Promise<void> {
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
-    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, { revertible: false });
+    // Allowed-to-revert ONLY when a coinbase bid will fire, because `revertible` also
+    // turns off the public-mempool mirror (see act()) and the two failure modes trade
+    // against each other:
+    //
+    //   revertible + bid  — bundle-only, revert-tolerant. A stale target (already
+    //     audited, auditor out of capacity) reverts harmlessly inside the bundle instead
+    //     of invalidating it, so the bundle still lands at the position the bid bought.
+    //   not revertible, no bid — all-or-nothing, but each audit keeps its mempool copy.
+    //     Without a bid the bundle rarely wins top-of-block anyway, so the mirror is the
+    //     only thing likely to land at all.
+    //
+    // Getting this wrong the other way is what cost an epoch of audits: with a 0.022 ETH
+    // bid configured, ONE doomed audit invalidated the whole all-or-nothing bundle, the
+    // builder dropped it, and the bid — which is bundle-only and never mirrored — died
+    // with it. The audits then trickled out through the mempool naked, landed at tx index
+    // 40+ instead of 0, and every one reverted with AuditAlreadyActive because faster
+    // bundles had already taken the targets.
+    const bidding = coinbaseBidActive(s);
+    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, { revertible: bidding });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
     if (queuedAudit) await maybeQueueCoinbaseBid();
   } catch (err) {
