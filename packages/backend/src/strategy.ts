@@ -1074,18 +1074,23 @@ export async function firePreBoundaryBundle(): Promise<void> {
     if (s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) === targetEpoch) {
       paidInBundle = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
     }
-    // Audits next (higher nonces). They ride allowed-to-revert (bundle-only, no mempool
-    // mirror) ONLY when a payment shares the bundle — so a reverting audit can't drop the
-    // payment and no extra mempool nonce demotes it. With no payment to protect (audit-only
-    // boundary), send them revertible:false so they ALSO mirror to the mempool per
-    // racePublicMempool: the bid still bids for the slot, and the mirror is a fallback if
-    // the bundle loses it.
+    // Audits next (higher nonces), always allowed-to-revert here. Two independent reasons,
+    // and this fire always has at least the second:
+    //   - a payment shares the bundle -> a reverting audit must not be able to drop it,
+    //     and no extra mempool nonce may demote it;
+    //   - a coinbase bid is queued below (this fire only runs when combinedBundleActive,
+    //     which requires one) -> a doomed audit must not invalidate the bundle and take
+    //     the bid down with it. That is what cost an ally a whole epoch of audits on the
+    //     standalone path: one stale target killed the bundle, the bundle-only bid died
+    //     with it, and the mempool mirrors landed naked at tx index 40 and reverted.
+    // Bundle-only costs us the mirror, but with a bid backing the bundle the mirror was
+    // never the copy that was going to win position anyway.
     if (
       s.preBoundaryAudit && s.offenseEnabled && s.autoAudit &&
       !(s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin))
     ) {
       auditQueued = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
-        revertible: paidInBundle.size > 0,
+        revertible: paidInBundle.size > 0 || coinbaseBidActive(s),
         // Tokens paid above are current by the time the audit executes, so they can
         // serve as audit "from" tokens even though the chain still reads them behind.
         paidInBundle,

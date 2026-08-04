@@ -582,6 +582,62 @@ describe("combined boundary bundle with multiple citizens", () => {
     expect(vi.mocked(queueCoinbaseBid).mock.calls[0]?.[1]).toBe(20_000_000_000_000_000n); // 0.02 ETH
   });
 
+// The whole reason payments and audits may share a bundle: a Flashbots bundle is
+  // atomic, so a reverting audit would normally invalidate it and take the PAYMENT down
+  // too — losing a citizen its tax at the exact boundary it needed it. flushBundle builds
+  // revertingTxHashes from the `revertible` flag, so this is the flag that decides it.
+  it("marks payments MANDATORY and audits allowed-to-revert, so a failed audit can't drop a payment", async () => {
+    await firePreBoundaryBundle();
+
+    const opts = (data: string) =>
+      vi.mocked(submitTx).mock.calls
+        .filter(([i]) => (i as { data: string }).data === data)
+        .map(([, o]) => o as { revertible?: boolean; race?: boolean });
+
+    const pays = opts("0xPAYTAXES");
+    const audits = opts("0xAUDIT");
+    expect(pays.length).toBeGreaterThan(0);
+    expect(audits.length).toBeGreaterThan(0);
+
+    // Payments are NOT revertible -> absent from revertingTxHashes -> the builder must
+    // include them successfully or drop the whole bundle. That is the guarantee.
+    for (const p of pays) expect(p.revertible).toBeFalsy();
+    // Audits ARE revertible -> a defended or already-audited target reverts harmlessly
+    // beside the payment instead of invalidating the bundle.
+    for (const a of audits) expect(a.revertible).toBe(true);
+  });
+
+  it("orders payments BEFORE audits, so a paid citizen is current when it audits", async () => {
+    await firePreBoundaryBundle();
+
+    // A bundle executes in nonce order (flushBundle sorts on it), so the payment's nonce
+    // must be lower than every audit's. This is also what lets a just-paid token serve as
+    // an auditor in the same bundle while the chain still reads it as behind.
+    const order = vi.mocked(submitTx).mock.calls.map(([i]) => (i as { data: string }).data);
+    const lastPay = order.lastIndexOf("0xPAYTAXES");
+    const firstAudit = order.indexOf("0xAUDIT");
+    expect(lastPay).toBeGreaterThanOrEqual(0);
+    expect(firstAudit).toBeGreaterThanOrEqual(0);
+    expect(lastPay).toBeLessThan(firstAudit);
+  });
+
+  it("keeps audits revert-tolerant even when NO payment is due", async () => {
+    // Nothing to pay this boundary (JIT not armed for it), so there is no payment to
+    // protect — but a coinbase bid still rides the bundle, and a doomed audit must not
+    // invalidate it and take the bid down. Same failure that cost an ally an epoch.
+    runtime.strategy = { ...runtime.strategy, jitEnabled: false, jitTargetEpoch: null };
+    await firePreBoundaryBundle();
+
+    const audits = vi.mocked(submitTx).mock.calls
+      .filter(([i]) => (i as { data: string }).data === "0xAUDIT")
+      .map(([, o]) => o as { revertible?: boolean });
+    const pays = vi.mocked(submitTx).mock.calls.filter(([i]) => (i as { data: string }).data === "0xPAYTAXES");
+
+    expect(pays).toHaveLength(0);
+    expect(audits.length).toBeGreaterThan(0);
+    for (const a of audits) expect(a.revertible).toBe(true);
+  });
+
   it("respects each citizen's auditLimit — no token audits more than its capacity", async () => {
     await firePreBoundaryBundle();
 
