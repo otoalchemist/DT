@@ -290,7 +290,13 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   const out = new Map<number, BundleTxResult>();
   if (!queue || queue.length === 0) return out;
 
-  // A bundle executes its txs in the given order, so nonces must ascend.
+  // A bundle executes its txs in the given order, and each ACCOUNT's txs must appear in
+  // ascending nonce order. Sorting the whole queue by nonce value satisfies that even
+  // with several wallets in one bundle: for any two txs of the same wallet, n1 < n2 puts
+  // n1 first, and Array#sort is stable (ES2019) so equal nonces from different wallets
+  // keep insertion order. Cross-wallet interleaving is arbitrary but harmless — a token
+  // is paid and audited by the SAME wallet (both calls are owner-only), so a payment
+  // always precedes the audit that depends on it within that wallet's own sequence.
   queue.sort((a, b) => a.nonce - b.nonce);
   const signedList = queue.map((q) => q.signed);
   // Txs allowed to revert without invalidating the bundle (audits riding a payment
