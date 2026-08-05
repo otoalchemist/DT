@@ -149,11 +149,48 @@ download time via `git archive` `export-subst`), so even the unversioned
 `DT-master.zip` from the green button is identifiable — it reads e.g.
 `v0.5.0-3-g<sha>`.
 
+#### Auto-updating default lists — no re-download needed
+
+The four curated list files are the bot's shared game intelligence, and they change
+as the game is played — far more often than the code does:
+
+| File | What it is |
+| --- | --- |
+| `data/rival-targets.json` | The curated rival roster (the "reset to default" list). |
+| `data/rival-skippers.json` | Rivals that pay on a ~2-epoch cadence, so they're auditable at every boundary. Seeds the offense targets. |
+| `data/ally-tokens.json` | Teammates. **Never** audited or killed. |
+| `data/do-not-target.json` | Big-boy operators that cure at the top of the boundary block, so an audit slot spent there is wasted. |
+
+**At every startup the bot fetches these from `master` and refreshes its local
+copies**, so a roster change reaches everyone on their next restart — no new
+download, no hand-merging into a `data/` folder. Pressing **Refresh data** in the
+dashboard does the same thing without a restart. It's best-effort and time-boxed
+(8s): if the fetch fails you keep the copy you have, and the bot starts normally.
+
+Three things it will not do, because each would destroy something:
+
+- **It never touches a git checkout.** In a clone the lists are managed by git, so
+  the sync is skipped entirely (`LIST_AUTO_UPDATE=force` opts in for testing it).
+- **It never overwrites a list you edited.** The hash of each file it writes is
+  recorded in `data/.list-sync.json`; if the file no longer matches, it's yours and
+  the sync leaves it alone and says so. To go back to the shared copy, delete the
+  file and restart.
+- **It never adopts an empty list.** An empty `ally-tokens.json` would let the
+  offense engine audit teammates, so a payload that arrives empty or malformed is
+  treated as a failed fetch, not as an instruction.
+
+Your **offense targets** follow the refreshed skippers list only if they were still
+tracking the default. Once you've customised the target box it's yours; re-adopt any
+time with the one-click *skippers* template in the Config panel.
+
+Set `LIST_AUTO_UPDATE=off` in `.env` to disable the whole thing.
+
 #### `DEFAULTS_VERSION` — pushing new defaults to existing users
 
 `DEFAULTS_VERSION` (in `packages/backend/src/runtime.ts`) is **separate from
-`VERSION`** and is what makes updated recommended settings actually reach people
-who already run the bot.
+`VERSION`** and is what makes updated recommended *settings* reach people who
+already run the bot. (The list files above no longer need it — they update
+themselves.)
 
 Users keep their `data/` folder across updates (it holds the wallet keystore and
 API key), so their `data/config.json` survives — and saved values win per-field,
@@ -171,9 +208,11 @@ anyone's tuning.
    field in the root + all three `packages/*/package.json` (`npm run package`
    refuses to run if they disagree), then `npm install --package-lock-only`.
 2. **Bump `DEFAULTS_VERSION`** in `packages/backend/src/runtime.ts` **if — and only
-   if — you changed a recommended default or edited `data/rival-targets.json`.**
+   if — you changed a recommended default** (gas tuning or a behaviour flag).
    Skipping this means existing users silently stay on the old settings; bumping it
-   needlessly resets their tuning.
+   needlessly resets their tuning. **Editing a list file no longer needs a bump or
+   even a release** — commit it to `master` and every bot picks it up on its next
+   start (see *Auto-updating default lists* above).
 3. Mirror any default changes into `data/config.example.json` (docs only, but keep
    it honest).
 4. `npm run build && npm test`, then commit.
@@ -192,6 +231,7 @@ anyone's tuning.
 | `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to Flashbots, **BuilderNet**, beaverbuild and Titan (all verified live). Endpoints do change — verify against each builder's docs. |
 | `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
+| `LIST_AUTO_UPDATE` | `on` (**default**) refreshes the curated default lists from `master` at startup; `off` disables it; `force` syncs even in a git checkout. See [Auto-updating default lists](#auto-updating-default-lists--no-re-download-needed). |
 
 Secrets live in `.env` and `data/` (the encrypted keystore + a Flashbots
 reputation key). Both are git-ignored. **Never commit them.**

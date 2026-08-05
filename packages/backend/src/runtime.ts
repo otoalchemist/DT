@@ -151,6 +151,42 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
 };
 
 /**
+ * Re-seed the shipped defaults from the list files on disk, after the startup sync in
+ * list-sync.ts has refreshed them.
+ *
+ * DEFAULT_STRATEGY captures `loadRivalSkippers()` at import time, which is BEFORE the
+ * sync runs, so without this the freshly-downloaded skippers list would reach every
+ * consumer that reads the file live (offense filters, the panels, /api/rival-skippers)
+ * but not the one place that snapshots it: the pinned offense targets.
+ *
+ * `previousSkippers` is the list as it was before the sync. The user's saved pins are
+ * only re-pointed at the new list when they still match the old one exactly — i.e. they
+ * were tracking the curated default and never customised. A hand-edited target box is
+ * the user's own strategy and is left alone; they can re-adopt with the one-click
+ * "skippers" template in the Config UI.
+ *
+ * Returns true when the saved pins were re-pointed, so startup can say so.
+ */
+export function adoptRefreshedLists(previousSkippers: string[]): boolean {
+  const fresh = loadRivalSkippers();
+  DEFAULT_STRATEGY.offenseTargetTokenIds = fresh;
+
+  // Compared by canonical BigInt string so a pure formatting difference ("0084" vs "84")
+  // between two versions of the file doesn't read as the user having customised. A
+  // non-numeric entry can't be canonicalised, so it's compared literally rather than
+  // throwing and taking startup down.
+  const canon = (id: string) => { try { return BigInt(id).toString(); } catch { return id; } };
+  const sameIds = (a: string[], b: string[]) =>
+    a.length === b.length && a.every((id, i) => canon(id) === canon(b[i] ?? ""));
+
+  if (sameIds(fresh, previousSkippers)) return false; // list didn't change; nothing to do
+  if (!sameIds(runtime.strategy.offenseTargetTokenIds, previousSkippers)) return false; // customised
+
+  runtime.saveStrategy({ offenseTargetTokenIds: fresh });
+  return true;
+}
+
+/**
  * Bump ONLY when the recommended defaults change (gas tuning, behaviour flags, or
  * the curated rival-target list in data/rival-targets.json).
  *
