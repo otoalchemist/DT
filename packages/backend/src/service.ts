@@ -126,6 +126,10 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   const pinnedSet = new Set(runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x).toString()));
   // Normalised the same way pins are, so "0084" and "84" both match (see excludedTokenSet).
   const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
+  // Big boys have their own panel section (readDoNotTarget), so listing them here too
+  // showed the same citizens twice — and "Others" reads as a shortlist of things to
+  // consider attacking, which is the opposite of what the roster means.
+  const dntSet = new Set(loadDoNotTarget().tokenIds.map((x) => BigInt(x).toString()));
 
   // The cached live set already contains EVERY live token (Alchemy owner index), so a
   // live pinned rival is included by definition — no separate pin liveness check needed.
@@ -174,6 +178,7 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   let ownedSkipped = 0;
   let emigratedSkipped = 0;
   let allySkipped = 0;
+  let dntSkipped = 0;
   for (const t of allStatuses) {
     if (isOurs(t)) {
       ownedSkipped++;
@@ -195,13 +200,23 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
       continue;
     }
     if (pinnedSet.has(t.tokenId)) {
+      // Pin checked BEFORE the roster: the do-not-target list is advice, and an explicit
+      // pin overrides it (the engine will audit a pinned big boy), so a pinned one still
+      // belongs under "My rivals" rather than being filtered away.
       pinned.push(t);
+    } else if (dntSet.has(t.tokenId)) {
+      dntSkipped++;
     } else if (t.delinquent || t.killable || t.auditDueTimestamp !== "0") {
       actionable.push(t);
     }
   }
   if (ownedSkipped > 0) {
     logger.debug(`readTargets: excluded ${ownedSkipped} token(s) we own from the rival list`);
+  }
+  if (dntSkipped > 0) {
+    logger.debug(
+      `readTargets: ${dntSkipped} do-not-target citizen(s) routed to their own section rather than Others`,
+    );
   }
   if (emigratedSkipped > 0) {
     logger.debug(`readTargets: excluded ${emigratedSkipped} emigrated citizen(s) from the rival list`);
