@@ -182,14 +182,35 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
   );
 }
 
-export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string | null; tipGwei: number }) {
+export function TargetScores({
+  currentEpoch,
+  tipGwei,
+  ownedCitizens,
+  auditCapacity,
+}: {
+  currentEpoch: string | null;
+  tipGwei: number;
+  /** Citizens this wallet set holds — the natural payment count for a boundary. */
+  ownedCitizens: number;
+  /** Sum of auditLimit across them — how many audits a boundary can actually carry. */
+  auditCapacity: number;
+}) {
   const [state, setState] = useState<TargetScoresState | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [onlyAuditableNext, setOnlyAuditableNext] = useState(true);
   // What the user plans to send this boundary. The bid buys position for the WHOLE
   // bundle, so both beat columns are priced against this rather than a fixed 1+1.
-  const [payments, setPayments] = useState(1);
-  const [audits, setAudits] = useState(1);
+  //
+  // null means "follow my wallet" — the defaults are the citizens held and their summed
+  // audit capacity, which is what a full boundary actually looks like. They can't be
+  // plain useState initial values: tokens load asynchronously, so at first render both
+  // would be 0 and stick there. Holding null until the user types keeps the numbers
+  // tracking the wallet (adding a wallet or a citizen updates them) without ever
+  // overwriting a figure someone entered deliberately.
+  const [paymentsEdit, setPaymentsEdit] = useState<number | null>(null);
+  const [auditsEdit, setAuditsEdit] = useState<number | null>(null);
+  const payments = paymentsEdit ?? ownedCitizens;
+  const audits = auditsEdit ?? auditCapacity;
   const pollRef = useRef<number | null>(null);
 
   const load = async () => {
@@ -293,7 +314,7 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
               <input
                 type="number" min={0} max={99} step={1} value={payments}
                 {...selectOnFocus}
-                onChange={(e) => setPayments(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
+                onChange={(e) => setPaymentsEdit(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
               />
             </label>
             <label className="field" style={{ marginBottom: 0, width: 92 }}>
@@ -301,7 +322,7 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
               <input
                 type="number" min={0} max={99} step={1} value={audits}
                 {...selectOnFocus}
-                onChange={(e) => setAudits(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
+                onChange={(e) => setAuditsEdit(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
               />
             </label>
             <span
@@ -310,6 +331,22 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
               title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus a fixed 60,000 for the CoinbasePayer transaction that carries the bid."
             >
               bundle {planGas.toLocaleString()} gas @ {tipGwei} gwei tip
+              {paymentsEdit === null && auditsEdit === null ? (
+                <> · from your wallet: {ownedCitizens} citizen{ownedCitizens === 1 ? "" : "s"},{" "}
+                  {auditCapacity} audit slot{auditCapacity === 1 ? "" : "s"}</>
+              ) : (
+                <>
+                  {" "}·{" "}
+                  <button
+                    type="button"
+                    onClick={() => { setPaymentsEdit(null); setAuditsEdit(null); }}
+                    style={{ padding: "1px 8px", fontSize: 11, borderRadius: 5, border: "1px solid #555" }}
+                    title={`Back to what this wallet set actually holds: ${ownedCitizens} citizen(s) and ${auditCapacity} audit slot(s).`}
+                  >
+                    reset to my wallet
+                  </button>
+                </>
+              )}
               <br />
               Beat2ep / BeatMax below are priced for this bundle — a bid buys position for
               all of it, so both scale with what you carry.

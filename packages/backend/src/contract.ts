@@ -207,13 +207,16 @@ export async function batchGetOwnedStatuses(
   prepayEpochs = 1,
 ): Promise<OwnedTokenStatus[]> {
   if (tokenIds.length === 0) return [];
-  const PER = 5; // lastEpochPaid, auditDueTimestamp, bribeBalance, hasLifeInsurance, estimateTaxesToPay
+  // auditLimit rides along in the same multicall — no extra round-trip — so the dashboard
+  // can total the audit capacity a wallet actually holds instead of assuming one each.
+  const PER = 6; // lastEpochPaid, auditDueTimestamp, bribeBalance, hasLifeInsurance, estimateTaxesToPay, auditLimit
   const contracts = tokenIds.flatMap((tokenId) => [
     { ...game, functionName: "lastEpochPaid" as const, args: [tokenId] as const },
     { ...game, functionName: "auditDueTimestamp" as const, args: [tokenId] as const },
     { ...game, functionName: "bribeBalance" as const, args: [tokenId] as const },
     { ...game, functionName: "hasLifeInsurance" as const, args: [tokenId] as const },
     { ...game, functionName: "estimateTaxesToPay" as const, args: [tokenId, prepayEpochs] as const },
+    { ...game, functionName: "auditLimit" as const, args: [tokenId] as const },
   ]);
 
   const results = await publicClient.multicall({ allowFailure: true, contracts });
@@ -222,9 +225,9 @@ export async function batchGetOwnedStatuses(
   for (let i = 0; i < tokenIds.length; i++) {
     const slice = results.slice(i * PER, i * PER + PER);
     if (slice.some((r) => !r || r.status === "failure")) continue;
-    const [lastEpochPaid, auditDue, bribeBalance, hasLifeInsurance, estimate] = slice.map(
+    const [lastEpochPaid, auditDue, bribeBalance, hasLifeInsurance, estimate, auditLimit] = slice.map(
       (r) => r!.result,
-    ) as [bigint, bigint, bigint, boolean, bigint];
+    ) as [bigint, bigint, bigint, boolean, bigint, bigint];
     const { risk, secondsUntilKillable } = classifyRisk(lastEpochPaid, currentEpoch, auditDue, nowSec);
     out.push({
       tokenId: tokenIds[i]!.toString(),
@@ -236,6 +239,7 @@ export async function batchGetOwnedStatuses(
       hasLifeInsurance,
       risk,
       estimatedPayWei: estimate.toString(),
+      auditLimit: Number(auditLimit),
     });
   }
   return out;

@@ -17,6 +17,13 @@ export interface OwnedTokenStatus {
   risk: TokenRisk;
   /** Estimated wei to pay to become current / clear an audit (1 epoch). */
   estimatedPayWei: string;
+  /**
+   * How many DISTINCT rivals this citizen may audit per epoch. Most are 1; auditor-role
+   * citizens carry more. Summed across owned citizens it is the wallet's audit capacity
+   * for a boundary, which is what sizes an offense bundle. Optional: absent from rows
+   * produced before it was fetched.
+   */
+  auditLimit?: number;
   /** Which unlocked wallet holds this citizen. Actions on it are owner-only on-chain, so
    *  this is the wallet that must sign — and the one that needs the gas. null if unknown
    *  (e.g. read while locked). */

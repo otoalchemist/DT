@@ -618,7 +618,15 @@ export function Dashboard({
         </div>
 
         <div className="spacer" />
-        <TargetScores currentEpoch={status?.currentEpoch ?? null} tipGwei={config?.offensePriorityFeeGwei ?? 20.1} />
+        <TargetScores
+          currentEpoch={status?.currentEpoch ?? null}
+          tipGwei={config?.offensePriorityFeeGwei ?? 20.1}
+          ownedCitizens={tokens.length}
+          // Sum of auditLimit, not tokens.length: auditor-role citizens carry more than
+          // one slot, so a wallet's real capacity is usually above its citizen count.
+          // Falls back to 1 per citizen for rows read before auditLimit was fetched.
+          auditCapacity={tokens.reduce((n, t) => n + (t.auditLimit ?? 1), 0)}
+        />
 
         <div className="spacer" />
         <PostMortem />
