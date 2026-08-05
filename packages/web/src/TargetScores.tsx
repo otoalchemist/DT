@@ -31,6 +31,28 @@ function beatFor(densityGwei: number | null | undefined, plan: Plan): number | n
   return bidToBeat(densityGwei, plan.tipGwei, plan.payments, plan.audits);
 }
 
+/**
+ * Make a small numeric field behave like one you can just retype: focus or click it and
+ * the value is selected, so the next keystroke replaces it instead of appending.
+ *
+ * onFocus alone only covers tab-focus — clicking places a caret on mouseup, which
+ * collapses that selection — so mouseup re-asserts it. Unconditionally, deliberately: a
+ * number input reports selectionStart/selectionEnd as null and throws on
+ * setSelectionRange, so a partial drag-selection cannot be detected and preserved. On a
+ * two-digit count that trade is free; on a longer field it would not be.
+ *
+ * onWheel blurs because a focused number input consumes wheel events and silently
+ * increments — on a scrollable dashboard that would re-price every row mid-scroll.
+ */
+const selectOnFocus = {
+  onFocus: (e: React.FocusEvent<HTMLInputElement>) => e.currentTarget.select(),
+  onMouseUp: (e: React.MouseEvent<HTMLInputElement>) => {
+    e.preventDefault();
+    e.currentTarget.select();
+  },
+  onWheel: (e: React.WheelEvent<HTMLInputElement>) => e.currentTarget.blur(),
+};
+
 function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: string; plan: Plan }) {
   if (rows.length === 0) return <p className="muted" style={{ fontSize: 12 }}>{empty}</p>;
   const cell: React.CSSProperties = { padding: "5px 10px", fontSize: 12, whiteSpace: "nowrap" };
@@ -265,6 +287,7 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
               Payments
               <input
                 type="number" min={0} max={99} step={1} value={payments}
+                {...selectOnFocus}
                 onChange={(e) => setPayments(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
               />
             </label>
@@ -272,6 +295,7 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
               Audits
               <input
                 type="number" min={0} max={99} step={1} value={audits}
+                {...selectOnFocus}
                 onChange={(e) => setAudits(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
               />
             </label>
