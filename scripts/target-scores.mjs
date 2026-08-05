@@ -548,10 +548,14 @@ async function main() {
   // target sections entirely — they are not candidates, so ranking them among candidates
   // only invites a misread. Evidence-flagged rows STAY in place (greyed by a 0 score):
   // that flag is a judgement the data might revise, not a standing instruction.
-  // Deliberately built from `rows`, not `pool`: this section is a reference roster, so
-  // --auditable-next must not hide the big boys that happen not to be delinquent today.
-  const listed = rows.filter((r) => r.dntOwner !== null)
+  // Follows the same --auditable-next filter as the sections above. It was built from
+  // `rows` on the reasoning that the roster is reference material, but that listed paid-up
+  // big boys beside delinquent ones under a filter claiming to show only what is
+  // auditable. The header reports the hidden count instead.
+  const listedAll = rows.filter((r) => r.dntOwner !== null)
     .sort((a, b) => a.dntOwner.localeCompare(b.dntOwner) || Number(a.token) - Number(b.token));
+  const listedSet = new Set(pool);
+  const listed = listedAll.filter((r) => listedSet.has(r));
   const targetable = pool.filter((r) => r.dntOwner === null);
   const skippers = targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
   const others = targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
@@ -564,12 +568,16 @@ async function main() {
   console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list, ${scope} ===`);
   console.log(header); others.forEach((r) => console.log(fmt(r)));
 
-  // DO NOT TARGET — the curated big-boy roster, always shown in full. Their live state
+  // DO NOT TARGET — the curated big-boy roster. Their live state
   // still matters (a big boy drifting delinquent is worth knowing about), they are just
   // never offered as candidates. Pinning one by hand in the Strategy targets box still
   // audits it: the roster keeps them out of auto-discovery, it does not veto the user.
   if (listed.length > 0) {
-    console.log(`\n=== DO NOT TARGET (${listed.length}) — big boys, excluded from the sections above ===`);
+    const hidden = listedAll.length - listed.length;
+    console.log(
+      `\n=== DO NOT TARGET (${listed.length}${hidden > 0 ? ` of ${listedAll.length}` : ""})` +
+        ` — big boys, excluded from the sections above ===`,
+    );
     console.log("operator     " + header);
     for (const r of listed) console.log(`${r.dntOwner.padEnd(12)} ` + fmt(r));
   }

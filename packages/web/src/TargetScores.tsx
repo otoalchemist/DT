@@ -228,10 +228,15 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
   // built from the FULL row set, not the auditable-next pool, because it's a reference
   // roster: a big boy that isn't delinquent today should still be listed.
   const targetable = pool ? pool.filter((r) => !r.dntOwner) : null;
-  const listed = rows
+  // Follows the same auditable-next filter as the two sections above. It used to be built
+  // from the full row set on the reasoning that the roster is reference material, but that
+  // put paid-up big boys beside delinquent ones under a filter that claims to show only
+  // what is auditable. The header reports how many are hidden instead.
+  const listedAll = rows
     ? rows.filter((r) => !!r.dntOwner)
         .sort((a, b) => a.dntOwner!.localeCompare(b.dntOwner!) || Number(a.token) - Number(b.token))
     : [];
+  const listed = pool ? listedAll.filter((r) => pool.includes(r)) : listedAll;
   const skippers = targetable ? targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score) : [];
   const others = targetable ? targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score) : [];
   // Reachable, not "score > 0": a 0.00 can now mean catchable-but-not-weak (rich, defends
@@ -328,9 +333,11 @@ export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string |
               <div
                 className="muted"
                 style={{ fontSize: 11, marginBottom: 4 }}
-                title="Curated in data/do-not-target.json. Kept out of auto-discovery because these operators cure at the top of the boundary block, so an audit slot spent here is normally wasted. Shown in full regardless of the filter above, since a big boy drifting delinquent is worth seeing."
+                title="Curated in data/do-not-target.json. Kept out of auto-discovery because these operators cure at the top of the boundary block, so an audit slot spent here is normally wasted. Follows the same auditable filter as the lists above; the count shows how much of the roster is hidden by it."
               >
-                DO NOT TARGET ({listed.length}) · big boys — excluded from the lists above
+                DO NOT TARGET ({listed.length}
+                {listed.length !== listedAll.length ? ` of ${listedAll.length}` : ""}) · big boys
+                — excluded from the lists above
               </div>
               <ScoreTable rows={listed} empty="None listed." plan={plan} />
             </>
