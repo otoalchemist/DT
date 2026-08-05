@@ -478,6 +478,39 @@ export function clearAwayTimers(): void {
   runtime.emitStatus();
 }
 
+/**
+ * Report a pre-boundary race we never got to arm.
+ *
+ * Every pre-boundary scheduler bails with `deltaMs <= 0` when it runs inside (or past)
+ * the lead window, and it used to do so silently — so an engine that started a few
+ * seconds too late, or a machine that suspended across the boundary, simply produced no
+ * race and no explanation. That is the single hardest failure to diagnose from the
+ * activity log, because nothing appears in it at all.
+ *
+ * Only warns when we never ARMED a timer for that boundary. These schedulers re-run on
+ * every tick, so the last few seconds before a boundary legitimately hit the same branch
+ * after the race had already fired — warning on that would cry wolf every 12s and after
+ * every successful race.
+ */
+const armedRaceFor = new Map<string, bigint>();
+function noteRaceArmed(kind: string, targetEpoch: bigint): void {
+  armedRaceFor.set(kind, targetEpoch);
+}
+function warnRaceMissed(kind: string, targetEpoch: bigint, boundarySec: bigint): void {
+  if (armedRaceFor.get(kind) === targetEpoch) return; // armed in time; this call is just a later tick
+  armedRaceFor.set(kind, targetEpoch); // report once per boundary, not once per tick
+  const lateSec = Number(BigInt(Math.floor(Date.now() / 1000)) - boundarySec);
+  const where = lateSec >= 0
+    ? `the boundary passed ${lateSec}s ago`
+    : `only ${-lateSec}s of the ${(effectiveLeadMs() / 1000).toFixed(1)}s lead remained`;
+  const msg =
+    `Missed the epoch ${targetEpoch} pre-boundary ${kind} race — ${where} when the engine ` +
+    `armed, so nothing was pre-submitted. Usually means the engine started late or the ` +
+    `machine was asleep through the window.`;
+  logger.warn(msg);
+  activity.add({ kind: "info", status: "info", message: msg });
+}
+
 /** Fire an extra tick precisely at the armed epoch's boundary (near-instant JIT pay). */
 export function scheduleJitBoundary(): void {
   if (boundaryTimer) {
@@ -519,7 +552,13 @@ export function schedulePreBoundaryPay(): void {
   const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
-  if (deltaMs <= 0) return; // too late to pre-submit; the +500ms JIT tick covers it
+  if (deltaMs <= 0) {
+    // The +500ms JIT tick still pays, just a block later instead of racing into the
+    // boundary block — worth saying so rather than leaving the log empty.
+    warnRaceMissed("payment", BigInt(s.jitTargetEpoch ?? 0), boundary);
+    return;
+  }
+  noteRaceArmed("payment", BigInt(s.jitTargetEpoch ?? 0));
   preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(), Math.min(deltaMs, 2_000_000_000));
 }
 
@@ -877,7 +916,14 @@ export function schedulePreBoundaryAudit(): void {
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
-  if (deltaMs <= 0) return; // too late; normal offense picks it up after the roll
+  const auditTarget = (runtime.currentEpoch ?? 0n) + 1n;
+  if (deltaMs <= 0) {
+    // Normal offense still audits after the roll, but a block or more later — usually
+    // too late to beat a rival's cure, which is the whole point of the race.
+    warnRaceMissed("audit", auditTarget, boundary);
+    return;
+  }
+  noteRaceArmed("audit", auditTarget);
   preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
 }
 
@@ -1126,7 +1172,9 @@ export function schedulePreBoundaryBundle(): void {
   const boundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS; // starts current+1
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
-  if (deltaMs <= 0) return;
+  const targetEpoch = runtime.currentEpoch + 1n;
+  if (deltaMs <= 0) { warnRaceMissed("bundle", targetEpoch, boundary); return; }
+  noteRaceArmed("bundle", targetEpoch);
   preBoundaryBundleTimer = setTimeout(() => void firePreBoundaryBundle(), Math.min(deltaMs, 2_000_000_000));
 }
 

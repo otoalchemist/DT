@@ -198,19 +198,31 @@ export function Dashboard({
         const s = await api.refreshChain().catch(() => null);
         if (s) pushStatus(s);
       }
+      // A failed read must NOT blank the panel. These used to catch to [], which was then
+      // written to state — so one dropped request (a laptop suspending, a brief RPC
+      // hiccup) replaced the citizen and rival lists with "none". In away mode there is
+      // no 20s poll behind it to repair that, so it stayed empty until Refresh data was
+      // pressed, which reads as "the bot lost my citizens". Keep the last good rows and
+      // report the failure instead.
+      const keep = <T,>(p: Promise<T>): Promise<T | null> => p.then((v) => v, () => null);
       const [t, g, e, a, dnt] = await Promise.all([
-        api.tokens().catch(() => []),
-        api.targets().catch(() => []),
-        api.emigrated().catch(() => []),
-        api.allies().catch(() => []),
-        api.doNotTarget().catch(() => []),
+        keep(api.tokens()),
+        keep(api.targets()),
+        keep(api.emigrated()),
+        keep(api.allies()),
+        keep(api.doNotTarget()),
       ]);
-      setTokens(t);
-      setTargets(g);
-      setEmigrated(e);
-      setAllies(a);
-      setDoNotTarget(dnt);
-      setErr(null);
+      if (t) setTokens(t);
+      if (g) setTargets(g);
+      if (e) setEmigrated(e);
+      if (a) setAllies(a);
+      if (dnt) setDoNotTarget(dnt);
+      const failed = [t, g, e, a, dnt].filter((v) => v === null).length;
+      setErr(
+        failed === 0
+          ? null
+          : `${failed} of 5 reads failed — showing the last good data. Press "Refresh data" to retry.`,
+      );
     } catch (e) {
       setErr((e as Error).message);
     }

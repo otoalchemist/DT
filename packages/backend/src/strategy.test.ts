@@ -145,7 +145,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -1626,5 +1626,101 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
     runtime.strategy = { ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: "" };
     await firePreBoundaryAudit();
     for (const o of auditOpts()) expect(o.revertible).toBe(false);
+  });
+});
+
+// A missed pre-boundary race used to produce NOTHING in the log — the scheduler bailed on
+// `deltaMs <= 0` in silence, so an engine that started seconds too late, or a laptop that
+// slept through the window, looked identical to a boundary where there was simply nothing
+// to do. That is the hardest failure to diagnose from an activity log.
+//
+// The warning has to be precise in both directions: silent when the race was armed in
+// time (these schedulers re-run every tick, and the last seconds before a boundary hit the
+// same branch AFTER the race has already fired), and exactly once when it truly was not.
+describe("pre-boundary race: a missed window is reported, once", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const PAYER = "0x00000000000000000000000000000000000000b1";
+  const EPOCH = 86_400n;
+  const boundaryOf = (epoch: bigint) => epoch * EPOCH; // startTime 0; epoch E starts at E*EPOCH
+  const at = (sec: bigint) => vi.setSystemTime(Number(sec) * 1000);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    useWallet({ address: ADDR }, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.startTime = 0n;
+    runtime.citizenSupply = 500n;
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true, preBoundaryPay: true,
+      combinedBoundaryBundle: true, coinbaseBidEth: 0.02, coinbasePayerAddress: PAYER,
+      endgameOnlyWithin: null,
+    };
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    runtime.setWallets([]);
+    runtime.running = false;
+  });
+
+  const missedWarnings = () =>
+    vi.mocked(activity.add).mock.calls
+      .map(([e]) => (e as { message?: string }).message ?? "")
+      .filter((m) => m.includes("Missed the epoch"));
+
+  it("says nothing when the race is armed with time to spare", () => {
+    runtime.currentEpoch = 300n;
+    at(boundaryOf(300n) - 60n); // a minute of lead left
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()).toHaveLength(0);
+  });
+
+  it("stays silent on later ticks inside the lead window, once armed", () => {
+    runtime.currentEpoch = 301n;
+    at(boundaryOf(301n) - 60n);
+    schedulePreBoundaryBundle(); // armed in time
+
+    // Ticks keep running as the boundary approaches and re-enter the same branch. The
+    // race is already scheduled (or has fired), so warning here would cry wolf every 12s.
+    at(boundaryOf(301n) - 1n);
+    schedulePreBoundaryBundle();
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()).toHaveLength(0);
+  });
+
+  it("reports a genuinely missed window exactly once, however many ticks follow", () => {
+    // Engine comes up INSIDE the lead window — the case a sleeping laptop produces.
+    runtime.currentEpoch = 302n;
+    at(boundaryOf(302n) - 1n);
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()).toHaveLength(1);
+    expect(missedWarnings()[0]).toMatch(/epoch 303 pre-boundary bundle race/);
+
+    // Every subsequent tick in the same window must stay quiet.
+    schedulePreBoundaryBundle();
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()).toHaveLength(1);
+  });
+
+  it("says the boundary already passed when it has, not just that lead ran out", () => {
+    runtime.currentEpoch = 304n;
+    at(boundaryOf(304n) + 30n); // half a minute past it
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()[0]).toMatch(/boundary passed 30s ago/);
+  });
+
+  it("warns again for a NEW boundary — it is per-epoch, not once per process", () => {
+    runtime.currentEpoch = 305n;
+    at(boundaryOf(305n) - 1n);
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()).toHaveLength(1);
+
+    runtime.currentEpoch = 306n;
+    at(boundaryOf(306n) - 1n);
+    schedulePreBoundaryBundle();
+    expect(missedWarnings()).toHaveLength(2);
   });
 });
