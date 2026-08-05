@@ -606,7 +606,7 @@ export function Dashboard({
         </div>
 
         <div className="spacer" />
-        <TargetScores currentEpoch={status?.currentEpoch ?? null} />
+        <TargetScores currentEpoch={status?.currentEpoch ?? null} tipGwei={config?.offensePriorityFeeGwei ?? 20.1} />
 
         <div className="spacer" />
         <PostMortem />

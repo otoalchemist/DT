@@ -66,3 +66,40 @@ export const GameState = {
   ENDED: 2,
 } as const;
 export type GameStateValue = (typeof GameState)[keyof typeof GameState];
+
+/**
+ * Measured gas per game action, from real on-chain transactions over a 10-epoch window.
+ * Used to price what a coinbase bid must cover: a bid buys position for the WHOLE bundle,
+ * so the cost of out-ranking a rival scales linearly with how much gas you are carrying.
+ *
+ * Keep in sync with scripts/target-scores.mjs, which duplicates these — that script is
+ * deliberately dependency-free (it runs standalone against an RPC) so it cannot import
+ * from this package.
+ */
+export const GAS_PER_PAYMENT = 82_875;
+export const GAS_PER_AUDIT = 130_409;
+/** The CoinbasePayer forwarder tx that carries the bid. Fixed overhead per bundle. */
+export const GAS_COINBASE_BID_TX = 60_000;
+
+/**
+ * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.
+ *
+ * Builders order by value per gas, so the bar is the rival's DENSITY — (their bid + their
+ * priority tips) / their gas — and what we bring to clear it is our own tip plus the bid
+ * spread across our bundle. Returns 0 when our tip already out-ranks them.
+ */
+export function bidToBeat(
+  defenseGwei: number,
+  ourTipGwei: number,
+  payments: number,
+  audits: number,
+): number {
+  const gas = payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
+  if (defenseGwei <= ourTipGwei) return 0;
+  return ((defenseGwei - ourTipGwei) * gas) / 1e9;
+}
+
+/** Total gas of a bundle carrying `payments` payments, `audits` audits and the bid tx. */
+export function bundleGas(payments: number, audits: number): number {
+  return payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
+}

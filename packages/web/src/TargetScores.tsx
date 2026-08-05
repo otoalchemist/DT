@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { TargetScoreRow, TargetScoresState } from "@dat-bot/shared";
+import { bidToBeat, bundleGas, type TargetScoreRow, type TargetScoresState } from "@dat-bot/shared";
 import { api } from "./api.js";
 
 /**
@@ -14,7 +14,24 @@ import { api } from "./api.js";
  */
 const dnt = (r: TargetScoreRow): boolean => r.doNotTarget ?? r.uncatchable ?? false;
 
-function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) {
+/** The bundle the user plans to send, and the tip they'll send it with. */
+interface Plan { payments: number; audits: number; tipGwei: number }
+
+/**
+ * Price a beat-bid for THIS plan from the rival's raw defense density.
+ *
+ * A bid buys position for the whole bundle, so the cost scales with the gas you carry —
+ * out-ranking a rival at 128 gwei/gas costs ~0.03 ETH on a 1-pay/1-audit bundle and
+ * ~0.24 on a 9-pay/11-audit one. The stored beatBid* fields are the server's answer for
+ * a fixed 1+1 bundle, so they can't be reused once the plan changes: recompute from
+ * density, and show "·" when a cached row predates density being exposed.
+ */
+function beatFor(densityGwei: number | null | undefined, plan: Plan): number | null {
+  if (densityGwei === null || densityGwei === undefined) return null;
+  return bidToBeat(densityGwei, plan.tipGwei, plan.payments, plan.audits);
+}
+
+function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: string; plan: Plan }) {
   if (rows.length === 0) return <p className="muted" style={{ fontSize: 12 }}>{empty}</p>;
   const cell: React.CSSProperties = { padding: "5px 10px", fontSize: 12, whiteSpace: "nowrap" };
   return (
@@ -31,8 +48,8 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments) — the 'are they bidding right now' signal, deliberately narrower than the window BeatBid is priced against. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
-            <th style={cell} title="Coinbase bid (ETH) to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to BeatMax: equal means a steady defender and this number is reliable; a gap means it escalates. — = nothing needed, our 20.1 gwei tip already out-ranks it. · = it made no payment in the last 2 epochs.">Beat2ep</th>
-            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for a 1-payment + 1-audit bundle at our 20.1 gwei tip. Peak, not recent: what you must clear is the strongest defense it has actually mounted. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A ceiling, not a forecast — off-chain builder deals stay invisible. — = peak defense already at or below our tip.">BeatMax</th>
+            <th style={cell} title="Coinbase bid (ETH) to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to BeatMax: equal means a steady defender and this number is reliable; a gap means it escalates. — = nothing needed, your tip already out-ranks it. · = it made no payment in the last 2 epochs. Priced for the bundle set above.">Beat2ep</th>
+            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for the bundle you set above, at your configured offense tip. Peak, not recent: what you must clear is the strongest defense it has actually mounted. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A ceiling, not a forecast — off-chain builder deals stay invisible. — = peak defense already at or below your tip. Both columns scale with bundle gas: a bid buys position for everything you carry, so adding uncontested payments raises what the contested audits cost.">BeatMax</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
@@ -90,32 +107,45 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
                 {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
               </td>
               <td style={cell}>
-                {r.beatBidRecentEth === undefined || r.beatBidRecentEth === null ? (
-                  <span className="muted" title="No payment observed in the last 2 epochs — nothing recent to price against.">·</span>
-                ) : r.beatBidRecentEth > 0 ? (
-                  <span title={r.defenseRecentGwei ? `defended at ~${r.defenseRecentGwei} gwei/gas in the last 2 epochs` : undefined}>
-                    {r.beatBidRecentEth.toFixed(4)}
-                  </span>
-                ) : (
-                  <span className="muted" title={`Defended at ~${r.defenseRecentGwei} gwei/gas lately — our 20.1 gwei tip already out-ranks that.`}>—</span>
-                )}
+                {(() => {
+                  const bid = beatFor(r.defenseRecentGwei, plan);
+                  if (bid === null) {
+                    return <span className="muted" title="No payment observed in the last 2 epochs — nothing recent to price against.">·</span>;
+                  }
+                  if (bid > 0) {
+                    return (
+                      <span title={`Defended at ~${r.defenseRecentGwei} gwei/gas in the last 2 epochs. Priced for ${plan.payments} payment(s) + ${plan.audits} audit(s) at a ${plan.tipGwei} gwei tip.`}>
+                        {bid.toFixed(4)}
+                      </span>
+                    );
+                  }
+                  return <span className="muted" title={`Defended at ~${r.defenseRecentGwei} gwei/gas lately — your ${plan.tipGwei} gwei tip already out-ranks that.`}>—</span>;
+                })()}
               </td>
-              <td style={cell} title={r.beatBidEth ? "Set coinbaseBidEth to at least this to out-rank the strongest defense it has mounted" : undefined}>
-                {r.beatBidEth ? (
-                  <span title={r.defenseGwei ? `defends at ~${r.defenseGwei} gwei/gas` : undefined}>
-                    {r.beatBidEth.toFixed(4)}
-                  </span>
-                ) : r.beatBidEth === undefined ? (
-                  // Cached from a scan before this column existed — unknown, not zero.
-                  <span className="muted" title="Re-run Analyze targets to price this">·</span>
-                ) : r.defenseUnexplained ? (
-                  <span
-                    style={{ color: "var(--amber)" }}
-                    title={`Measures only ~${r.defenseGwei} gwei/gas, below our own tip — yet it reaches tx index ${r.bestIdx}. Something is buying that position where we cannot see it: a bid older than the 2-epoch trace window, or an off-chain builder deal. Treat "no bid needed" as unproven.`}
-                  >?</span>
-                ) : (
-                  <span className="muted" title={`Defends at ~${r.defenseGwei} gwei/gas — our 20.1 gwei tip already out-ranks that, so no bid is needed.`}>—</span>
-                )}
+              <td style={cell}>
+                {(() => {
+                  const bid = beatFor(r.defenseGwei, plan);
+                  if (bid === null) {
+                    // Cached from a scan before density was exposed. The stored figure is
+                    // for a 1+1 bundle, so reusing it under a different plan would lie.
+                    return <span className="muted" title="Re-run Analyze targets to price this for your bundle">·</span>;
+                  }
+                  if (bid > 0) {
+                    return (
+                      <span title={`Defends at ~${r.defenseGwei} gwei/gas at its peak. Set coinbaseBidEth to at least this to out-rank it with ${plan.payments} payment(s) + ${plan.audits} audit(s) at a ${plan.tipGwei} gwei tip.`}>
+                        {bid.toFixed(4)}
+                      </span>
+                    );
+                  }
+                  return r.defenseUnexplained ? (
+                    <span
+                      style={{ color: "var(--amber)" }}
+                      title={`Measures only ~${r.defenseGwei} gwei/gas, below your tip — yet it reaches tx index ${r.bestIdx}. Something is buying that position where we cannot see it: a bid older than the 2-epoch trace window, or an off-chain builder deal. Treat "no bid needed" as unproven.`}
+                    >?</span>
+                  ) : (
+                    <span className="muted" title={`Defends at ~${r.defenseGwei} gwei/gas — your ${plan.tipGwei} gwei tip already out-ranks that, so no bid is needed.`}>—</span>
+                  );
+                })()}
               </td>
               <td style={cell}>{r.bribes || ""}</td>
               <td style={cell}>{r.audited || ""}</td>
@@ -130,10 +160,14 @@ function ScoreTable({ rows, empty }: { rows: TargetScoreRow[]; empty: string }) 
   );
 }
 
-export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) {
+export function TargetScores({ currentEpoch, tipGwei }: { currentEpoch: string | null; tipGwei: number }) {
   const [state, setState] = useState<TargetScoresState | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [onlyAuditableNext, setOnlyAuditableNext] = useState(true);
+  // What the user plans to send this boundary. The bid buys position for the WHOLE
+  // bundle, so both beat columns are priced against this rather than a fixed 1+1.
+  const [payments, setPayments] = useState(1);
+  const [audits, setAudits] = useState(1);
   const pollRef = useRef<number | null>(null);
 
   const load = async () => {
@@ -160,6 +194,8 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
     catch (e) { setErr((e as Error).message); }
   };
 
+  const plan = { payments, audits, tipGwei };
+  const planGas = bundleGas(payments, audits);
   const running = state?.running ?? false;
   const rows = state?.rows ?? null;
   const pool = rows
@@ -221,16 +257,46 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
             Only those auditable at the next boundary
           </label>
 
+          <div
+            className="row wrap"
+            style={{ gap: 10, alignItems: "flex-end", marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid var(--border)" }}
+          >
+            <label className="field" style={{ marginBottom: 0, width: 92 }}>
+              Payments
+              <input
+                type="number" min={0} max={99} step={1} value={payments}
+                onChange={(e) => setPayments(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
+              />
+            </label>
+            <label className="field" style={{ marginBottom: 0, width: 92 }}>
+              Audits
+              <input
+                type="number" min={0} max={99} step={1} value={audits}
+                onChange={(e) => setAudits(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
+              />
+            </label>
+            <span
+              className="muted"
+              style={{ fontSize: 11, lineHeight: 1.5 }}
+              title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus a fixed 60,000 for the CoinbasePayer transaction that carries the bid."
+            >
+              bundle {planGas.toLocaleString()} gas @ {tipGwei} gwei tip
+              <br />
+              Beat2ep / BeatMax below are priced for this bundle — a bid buys position for
+              all of it, so both scale with what you carry.
+            </span>
+          </div>
+
           <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
             RIVAL SKIPPERS ({skippers.length})
           </div>
-          <ScoreTable rows={skippers} empty="No skippers match." />
+          <ScoreTable rows={skippers} empty="No skippers match." plan={plan} />
 
           <div className="spacer" />
           <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
             NON-SKIPPERS ({others.length})
           </div>
-          <ScoreTable rows={others} empty="No non-skippers match." />
+          <ScoreTable rows={others} empty="No non-skippers match." plan={plan} />
 
           {listed.length > 0 && (
             <>
@@ -242,7 +308,7 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
               >
                 DO NOT TARGET ({listed.length}) · big boys — excluded from the lists above
               </div>
-              <ScoreTable rows={listed} empty="None listed." />
+              <ScoreTable rows={listed} empty="None listed." plan={plan} />
             </>
           )}
 
@@ -273,7 +339,7 @@ export function TargetScores({ currentEpoch }: { currentEpoch: string | null }) 
 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>
             Beat2ep / BeatMax = bid needed to out-rank its defense recently vs at its peak
-            (a gap means it escalates) · Beh 1 = auditable next boundary · Skip = skips survived / skips that drew an audit,
+            (a gap means it escalates), priced for the payments/audits you set above · Beh 1 = auditable next boundary · Skip = skips survived / skips that drew an audit,
             out of attempted (a skip = a boundary entered 2+ behind) ·
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
