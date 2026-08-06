@@ -149,6 +149,57 @@ download time via `git archive` `export-subst`), so even the unversioned
 `DT-master.zip` from the green button is identifiable — it reads e.g.
 `v0.5.0-3-g<sha>`.
 
+#### Self-update — the bot updates its own code at launch
+
+The launchers (`start.bat` / `start.command`) check `master` for a newer version
+**before the app boots** and install it if there is one. Downloading a new ZIP and
+hand-copying your `data/` folder across is no longer part of running the bot.
+
+It runs *before* startup on purpose: a Node process can't safely replace the code it
+is currently executing, so the app only ever starts on one coherent tree.
+
+**What it never touches:** `data/` (your encrypted keystore, API key, `config.json`,
+activity log) and `.env`. Those are yours; an update replaces only the shipped code.
+
+Also, it:
+
+- **Skips a git checkout entirely** — there `git pull` is the update path and
+  overwriting the working tree would destroy uncommitted work. `BOT_AUTO_UPDATE=force`
+  opts in if you're testing the updater itself.
+- **Refuses a tree that isn't this project.** A truncated download or an HTML error
+  page is rejected rather than written over a working install: the archive must
+  contain the expected files and identify as `death-and-taxes-bot`.
+- **Never installs an older version.** Only a strictly newer one is applied, so a
+  local build ahead of `master` is left alone.
+- **Backs up every file it replaces** to `.update-backup/`, so a bad update is
+  recoverable by hand.
+- **Reinstalls dependencies only when the lockfile actually changed**, so an ordinary
+  code update stays a couple of seconds rather than minutes.
+- **Never blocks startup.** Offline, GitHub down, a 20s timeout — it says so and
+  starts the version you already have.
+- **Won't rewrite the launcher underneath itself.** `cmd.exe` and `bash` both read a
+  script incrementally as they run it, so overwriting `start.bat`/`start.command`
+  mid-launch makes the shell resume at a stale byte offset and skip the rest silently
+  (Windows also refuses the atomic rename that would avoid this). A launcher change is
+  therefore *staged* and applied by the next `npm run update`, which the log tells you
+  to run. Launcher edits are rare — they're a few lines of glue around these scripts.
+
+Works the same on Windows and macOS: the archive keeps CRLF for `start.bat` and LF plus
+the executable bit for `start.command`, both verified after a real update.
+
+Check or run it by hand:
+
+```bash
+npm run update:check   # report only; exit code 10 means an update is available
+npm run update         # apply it
+```
+
+Set `BOT_AUTO_UPDATE=off` in `.env` to disable it.
+
+> One bootstrap caveat: a build from **before** this feature existed has no updater to
+> run, so it can't self-update. Those installs need one final manual download — after
+> which every future update is automatic.
+
 #### Auto-updating default lists — no re-download needed
 
 The four curated list files are the bot's shared game intelligence, and they change
