@@ -9,16 +9,63 @@ import { ownershipIndexingAvailable } from "./index-tokens.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
+/**
+ * Parsed-list cache, keyed by file and invalidated on mtime+size.
+ *
+ * These four files are read on the HOT PATH: fetchOffenseCandidates reads the ally and
+ * do-not-target lists on every offense sweep (once per block with a WebSocket), and
+ * readTargets reads them again on every dashboard poll — each read a synchronous
+ * readFileSync + JSON.parse (measured at 0.19 ms for the pair). They only change when the
+ * startup sync rewrites them or the user edits one by hand.
+ *
+ * Keyed on mtimeMs + size rather than a TTL so a hand edit or a list-sync write is picked
+ * up on the very next read, with no staleness window — the whole point of the files being
+ * user-editable. `statSync` is ~an order of magnitude cheaper than reading and parsing.
+ *
+ * Deliberately NOT keyed on content hash: hashing means reading the file, which is the
+ * cost being avoided.
+ */
+const fileCache = new Map<string, { key: string; value: unknown }>();
+
+/**
+ * Read and parse a JSON file, reusing the last parse while the file is unchanged.
+ * Returns null when the file is absent or unreadable, so callers keep their existing
+ * "missing means empty" behaviour.
+ *
+ * The cached value is returned BY REFERENCE, so callers must not mutate it. Every caller
+ * below derives a new array/Set from it, which is why this is safe.
+ */
+function readJsonCached(fileName: string): unknown | null {
+  const p = path.join(appConfig.dataDir, fileName);
+  let key: string;
+  try {
+    const st = fs.statSync(p);
+    key = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    // Absent (or unreadable) — drop any cached parse so a later re-appearance is seen.
+    fileCache.delete(fileName);
+    return null;
+  }
+  const hit = fileCache.get(fileName);
+  if (hit && hit.key === key) return hit.value;
+  const value = JSON.parse(fs.readFileSync(p, "utf8"));
+  fileCache.set(fileName, { key, value });
+  return value;
+}
+
+/** Drop every cached list parse. For tests, which rewrite data files within the same
+ *  millisecond — fine in production (mtime+size moves) but not at test speed. */
+export function invalidateListCache(): void {
+  fileCache.clear();
+}
+
 // Curated rival token IDs ship in git (data/rival-targets.json, unlike the
 // gitignored data/config.json) so a fresh clone has offense targets without
 // needing to `cp data/config.example.json data/config.json` first.
 function loadRivalIdFile(fileName: string, label: string): string[] {
   try {
-    const p = path.join(appConfig.dataDir, fileName);
-    if (fs.existsSync(p)) {
-      const ids = JSON.parse(fs.readFileSync(p, "utf8"));
-      if (Array.isArray(ids)) return ids.map(String);
-    }
+    const ids = readJsonCached(fileName);
+    if (Array.isArray(ids)) return ids.map(String);
   } catch (err) {
     logger.warn(`Could not load ${label}:`, (err as Error).message);
   }
@@ -66,8 +113,14 @@ export function loadAllyTokens(): string[] {
  */
 export function loadDoNotTarget(): { tokenIds: string[]; owners: Record<string, string[]> } {
   try {
-    const file = path.join(appConfig.dataDir, "do-not-target.json");
-    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { owners?: Record<string, unknown> };
+    const raw = readJsonCached("do-not-target.json") as { owners?: Record<string, unknown> } | null;
+    if (!raw) return { tokenIds: [], owners: {} };
+    // Memoize the DERIVED shape against the same parsed object, not just the parse: the
+    // normalize + dedupe below runs on every offense sweep and every dashboard poll, and
+    // its input only changes when the file does. Identity holds because readJsonCached
+    // returns the cached parse by reference.
+    const memo = dntMemo;
+    if (memo && memo.src === raw) return memo.out;
     const owners: Record<string, string[]> = {};
     for (const [name, ids] of Object.entries(raw.owners ?? {})) {
       if (!Array.isArray(ids)) continue;
@@ -75,11 +128,19 @@ export function loadDoNotTarget(): { tokenIds: string[]; owners: Record<string, 
     }
     // De-duplicated across owners: a token listed twice must not be counted twice.
     const tokenIds = [...new Set(Object.values(owners).flat())];
-    return { tokenIds, owners };
+    const out = { tokenIds, owners };
+    dntMemo = { src: raw, out };
+    return out;
   } catch {
     return { tokenIds: [], owners: {} };
   }
 }
+
+/** Memo for loadDoNotTarget's derived output, tied to the identity of the parsed file. */
+let dntMemo: {
+  src: object;
+  out: { tokenIds: string[]; owners: Record<string, string[]> };
+} | null = null;
 
 /** Flat lookup of tokenId -> operator name, for tagging rows in the UI. */
 export function doNotTargetOwnerOf(): Record<string, string> {

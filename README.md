@@ -299,6 +299,36 @@ cp data/config.example.json data/config.json
 
 ---
 
+## Away mode — cut provider usage to near zero
+
+Every automatic action the bot takes fires **at an epoch boundary** (proactive pay, JIT,
+pre-boundary audit/kill). But a running engine reacts to *every block*, which costs
+roughly **22 provider requests per minute** around the clock — for work that happens
+once a day.
+
+**Away mode keeps the engine stopped and wakes it just before each boundary**, then
+stops it again once the boundary work has settled (5 minutes of grace). Toggle it in the
+dashboard's top bar; it applies instantly, like **Start bot**.
+
+Idling costs **zero requests**. Boundaries are `startTime + N × EPOCH_DURATION`, so the
+next one is arithmetic on the wall clock — there is nothing to poll. The dashboard also
+stops its own 20s poll while away mode is on, so an open tab costs nothing either.
+
+`awayLeadMinutes` (default **15**) sets how early to wake. The engine needs to be up
+before the pre-boundary race arms, so leave headroom rather than trimming this to
+seconds.
+
+It only wakes when there is something to wake **for** — proactive pay on, a JIT arm, or
+offense enabled. With everything off, no wake is scheduled and the dashboard says so
+rather than counting down to a no-op.
+
+**The trade-off:** while the engine is stopped the bot is not watching. Nothing reacts to
+a mid-epoch event — an ally in trouble, a rival suddenly becoming killable — until the
+next wake. Away mode suits defending your own citizens on a schedule; leave it off if you
+want the bot opportunistically hunting between boundaries.
+
+---
+
 ## Safety model
 
 - **You are the sole custodian.** The key never leaves your machine and is only

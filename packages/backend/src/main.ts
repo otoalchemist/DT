@@ -6,6 +6,7 @@ import { buildServer } from "./api.js";
 import { getChainId } from "./chain.js";
 import { prewarmTargets } from "./service.js";
 import { syncDefaultLists } from "./list-sync.js";
+import { activity } from "./activity.js";
 
 async function main(): Promise<void> {
   logger.info(`DeathAndTaxes bot v${VERSION} starting in ${appConfig.mode} mode`);
@@ -52,6 +53,9 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     logger.info("Shutting down...");
     await app.close();
+    // The periodic flush is async now, so a pending write may not have had a turn before
+    // exit — persist synchronously here or the last few seconds of activity are lost.
+    activity.flushSync();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

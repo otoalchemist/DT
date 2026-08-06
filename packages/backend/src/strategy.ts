@@ -1005,6 +1005,9 @@ export async function queuePreBoundaryAudits(
     // affordability check has to be against THAT wallet's balance, not the primary's.
     const from = auditors[idx]!;
     const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(from));
+    // Fee over cap fails for every remaining target too, and here the wasted awaits eat
+    // the pre-boundary lead window itself — stop rather than scan on.
+    if (guard.fatal) { logger.debug(`pre-boundary audit stopped early: ${guard.reason}`); break; }
     if (!guard.ok) continue;
     // An auditor that only qualifies via a payment earlier in THIS bundle can't be
     // simulated: the sim runs the audit alone against pre-payment state and would
@@ -1223,6 +1226,7 @@ async function firePreBoundaryKill(): Promise<void> {
       if (due === 0n || t.killable) continue; // not under audit, or already killable (normal path handles it)
       if (due <= nowSec || due - nowSec > windowSec) continue; // not imminent
       const guard = await canSpend(0n, true);
+      if (guard.fatal) { logger.debug(`pre-boundary kill stopped early: ${guard.reason}`); break; }
       if (!guard.ok) continue;
       await act(
         { to: appConfig.gameAddress, data: encodeKill(BigInt(t.tokenId)), value: 0n, gas: PRE_BOUNDARY_OFFENSE_GAS },
@@ -1316,7 +1320,15 @@ async function refreshSnapshot(): Promise<void> {
 
 /** Pre-flight guardrail: can we afford this spend without breaching caps/floors?
  *  `offense` selects the audit/kill gas profile so the base-fee cap and gas
- *  estimate match what `submitTx` will actually bid. */
+ *  estimate match what `submitTx` will actually bid.
+ *
+ *  `fatal` marks a failure that is a property of the BLOCK, not of this candidate — the
+ *  base fee being over cap. Every remaining candidate in the sweep would fail it
+ *  identically, so a loop should stop rather than re-await the same verdict per target.
+ *  Without it, a fee spike made the offense loop walk the entire target list (hundreds of
+ *  rivals when unpinned), awaiting once each and submitting nothing — and in the
+ *  pre-boundary path that burned the lead window the race depends on. Per-wallet failures
+ *  (min-balance floor) are NOT fatal: another candidate may be held by a funded wallet. */
 async function canSpend(
   valueWei: bigint,
   offense: boolean,
@@ -1324,14 +1336,18 @@ async function canSpend(
   // its own gas: checking a shared total would let a rich wallet mask an empty one and
   // send a tx that cannot pay for itself.
   wallet: Wallet | null = runtime.primary,
-): Promise<{ ok: boolean; reason?: string }> {
+): Promise<{ ok: boolean; reason?: string; fatal?: boolean }> {
   const s = runtime.strategy;
   const gas = resolveGas(s, offense);
   const block = await getLatestBlockCached();
   const baseFee = block.baseFeePerGas ?? 0n;
   const maxBase = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
   if (baseFee > maxBase) {
-    return { ok: false, reason: `base fee ${formatEther(baseFee * 1_000_000_000n)} gwei over cap` };
+    return {
+      ok: false,
+      reason: `base fee ${formatEther(baseFee * 1_000_000_000n)} gwei over cap`,
+      fatal: true,
+    };
   }
   // Runaway-payment backstop: never send a single tx whose value exceeds the
   // cap. Guards against a bad tax estimate or a token being many epochs behind
@@ -1745,6 +1761,10 @@ async function offensePass(
   ]);
   let auditorIdx = 0;
   let noAuditorSkips = 0;
+  // Set when the sweep stopped early because the guardrail failed for a reason that
+  // applies to the whole block (base fee over cap). Reported below so an offense pass
+  // that did nothing is never silent about why.
+  let fatalGuard: string | null = null;
 
   // Track the soonest not-yet-expired audit deadline so the boundary scheduler
   // can pre-empt the exact moment a kill becomes valid. Reset each sweep.
@@ -1761,6 +1781,9 @@ async function offensePass(
 
     if (s.autoKill && t.killable) {
       const guard = await canSpend(0n, true);
+      // A fee spike fails identically for every remaining target — stop the sweep
+      // instead of re-awaiting the same verdict once per rival.
+      if (guard.fatal) { fatalGuard = guard.reason ?? null; break; }
       if (!guard.ok) continue;
       await act(
         { to: appConfig.gameAddress, data: encodeKill(tokenId), value: 0n },
@@ -1775,6 +1798,7 @@ async function offensePass(
       // Auditor first, then afford-check against the wallet that actually holds it.
       const auditFrom = auditors[auditorIdx]!;
       const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(auditFrom));
+      if (guard.fatal) { fatalGuard = guard.reason ?? null; break; }
       if (!guard.ok) continue;
       const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },
@@ -1791,6 +1815,13 @@ async function offensePass(
       status: "info",
       message: `Audited ${auditorIdx} rival(s) this sweep; ${noAuditorSkips} more auditable but no eligible auditor token left (each audits up to its per-epoch limit).`,
     });
+  }
+
+  // Debug, not activity: a fee spike lasts many blocks and the sweep runs every block, so
+  // an activity entry here would flood the feed with the same line. The guardrail working
+  // as configured isn't an event worth 50 rows.
+  if (fatalGuard) {
+    logger.debug(`offense sweep stopped early: ${fatalGuard}`);
   }
 
   // Publish the nearest kill deadline and (re)arm the pre-emptive kill tick.

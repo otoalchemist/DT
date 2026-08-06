@@ -459,6 +459,88 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
     expect(queued).toBe(false);
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
   });
+
+  // The base fee being over cap is a property of the BLOCK, so it fails identically for
+  // every candidate. It used to be re-checked once per target, which meant the loop awaited
+  // its way through the whole list submitting nothing — hundreds of sequential awaits per
+  // tick with offense unpinned, and in this pre-boundary path it burned the very lead
+  // window the race depends on. The guard now reports `fatal` so the loop stops at the
+  // first one.
+  //
+  // The fee override has to be undone: getLatestBlockCached is a module-level mock shared
+  // by every test in this file, so leaving it at 500 gwei makes every later spend check
+  // fail. Restored to the 10 gwei default in a local afterEach.
+  describe("base-fee cap short-circuits the sweep", () => {
+    const NORMAL_BLOCK = {
+      baseFeePerGas: 10_000_000_000n, number: 100n, gasUsed: 0n, gasLimit: 30_000_000n,
+    };
+
+    afterEach(async () => {
+      const { getLatestBlockCached } = await import("./chain.js");
+      vi.mocked(getLatestBlockCached).mockResolvedValue(
+        NORMAL_BLOCK as unknown as Awaited<ReturnType<typeof getLatestBlockCached>>,
+      );
+    });
+
+    it("stops at the first target when the base fee is over cap, instead of scanning them all", async () => {
+      const { getLatestBlockCached } = await import("./chain.js");
+      // 500 gwei, far above the 69.1 default cap.
+      vi.mocked(getLatestBlockCached).mockResolvedValue({
+        ...NORMAL_BLOCK, baseFeePerGas: 500_000_000_000n,
+      } as unknown as Awaited<ReturnType<typeof getLatestBlockCached>>);
+
+      // Ten auditable pinned rivals, and enough auditor slots that capacity isn't the limit.
+      const many = Array.from({ length: 10 }, (_, i) => `${2000 + i}`);
+      runtime.strategy = { ...runtime.strategy, offenseTargetTokenIds: many };
+      vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n, 2n, 3n]);
+      vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+        many.map((tokenId) => ({
+          tokenId,
+          owner: "0x00000000000000000000000000000000000000dd" as `0x${string}`,
+          lastEpochPaid: (TARGET_EPOCH - 2n).toString(),
+          delinquent: true,
+          epochsBehind: 2,
+          auditable: true,
+          auditDueTimestamp: "0",
+          killable: false,
+        })),
+      );
+
+      const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+      expect(queued).toBe(false);
+      // Nothing submitted (the point of the cap) ...
+      expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
+      // ...and the block was read ONCE, not once per rival. Before the fix this was 10.
+      expect(vi.mocked(getLatestBlockCached).mock.calls.length).toBe(1);
+    });
+
+    it("still considers every candidate when the failure is per-wallet, not per-block", async () => {
+      // Contrast with the fee cap: an unaffordable wallet says nothing about the next
+      // candidate, which may be held by a funded one — so the sweep must NOT stop.
+      const { getLatestBlockCached } = await import("./chain.js");
+      vi.mocked(getLatestBlockCached).mockResolvedValue(
+        NORMAL_BLOCK as unknown as Awaited<ReturnType<typeof getLatestBlockCached>>,
+      );
+      setTestBalance(0n); // below the floor
+      runtime.strategy = { ...runtime.strategy, minBalanceEth: 1, offenseTargetTokenIds: ["1612", "1613"] };
+      vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n, 2n]);
+      vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+        ["1612", "1613"].map((tokenId) => ({
+          tokenId,
+          owner: "0x00000000000000000000000000000000000000dd" as `0x${string}`,
+          lastEpochPaid: (TARGET_EPOCH - 2n).toString(),
+          delinquent: true,
+          epochsBehind: 2,
+          auditable: true,
+          auditDueTimestamp: "0",
+          killable: false,
+        })),
+      );
+      await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+      // Both candidates were considered — the loop continued rather than breaking out.
+      expect(vi.mocked(getLatestBlockCached).mock.calls.length).toBe(2);
+    });
+  });
 });
 
 // A multi-citizen wallet is the case where the combined boundary bundle has the most
