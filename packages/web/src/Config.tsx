@@ -2,6 +2,12 @@ import { useEffect, useState } from "react";
 import type { StrategyConfig } from "@dat-bot/shared";
 import { api } from "./api.js";
 
+/** Token ids out of free text: newline OR comma separated, blanks dropped. Kept apart
+ *  from the textarea's own value so a half-typed separator survives (see targetsDraft). */
+function parseTokenIds(raw: string): string[] {
+  return raw.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+}
+
 function AlchemyKeySection() {
   const [key, setKey] = useState("");
   const [busyKey, setBusyKey] = useState(false);
@@ -97,6 +103,22 @@ export function Config({
   // The "big boys" roster (data/do-not-target.json). Offered as a template because the
   // roster is advice, not a block: pinning one is how you deliberately go after it.
   const [bigBoys, setBigBoys] = useState<string[]>([]);
+
+  // The raw text of the targets box, kept separately from the parsed id list.
+  //
+  // It cannot render `cfg.offenseTargetTokenIds.join("\n")` directly: parsing drops empty
+  // segments, so the moment you typed the "," or Enter that starts a second id, the value
+  // round-tripped back without it and the separator vanished as you typed. There was no
+  // way to reach a second line by hand. Editing the text and deriving the ids from it —
+  // the same split PostMortem uses for tx hashes — keeps separators alive while typing.
+  const [targetsDraft, setTargetsDraft] = useState<string>(cfg.offenseTargetTokenIds.join("\n"));
+  const targetsKey = cfg.offenseTargetTokenIds.join(",");
+  // Re-seed only when the list changed from OUTSIDE this box — a template button, a reset,
+  // or a save elsewhere. If the parsed draft already matches, the change was our own
+  // typing and the raw text must be left exactly as the user left it.
+  useEffect(() => {
+    setTargetsDraft((prev) => (parseTokenIds(prev).join(",") === targetsKey ? prev : targetsKey.split(",").filter(Boolean).join("\n")));
+  }, [targetsKey]);
 
   useEffect(() => {
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
@@ -232,10 +254,10 @@ export function Config({
         <textarea
           rows={5}
           style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, resize: "vertical" }}
-          value={cfg.offenseTargetTokenIds.join("\n")}
+          value={targetsDraft}
           onChange={(e) => {
-            const ids = e.target.value.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
-            set("offenseTargetTokenIds", ids);
+            setTargetsDraft(e.target.value);
+            set("offenseTargetTokenIds", parseTokenIds(e.target.value));
           }}
           disabled={!cfg.offenseEnabled}
           placeholder={"42\n137\n501"}
