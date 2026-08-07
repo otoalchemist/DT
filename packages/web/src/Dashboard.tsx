@@ -253,6 +253,8 @@ export function Dashboard({
   //
   // In away mode it stops polling entirely — that's the point of the mode. One read on
   // mount so the page isn't blank, then nothing until "Refresh data" is pressed.
+  // Away mode IS the autonomous mode: it arms payments itself, since nobody is at the
+  // keyboard to do it. One switch, so there is no state where it wakes to do nothing.
   const awayMode = config?.awayMode ?? false;
   useEffect(() => {
     const tick = () => { if (!document.hidden) void refresh(); };
@@ -424,7 +426,7 @@ export function Dashboard({
                       : "Away mode: this is the boundary window, so the engine is running. It will idle again shortly after the boundary."
                 }
               >
-                AWAY{awayIdleNoWork ? " · nothing armed" : ""}
+                AWAY · AUTO{awayIdleNoWork ? " · nothing armed" : ""}
               </span>
             )}
             <button
@@ -478,11 +480,17 @@ export function Dashboard({
                 disabled={awayBusy || config === null}
                 title={
                   awayMode
-                    ? `Away mode ON — the engine idles at zero RPC between epochs, starts itself ${leadMinutes} min before the boundary, runs through it, then stops 5 min after. The dashboard also stops its 20s polling; use Refresh data to read on demand. Mid-epoch work is missed: kill deadlines fall 24h after an audit, not on a boundary. Click to turn off.`
-                    : "Away mode OFF — the engine runs continuously (~22 provider requests/minute) and the dashboard polls every 20s. Click to idle between epochs and wake only for the boundary. Applies immediately; no save needed."
+                    ? `Away/Autonomous ON — the engine idles at zero RPC between epochs, starts itself ${leadMinutes} min before the boundary, runs through it, then stops 5 min after. The dashboard also stops its 20s polling; use Refresh data to read on demand.
+
+` +
+                      `Autonomous: it arms payments itself when a citizen falls behind, paying on the payment bid and dropping back to the audit-only bid on quiet epochs. Both bids are set under Coinbase bid — while this is on, they are spent without a keypress.` +
+                      `
+
+Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a boundary. Click to turn off.`
+                    : "Away/Autonomous OFF — the engine runs continuously (~22 provider requests/minute) and the dashboard polls every 20s. Click to idle between epochs and wake only for the boundary, which is also what makes unattended operation possible. Applies immediately; no save needed."
                 }
               >
-                {awayBusy ? "…" : awayMode ? "◐ Away mode ON" : "Away mode off"}
+                {awayBusy ? "…" : awayMode ? "◐ Away/Autonomous ON" : "Away/Autonomous off"}
               </button>
               <input
                 className="away-lead"

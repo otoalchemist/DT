@@ -145,7 +145,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -592,6 +592,8 @@ describe("combined boundary bundle with multiple citizens", () => {
       // Combined bundle requires a bid + payer to actually fuse.
       combinedBoundaryBundle: true,
       coinbaseBidEth: 0.02,
+      // Deliberately different so a test can tell WHICH bid fired, not just that one did.
+      coinbaseBidAuditOnlyEth: 0.005,
       coinbasePayerAddress: PAYER,
       offenseTargetTokenIds: RIVALS,
     };
@@ -769,6 +771,9 @@ describe("combined boundary bundle with multiple citizens", () => {
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xPAYTAXES")).toHaveLength(0);
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(TOTAL_CAPACITY);
     expect(vi.mocked(queueCoinbaseBid)).toHaveBeenCalledTimes(1);
+    // ...and it must be the AUDIT-ONLY bid (0.005), not the payment bid (0.02). Which
+    // amount fires is decided by what actually got queued, not by what was configured.
+    expect(vi.mocked(queueCoinbaseBid).mock.calls[0]?.[1]).toBe(5_000_000_000_000_000n);
   });
 
   it("does NOT bid when the bundle ends up empty (no payments, no audits)", async () => {
@@ -1678,13 +1683,16 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
       .map(([, o]) => o as { revertible?: boolean; race?: boolean });
 
   it("is a no-op predicate without a payer, however large the bid", () => {
-    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: "" })).toBe(false);
-    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0, coinbasePayerAddress: PAYER })).toBe(false);
-    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: PAYER })).toBe(true);
+    expect(coinbaseBidActive({ ...base, coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: "" }, "audit")).toBe(false);
+    expect(coinbaseBidActive({ ...base, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: PAYER }, "audit")).toBe(false);
+    expect(coinbaseBidActive({ ...base, coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: PAYER }, "audit")).toBe(true);
+    // The two bids are independent: a payment bid says nothing about an audit-only night.
+    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0.05, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: PAYER }, "audit")).toBe(false);
+    expect(coinbaseBidActive({ ...base, coinbaseBidEth: 0.05, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: PAYER }, "payment")).toBe(true);
   });
 
   it("WITH a bid: audits are revert-tolerant so one stale target can't drop the bundle", async () => {
-    runtime.strategy = { ...base, coinbaseBidEth: 0.022, coinbasePayerAddress: PAYER };
+    runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0.022, coinbasePayerAddress: PAYER };
     await firePreBoundaryAudit();
     const opts = auditOpts();
     expect(opts.length).toBeGreaterThan(0);
@@ -1695,7 +1703,7 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
   it("WITHOUT a bid: audits stay all-or-nothing and keep the mempool mirror", async () => {
     // No bid means the bundle is unlikely to win top-of-block at all, so the mirror is
     // the only copy that will realistically land — losing it would be strictly worse.
-    runtime.strategy = { ...base, coinbaseBidEth: 0, coinbasePayerAddress: PAYER };
+    runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: PAYER };
     await firePreBoundaryAudit();
     const opts = auditOpts();
     expect(opts.length).toBeGreaterThan(0);
@@ -1705,7 +1713,7 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
   it("a bid amount with no payer configured does NOT switch to bundle-only", async () => {
     // maybeQueueCoinbaseBid is a no-op without a payer, so treating this as "bidding"
     // would drop the mempool mirror while buying no position whatsoever.
-    runtime.strategy = { ...base, coinbaseBidEth: 0.05, coinbasePayerAddress: "" };
+    runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: "" };
     await firePreBoundaryAudit();
     for (const o of auditOpts()) expect(o.revertible).toBe(false);
   });
@@ -1804,5 +1812,313 @@ describe("pre-boundary race: a missed window is reported, once", () => {
     at(boundaryOf(306n) - 1n);
     schedulePreBoundaryBundle();
     expect(missedWarnings()).toHaveLength(2);
+  });
+});
+
+// Auto-arm is the only path that commits real ETH with no keypress, and it exists to close
+// the autonomy gap in away mode: JIT is one-shot (it disarms after paying) and proactive
+// pay only acts on citizens ALREADY 2+ behind — which under a 1-epoch auto-pay cap are
+// quoted above the cap and skipped. So an unattended bot had no route from "a citizen fell
+// behind" to "that citizen got paid". Gated on away mode itself, which IS the consent to
+// run unattended; these pin that it fires, and the cases where it must stay out of the way.
+describe("auto-arm: unattended JIT arming for the next boundary", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const EPOCH = 200n;
+  const OWNED = [10n, 20n];
+
+  /** lastEpochPaid / auditDueTimestamp per token, driving batchGetOwnedStatuses. */
+  const stage = (rows: Record<string, { paid: bigint; auditDue?: string }>) => {
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], cur: bigint) =>
+      ids.map((id) => ({
+        tokenId: id.toString(),
+        lastEpochPaid: (rows[id.toString()]?.paid ?? cur).toString(),
+        currentEpoch: cur.toString(),
+        auditDueTimestamp: rows[id.toString()]?.auditDue ?? "0",
+        secondsUntilKillable: null,
+        bribeBalance: "0",
+        hasLifeInsurance: false,
+        risk: "safe",
+        estimatedPayWei: "1000000000000000",
+      })) ) as never);
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useWallet({ address: ADDR }, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.currentEpoch = EPOCH;
+    runtime.startTime = 0n;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.strategy = { ...DEFAULT_STRATEGY, awayMode: true, jitEnabled: false, jitTargetEpoch: null };
+    stage({ "10": { paid: EPOCH - 1n } }); // #10 is a full epoch behind, #20 is current
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.running = false;
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    vi.mocked(batchGetOwnedStatuses).mockReset();
+  });
+
+  it("arms for the NEXT boundary when a citizen is behind", async () => {
+    await maybeAutoArmPayment(OWNED, EPOCH, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(true);
+    // currentEpoch + 1: the boundary at which that citizen would become auditable. Arming
+    // for the CURRENT epoch would be arming for a boundary that has already gone.
+    expect(runtime.strategy.jitTargetEpoch).toBe(Number(EPOCH + 1n));
+    // jitPass is gated on `enabled`, so arming without it would be inert.
+    expect(runtime.strategy.enabled).toBe(true);
+  });
+
+  it("does nothing when away mode is off", async () => {
+    // Attended, arming stays a keypress: there is somebody there to decide, so the engine
+    // must not start spending on its own. Away mode is the whole of the consent.
+    runtime.strategy = { ...runtime.strategy, awayMode: false };
+    await maybeAutoArmPayment(OWNED, EPOCH, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(false);
+  });
+
+  it("stays idle when every citizen is current", async () => {
+    stage({}); // all paid up to the current epoch
+    await maybeAutoArmPayment(OWNED, EPOCH, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(false);
+  });
+
+  it("never arms for a citizen that is UNDER AUDIT", async () => {
+    // An audited citizen gets no automatic response — recovering one is a manual
+    // decision. Auto-arm must not become a back door around that.
+    stage({ "10": { paid: EPOCH - 1n, auditDue: "99999999999" } });
+    await maybeAutoArmPayment(OWNED, EPOCH, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(false);
+  });
+
+  it("never arms for a citizen the user excluded from payment", async () => {
+    runtime.strategy = { ...runtime.strategy, excludedTokenIds: ["10"] };
+    await maybeAutoArmPayment(OWNED, EPOCH, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(false);
+  });
+
+  it("leaves an already-armed JIT alone", async () => {
+    // Re-arming mid-flight would reset the submission bookkeeping and could double-pay.
+    runtime.strategy = { ...runtime.strategy, jitEnabled: true, jitTargetEpoch: 999 };
+    await maybeAutoArmPayment(OWNED, EPOCH, 0n);
+    expect(runtime.strategy.jitTargetEpoch).toBe(999);
+  });
+});
+
+// WHICH boundary auto-arm is aiming at, which is not the same in both halves of the away
+// window and decides whether a citizen waits ~24h to be paid. The trigger is
+// `lastEpochPaid < currentEpoch`, so everything turns on whether the debt already existed
+// when the engine woke, or only appeared when the epoch rolled over.
+describe("auto-arm timing: 15-min wake vs epoch crossover", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const N = 200n;
+
+  const paidThrough = (lastEpochPaid: bigint) => {
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], cur: bigint) =>
+      ids.map((id) => ({
+        tokenId: id.toString(), lastEpochPaid: lastEpochPaid.toString(), currentEpoch: cur.toString(),
+        auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+        hasLifeInsurance: false, risk: "safe", estimatedPayWei: "1000000000000000",
+      })) ) as never);
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useWallet({ address: ADDR }, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.startTime = 0n;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.strategy = { ...DEFAULT_STRATEGY, awayMode: true, jitEnabled: false, jitTargetEpoch: null };
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.running = false;
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    vi.mocked(batchGetOwnedStatuses).mockReset();
+  });
+
+  it("ALREADY behind at the wake -> arms for the boundary 15 minutes away", async () => {
+    // Owes epoch N as the engine wakes, so it turns auditable the instant the boundary
+    // lands. This is the urgent case and it is caught before the crossover, not after.
+    runtime.currentEpoch = N;
+    paidThrough(N - 1n);
+    await maybeAutoArmPayment([10n], N, 0n);
+    expect(runtime.strategy.jitTargetEpoch).toBe(Number(N + 1n));
+  });
+
+  it("current at the wake -> nothing arms, because nothing is owed yet", async () => {
+    runtime.currentEpoch = N;
+    paidThrough(N);
+    await maybeAutoArmPayment([10n], N, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(false);
+  });
+
+  it("falls behind AT the crossover -> armed in the grace, for the NEXT boundary", async () => {
+    // The steady state. The epoch rolled to N+1 and the citizen now owes one, which the
+    // post-boundary grace tick sees. One behind is not auditable, so the deadline is the
+    // FOLLOWING boundary — the engine sleeps the epoch out and wakes 15 min before it.
+    runtime.currentEpoch = N + 1n;
+    paidThrough(N);
+    await maybeAutoArmPayment([10n], N + 1n, 0n);
+    expect(runtime.strategy.jitTargetEpoch).toBe(Number(N + 2n));
+  });
+});
+
+// The three boundary shapes, and which bid each one buys position with. This is the whole
+// point of splitting the bid: a payment boundary is defensive and must land, an audit-only
+// boundary is speculative and smaller. Getting the routing wrong would silently spend the
+// expensive bid on quiet epochs, or the cheap one on the boundary that actually matters.
+describe("boundary pathways: payment, audit, and both", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const PAYER = "0x00000000000000000000000000000000000000b1";
+  const TARGET = 200n;
+  const PAY_BID = 20_000_000_000_000_000n;   // 0.02
+  const AUDIT_BID = 5_000_000_000_000_000n;  // 0.005
+
+  const base = {
+    ...DEFAULT_STRATEGY,
+    offenseEnabled: true, autoAudit: true, preBoundaryAudit: true, preBoundaryPay: true,
+    combinedBoundaryBundle: true,
+    coinbaseBidEth: 0.02, coinbaseBidAuditOnlyEth: 0.005, coinbasePayerAddress: PAYER,
+    minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, endgameOnlyWithin: null,
+    offenseTargetTokenIds: ["501"],
+  };
+
+  /** owedByUs: whether our citizen still owes the target epoch. */
+  const stage = (owedByUs: boolean, auditableRival: boolean) => {
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n
+          : owedByUs ? TARGET - 1n : TARGET,
+      })) ) as never);
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
+    );
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+      auditableRival
+        ? [{
+            tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+            lastEpochPaid: (TARGET - 2n).toString(), delinquent: true, epochsBehind: 2,
+            auditable: true, auditDueTimestamp: "0", killable: false,
+          }]
+        : [],
+    );
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useWallet({ address: ADDR }, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.citizenSupply = 500n;
+    runtime.currentEpoch = TARGET - 1n;
+    runtime.startTime = 0n;
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.running = false;
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([]);
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([]);
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(false);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+      })) ) as never);
+  });
+
+  const sent = (data: string) => vi.mocked(submitTx).mock.calls.filter(([i]) => (i as { data: string }).data === data);
+  const bidAmount = () => vi.mocked(queueCoinbaseBid).mock.calls[0]?.[1];
+
+  it("BOTH: payment + audit fuse into one bundle on the PAYMENT bid", async () => {
+    runtime.strategy = { ...base, jitEnabled: true, jitTargetEpoch: Number(TARGET), jitTokenIds: [] };
+    stage(true, true);
+    await firePreBoundaryBundle();
+
+    expect(sent("0xPAYTAXES").length).toBeGreaterThan(0);
+    expect(sent("0xAUDIT").length).toBeGreaterThan(0);
+    expect(vi.mocked(queueCoinbaseBid)).toHaveBeenCalledTimes(1); // one bid for the whole bundle
+    expect(bidAmount()).toBe(PAY_BID);
+  });
+
+  it("PAYMENT ONLY: no auditable rival, still the payment bid", async () => {
+    runtime.strategy = { ...base, jitEnabled: true, jitTargetEpoch: Number(TARGET), jitTokenIds: [] };
+    stage(true, false);
+    await firePreBoundaryBundle();
+
+    expect(sent("0xPAYTAXES").length).toBeGreaterThan(0);
+    expect(sent("0xAUDIT")).toHaveLength(0);
+    expect(bidAmount()).toBe(PAY_BID);
+  });
+
+  it("AUDIT ONLY: nothing owed, so the cheaper audit bid buys position", async () => {
+    runtime.strategy = { ...base, jitEnabled: false, jitTargetEpoch: null };
+    stage(false, true);
+    await firePreBoundaryBundle();
+
+    expect(sent("0xPAYTAXES")).toHaveLength(0);
+    expect(sent("0xAUDIT").length).toBeGreaterThan(0);
+    expect(bidAmount()).toBe(AUDIT_BID);
+  });
+
+  it("AUDIT ONLY via the standalone fire also uses the audit bid", async () => {
+    // combinedBoundaryBundle off -> the separate audit scheduler owns the boundary.
+    runtime.strategy = { ...base, combinedBoundaryBundle: false, jitEnabled: false, jitTargetEpoch: null };
+    stage(false, true);
+    await firePreBoundaryAudit();
+
+    expect(sent("0xAUDIT").length).toBeGreaterThan(0);
+    expect(bidAmount()).toBe(AUDIT_BID);
+  });
+
+  it("end to end: auto-arm turns a quiet boundary into a payment boundary", async () => {
+    // Sit just before the epoch-200 boundary on the test's own grid (startTime 0), so the
+    // arming re-schedules a FUTURE boundary the way it would in production. Left on the
+    // real clock, that boundary is decades past, scheduleJitBoundary fires an immediate
+    // catch-up tick, and the in-flight guard then defers the bundle we are asserting on.
+    vi.useFakeTimers();
+    vi.setSystemTime(Number((TARGET - 1n) * 86_400n - 600n) * 1000);
+    // The autonomy loop. Citizen falls behind, nothing is armed, nobody is at the keyboard.
+    runtime.strategy = { ...base, awayMode: true, jitEnabled: false, jitTargetEpoch: null };
+    stage(true, true);
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], cur: bigint) =>
+      ids.map((id) => ({
+        tokenId: id.toString(), lastEpochPaid: (cur - 1n).toString(), currentEpoch: cur.toString(),
+        auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+        hasLifeInsurance: false, risk: "safe", estimatedPayWei: "1000000000000000",
+      })) ) as never);
+
+    await maybeAutoArmPayment([10n], TARGET - 1n, 0n);
+    expect(runtime.strategy.jitEnabled).toBe(true);
+    expect(runtime.strategy.jitTargetEpoch).toBe(Number(TARGET));
+
+    // Hand the owned-status read back to the file's default before firing: the override
+    // above exists only to make the auto-arm see a citizen behind, and leaving it in place
+    // would have it answering the payment pass's questions too.
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], cur: bigint) =>
+      ids.map((id) => ({
+        tokenId: id.toString(), lastEpochPaid: "3", currentEpoch: cur.toString(),
+        auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+        hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+      })) ) as never);
+
+    // ...and the boundary that follows is now a PAYMENT boundary, priced accordingly.
+    await firePreBoundaryBundle();
+    expect(sent("0xPAYTAXES").length).toBeGreaterThan(0);
+    expect(bidAmount()).toBe(PAY_BID);
+    vi.useRealTimers();
   });
 });

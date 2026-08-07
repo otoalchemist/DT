@@ -204,6 +204,9 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   dynamicTipEnabled: true,
   dynamicTipMaxGwei: 69.1,
   coinbaseBidEth: 0, // off; flat builder payment for top-of-block, opt-in
+  // Audit-only boundaries bid separately: that bundle is smaller and losing it costs only
+  // the audit fee, so it rarely warrants what a must-land payment bundle does.
+  coinbaseBidAuditOnlyEth: 0,
   // Shared CoinbasePayer forwarder (verified on-chain to forward 100% to
   // block.coinbase). Only used when coinbaseBidEth > 0; deploy your own if you'd
   // rather not share (see contracts/CoinbasePayer.sol).
@@ -404,6 +407,19 @@ class Runtime {
       const merged: Record<string, unknown> = {};
       for (const k of Object.keys(DEFAULT_STRATEGY) as (keyof StrategyConfig)[]) {
         merged[k] = k in raw ? raw[k] : DEFAULT_STRATEGY[k];
+      }
+      // Upgrade path for the split coinbase bid. A config written before
+      // coinbaseBidAuditOnlyEth existed has one bid that covered BOTH boundary kinds, so
+      // defaulting the new field to 0 would silently stop bidding on every audit-only
+      // night — and, worse, drop those audits back to the mempool-mirror path. Carry the
+      // old value across so behaviour is unchanged on upgrade; 0 means 0 from then on,
+      // which is what makes "bid on payments only" expressible at all.
+      if (!("coinbaseBidAuditOnlyEth" in raw) && typeof raw.coinbaseBidEth === "number" && raw.coinbaseBidEth > 0) {
+        (merged as Record<string, unknown>).coinbaseBidAuditOnlyEth = raw.coinbaseBidEth;
+        logger.info(
+          `Config upgrade: audit-only coinbase bid seeded from the existing bid (${raw.coinbaseBidEth} ETH). ` +
+            `Set it separately to bid less on offense-only boundaries.`,
+        );
       }
       this.strategy = merged as unknown as StrategyConfig;
       if (savedDefaults < DEFAULTS_VERSION) {

@@ -66,6 +66,7 @@ const strategyPatch = z
     dynamicTipMaxGwei: z.number().positive(),
     maxPaymentEth: z.number().min(0),
     coinbaseBidEth: z.number().min(0),
+    coinbaseBidAuditOnlyEth: z.number().min(0),
     coinbasePayerAddress: z.string().regex(/^(0x[a-fA-F0-9]{40})?$/, "must be a 0x address or empty"),
   })
   .partial();

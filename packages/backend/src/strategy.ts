@@ -368,10 +368,17 @@ export function scheduleAwayWake(): void {
       runtime.emitStatus();
       return;
     }
+    // Spell out the autonomy, and the bid it will spend to get it. Away mode now arms
+    // payments by itself, so someone who only ever wanted "idle between epochs" would
+    // otherwise be opted into unattended spending without being told.
+    const bid = runtime.strategy.coinbaseBidEth;
     activity.add({
       kind: "info",
       status: "info",
-      message: "Away mode enabled — going idle until the next boundary window",
+      message:
+        "Away/Autonomous mode enabled — going idle until the next boundary window. It will " +
+        "arm payments itself when a citizen falls behind" +
+        (bid > 0 ? `, bidding up to ${bid} ETH to the builder without a keypress.` : "."),
     });
     stopEngine();
   }
@@ -653,7 +660,7 @@ export async function firePreBoundaryPay(): Promise<void> {
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     const paid = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
-    if (paid.size > 0) await maybeQueueCoinbaseBid();
+    if (paid.size > 0) await maybeQueueCoinbaseBid("payment");
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary pay error: ${(err as Error).message}` });
@@ -690,10 +697,11 @@ function applyExclusions(ids: bigint[], context: string): bigint[] {
   return kept;
 }
 
-async function maybeQueueCoinbaseBid(): Promise<void> {
+async function maybeQueueCoinbaseBid(kind: BidKind): Promise<void> {
   const s = runtime.strategy;
-  if (s.coinbaseBidEth <= 0 || !s.coinbasePayerAddress) return;
-  const bidWei = parseEther(String(s.coinbaseBidEth));
+  const amount = coinbaseBidFor(s, kind);
+  if (amount <= 0 || !s.coinbasePayerAddress) return;
+  const bidWei = parseEther(String(amount));
   const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei);
   if (!queued) return;
   // The bid is real ETH but it does NOT go through act(), so it was invisible to every
@@ -717,12 +725,34 @@ async function maybeQueueCoinbaseBid(): Promise<void> {
 /** Whether a coinbase bid will actually fire: an amount to pay AND a payer to route it
  *  through. Without both, `maybeQueueCoinbaseBid` is a no-op and a bundle competes on
  *  priority fee alone — which decides whether bundle-only submission is safe. */
-export function coinbaseBidActive(s: StrategyConfig): boolean {
-  return s.coinbaseBidEth > 0 && !!s.coinbasePayerAddress;
+/**
+ * Which bid funds a given boundary.
+ *
+ * "payment" = a payment shares the bundle (or is the bundle). Defensive, must land, and
+ * bigger — every payment adds ~82,875 gas, so the same position costs more to buy.
+ * "audit"   = offense only. Speculative: losing it costs the audit fee and nothing else,
+ * and the bundle is far smaller, so a given density is cheaper.
+ *
+ * Splitting them is what lets a quiet epoch run cheap while the one boundary that
+ * actually has a payment on it bids properly.
+ */
+export type BidKind = "payment" | "audit";
+
+export function coinbaseBidFor(s: StrategyConfig, kind: BidKind): number {
+  return kind === "payment" ? s.coinbaseBidEth : s.coinbaseBidAuditOnlyEth;
 }
 
+export function coinbaseBidActive(s: StrategyConfig, kind: BidKind = "payment"): boolean {
+  return coinbaseBidFor(s, kind) > 0 && !!s.coinbasePayerAddress;
+}
+
+/**
+ * Whether the fused pay+audit fire owns the boundary. Either bid qualifies: which one
+ * actually fires is decided at fire time by whether a payment made it into the bundle,
+ * so routing must not depend on guessing that in advance.
+ */
 export function combinedBundleActive(s: StrategyConfig): boolean {
-  return s.combinedBoundaryBundle && coinbaseBidActive(s);
+  return s.combinedBoundaryBundle && (coinbaseBidActive(s, "payment") || coinbaseBidActive(s, "audit"));
 }
 
 // Generous fixed gas for an unsimulated offense pre-submit (real audits used
@@ -1076,10 +1106,10 @@ export async function firePreBoundaryAudit(): Promise<void> {
     // with it. The audits then trickled out through the mempool naked, landed at tx index
     // 40+ instead of 0, and every one reverted with AuditAlreadyActive because faster
     // bundles had already taken the targets.
-    const bidding = coinbaseBidActive(s);
+    const bidding = coinbaseBidActive(s, "audit");
     const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, { revertible: bidding });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
-    if (queuedAudit) await maybeQueueCoinbaseBid();
+    if (queuedAudit) await maybeQueueCoinbaseBid("audit");
   } catch (err) {
     logger.error("pre-boundary audit error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary audit error: ${(err as Error).message}` });
@@ -1139,7 +1169,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
       !(s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin))
     ) {
       auditQueued = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
-        revertible: paidInBundle.size > 0 || coinbaseBidActive(s),
+        revertible: paidInBundle.size > 0 || coinbaseBidActive(s, "audit"),
         // Tokens paid above are current by the time the audit executes, so they can
         // serve as audit "from" tokens even though the chain still reads them behind.
         paidInBundle,
@@ -1148,7 +1178,11 @@ export async function firePreBoundaryBundle(): Promise<void> {
     // Coinbase bid tails the bundle to win the slot. This fire only runs when a bid is
     // active (combinedBundleActive), so the audits always have the bid backing them —
     // no-bid falls back to the separate schedulers, where audits keep their mempool mirror.
-    if (paidInBundle.size > 0 || auditQueued) await maybeQueueCoinbaseBid();
+    // Which bid this is depends on what actually got queued, not on what was configured:
+    // a payment in the bundle makes it a must-land defensive boundary, otherwise it is an
+    // ordinary offense night on the cheaper bid.
+    const bidKind: BidKind = paidInBundle.size > 0 ? "payment" : "audit";
+    if (paidInBundle.size > 0 || auditQueued) await maybeQueueCoinbaseBid(bidKind);
   } catch (err) {
     logger.error("pre-boundary bundle error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary bundle error: ${(err as Error).message}` });
@@ -1237,7 +1271,8 @@ async function firePreBoundaryKill(): Promise<void> {
       queuedKill = true;
     }
     // Tail a coinbase bid so the kill bundle wins the slot (no-op unless configured).
-    if (queuedKill) await maybeQueueCoinbaseBid();
+    // A kill race carries no payment, so it prices as offense.
+    if (queuedKill) await maybeQueueCoinbaseBid("audit");
   } catch (err) {
     logger.error("pre-boundary kill error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary kill error: ${(err as Error).message}` });
@@ -1542,6 +1577,66 @@ async function act(
  * never from a regular poll/block tick — so a citizen that's already delinquent
  * is left alone until the next epoch boundary, then paid immediately.
  */
+/**
+ * Self-arm a JIT payment when an owned citizen would be auditable at the next boundary.
+ *
+ * This is the piece that makes away mode autonomous. Without it the bot wakes, finds
+ * nothing armed, and idles while a citizen drifts — because JIT is one-shot (it disarms
+ * itself after paying) and proactivePay only acts on citizens ALREADY 2+ behind, which by
+ * then are auditable and, under a 1-epoch auto-pay cap, quoted above the cap and skipped.
+ * So an unattended bot had no path from "citizen fell behind" to "citizen paid".
+ *
+ * Arms on 1+ behind, i.e. BEFORE the boundary that would make it auditable — the whole
+ * point of a just-in-time payment. Deliberately skips:
+ *   - citizens under audit — an audited citizen gets no automatic response at all, by
+ *     explicit instruction; recovering one stays a manual decision
+ *   - excluded citizens — the per-citizen opt-out means never pay, including here
+ *   - an already-armed JIT — re-arming would reset its bookkeeping mid-flight
+ *
+ * Tied to away mode, which is what makes away mode autonomous rather than merely idle:
+ * nobody is at the keyboard to arm, so without this the engine wakes, finds nothing armed
+ * and idles while a citizen drifts. Running attended, arming stays a deliberate keypress.
+ */
+// Exported for tests: this is the one path that spends ETH with no keypress.
+export async function maybeAutoArmPayment(
+  ownedIds: bigint[],
+  currentEpoch: bigint,
+  nowSec: bigint,
+): Promise<void> {
+  const s = runtime.strategy;
+  if (!s.awayMode) return;
+  if (s.jitEnabled && s.jitTargetEpoch !== null) return; // already armed; leave it alone
+  const candidates = applyExclusions(ownedIds, "auto-arm");
+  if (candidates.length === 0) return;
+
+  const statuses = await batchGetOwnedStatuses(candidates, currentEpoch, nowSec, 1);
+  const behind = statuses.filter(
+    (st) => st.auditDueTimestamp === "0" && BigInt(st.lastEpochPaid) < currentEpoch,
+  );
+  if (behind.length === 0) return;
+
+  const target = Number(currentEpoch + 1n);
+  runtime.saveStrategy({ enabled: true, jitEnabled: true, jitTargetEpoch: target, jitTokenIds: [] });
+  resetJitState();
+  activity.add({
+    kind: "info",
+    status: "info",
+    message:
+      `Auto-armed JIT payment for epoch ${target}: ${behind.length} citizen(s) behind ` +
+      `(#${behind.map((b) => b.tokenId).join(", #")}). The boundary bundle will pay and audit ` +
+      `together on the payment bid; JIT disarms itself once they are paid.`,
+  });
+  // The boundary timers were armed for an unarmed engine — re-arm them now that a payment
+  // is due, or this boundary passes with the audit-only path still scheduled.
+  scheduleJitBoundary();
+  schedulePreBoundaryPay();
+  schedulePreBoundaryAudit();
+  schedulePreBoundaryBundle();
+  // Always in away mode to reach here, and the wake window is picked from what is armed —
+  // so it has to be recomputed now that a payment is due.
+  scheduleAwayWake();
+}
+
 async function proactivePayPass(
   ownedIds: bigint[],
   currentEpoch: bigint,
@@ -1990,6 +2085,7 @@ async function tick(fireProactivePay = false): Promise<void> {
     const currentEpoch = runtime.currentEpoch ?? 0n;
 
     const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
+    await maybeAutoArmPayment(ownedIds, currentEpoch, nowSec);
 
     if (runtime.strategy.enabled) {
       // No defense pass: an audited citizen gets no automatic response at all. Only

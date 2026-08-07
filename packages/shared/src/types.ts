@@ -399,6 +399,21 @@ export interface StrategyConfig {
    *  a pre-boundary payment is queued; the bid rides the bundle (allowed-to-revert,
    *  never mirrored), so it only spends when the bundle wins the slot. */
   coinbaseBidEth: number;
+  /**
+   * The bid used for an AUDIT-ONLY boundary — offense running with no payment armed.
+   *
+   * Separate from coinbaseBidEth because the two boundaries are not the same purchase.
+   * A payment bundle is defensive and must land: missing it can cost a citizen, and the
+   * bundle is bigger (every payment adds ~82,875 gas), so the same position costs more.
+   * An audit-only bundle is speculative: losing it costs the audit fee and nothing else,
+   * and it is far smaller, so a given density is cheaper to buy. Being forced to use one
+   * number for both means overpaying on every audit-only night or underpaying on the one
+   * boundary that actually matters.
+   *
+   * 0 = no bid on audit-only boundaries (audits then keep their mempool mirror; see
+   * firePreBoundaryAudit).
+   */
+  coinbaseBidAuditOnlyEth: number;
   /** Address of the deployed CoinbasePayer forwarder used for coinbaseBidEth. Its
    *  receive() forwards ETH to block.coinbase. Empty = coinbase bidding disabled. */
   coinbasePayerAddress: string;
