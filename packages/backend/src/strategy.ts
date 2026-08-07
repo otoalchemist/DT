@@ -206,6 +206,14 @@ export function resetJitState(): void {
   jitSubmittedTarget = null;
 }
 
+/** Clear the per-tick spend budget. Every entry point that can reach act() already does
+ *  this on the way in (firePreBoundaryPay/Audit/Bundle/Kill, runManualAction, tick), which
+ *  is what stops committed spend accumulating across ticks and eventually blocking all
+ *  spending. Exported so a test calling a pass directly can stand in for its caller. */
+export function resetTickBudget(): void {
+  committedThisTickWei = new Map();
+}
+
 /** Clear defense-mode bookkeeping. Deliberately NOT called from stopEngine: away mode
  *  stops the engine every epoch, and forgetting a submitted-but-not-yet-mined payment
  *  across that gap would pay the same audit twice. Entries expire on their own once the
@@ -1621,6 +1629,21 @@ export async function maybeAutoDefendAudit(
   // n=1 is enough to price the whole debt: the contract force-settles every delinquent
   // epoch, so estimateTaxesToPay(id, 1) already quotes the full catch-up.
   const statuses = await batchGetOwnedStatuses(candidates, currentEpoch, nowSec, 1);
+  // batchGetOwnedStatuses DROPS any token whose multicall slice partly failed. On the
+  // other passes that costs an opportunity; here it would let a citizen be killed with
+  // nothing said, so a short read is surfaced rather than swallowed. Not fatal — the next
+  // tick re-reads — but it must be visible if it keeps happening.
+  if (statuses.length < candidates.length) {
+    const got = new Set(statuses.map((st) => st.tokenId));
+    const missing = candidates.map((id) => id.toString()).filter((id) => !got.has(id));
+    activity.add({
+      kind: "info",
+      status: "info",
+      message:
+        `Benji (Defense) Mode could not read #${missing.join(", #")} this tick — audit status ` +
+        `unknown, so they were not checked. Retrying next tick.`,
+    });
+  }
 
   const audited = statuses.filter((st) => st.auditDueTimestamp !== "0");
   // Drop bookkeeping for audits that are over, so the set can't grow without bound.

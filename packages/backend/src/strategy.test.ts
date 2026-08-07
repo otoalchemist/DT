@@ -145,7 +145,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -866,7 +866,7 @@ describe("audited citizens are never auto-paid", () => {
       enabled: true, offenseEnabled: false,
       jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
     };
-    const { jitPass } = await import("./strategy.js");
+
     await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xPAYTAXES")).toHaveLength(0);
   });
@@ -884,7 +884,7 @@ describe("audited citizens are never auto-paid", () => {
         risk: "at-risk", estimatedPayWei: "1000000000000000",
       },
     ]);
-    const { jitPass } = await import("./strategy.js");
+
     await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xBRIBE")).toHaveLength(0);
   });
@@ -911,7 +911,7 @@ describe("audited citizens are never auto-paid", () => {
     vi.mocked(submitTx).mockResolvedValueOnce({
       ok: false, simulated: true, error: "sim revert", nonce: 0, valueWei: 0n, gasWei: 0n,
     } as never);
-    const { jitPass } = await import("./strategy.js");
+
     const saveSpy = vi.spyOn(runtime, "saveStrategy");
     await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
     // Must NOT have disarmed — the citizen still needs paying.
@@ -925,7 +925,7 @@ describe("audited citizens are never auto-paid", () => {
       ...DEFAULT_STRATEGY, enabled: true, offenseEnabled: false,
       jitEnabled: true, jitTargetEpoch: 150, excludedTokenIds: ["1"],
     };
-    const { jitPass } = await import("./strategy.js");
+
     await jitPass([1n], 150n, BigInt(Math.floor(Date.now() / 1000)));
     expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
   });
@@ -2096,6 +2096,251 @@ describe("benji (defense) mode: auto-paying an audited citizen", () => {
     stage({ auditDue: "88888888888" }); // re-audited later: a different deadline
     await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
     expect(paid()).toHaveLength(2);
+  });
+});
+
+// Everything shipped today, exercised with a REAL roster rather than one citizen. Each of
+// these paths loops per-citizen and spends per-citizen, so the single-token tests above
+// can't see the failures that matter most here: cumulative spend against one balance,
+// signing across wallets, and one shared coinbase bid covering a bundle of many.
+describe("multi-citizen: today's paths under a real roster", () => {
+  const A = "0xaaaa000000000000000000000000000000000001" as const;
+  const B = "0xbbbb000000000000000000000000000000000002" as const;
+  const acctA = { address: A } as unknown as PrivateKeyAccount;
+  const acctB = { address: B } as unknown as PrivateKeyAccount;
+  const EPOCH = 200n;
+  const DEBT = 3_000_000_000_000_000n; // 0.003 — an audited citizen's catch-up
+
+  type Row = { audited?: boolean; bribes?: bigint; behind?: bigint };
+  /** Per-token status, so a roster can mix audited / bribed / current citizens. */
+  const roster = (rows: Record<string, Row>) => {
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], cur: bigint) =>
+      ids.map((id) => {
+        const r = rows[id.toString()] ?? {};
+        return {
+          tokenId: id.toString(),
+          lastEpochPaid: (cur - (r.behind ?? 0n)).toString(),
+          currentEpoch: cur.toString(),
+          auditDueTimestamp: r.audited ? "99999999999" : "0",
+          secondsUntilKillable: r.audited ? 3600 : null,
+          bribeBalance: (r.bribes ?? 0n).toString(),
+          hasLifeInsurance: false,
+          risk: r.audited ? "audited" : r.behind ? "delinquent" : "safe",
+          estimatedPayWei: DEBT.toString(),
+        };
+      }) ) as never);
+  };
+
+  const paidTokens = () =>
+    vi.mocked(activity.add).mock.calls
+      .map(([e]) => e as { kind: string; status: string; tokenId?: string })
+      .filter((e) => e.kind === "pay-taxes" && e.status === "submitted")
+      .map((e) => e.tokenId);
+  const payCount = () =>
+    vi.mocked(submitTx).mock.calls.filter(([i]) => (i as { data: string }).data === "0xPAYTAXES").length;
+  const signersByData = () =>
+    vi.mocked(submitTx).mock.calls.map(([intent, opts]) => ({
+      data: (intent as { data: string }).data,
+      signer: (opts as { account?: { address: string } })?.account?.address,
+    }));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.currentEpoch = EPOCH;
+    runtime.startTime = 0n;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.citizenSupply = 500n;
+    resetDefenseState();
+    resetJitState();
+    // These tests call passes directly, where production only ever reaches them through
+    // tick(). tick() clears the per-tick spend budget on the way in; without doing the
+    // same, spend from an earlier test still counts against this one's balance.
+    resetTickBudget();
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.running = false;
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    resetDefenseState();
+    resetJitState();
+    vi.mocked(batchGetOwnedStatuses).mockReset();
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(false);
+  });
+
+  /** One wallet holding `ids`, with ownership primed the way tick() does. */
+  const oneWallet = async (ids: bigint[], balanceWei: bigint) => {
+    runtime.setWallets([{ account: acctA as never, label: "A", balanceWei }]);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue(ids);
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+  };
+
+  it("Benji: rescues every audited citizen in the roster, not just the first", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, autoDefendAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+    };
+    await oneWallet([10n, 20n, 30n], 100_000_000_000_000_000_000n);
+    roster({ "10": { audited: true, behind: 3n }, "20": { audited: true, behind: 2n }, "30": { audited: true, behind: 4n } });
+
+    await maybeAutoDefendAudit([10n, 20n, 30n], EPOCH, 0n);
+    expect(paidTokens().sort()).toEqual(["10", "20", "30"]);
+  });
+
+  it("Benji: sorts a mixed roster — pays only the audited, unbribed, non-excluded", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, autoDefendAudit: true, excludedTokenIds: ["40"],
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+    };
+    await oneWallet([10n, 20n, 30n, 40n], 100_000_000_000_000_000_000n);
+    roster({
+      "10": { audited: true, behind: 3n },              // rescue
+      "20": { audited: true, behind: 3n, bribes: 1n },  // holds a bribe — free fix, stays manual
+      "30": { behind: 1n },                             // behind but not audited — pre-audit paths own it
+      "40": { audited: true, behind: 3n },              // excluded — "never pay" means never
+    });
+
+    await maybeAutoDefendAudit([10n, 20n, 30n, 40n], EPOCH, 0n);
+    expect(paidTokens()).toEqual(["10"]);
+  });
+
+  it("Benji: several rescues in one tick cannot cumulatively breach the balance floor", async () => {
+    // The failure single-citizen tests cannot see. Each rescue passes canSpend on its own;
+    // only the running total says no. Balance 0.012, each rescue costs 0.003 + 0.004 gas,
+    // so exactly two fit and the third must be refused rather than overdrawing.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, autoDefendAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+    };
+    await oneWallet([10n, 20n, 30n], 12_000_000_000_000_000n);
+    roster({ "10": { audited: true, behind: 3n }, "20": { audited: true, behind: 3n }, "30": { audited: true, behind: 3n } });
+
+    await maybeAutoDefendAudit([10n, 20n, 30n], EPOCH, 0n);
+    expect(payCount()).toBe(2);
+    // And the one it could not save is reported, not dropped silently — a citizen about to
+    // die is the last thing that should fail quietly.
+    const skips = vi.mocked(activity.add).mock.calls
+      .map(([e]) => e as { kind: string; status: string; message?: string })
+      .filter((e) => e.kind === "pay-taxes" && e.status === "skipped");
+    expect(skips).toHaveLength(1);
+    expect(skips[0]?.message).toMatch(/could NOT save/);
+  });
+
+  it("Benji: rescues each citizen from the wallet that actually holds it", async () => {
+    // payTaxes is owner-only, so signing #20 with wallet A is a guaranteed revert that
+    // still burns gas — and would leave that citizen to die.
+    runtime.setWallets([
+      { account: acctA as never, label: "A", balanceWei: 100_000_000_000_000_000_000n },
+      { account: acctB as never, label: "B", balanceWei: 100_000_000_000_000_000_000n },
+    ]);
+    const OWNED: Record<string, bigint[]> = { [A.toLowerCase()]: [10n], [B.toLowerCase()]: [20n] };
+    vi.mocked(fetchOwnedTokenIds).mockImplementation(async (_c: unknown, addr: string) => OWNED[addr.toLowerCase()] ?? []);
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, autoDefendAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+    };
+    roster({ "10": { audited: true, behind: 3n }, "20": { audited: true, behind: 3n } });
+
+    await maybeAutoDefendAudit([10n, 20n], EPOCH, 0n);
+    const pays = signersByData().filter((c) => c.data === "0xPAYTAXES");
+    expect(pays).toHaveLength(2);
+    expect(new Set(pays.map((p) => p.signer))).toEqual(new Set([A, B]));
+  });
+
+  it("auto-arm: one citizen falling behind arms the whole roster, and JIT pays only those behind", async () => {
+    // jitTokenIds stays empty (= all owned) on purpose, so a roster that drifts apart over
+    // several epochs is caught by one arm. jitPass is what filters to the ones that owe.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, awayMode: true, jitEnabled: false, jitTargetEpoch: null,
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+    };
+    await oneWallet([10n, 20n, 30n], 100_000_000_000_000_000_000n);
+    roster({ "10": { behind: 1n }, "20": { behind: 2n }, "30": {} }); // #30 is current
+
+    await maybeAutoArmPayment([10n, 20n, 30n], EPOCH, 0n);
+    expect(runtime.strategy.jitTargetEpoch).toBe(Number(EPOCH + 1n));
+    expect(runtime.strategy.jitTokenIds).toEqual([]); // every owned citizen, not a snapshot
+
+    // Now run the boundary the arm was for: only the two that owe should be paid.
+    resetJitState();
+    await jitPass([10n, 20n, 30n], EPOCH + 1n, 0n);
+    expect(paidTokens().sort()).toEqual(["10", "20"]);
+  });
+
+  it("Benji: says so when a citizen's status could not be read, instead of silently skipping", async () => {
+    // batchGetOwnedStatuses drops a token whose multicall slice partly failed. On other
+    // passes that is a missed opportunity; here an unread citizen can be killed while the
+    // log shows nothing wrong, so a short read has to be visible.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY, autoDefendAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+    };
+    await oneWallet([10n, 20n, 30n], 100_000_000_000_000_000_000n);
+    roster({ "10": { audited: true, behind: 3n }, "20": { audited: true, behind: 3n }, "30": { audited: true, behind: 3n } });
+    // #30's read comes back short, exactly as a partial multicall failure looks.
+    const full = vi.mocked(batchGetOwnedStatuses).getMockImplementation()!;
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], ...rest: never[]) =>
+      (await (full as never as (...a: unknown[]) => Promise<{ tokenId: string }[]>)(ids, ...rest))
+        .filter((st) => st.tokenId !== "30")) as never);
+
+    await maybeAutoDefendAudit([10n, 20n, 30n], EPOCH, 0n);
+    expect(paidTokens().sort()).toEqual(["10", "20"]);
+    const notes = vi.mocked(activity.add).mock.calls
+      .map(([e]) => e as { message?: string })
+      .filter((e) => /could not read/.test(e.message ?? ""));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]?.message).toContain("#30");
+  });
+
+  it("split bid: a bundle of many payments and audits still buys position ONCE", async () => {
+    // The bid is per-BUNDLE, not per-citizen. Queuing one per token would multiply the
+    // spend by the roster size, and paying the audit-only rate on a night that carries
+    // payments would underbid the boundary that actually matters.
+    const PAY_BID = 20_000_000_000_000_000n;
+    runtime.currentEpoch = EPOCH - 1n;
+    runtime.setWallets([{ account: acctA as never, label: "A", balanceWei: 100_000_000_000_000_000_000n }]);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n, 20n, 30n]);
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true, preBoundaryPay: true,
+      combinedBoundaryBundle: true, jitEnabled: true, jitTargetEpoch: Number(EPOCH), jitTokenIds: [],
+      coinbaseBidEth: 0.02, coinbaseBidAuditOnlyEth: 0.005,
+      coinbasePayerAddress: "0x00000000000000000000000000000000000000b1",
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
+      endgameOnlyWithin: null, offenseTargetTokenIds: ["501", "502"],
+    };
+    // Every owned citizen still owes the target epoch; auditLimit 1 each.
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n
+          : EPOCH - 1n,
+      })) ) as never);
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_c: unknown, ids: bigint[]) =>
+      ids.map((id) => ({ id, owner: "0x00000000000000000000000000000000000000dd" as `0x${string}` })),
+    );
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+      ["501", "502"].map((tokenId) => ({
+        tokenId, owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      })),
+    );
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(true);
+
+    await firePreBoundaryBundle();
+
+    const data = signersByData().map((c) => c.data);
+    expect(data.filter((d) => d === "0xPAYTAXES").length).toBeGreaterThan(1); // several citizens
+    expect(data).toContain("0xAUDIT");
+    expect(vi.mocked(queueCoinbaseBid)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(queueCoinbaseBid).mock.calls[0]?.[1]).toBe(PAY_BID); // payment rate, not audit-only
   });
 });
 

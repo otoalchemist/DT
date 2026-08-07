@@ -9,8 +9,8 @@ replaced by `git archive` via .gitattributes `export-subst`:
   Date:    $Format:%cI$
 
 Notes:
-  - Downloaded from a tag (e.g. v1.2.0)  -> Version reads "v1.2.0".
-  - Downloaded from the master branch    -> Version reads "v1.2.0-<n>-g<sha>"
+  - Downloaded from a tag (e.g. v1.2.1)  -> Version reads "v1.2.1".
+  - Downloaded from the master branch    -> Version reads "v1.2.1-<n>-g<sha>"
     (the latest release plus how many commits past it you are).
   - In a plain `git clone` these stay as raw, unsubstituted placeholders, because
     substitution only happens at archive time. In that case, check the "version"
