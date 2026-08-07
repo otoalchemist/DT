@@ -152,6 +152,9 @@ export function doNotTargetOwnerOf(): Record<string, string> {
 
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
+  // Pays an unbounded catch-up with no keypress, so opt-in — and deliberately NOT a
+  // RECOMMENDED_FIELD: a defaults bump must never switch on automatic spending.
+  autoDefendAudit: false,
   proactivePay: true,
   prepayEpochs: 1,
   maxAutoPayEpochs: 1, // auto-payments cover at most 1 epoch (1 day) each; JIT always fires

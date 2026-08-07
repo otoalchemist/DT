@@ -145,7 +145,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -1965,6 +1965,137 @@ describe("auto-arm timing: 15-min wake vs epoch crossover", () => {
     paidThrough(N);
     await maybeAutoArmPayment([10n], N + 1n, 0n);
     expect(runtime.strategy.jitTargetEpoch).toBe(Number(N + 2n));
+  });
+});
+
+// Benji (Defense) Mode inverts the bot's oldest safety rule — "an audited citizen gets no
+// automatic response at all" — and is the only path that pays an UNBOUNDED amount without
+// a keypress, since an audited citizen is 2+ epochs behind and payTaxes force-settles all
+// of them at once. So these pin the boundaries of the exception as tightly as the feature:
+// what it will spend, what it refuses to touch, and the limits it still answers to.
+describe("benji (defense) mode: auto-paying an audited citizen", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const EPOCH = 200n;
+  const OWNED = [10n];
+  const DEBT = 3_000_000_000_000_000n; // 3 epochs' catch-up
+
+  /** One owned citizen, audited or not, with a bribe balance and a quoted debt. */
+  const stage = (o: { auditDue?: string; bribes?: bigint; owed?: bigint; behind?: bigint } = {}) => {
+    vi.mocked(batchGetOwnedStatuses).mockImplementation((async (ids: bigint[], cur: bigint) =>
+      ids.map((id) => ({
+        tokenId: id.toString(),
+        lastEpochPaid: (cur - (o.behind ?? 3n)).toString(),
+        currentEpoch: cur.toString(),
+        auditDueTimestamp: o.auditDue ?? "99999999999",
+        secondsUntilKillable: 3600,
+        bribeBalance: (o.bribes ?? 0n).toString(),
+        hasLifeInsurance: false,
+        risk: "audited",
+        estimatedPayWei: (o.owed ?? DEBT).toString(),
+      })) ) as never);
+  };
+
+  const paid = () => vi.mocked(submitTx).mock.calls.filter(([i]) => (i as { data: string }).data === "0xPAYTAXES");
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    useWallet({ address: ADDR }, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.currentEpoch = EPOCH;
+    runtime.startTime = 0n;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    // maxAutoPayEpochs: 1 throughout — a 3-epoch debt is far over it, which is the point.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      autoDefendAudit: true, maxAutoPayEpochs: 1, maxPaymentEth: 0,
+      minBalanceEth: 0, maxBaseFeeGwei: 1000,
+    };
+    // payTaxes is owner-only, so the pass fails closed unless it can resolve the holding
+    // wallet. tick() primes that by fetching ownership first; do the same here.
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+    // Bookkeeping is module state keyed by audit, so without this a token paid in one
+    // test is silently skipped in the next — which made a later assertion pass for the
+    // wrong reason before this was added.
+    resetDefenseState();
+    stage();
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.running = false;
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    vi.mocked(batchGetOwnedStatuses).mockReset();
+  });
+
+  it("pays off an audited citizen that holds no bribes", async () => {
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(1);
+    expect((paid()[0]?.[0] as { value: bigint }).value).toBe(DEBT);
+  });
+
+  it("does nothing when the toggle is off", async () => {
+    runtime.strategy = { ...runtime.strategy, autoDefendAudit: false };
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(0);
+  });
+
+  it("ignores a citizen that is not under audit", async () => {
+    stage({ auditDue: "0" });
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(0);
+  });
+
+  it("leaves an audited citizen alone while it still holds a bribe", async () => {
+    // A bribe clears the audit for free, so paying tax instead would be strictly worse.
+    // Which one to burn stays the user's call.
+    stage({ bribes: 1n });
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(0);
+  });
+
+  it("never rescues a citizen the user excluded from payment", async () => {
+    // "Never pay this one" has to mean never, or this switch would quietly resurrect a
+    // citizen the user had decided to let go.
+    runtime.strategy = { ...runtime.strategy, excludedTokenIds: ["10"] };
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(0);
+  });
+
+  it("pays a catch-up far over the Auto-Pay Limit, on purpose", async () => {
+    // maxAutoPayEpochs is 1 and the debt is 3 epochs. Honouring that cap here would block
+    // the feature in exactly the case it exists for, so it is deliberately not applied.
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(1);
+  });
+
+  it("still answers to Max single payment", async () => {
+    // The one ceiling the user sets that this must NOT override, or "Benji (Defense) Mode" would
+    // mean "no spending limit at all".
+    runtime.strategy = { ...runtime.strategy, maxPaymentEth: 0.002 }; // debt is 0.003
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(0);
+  });
+
+  it("retries after a refusal rather than giving up on the citizen", async () => {
+    // A base-fee spike must not permanently abandon a citizen with a death clock running.
+    runtime.strategy = { ...runtime.strategy, maxPaymentEth: 0.002 };
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(0);
+    runtime.strategy = { ...runtime.strategy, maxPaymentEth: 0 }; // spike passes
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(1);
+  });
+
+  it("pays one audit once, but arms again for a NEW audit on the same citizen", async () => {
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(1); // same audit, no double-pay
+
+    stage({ auditDue: "88888888888" }); // re-audited later: a different deadline
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    expect(paid()).toHaveLength(2);
   });
 });
 

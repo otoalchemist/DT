@@ -242,11 +242,30 @@ export interface StrategyConfig {
   /** Master switch: when false, the engine observes but never submits. */
   enabled: boolean;
 
-  // --- Defense (pre-audit only) ---
+  // --- Defense ---
   //
-  // There is no automatic response to an audit: the bot never pays to clear one and
-  // never spends a held bribe. Both are manual actions on the token row. The settings
-  // below only govern keeping a citizen current BEFORE it can be audited.
+  // By default there is no automatic response to an audit: the bot never pays to clear
+  // one and never spends a held bribe. Both are manual actions on the token row, and the
+  // settings below govern keeping a citizen current BEFORE it can be audited. The single
+  // exception is `autoDefendAudit`, which the user must opt in to.
+  /**
+   * "Benji (Defense) Mode" in the UI — the field keeps the descriptive name so its job is
+   * readable from the config file alone.
+   *
+   * Pay off an audited citizen to clear the audit — the ONE automatic response to an
+   * audit, and off by default.
+   *
+   * Only fires for a citizen holding NO bribes: a bribe clears an audit for free, which
+   * is cheaper than paying the tax, so burning one stays a manual decision.
+   *
+   * Cost warning: an audited citizen is 2+ epochs behind by definition, and payTaxes
+   * force-settles every delinquent epoch at once, so this pays a multiple of one day's
+   * tax. It deliberately ignores `maxAutoPayEpochs` — that cap sizes routine auto-pay,
+   * and applying it here would block the feature in precisely the case it exists for.
+   * `maxPaymentEth`, the base-fee cap and the per-wallet balance floor still apply, and
+   * `excludedTokenIds` still wins.
+   */
+  autoDefendAudit: boolean;
   /** Proactively pay before becoming delinquent (don't wait to be audited). */
   proactivePay: boolean;
   /** Epochs to prepay per payTaxes call (1-7) to lock the current rate. */

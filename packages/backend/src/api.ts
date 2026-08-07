@@ -33,6 +33,7 @@ import { syncDefaultLists } from "./list-sync.js";
 const strategyPatch = z
   .object({
     enabled: z.boolean(),
+    autoDefendAudit: z.boolean(),
     proactivePay: z.boolean(),
     prepayEpochs: z.number().int().min(1).max(7),
     maxAutoPayEpochs: z.number().int().min(1),

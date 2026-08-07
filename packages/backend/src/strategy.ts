@@ -88,7 +88,10 @@ function walletForToken(tokenId: bigint | string): Wallet | null {
  * owned set is their union, and every downstream pass needs to know which wallet a token
  * came from in order to sign for it.
  */
-async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint[]> {
+// Exported for tests: it is what populates `ownedBy`, and every owner-only path fails
+// closed without it — so a test that submits for an owned token has to prime it the same
+// way tick() does, rather than assuming a wallet.
+export async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint[]> {
   const per = await Promise.all(
     runtime.wallets.map(async (w) => ({
       w,
@@ -201,6 +204,14 @@ let jitSubmittedTarget: number | null = null;
 export function resetJitState(): void {
   jitSubmitted = new Set();
   jitSubmittedTarget = null;
+}
+
+/** Clear defense-mode bookkeeping. Deliberately NOT called from stopEngine: away mode
+ *  stops the engine every epoch, and forgetting a submitted-but-not-yet-mined payment
+ *  across that gap would pay the same audit twice. Entries expire on their own once the
+ *  audit clears (see the prune in maybeAutoDefendAudit). Exported for tests. */
+export function resetDefenseState(): void {
+  defendSubmitted = new Set();
 }
 
 // Proactive-pay bookkeeping: tokenIds already submitted for the current epoch.
@@ -1557,19 +1568,109 @@ async function act(
   }
 }
 
-// There is deliberately NO defense pass.
+// By default there is NO defense pass.
 //
 // The bot takes ZERO automatic action once one of your citizens is audited — it will not
 // pay taxes to clear the audit, and it will not spend a held bribe. Recovering an audited
-// citizen is entirely the user's decision, via the manual "Pay to current" / "Clear audit
-// (bribe)" buttons on the token row (see manualPayToCurrent / manualUseBribe).
+// citizen is the user's decision, via the manual "Pay to current" / "Clear audit (bribe)"
+// buttons on the token row (see manualPayToCurrent / manualUseBribe).
 //
-// What remains automatic is only PRE-audit protection: proactivePayPass and the JIT
+// What is always automatic is only PRE-audit protection: proactivePayPass and the JIT
 // payment keep a citizen current so it never becomes auditable in the first place. Both
 // skip any citizen that is already under audit, and both honour `excludedTokenIds`.
 //
 // Consequence, stated plainly: an audited citizen you do not pay yourself will be
-// killable when its 24h audit expires, and nothing here will stop that.
+// killable when its 24h audit expires, and nothing here will stop that — UNLESS the
+// user opts in to `autoDefendAudit` below, which is the single exception.
+
+/** Tokens already defended, keyed `tokenId:auditDueTimestamp` so that a *new* audit on
+ *  the same token arms again while a retry of the same one does not double-pay. */
+let defendSubmitted = new Set<string>();
+
+/**
+ * "Benji (Defense) Mode": pay off an audited citizen to clear the audit — the ONE automatic
+ * response to an audit.
+ *
+ * Opt-in and off by default, because it inverts the rule above and spends an unbounded
+ * amount: an audited citizen is 2+ epochs behind by definition, and payTaxes force-settles
+ * every delinquent epoch at once, so the bill is a multiple of a normal day's tax. That is
+ * also why it deliberately ignores `maxAutoPayEpochs` — that cap sizes ROUTINE auto-pay,
+ * and honouring it here would block this in exactly the case it exists for, letting the
+ * citizen die with the feature switched on. The hard limits still apply: `maxPaymentEth`,
+ * the base-fee cap and the per-wallet balance floor are all enforced via canSpend, so
+ * there is still a ceiling the user controls.
+ *
+ * Only acts on a citizen with NO bribes. A held bribe clears the audit for free, which is
+ * strictly cheaper than paying the tax, and choosing to burn one stays a manual decision.
+ *
+ * Timing note: under away mode the engine only ticks in the boundary window, but a 24h
+ * kill deadline cannot outrun a window that recurs every 24h — see the test.
+ */
+// Exported for tests: this pays an unbounded amount with no keypress.
+export async function maybeAutoDefendAudit(
+  ownedIds: bigint[],
+  currentEpoch: bigint,
+  nowSec: bigint,
+): Promise<void> {
+  const s = runtime.strategy;
+  if (!s.autoDefendAudit) return;
+  // The per-citizen payment opt-out wins: "never pay this one" has to mean never, or the
+  // switch would quietly resurrect a citizen the user had decided to let go.
+  const candidates = applyExclusions(ownedIds, "auto-defend");
+  if (candidates.length === 0) return;
+  // n=1 is enough to price the whole debt: the contract force-settles every delinquent
+  // epoch, so estimateTaxesToPay(id, 1) already quotes the full catch-up.
+  const statuses = await batchGetOwnedStatuses(candidates, currentEpoch, nowSec, 1);
+
+  const audited = statuses.filter((st) => st.auditDueTimestamp !== "0");
+  // Drop bookkeeping for audits that are over, so the set can't grow without bound.
+  const liveKeys = new Set(audited.map((st) => `${st.tokenId}:${st.auditDueTimestamp}`));
+  for (const k of defendSubmitted) if (!liveKeys.has(k)) defendSubmitted.delete(k);
+
+  for (const st of audited) {
+    const key = `${st.tokenId}:${st.auditDueTimestamp}`;
+    if (defendSubmitted.has(key)) continue;
+    if (BigInt(st.bribeBalance) > 0n) continue; // free fix available; stays the user's call
+
+    const value = BigInt(st.estimatedPayWei);
+    if (value === 0n) continue;
+    const tokenId = BigInt(st.tokenId);
+    const wallet = walletForToken(tokenId);
+    const guard = await canSpend(value, false, wallet);
+    if (!guard.ok) {
+      // Not marked submitted: retry next tick. A base-fee spike or a temporary floor
+      // breach must not permanently give up on a citizen that is about to be killed.
+      activity.add({
+        kind: "pay-taxes",
+        status: "skipped",
+        tokenId: st.tokenId,
+        message:
+          `Benji (Defense) Mode could NOT save #${st.tokenId}: ${guard.reason}. It is under audit ` +
+          `with no bribes and will be killable in ${st.secondsUntilKillable ?? 0}s.`,
+      });
+      continue;
+    }
+    defendSubmitted.add(key); // before awaiting, so a rapid re-fire can't double-pay
+    const res = await act(
+      { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, 1), value },
+      "pay-taxes",
+      {
+        tokenId: st.tokenId,
+        // canSpend already refused a null wallet above, so this is set in practice; act()
+        // re-resolves from the tokenId and fails closed anyway if it somehow isn't.
+        wallet: wallet ?? undefined,
+        message:
+          `Benji (Defense) Mode: paying off audited #${st.tokenId} = ${formatEther(value)} ETH ` +
+          `(${Number(currentEpoch - BigInt(st.lastEpochPaid))} epoch(s) behind, no bribes held) — clears the audit`,
+      },
+    );
+    // act() returns null when nothing was submitted (sim revert, no signer, send failed).
+    // Elsewhere leaving the token marked is fine; here it would mean one failed send is
+    // the difference between a citizen living and dying, so release it and retry next
+    // tick. A submission that DID go out stays marked, so this can't double-pay.
+    if (!res) defendSubmitted.delete(key);
+  }
+}
 
 /**
  * Pay delinquent-but-not-yet-audited citizens. Only invoked from the
@@ -2088,8 +2189,12 @@ async function tick(fireProactivePay = false): Promise<void> {
     await maybeAutoArmPayment(ownedIds, currentEpoch, nowSec);
 
     if (runtime.strategy.enabled) {
-      // No defense pass: an audited citizen gets no automatic response at all. Only
-      // pre-audit protection runs here (see the note above proactivePayPass).
+      // The only automatic response to an audit, and off unless opted in. Runs before the
+      // pre-audit passes because it is the one with a death clock on it, and every tick
+      // rather than only on boundary ticks — an audit expires 24h after it was cast, not
+      // on a boundary, so waiting for one could be waiting past the deadline.
+      await maybeAutoDefendAudit(ownedIds, currentEpoch, nowSec);
+      // Otherwise: pre-audit protection only (see the note above proactivePayPass).
       if (fireProactivePay && runtime.strategy.proactivePay) {
         await proactivePayPass(ownedIds, currentEpoch, nowSec);
       }

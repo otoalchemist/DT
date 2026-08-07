@@ -65,7 +65,7 @@ const STRATEGY_FIELDS: (keyof StrategyConfig)[] = [
   "endgameOnlyWithin", "offenseTargetTokenIds",
   "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
   "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
-  "racePublicMempool", "minBalanceEth", "maxPaymentEth",
+  "racePublicMempool", "minBalanceEth", "maxPaymentEth", "autoDefendAudit",
   // NOTE: awayMode/awayLeadMinutes are deliberately absent. They live in the top bar as
   // an instant-apply control (like Start bot), so they persist the moment they're
   // pressed and must never light up this panel's unsaved-changes indicator.
@@ -306,12 +306,58 @@ export function Config({
           bundle so any builder can include them next block) and stays that way; still
           editable in data/config.json. */}
 
-      {/* DEFENSE is intentionally not rendered — it's rarely touched, and arming a
-          JIT payment enables it automatically. The remaining values stay editable in
-          data/config.json (enabled, proactivePay, prepayEpochs), and cover PRE-AUDIT
-          protection only: there is no automatic response to an audit at all, so there
-          is no safety-buffer or auto-bribe setting to expose. Per-citizen opt-out and
-          the per-payment epoch cap live in the Just-in-time panel. */}
+      {/* The rest of DEFENSE is intentionally not rendered — rarely touched, and arming a
+          JIT payment enables it automatically. Those values stay editable in
+          data/config.json (enabled, proactivePay, prepayEpochs) and cover PRE-AUDIT
+          protection only. Per-citizen opt-out and the per-payment epoch cap live in the
+          Just-in-time panel.
+
+          autoDefendAudit IS rendered, because it is the one setting that spends an
+          unbounded amount by itself — a thing a user must be able to see is on. It sits
+          down here, after offense gas rather than up with the payment controls, because
+          almost nobody should want it: letting an audited citizen go is usually correct,
+          and this is the deliberate exception. */}
+      <div className="spacer" />
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>BENJI (DEFENSE) MODE — POST-AUDIT</div>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.autoDefendAudit}
+          onChange={chk("autoDefendAudit")}
+        />
+        Benji (Defense) Mode — auto-pay an audited citizen
+      </label>
+      {cfg.autoDefendAudit ? (
+        <p
+          style={{
+            fontSize: 11,
+            color: "var(--red)",
+            border: "1px solid var(--red)",
+            borderRadius: 4,
+            padding: "8px 10px",
+            margin: "6px 0 8px 24px",
+            lineHeight: 1.55,
+          }}
+        >
+          <b>⚠ BENJI (DEFENSE) MODE IS ON — this spends without asking.</b>
+          <br />
+          When one of your citizens is audited and holds <b>no bribes</b>, the bot pays off its
+          whole debt to clear the audit. An audited citizen is at least 2 epochs behind, and
+          paying force-settles <em>every</em> delinquent epoch at once, so the bill is a
+          multiple of a normal day's tax and grows the further behind it is.
+          <br />
+          <b>This ignores your Auto-Pay Limit</b> — that cap would block it in exactly the case
+          it exists for. Max single payment, the base-fee cap and the min-balance floor still
+          apply, and a citizen you unchecked in the JIT panel is still never paid.
+        </p>
+      ) : (
+        <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
+          Off: an audited citizen gets no automatic response and will be killable when its 24h
+          audit expires. Recovering one is manual — "Pay to current" or "Clear audit (bribe)" on
+          the token row. Turn this on only if you want the bot to buy a citizen back unattended,
+          at whatever the catch-up costs.
+        </p>
+      )}
 
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>GUARDRAILS</div>
