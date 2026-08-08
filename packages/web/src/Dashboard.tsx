@@ -648,7 +648,13 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
         <div className="spacer" />
         <TargetScores
           currentEpoch={status?.currentEpoch ?? null}
-          tipGwei={config?.offensePriorityFeeGwei ?? 20.1}
+          // Must mirror resolveGas(): the offense tip only applies when separateOffenseGas
+          // is on. With it off, audits ride the PAYMENT tip — reading offensePriorityFeeGwei
+          // unconditionally priced the bundle at a tip the bot wasn't going to bid, which
+          // overstated every beat figure (the gap is charged across the whole bundle gas).
+          tipGwei={
+            (config?.separateOffenseGas ? config?.offensePriorityFeeGwei : config?.priorityFeeGwei) ?? 20.1
+          }
           ownedCitizens={tokens.length}
           // Sum of auditLimit, not tokens.length: auditor-role citizens carry more than
           // one slot, so a wallet's real capacity is usually above its citizen count.

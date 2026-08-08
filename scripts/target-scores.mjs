@@ -84,7 +84,18 @@ const EPOCH_DURATION = 86400n;
 // Gas measured from real on-chain game txs: payTaxes ~82,875, audit ~130,409, plus the
 // fixed 60,000 for the CoinbasePayer tx.
 const OUR_BUNDLE_GAS = 82_875 + 130_409 + 60_000;
-const OUR_TIP_GWEI = 20.1; // DEFAULT_STRATEGY.offensePriorityFeeGwei
+// The tip we would actually bid on an audit. Mirrors resolveGas(): the offense tip only
+// applies when separateOffenseGas is on, otherwise audits ride the payment tip. Read from
+// the live config rather than hardcoded, because pricing against a tip the bot won't bid
+// misstates every beat figure — the difference is charged across the whole bundle gas.
+const OUR_TIP_GWEI = (() => {
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf8"));
+    const tip = c.separateOffenseGas ? c.offensePriorityFeeGwei : c.priorityFeeGwei;
+    if (typeof tip === "number" && tip >= 0) return tip;
+  } catch {}
+  return 20.1; // DEFAULT_STRATEGY.offensePriorityFeeGwei
+})();
 const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI, 0.00069 ETH
 const TAXES_PAID = "0xa13146c03f92fd93f0bccebeff87928581da5e13079c83238adc89e466ebfaca";
 const AUDITED = "0xee1e30708b892ceb30b2a542bccb9a10c605f220dd821cc582226d1fbeea4f6f";
@@ -622,8 +633,8 @@ async function main() {
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
     console.log("clean/caught of N = skips (boundaries crossed 2+ behind) survived / caught by an audit, out of attempted — all-clean = proven-safe cadence, caught often = soft target");
     console.log("beat2ep = bid to out-rank its defense over the LAST 2 EPOCHS (likely cost next boundary) · beatMax = same against its PEAK over the whole window (what it can mount again)");
-    console.log("  '-' = no bid needed, our 20.1 gwei tip already out-ranks it · '?' = tops the block anyway, so something unobservable buys that position · '·' = no payment seen in that window");
-    console.log("  both price a 1-pay + 1-audit bundle at our 20.1 gwei tip against DENSITY ((bid + tips)/gas, what builders sort on) — a bidder's tip can be ~0 while its density is hundreds of gwei/gas");
+    console.log(`  '-' = no bid needed, our ${OUR_TIP_GWEI} gwei tip already out-ranks it · '?' = tops the block anyway, so something unobservable buys that position · '·' = no payment seen in that window`);
+    console.log(`  both price a 1-pay + 1-audit bundle at our ${OUR_TIP_GWEI} gwei tip against DENSITY ((bid + tips)/gas, what builders sort on) — a bidder's tip can be ~0 while its density is hundreds of gwei/gas`);
     console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
     console.log("bid = coinbase bid over the LAST 2 EPOCHS (ETH x bid-backed payments) — buys top-of-block, so a bidder is near-unauditable; shared when one operator co-pays several citizens; '?' = RPC has no tracing");
   }
