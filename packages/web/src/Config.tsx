@@ -8,6 +8,42 @@ function parseTokenIds(raw: string): string[] {
   return raw.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
 }
 
+/**
+ * One additive target group. Lit when every id it carries is already selected, so the
+ * button reflects the actual list rather than a click it remembers — hand-editing the
+ * textarea keeps the lights honest.
+ */
+function GroupToggle({
+  label, ids, on, onClick, disabled, title,
+}: {
+  label: string;
+  ids: string[];
+  on: boolean;
+  onClick: (ids: string[]) => void;
+  disabled: boolean;
+  title: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(ids)}
+      disabled={disabled || ids.length === 0}
+      title={`${title}\n\n${on ? "Selected — click to remove these from the list." : "Click to ADD these to the list (combines with anything already selected)."}`}
+      style={{
+        padding: "3px 12px",
+        borderRadius: 6,
+        fontSize: 12,
+        border: `1px solid ${on ? "var(--accent)" : "#555"}`,
+        background: on ? "var(--accent)" : "transparent",
+        color: on ? "#06121f" : undefined,
+        fontWeight: on ? 600 : undefined,
+      }}
+    >
+      {on ? "✓ " : ""}{label} <span style={{ opacity: 0.7 }}>({ids.length})</span>
+    </button>
+  );
+}
+
 function AlchemyKeySection() {
   const [key, setKey] = useState("");
   const [busyKey, setBusyKey] = useState(false);
@@ -102,7 +138,11 @@ export function Config({
   const [skippers, setSkippers] = useState<string[]>([]);
   // The "big boys" roster (data/do-not-target.json). Offered as a template because the
   // roster is advice, not a block: pinning one is how you deliberately go after it.
-  const [bigBoys, setBigBoys] = useState<string[]>([]);
+  // The do-not-target roster kept GROUPED by operator, not flattened. Each big-boy
+  // operator is a different proposition — one is actively hunting, two have not audited
+  // in months — so "target the roster" was never really one decision.
+  const [dntByOperator, setDntByOperator] = useState<Record<string, string[]>>({});
+  const bigBoys = Object.values(dntByOperator).flat();
 
   // The raw text of the targets box, kept separately from the parsed id list.
   //
@@ -123,13 +163,50 @@ export function Config({
   useEffect(() => {
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
     api.rivalSkippers().then((r) => setSkippers(r.tokenIds)).catch(() => {});
-    api.doNotTarget().then((rows) => setBigBoys(rows.map((r) => r.tokenId))).catch(() => {});
+    api
+      .doNotTarget()
+      .then((rows) => {
+        const byOp: Record<string, string[]> = {};
+        for (const r of rows) (byOp[r.operator] ??= []).push(r.tokenId);
+        setDntByOperator(byOp);
+      })
+      .catch(() => {});
   }, []);
 
   // True when the current target list already equals `list` (same ids, same order).
   const targetsEqual = (list: string[]) =>
     cfg.offenseTargetTokenIds.length === list.length &&
     cfg.offenseTargetTokenIds.every((id, i) => id === list[i]);
+
+  // Compare by canonical numeric form, so "0206" typed by hand still matches "206" from
+  // a list. Non-numeric text mid-edit falls back to itself rather than throwing.
+  const canon = (id: string) => {
+    try {
+      return BigInt(id.trim()).toString();
+    } catch {
+      return id.trim();
+    }
+  };
+  const selected = new Set(cfg.offenseTargetTokenIds.map(canon));
+  /** A group counts as ON only when every one of its ids is already selected. */
+  const groupOn = (group: string[]) => group.length > 0 && group.every((id) => selected.has(canon(id)));
+  /**
+   * Toggle a whole group in or out of the selection, so groups COMBINE rather than
+   * replace: skippers + non-skippers is a legitimate ask, and re-typing one of them by
+   * hand to get both was the only way before. Union on the way in (no duplicates),
+   * set-difference on the way out. Order is preserved so the textarea doesn't reshuffle
+   * under the cursor.
+   */
+  const toggleGroup = (group: string[]) => {
+    const current = cfg.offenseTargetTokenIds;
+    if (groupOn(group)) {
+      const drop = new Set(group.map(canon));
+      set("offenseTargetTokenIds", current.filter((id) => !drop.has(canon(id))));
+    } else {
+      const have = new Set(current.map(canon));
+      set("offenseTargetTokenIds", [...current, ...group.filter((id) => !have.has(canon(id)))]);
+    }
+  };
 
   // Non-skippers = the curated default list minus the skippers subset, derived here
   // rather than shipped as its own file: skippers is already a strict subset of the
@@ -214,32 +291,33 @@ export function Config({
         >
           Reset to default list
         </button>
+        {/* Groups TOGGLE and combine — lit when every id in the group is selected.
+            Each is additive, so "skippers + non-skippers" is two clicks instead of
+            re-typing a list by hand. The roster is split per operator because they are
+            not one decision: they defend differently and only one of them attacks. */}
+        <GroupToggle label="Rival Skippers" ids={skippers} on={groupOn(skippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
+          title="Rivals that pay on a ~2-epoch cadence, so they are delinquent at every second boundary." />
+        <GroupToggle label="Non-skippers" ids={nonSkippers} on={groupOn(nonSkippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
+          title="The curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)." />
+        {Object.keys(dntByOperator).sort().map((op) => (
+          <GroupToggle
+            key={op}
+            label={op}
+            ids={dntByOperator[op]!}
+            on={groupOn(dntByOperator[op]!)}
+            onClick={toggleGroup}
+            disabled={!cfg.offenseEnabled}
+            title={`Big-boy operator "${op}" (data/do-not-target.json). Normally excluded because they cure at the top of the boundary block — selecting them here is the deliberate override that makes the bot audit them anyway.`}
+          />
+        ))}
         <button
           type="button"
-          onClick={() => set("offenseTargetTokenIds", [...skippers])}
-          disabled={!cfg.offenseEnabled || skippers.length === 0 || targetsEqual(skippers)}
+          onClick={() => set("offenseTargetTokenIds", [])}
+          disabled={!cfg.offenseEnabled || cfg.offenseTargetTokenIds.length === 0}
           style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
-          title="Target only rivals that pay on a ~2-epoch cadence (delinquent at every second boundary)"
+          title="Clear the list. Blank = target every delinquent rival the bot discovers."
         >
-          Rival Skippers
-        </button>
-        <button
-          type="button"
-          onClick={() => set("offenseTargetTokenIds", [...nonSkippers])}
-          disabled={!cfg.offenseEnabled || nonSkippers.length === 0 || targetsEqual(nonSkippers)}
-          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
-          title="Target the curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)"
-        >
-          Non-skippers
-        </button>
-        <button
-          type="button"
-          onClick={() => set("offenseTargetTokenIds", [...bigBoys])}
-          disabled={!cfg.offenseEnabled || bigBoys.length === 0 || targetsEqual(bigBoys)}
-          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
-          title="Target the Do Not Target roster (data/do-not-target.json). These are normally excluded because they cure at the top of the boundary block — pinning them here is the deliberate override that makes the bot audit them anyway."
-        >
-          Big Boys
+          Clear
         </button>
         {defaultRivals.length > 0 && (
           <span className="muted" style={{ fontSize: 11 }}>

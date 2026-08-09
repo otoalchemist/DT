@@ -340,6 +340,31 @@ export function Dashboard({
   const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
   const otherTargets = targets.filter((t) => !pinnedSet.has(t.tokenId));
+  // How much offense the coming boundary actually offers.
+  //
+  // A citizen already under audit cannot be audited again, so it never counts however far
+  // behind it is. "Next boundary" is everything 1+ epoch behind: each rolls one deeper
+  // when the epoch turns, so that set includes the ones auditable right now — and it is
+  // what the bot can actually queue into the boundary bundle.
+  const auditableNextIn = (rows: TargetTokenStatus[]) =>
+    rows.filter((t) => t.auditDueTimestamp === "0" && t.epochsBehind >= 1).length;
+
+  // The whole board. readTargets drops UNPINNED roster members, so the big boys have to
+  // be added back — but a PINNED one is already in `targets` (readTargets checks the pin
+  // before the roster, so it lands under My rivals). Concatenating blindly counted those
+  // twice, so dedupe by tokenId.
+  const board = new Map<string, TargetTokenStatus>();
+  for (const t of [...targets, ...doNotTarget]) board.set(t.tokenId, t);
+  const totalAuditableNext = auditableNextIn([...board.values()]);
+
+  // What the bot will actually go after. With pins, that is exactly the My rivals
+  // table — pinned big boys are already in it, so no second list to merge. Blank means
+  // "audit every delinquent rival discovered", which excludes the roster: it stays out
+  // of auto-discovery, and a pin is the only override.
+  const myAuditableNext = pinnedSet.size > 0 ? auditableNextIn(myTargets) : auditableNextIn(targets);
+  // Slots are the scarce resource, not targets: an owned citizen audits at most
+  // `auditLimit` times per epoch, and auditor-role citizens carry more than one.
+  const auditCapacity = tokens.reduce((n, t) => n + (t.auditLimit ?? 1), 0);
 
   // Manual per-token actions. `tokenBusy` keys off `${tokenId}:${action}` so only the
   // pressed button shows a spinner, and both buttons on that row lock while it runs.
@@ -671,7 +696,7 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
           // Sum of auditLimit, not tokens.length: auditor-role citizens carry more than
           // one slot, so a wallet's real capacity is usually above its citizen count.
           // Falls back to 1 per citizen for rows read before auditLimit was fetched.
-          auditCapacity={tokens.reduce((n, t) => n + (t.auditLimit ?? 1), 0)}
+          auditCapacity={auditCapacity}
         />
 
         <div className="spacer" />
@@ -683,6 +708,38 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
       <div style={{ width: 380, flexShrink: 0, position: "sticky", top: 20 }}>
         <div className="panel">
           <h2>Rival targets</h2>
+          <div
+            style={{ display: "flex", gap: 14, alignItems: "baseline", margin: "0 0 10px 0", fontSize: 12, flexWrap: "wrap" }}
+            title={
+              `My target audits: what the bot will actually go after at the coming boundary. A big boy counts only when you pin it — the roster is kept out of auto-discovery, and a pin is the override.` +
+              (pinnedSet.size === 0
+                ? ` Your target list is blank, which means "audit every delinquent rival discovered" — so this is every rival EXCEPT the big boys.`
+                : ``) +
+              `\n\nTotal: every delinquent rival on the board, pinned or not, big boys included.` +
+              `\n\nBoth count citizens 1+ epoch behind (they roll one deeper when the epoch turns) and exclude any already under audit, which cannot be audited again until it resolves.` +
+              `\n\nYou hold ${auditCapacity} audit slot(s) this epoch, so that is the most you can act on.`
+            }
+          >
+            <span>
+              <b style={{ fontSize: 18, color: "var(--amber)" }}>{myAuditableNext}</b>{" "}
+              <span className="muted">my target audits next boundary</span>
+            </span>
+            {/* A blank target list means "audit every delinquent rival", not "audit
+                nobody" — pinnedTargetSet() returns null and every offense filter treats
+                null as unfiltered. A bare number here reads as a selection, so say
+                outright that there is no selection and this is the whole field. */}
+            {pinnedSet.size === 0 && (
+              <span
+                className="badge warn"
+                style={{ fontSize: 10, padding: "1px 6px" }}
+                title="Your target list is empty, which the engine reads as “audit every delinquent rival discovered” — not “audit none”. Big boys stay excluded (a pin is the only way to include one). Pin token IDs in Strategy to narrow it."
+              >
+                no pins · all rivals
+              </span>
+            )}
+            <span className="muted">{totalAuditableNext} total auditable</span>
+            <span className="muted">· {auditCapacity} slot{auditCapacity === 1 ? "" : "s"}</span>
+          </div>
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>My rivals ({myTargets.length})</div>
           <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." />
           <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}>
