@@ -96,11 +96,23 @@ export function deriveUrlsFromKey(key: string) {
 // tx (one per target block), so a burst of many tokens at once may get throttled.
 // (rsync-builder.xyz was dropped — verified unreachable as of 2026-07; add it back
 // via BUILDER_URLS if it returns.)
+// Coverage is the binding constraint, not bid size. Measured over the 51 blocks around
+// the epoch-160 boundary: Titan 21, Quasar 9, Eureka 5, BuilderNet 4, Builder+ 4, and 8
+// built by solo validators with no bundle endpoint at all. With only the first four
+// entries below we could win 25/51 — and that boundary went to Builder+, so a correctly
+// priced bundle (113.6 gwei/gas, enough for index 1 in a block whose marginal tx paid
+// 0.0) was never seen by the builder that mattered, and the citizen got audited.
+// Adding the three below takes reachable slots from ~49% to ~84%; the remaining ~16%
+// are solo-built blocks that no bundle can reach at any price.
+// Each was verified to answer eth_sendBundle with a protocol-level error (2026-08).
 const DEFAULT_BUILDER_URLS = [
   "https://relay.flashbots.net",
   "https://rpc.buildernet.org", // BuilderNet — built the boundary blocks we lost
   "https://rpc.beaverbuild.org",
   "https://rpc.titanbuilder.xyz",
+  "https://rpc.quasar.win", // Quasar — 2nd most frequent winner in the sample
+  "https://rpc.eurekabuilder.xyz", // Eureka
+  "https://rpc.btcs.com", // Builder+ — built the boundary block that cost us #2036
 ];
 
 function derive() {
