@@ -1596,6 +1596,28 @@ async function act(
 let defendSubmitted = new Set<string>();
 
 /**
+ * Latest audit deadline among owned citizens Benji still intends to pay off, or null.
+ *
+ * Exists so away mode cannot idle into a running death clock. When the boundary bundle
+ * loses its block, a citizen can be audited seconds later; the away window then closes
+ * five minutes after the boundary and the engine sleeps ~23h40m, leaving one retry about
+ * fifteen minutes before the 24h deadline. That is far too thin a margin for the one
+ * failure mode that permanently loses a citizen.
+ *
+ * Only counts citizens Benji would actually act on — audited, unbribed, not excluded —
+ * so a held bribe or an opt-out never keeps the engine awake for nothing. Cleared as soon
+ * as the audit clears, and never held past the deadline itself, so it cannot wedge away
+ * mode open: once the deadline passes the citizen is killable and there is nothing left
+ * to do about it.
+ */
+let defensePendingUntilSec: bigint | null = null;
+
+/** The deadline Benji is still working against, or null when there is nothing pending. */
+export function defensePendingUntil(): bigint | null {
+  return defensePendingUntilSec;
+}
+
+/**
  * "Benji (Defense) Mode": pay off an audited citizen to clear the audit — the ONE automatic
  * response to an audit.
  *
@@ -1649,6 +1671,15 @@ export async function maybeAutoDefendAudit(
   // Drop bookkeeping for audits that are over, so the set can't grow without bound.
   const liveKeys = new Set(audited.map((st) => `${st.tokenId}:${st.auditDueTimestamp}`));
   for (const k of defendSubmitted) if (!liveKeys.has(k)) defendSubmitted.delete(k);
+
+  // Publish the deadline away mode must not sleep through: the citizens Benji still
+  // intends to pay off. A bribed one is excluded because Benji leaves it alone, and an
+  // expired deadline is excluded because the citizen is already killable — neither is a
+  // reason to hold the engine open. Recomputed every pass, so it clears itself.
+  const actionable = audited
+    .filter((st) => BigInt(st.bribeBalance) === 0n && BigInt(st.auditDueTimestamp) > nowSec)
+    .map((st) => BigInt(st.auditDueTimestamp));
+  defensePendingUntilSec = actionable.length > 0 ? actionable.reduce((a, b) => (a > b ? a : b)) : null;
 
   for (const st of audited) {
     const key = `${st.tokenId}:${st.auditDueTimestamp}`;
