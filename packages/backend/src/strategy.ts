@@ -1622,8 +1622,10 @@ export function defensePendingUntil(): bigint | null {
  * response to an audit.
  *
  * Opt-in and off by default, because it inverts the rule above and spends an unbounded
- * amount: an audited citizen is 2+ epochs behind by definition, and payTaxes force-settles
- * every delinquent epoch at once, so the bill is a multiple of a normal day's tax. That is
+ * amount: an audited citizen is 2+ epochs behind by definition, and BEING AUDITED revokes
+ * the one-epoch skip — it must settle every delinquent epoch at once, so the bill is a
+ * multiple of a normal day's tax. (Unaudited, the same citizen would owe 1x; see
+ * cappedAutoPayEpochs for both branches.) That is
  * also why it deliberately ignores `maxAutoPayEpochs` — that cap sizes ROUTINE auto-pay,
  * and honouring it here would block this in exactly the case it exists for, letting the
  * citizen die with the feature switched on. The hard limits still apply: `maxPaymentEth`,
@@ -1648,8 +1650,9 @@ export async function maybeAutoDefendAudit(
   // switch would quietly resurrect a citizen the user had decided to let go.
   const candidates = applyExclusions(ownedIds, "auto-defend");
   if (candidates.length === 0) return;
-  // n=1 is enough to price the whole debt: the contract force-settles every delinquent
-  // epoch, so estimateTaxesToPay(id, 1) already quotes the full catch-up.
+  // n=1 is enough to price the whole debt: every citizen this pass acts on is audited,
+  // and for an audited citizen estimateTaxesToPay(id, 1) already quotes the full
+  // catch-up rather than the one-epoch skip price.
   const statuses = await batchGetOwnedStatuses(candidates, currentEpoch, nowSec, 1);
   // batchGetOwnedStatuses DROPS any token whose multicall slice partly failed. On the
   // other passes that costs an opportunity; here it would let a citizen be killed with
@@ -1818,8 +1821,10 @@ async function proactivePayPass(
 
     const value = BigInt(st.estimatedPayWei); // estimate for `epochs` (capped)
     if (value === 0n) continue;
-    // Auto-Pay Limit as a SPEND cap: the contract force-settles every delinquent epoch,
-    // so a token N behind is quoted Nx even at n=1 and cannot be partially paid.
+    // Auto-Pay Limit as a SPEND cap on whatever the chain actually quoted. For an
+    // unaudited citizen that is one epoch's price however far behind it is (the skip),
+    // so a 1-epoch cap does NOT block curing one — it only bites once the citizen is
+    // audited and the quote becomes the full settle. See cappedAutoPayEpochs.
     if (!withinAutoPayCap(value, s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI)) {
       const cap = autoPayCapWei(s.maxAutoPayEpochs, currentEpoch, BASE_TAX_RATE_WEI);
       activity.add({
@@ -2176,10 +2181,11 @@ async function runManualAction(
 }
 
 /**
- * Pay a token's full outstanding tax so it becomes current (and any active audit is
- * cleared). Quotes on-chain with numEpochs=1, which force-settles every delinquent
- * epoch — so a token N behind costs N x the current epoch rate. Deliberately NOT
- * subject to the Auto-Pay Limit: that cap governs automatic payments only.
+ * Pay a token's outstanding tax so it becomes current (and any active audit is cleared).
+ * Quotes on-chain with numEpochs=1 and sends exactly that, which is right either way:
+ * one epoch's price for an unaudited citizen (the skip), or the full N x settle once it
+ * is audited and the skip is revoked. Deliberately NOT subject to the Auto-Pay Limit —
+ * that cap governs automatic payments only, and this is the manual rescue.
  */
 export async function manualPayToCurrent(tokenId: bigint): Promise<ManualActionResult> {
   return runManualAction(tokenId, "pay-taxes", async () => {

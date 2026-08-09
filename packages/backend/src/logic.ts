@@ -145,11 +145,20 @@ export function excludedTokenSet(ids: string[]): { set: Set<string>; invalid: st
  * How many epochs a single automatic payTaxes should request: the requested count,
  * clamped to the global `maxAutoPayEpochs` cap and to at least 1.
  *
- * NOTE: clamping `n` does NOT by itself cap the ETH spent. Verified on-chain,
- * estimateTaxesToPay(id, n) = (epochsBehind + n - 1) * currentEpoch * base — the
- * contract force-settles every delinquent epoch, so a token 2 behind is quoted 2x
- * even at n=1 (mainnet tx 0x90cdbae4… paid 0.20424 ETH = 2 * 148 * base with n=1).
- * `n` only controls how much is PREPAID on top of that mandatory catch-up.
+ * NOTE: clamping `n` does NOT by itself cap the ETH spent, and the quote depends on
+ * whether the citizen is UNDER AUDIT. Both branches verified on-chain (2026-08):
+ *
+ *   not audited -> n * currentEpoch * base. One epoch's price advances the citizen to
+ *     current however far behind it is — this is the tax-skip the bot is built around.
+ *     #2711 went lastEpochPaid 157 -> 159 paying 1 * 159 * base (blk 25706529), and at
+ *     blk 25713687 the unaudited 2-behind #988/#99/#113 were each quoted exactly 1x.
+ *   under audit -> (epochsBehind + n - 1) * currentEpoch * base. The skip is revoked:
+ *     you must settle in full to clear the audit. #794 and #2036 were both quoted 2x
+ *     while 2 behind, and paying 1x reverted with IncorrectPayment().
+ *
+ * So a token 2 behind is quoted 2x ONLY once someone audits it (which is what the
+ * earlier note here generalised from — mainnet tx 0x90cdbae4… was an audited token).
+ * estimateTaxesToPay is authoritative for both branches: quote, don't compute.
  * Use `autoPayCapWei` to bound the actual spend.
  */
 export function cappedAutoPayEpochs(requestedEpochs: number, maxAutoPayEpochs: number): number {

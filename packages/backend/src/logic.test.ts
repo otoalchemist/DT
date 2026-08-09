@@ -168,10 +168,21 @@ describe("spend guardrails", () => {
   });
 
   describe("autoPayCapWei / withinAutoPayCap (per-payment SPEND cap)", () => {
-    // Verified on-chain: estimateTaxesToPay(id, n) = (epochsBehind + n - 1) * epoch * base.
-    // Probed at epoch 148 against mainnet: 1 behind -> 148 base units (0.10212 ETH),
-    // 2 behind -> 296 units (0.20424 ETH). Clamping n cannot reduce the catch-up, so
-    // the limit has to be enforced as a spend cap that DECLINES the payment.
+    // What the chain quotes depends on whether the citizen is UNDER AUDIT — the single
+    // most misread fact in this codebase, and worth pinning because getting it backwards
+    // once already produced a false "the payment will revert" alarm.
+    //
+    //   not audited -> n * epoch * base. One epoch's price advances a citizen to current
+    //     however far behind it is. Verified: #2711 went lastEpochPaid 157 -> 159 paying
+    //     1 * 159 * base (blk 25706529), and unaudited 2-behind citizens (#988, #99,
+    //     #113 at blk 25713687) were each quoted exactly 1x.
+    //   under audit -> (epochsBehind + n - 1) * epoch * base. Verified: #794 and #2036
+    //     were quoted 2x while 2 behind, and paying 1x reverted IncorrectPayment().
+    //
+    // Consequence for this cap: a 1-epoch limit does NOT block curing an unaudited
+    // citizen that is several epochs behind, because the quote is still one epoch. It
+    // only bites once the citizen is audited. Clamping n cannot reduce a settle quote,
+    // so the limit is enforced as a spend cap that DECLINES the payment.
     const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI
     const EPOCH = 148n;
     const oneEpoch = 148n * BASE; // 0.10212 ETH — a token 1 behind
@@ -184,6 +195,17 @@ describe("spend guardrails", () => {
 
     it("limit 1 admits a 1-behind token and rejects the 2-behind catch-up", () => {
       expect(withinAutoPayCap(oneEpoch, 1, EPOCH, BASE)).toBe(true);
+      expect(withinAutoPayCap(twoEpochs, 1, EPOCH, BASE)).toBe(false);
+    });
+
+    it("limit 1 still admits an UNAUDITED citizen many epochs behind", () => {
+      // The correction that matters operationally. An unaudited citizen 2, 3 or 10
+      // epochs behind is quoted ONE epoch (the skip), so a 1-epoch limit lets the bot
+      // cure it. Reading the quote as always-Nx is what made this look blocked, and
+      // would argue for raising the cap — spending more, for no reason.
+      expect(withinAutoPayCap(oneEpoch, 1, EPOCH, BASE)).toBe(true);
+      // ...and the 2x quote it rejects is specifically the AUDITED case, where the
+      // skip is revoked. That rejection is correct: it is the runaway-spend backstop.
       expect(withinAutoPayCap(twoEpochs, 1, EPOCH, BASE)).toBe(false);
     });
 

@@ -258,9 +258,10 @@ export interface StrategyConfig {
    * Only fires for a citizen holding NO bribes: a bribe clears an audit for free, which
    * is cheaper than paying the tax, so burning one stays a manual decision.
    *
-   * Cost warning: an audited citizen is 2+ epochs behind by definition, and payTaxes
-   * force-settles every delinquent epoch at once, so this pays a multiple of one day's
-   * tax. It deliberately ignores `maxAutoPayEpochs` — that cap sizes routine auto-pay,
+   * Cost warning: an audited citizen is 2+ epochs behind by definition, and being
+   * audited revokes the one-epoch skip — it must settle every delinquent epoch at once,
+   * so this pays a multiple of one day's tax. (The same citizen unaudited would owe 1x.)
+   * It deliberately ignores `maxAutoPayEpochs` — that cap sizes routine auto-pay,
    * and applying it here would block the feature in precisely the case it exists for.
    * `maxPaymentEth`, the base-fee cap and the per-wallet balance floor still apply, and
    * `excludedTokenIds` still wins.
