@@ -409,6 +409,18 @@ export function Dashboard({
                   {" "}· ⚠ backend v{status.version}
                 </span>
               )}
+              {/* Distinct from the badge above: that one means backend and dashboard
+                  disagree with each OTHER, this one means both are behind the release.
+                  Worth its own line — a stale bot silently misses fixes it already has
+                  waiting, and the launcher's updater cannot say so while running. */}
+              {status?.updateAvailable && status.latestVersion && (
+                <span
+                  className="version-warn"
+                  title={`You are running v${status.version}; v${status.latestVersion} has been released. Restart the bot to pick it up — the launcher installs it automatically. (If you run from a git clone, use "git pull" instead; the auto-updater deliberately skips checkouts.)`}
+                >
+                  {" "}· ⚠ update available: v{status.latestVersion}
+                </span>
+              )}
             </small>
           </div>
           <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>

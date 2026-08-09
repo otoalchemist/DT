@@ -6,6 +6,7 @@ import { buildServer } from "./api.js";
 import { getChainId } from "./chain.js";
 import { prewarmTargets } from "./service.js";
 import { syncDefaultLists } from "./list-sync.js";
+import { startVersionChecks } from "./version-check.js";
 import { activity } from "./activity.js";
 
 async function main(): Promise<void> {
@@ -23,6 +24,12 @@ async function main(): Promise<void> {
   if (adoptRefreshedLists(skippersBefore)) {
     logger.info("Offense targets re-pointed at the refreshed rival-skippers list.");
   }
+
+  // Advisory update check: reports on the dashboard, never installs. The launcher's
+  // updater only runs at startup and refuses on a git checkout, so a bot left running
+  // for days has no way to learn a fix shipped. Fire-and-forget — never awaited, so a
+  // slow or blocked network cannot delay the API coming up.
+  startVersionChecks();
 
   runtime.chainId = await getChainId();
 

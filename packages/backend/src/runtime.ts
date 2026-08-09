@@ -6,6 +6,7 @@ import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { activity } from "./activity.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
+import { versionState } from "./version-check.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
@@ -488,8 +489,11 @@ class Runtime {
   }
 
   status(): BotStatus {
+    const ver = versionState();
     return {
       version: VERSION,
+      latestVersion: ver.latest,
+      updateAvailable: ver.behind,
       running: this.running,
       unlocked: this.unlocked,
       // The primary address stays the single headline identity; `wallets` carries the
