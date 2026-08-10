@@ -24,6 +24,15 @@ vi.mock("./logger.js", () => ({
 }));
 
 const { scanEmigrations, resetEmigrationRoster } = await import("./emigration.js");
+const {
+  isEmigrated,
+  emigrationDestinationOf,
+  EMIGRATION_CONTRACT_ADDRESS: GOVERNOR_ADDRESS,
+  EMIGRATION_DEPLOY_BLOCK: GOVERNOR_DEPLOY,
+  ABBC_EMIGRATION_CONTRACT_ADDRESS: ABBC_ADDRESS,
+  ABBC_EMIGRATION_DEPLOY_BLOCK: ABBC_DEPLOY,
+  ABBC_TOKEN_CONTRACT_ADDRESS,
+} = await import("@dat-bot/shared");
 
 const DEPLOY_BLOCK = 25_640_893n;
 
@@ -127,5 +136,116 @@ describe("emigration roster (event-log sourced)", () => {
     const out = await scanEmigrations();
     expect(getLogs).toHaveBeenCalledTimes(1); // no second query
     expect(out).toHaveLength(1); // roster preserved
+  });
+});
+
+/**
+ * Emigration has more than one destination now: the original Governor contract and ABBC
+ * ("anti bot bot club", deployed ~86k blocks later). Both emit the identical
+ * `Emigrated(address indexed, uint256 indexed)` event — verified on-chain against ABBC tx
+ * 0x76b0389c…47a4, citizen #4632 — so the risk isn't decoding, it's bookkeeping: each route
+ * needs its own scan cursor, and anything that means "has this citizen left the game" has
+ * to consult BOTH. Getting that wrong means paying taxes for a citizen we no longer own and
+ * spending audit slots on one nobody defends.
+ */
+describe("emigration roster: multiple destinations", () => {
+  // Past both deploy blocks (Governor 25_640_893, ABBC 25_727_232), so both are in range.
+  const HEAD = 25_730_000n;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetEmigrationRoster();
+    getBlockNumber.mockResolvedValue(HEAD);
+  });
+
+  it("queries each destination from its OWN deploy block", async () => {
+    getLogs.mockResolvedValue([]);
+    await scanEmigrations();
+    expect(getLogs).toHaveBeenCalledTimes(2);
+    const ranges = getLogs.mock.calls.map(([a]) => a as { address: string; fromBlock: bigint });
+    // A single shared cursor would either re-scan ~86k pointless blocks for ABBC or skip
+    // history for Governor. Each route starts where its contract actually exists.
+    expect(ranges.map((r) => r.fromBlock)).toEqual([GOVERNOR_DEPLOY, ABBC_DEPLOY]);
+    expect(ranges.map((r) => r.address.toLowerCase())).toEqual([
+      GOVERNOR_ADDRESS.toLowerCase(),
+      ABBC_ADDRESS.toLowerCase(),
+    ]);
+  });
+
+  it("merges both routes into one roster, tagged with where each went", async () => {
+    getLogs
+      .mockResolvedValueOnce([log(829n, 25_640_900n, 0)])   // Governor
+      .mockResolvedValueOnce([log(4632n, 25_727_403n, 1)]); // ABBC (the real tx)
+    const out = await scanEmigrations();
+    expect(out.map((r) => r.tokenId.toString())).toEqual(["829", "4632"]);
+    expect(out.map((r) => r.destinationLabel)).toEqual(["Governor", "ABBC"]);
+  });
+
+  it("orders the merged roster chronologically, not by route", async () => {
+    // ABBC is newer, but ordering must follow block/logIndex — a route-major sort would
+    // misreport who left first, which is what the panel's index column means.
+    getLogs
+      .mockResolvedValueOnce([log(100n, 25_640_900n, 0), log(300n, 25_728_000n, 0)])
+      .mockResolvedValueOnce([log(200n, 25_727_403n, 0)]);
+    const out = await scanEmigrations();
+    expect(out.map((r) => r.tokenId.toString())).toEqual(["100", "200", "300"]);
+  });
+
+  it("keeps one route's results when the OTHER route's query fails", async () => {
+    getLogs
+      .mockResolvedValueOnce([log(829n, 25_640_900n, 0)])       // Governor OK
+      .mockRejectedValueOnce(new Error("ABBC RPC exploded"));   // ABBC fails
+    // Partial data beats none: the Governor emigrants are real and must still be listed,
+    // or one flaky route blanks a panel that drives "don't audit these" decisions.
+    const out = await scanEmigrations();
+    expect(out.map((r) => r.tokenId.toString())).toEqual(["829"]);
+  });
+
+  it("does not advance the failed route's cursor while advancing the healthy one", async () => {
+    getLogs
+      .mockResolvedValueOnce([log(829n, 25_640_900n, 0)])
+      .mockRejectedValueOnce(new Error("ABBC RPC exploded"));
+    await scanEmigrations();
+
+    getLogs.mockResolvedValue([]);
+    await scanEmigrations();
+    // Calls 3 and 4 are the second sweep. Governor resumes near HEAD (minus the reorg
+    // overlap); ABBC must re-cover from its deploy block, or the emigrations in the missed
+    // window are lost forever.
+    const second = getLogs.mock.calls.slice(2).map(([a]) => a as { fromBlock: bigint });
+    expect(second[0]!.fromBlock).toBe(HEAD - 64n); // Governor: overlap window
+    expect(second[1]!.fromBlock).toBe(ABBC_DEPLOY); // ABBC: full re-cover
+  });
+
+  it("throws when EVERY route fails, rather than reporting an empty roster", async () => {
+    // Returning [] here would render as "nobody has emigrated" on a broken RPC, and the
+    // caller's cache would adopt that emptiness as the new truth.
+    getLogs.mockRejectedValue(new Error("RPC down"));
+    await expect(scanEmigrations()).rejects.toThrow("RPC down");
+  });
+
+  it("treats a citizen at either destination as emigrated", async () => {
+    // The offense engine and every payment path gate on this predicate, so a hard-coded
+    // single-address comparison would silently put ABBC emigrants back in play as rivals.
+    expect(isEmigrated(GOVERNOR_ADDRESS)).toBe(true);
+    expect(isEmigrated(ABBC_ADDRESS)).toBe(true);
+    // Case-insensitive: Alchemy's owner index is lowercase, ownerOf returns checksummed.
+    expect(isEmigrated(ABBC_ADDRESS.toLowerCase())).toBe(true);
+    expect(isEmigrated(ABBC_ADDRESS.toUpperCase().replace("0X", "0x"))).toBe(true);
+    expect(isEmigrated("0x000000000000000000000000000000000000dead")).toBe(false);
+    expect(isEmigrated(null)).toBe(false);
+    expect(isEmigrated(undefined)).toBe(false);
+  });
+
+  it("does not treat the ABBC TOKEN contract as an emigration destination", async () => {
+    // The membership NFT is minted by a separate 45-byte proxy that never holds a citizen.
+    // Watching it finds zero emigrations — the wrong-address mistake this guards against.
+    expect(isEmigrated(ABBC_TOKEN_CONTRACT_ADDRESS)).toBe(false);
+  });
+
+  it("resolves which route an owner belongs to, for labelling", async () => {
+    expect(emigrationDestinationOf(GOVERNOR_ADDRESS)?.label).toBe("Governor");
+    expect(emigrationDestinationOf(ABBC_ADDRESS)?.label).toBe("ABBC");
+    expect(emigrationDestinationOf("0x000000000000000000000000000000000000dead")).toBeNull();
   });
 });

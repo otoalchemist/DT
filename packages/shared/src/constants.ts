@@ -28,11 +28,68 @@ export const EMIGRATION_CONTRACT_ADDRESS = "0xE56d011262d4738dC8307fb8a4Ae48B2bF
  *  before it, so scanning from genesis would be wasted range. */
 export const EMIGRATION_DEPLOY_BLOCK = 25_640_893n;
 
-/** True when `owner` is the Emigration contract, i.e. the citizen has emigrated.
- *  Case-insensitive: indexers return owners in varying casings (Alchemy's owner
- *  index is lowercase, `ownerOf` returns checksummed), so never compare raw. */
+/**
+ * ABBC — "anti bot bot club", the SECOND emigration destination (deployed 2026-08-10,
+ * block 25727232).
+ *
+ * Mechanically identical to the Governor route: `safeTransferFrom` a citizen to this
+ * vault and it mints you an ABBC token, holding the citizen indefinitely. It emits the
+ * same `Emigrated(address indexed, uint256 indexed)` signature with the same argument
+ * order, verified on-chain against tx 0x76b0389c…47a4 (citizen #4632).
+ *
+ * IMPORTANT — this is the VAULT that receives the citizens, not the ABBC token contract.
+ * The ABBC collection lives at 0xFEc1DD883E0D17E5F6C40B146160240470e58453 (a 45-byte
+ * EIP-1167 proxy) and never holds a citizen: it only mints the membership token. Watching
+ * the token address finds zero emigrations, which is exactly the wrong-address mistake
+ * this comment exists to prevent.
+ */
+export const ABBC_EMIGRATION_CONTRACT_ADDRESS = "0xbFFFc99Fa75A0FEA45b765d11d8e52F8E1114F8c" as const;
+
+/** The ABBC membership token minted in exchange for a citizen. Holds no citizens itself —
+ *  recorded so the two addresses are never confused (see the note above). */
+export const ABBC_TOKEN_CONTRACT_ADDRESS = "0xFEc1DD883E0D17E5F6C40B146160240470e58453" as const;
+
+/** Block the ABBC vault was deployed in (2026-08-10 21:17 UTC), found by binary-searching
+ *  `eth_getCode`. Lower bound for its `Emigrated` log scan. */
+export const ABBC_EMIGRATION_DEPLOY_BLOCK = 25_727_232n;
+
+/**
+ * Every contract a citizen can emigrate to, in deployment order.
+ *
+ * Emigration is no longer one destination, so anything that means "has this citizen left
+ * the game" has to consult the whole set rather than a single address — a hard-coded
+ * comparison silently treats ABBC emigrants as ordinary rivals, which means paying taxes
+ * for a citizen we no longer own and spending audit slots on one nobody defends.
+ *
+ * `label` is what the dashboard calls each route; `deployBlock` bounds its log scan.
+ */
+export const EMIGRATION_DESTINATIONS = [
+  {
+    address: EMIGRATION_CONTRACT_ADDRESS,
+    label: "Governor",
+    deployBlock: EMIGRATION_DEPLOY_BLOCK,
+  },
+  {
+    address: ABBC_EMIGRATION_CONTRACT_ADDRESS,
+    label: "ABBC",
+    deployBlock: ABBC_EMIGRATION_DEPLOY_BLOCK,
+  },
+] as const;
+
+/** Which emigration route `owner` belongs to, or null if it isn't an emigration contract. */
+export function emigrationDestinationOf(
+  owner: string | null | undefined,
+): (typeof EMIGRATION_DESTINATIONS)[number] | null {
+  if (!owner) return null;
+  const want = owner.toLowerCase();
+  return EMIGRATION_DESTINATIONS.find((d) => d.address.toLowerCase() === want) ?? null;
+}
+
+/** True when `owner` is ANY emigration contract, i.e. the citizen has left the main game.
+ *  Case-insensitive: indexers return owners in varying casings (Alchemy's owner index is
+ *  lowercase, `ownerOf` returns checksummed), so never compare raw. */
 export function isEmigrated(owner: string | null | undefined): boolean {
-  return !!owner && owner.toLowerCase() === EMIGRATION_CONTRACT_ADDRESS.toLowerCase();
+  return emigrationDestinationOf(owner) !== null;
 }
 
 /** Duration of one game epoch, in seconds (24 hours). */

@@ -72,6 +72,11 @@ export interface EmigratedTokenStatus {
   emigratedBy: string;
   /** Emigration order, 0-based. Also the Governor's metadata index at mint time. */
   index: number;
+  /** Which emigration route it took: the receiving contract's address. */
+  destination: string;
+  /** Human label for that route — "Governor" or "ABBC". Lets the panel group by route
+   *  without the UI needing to know any addresses. */
+  destinationLabel: string;
   /** False once the citizen has been killed and burned. Its tax/audit fields are
    *  then frozen at "—": there is no live token left to read a status from. */
   alive: boolean;

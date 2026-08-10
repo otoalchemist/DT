@@ -314,15 +314,20 @@ export async function readEmigrated(): Promise<EmigratedTokenStatus[]> {
 
   const aliveRecords = records.filter((r) => liveIds.has(r.tokenId.toString()));
   const statuses = await batchGetTargetStatuses(
-    aliveRecords.map((r) => ({ id: r.tokenId, owner: EMIGRATION_CONTRACT_ADDRESS as Address })),
+    // Owner is the route each citizen actually went to, not a single hard-coded address —
+    // otherwise every ABBC emigrant would be labelled as held by the Governor contract.
+    aliveRecords.map((r) => ({ id: r.tokenId, owner: r.destination as Address })),
     snap.currentEpoch,
     nowSec,
   );
   const statusById = new Map(statuses.map((s) => [s.tokenId, s]));
 
+  const perRoute = new Map<string, number>();
+  for (const r of records) perRoute.set(r.destinationLabel, (perRoute.get(r.destinationLabel) ?? 0) + 1);
   logger.debug(
     `readEmigrated: ${records.length} emigrated (${aliveRecords.length} alive, ` +
-      `${records.length - aliveRecords.length} already killed)`,
+      `${records.length - aliveRecords.length} already killed) — ` +
+      [...perRoute].map(([label, n]) => `${label}: ${n}`).join(", "),
   );
 
   return records.map((r, index) => {
@@ -332,6 +337,8 @@ export async function readEmigrated(): Promise<EmigratedTokenStatus[]> {
       tokenId: key,
       emigratedBy: r.emigratedBy,
       index,
+      destination: r.destination,
+      destinationLabel: r.destinationLabel,
       alive: liveIds.has(key),
       epochsBehind: s?.epochsBehind ?? 0,
       auditDueTimestamp: s?.auditDueTimestamp ?? "0",

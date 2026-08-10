@@ -28,7 +28,7 @@ You run it on your own machine with your own key. It ships with a local web dash
 | Kill | Free, callable by **anyone** once a token's audit countdown expires. Turns the Citizen into a dead "Evader". |
 | Clear an audit | The target `payTaxes` (pays back-taxes) or `useBribe` (free, if it holds a bribe) before expiry. |
 | Life insurance | **Cosmetic only** — it changes the dead-Evader artwork. It does **not** prevent death. |
-| Emigration | `safeTransferFrom` a Citizen to the [Emigration contract](https://etherscan.io/address/0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C) and it mints you a **Governor** NFT (36 available, first come). One-way: the contract holds the Citizen forever and has no way to pay taxes or spend a bribe. |
+| Emigration | `safeTransferFrom` a Citizen to an emigration contract and it mints you a membership NFT. Two routes exist: [Governor](https://etherscan.io/address/0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C) (36 available, first come) and [ABBC](https://etherscan.io/address/0xbFFFc99Fa75A0FEA45b765d11d8e52F8E1114F8c) — "anti bot bot club". One-way either way: the contract holds the Citizen forever and has no way to pay taxes or spend a bribe. |
 | Winning | The game ends when the Citizen supply drops to **69**; the survivors win. |
 
 **Emigrated citizens are out of the main game.** The bot treats them that way: they're
@@ -39,12 +39,25 @@ drops out of the owned set by itself. They still count toward the supply that en
 game (they leave it only when somebody else kills them), so the endgame gate
 (`endgameOnlyWithin`) still reads the raw on-chain Citizen supply.
 
-The **Emigrated citizens** panel is the full history, read from the contract's `Emigrated`
+**Both routes count as emigrated.** Every "has this citizen left the game" check consults
+the full destination set (`EMIGRATION_DESTINATIONS` in `packages/shared/src/constants.ts`),
+so adding a future route is one entry there rather than a hunt for hard-coded addresses.
+ABBC emits the identical `Emigrated(address, uint256)` event as the Governor contract, so
+one scanner covers both — each with its own cursor, since they were deployed ~86k blocks
+apart.
+
+> ⚠️ For ABBC the address that matters is the **vault** that receives the citizens
+> (`0xbFFFc99F…14F8c`), *not* the ABBC token contract (`0xFEc1DD88…58453`). The token
+> contract is a 45-byte proxy that only mints the membership NFT and never holds a
+> citizen — watching it finds zero emigrations.
+
+The **Emigrated citizens** panel is the full history, read from each contract's `Emigrated`
 event log rather than from who currently holds what. An emigrant that has already been
 killed is burned and disappears from every ownership index, so an ownership-based list
 would keep shrinking as they die — it read 5 when 13 had emigrated. Killed emigrants stay
-on the list, dimmed and marked `killed`, with the header splitting the count into still
-held / killed / slots left.
+on the list, dimmed and marked `killed`. Rows are grouped by route with a per-route
+held/killed count; the header's "slots left" counts the **Governor** route only, since that
+is the contract with a fixed supply of 36.
 
 ---
 

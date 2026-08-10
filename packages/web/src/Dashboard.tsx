@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import {
   VERSION,
   EMIGRATION_CONTRACT_ADDRESS,
+  ABBC_EMIGRATION_CONTRACT_ADDRESS,
   type BotStatus,
   type StrategyConfig,
   type ActivityEntry,
@@ -65,7 +66,7 @@ function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: strin
 }
 
 /**
- * Citizens that emigrated: sent to the Emigration contract, swapped for a Governor NFT,
+ * Citizens that emigrated: sent to an Emigration contract, swapped for a membership NFT,
  * and held there permanently. They're out of the main game — we never pay, audit or kill
  * them — so this table deliberately carries no action affordance and mutes every badge.
  *
@@ -74,34 +75,56 @@ function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: strin
  * they die — the panel would have read 5 when 13 had emigrated. The live rows still show
  * a status because it's the only clue to when each remaining emigrant gets killed by
  * someone else and drops out of the supply that ends the game.
+ *
+ * Grouped by ROUTE (Governor, ABBC, …) rather than listed flat: there is now more than one
+ * destination, they have separate capacities, and "which club did it join" is the thing you
+ * actually want to read off the panel. Grouping also means a third route needs no UI work.
  */
 function EmigratedTable({ rows }: { rows: EmigratedTokenStatus[] }) {
   if (rows.length === 0) {
     return <p className="muted" style={{ fontSize: 12 }}>No citizens have emigrated yet.</p>;
   }
+  // Preserve first-seen (chronological) route order, so the original Governor route stays
+  // on top and later ones append below it.
+  const byRoute = new Map<string, EmigratedTokenStatus[]>();
+  for (const r of rows) {
+    const list = byRoute.get(r.destinationLabel) ?? [];
+    list.push(r);
+    byRoute.set(r.destinationLabel, list);
+  }
+  const fate = (t: EmigratedTokenStatus) =>
+    !t.alive
+      ? "killed"
+      : t.killable
+        ? "awaiting kill"
+        : t.auditDueTimestamp !== "0"
+          ? `dies in ${countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}`
+          : "unaudited";
   return (
-    <table>
-      <thead><tr><th>Token</th><th>Behind</th><th>Fate</th></tr></thead>
-      <tbody>
-        {rows.map((t) => (
-          <tr key={t.tokenId} style={t.alive ? undefined : { opacity: 0.55 }}>
-            <td className="mono">#{t.tokenId}</td>
-            <td>{t.alive && t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
-            <td>
-              <span className="badge off">
-                {!t.alive
-                  ? "killed"
-                  : t.killable
-                    ? "awaiting kill"
-                    : t.auditDueTimestamp !== "0"
-                      ? `dies in ${countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}`
-                      : "unaudited"}
-              </span>
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <>
+      {[...byRoute.entries()].map(([label, list]) => {
+        const aliveCount = list.filter((t) => t.alive).length;
+        return (
+          <div key={label} style={{ marginBottom: 8 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
+              {label} ({list.length}) · {aliveCount} held · {list.length - aliveCount} killed
+            </div>
+            <table>
+              <thead><tr><th>Token</th><th>Behind</th><th>Fate</th></tr></thead>
+              <tbody>
+                {list.map((t) => (
+                  <tr key={t.tokenId} style={t.alive ? undefined : { opacity: 0.55 }}>
+                    <td className="mono">#{t.tokenId}</td>
+                    <td>{t.alive && t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
+                    <td><span className="badge off">{fate(t)}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+    </>
   );
 }
 
@@ -330,9 +353,13 @@ export function Dashboard({
   // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
 
-  // Emigrants still held by the contract. The rest of the roster is already dead — kept
+  // Emigrants still held by a contract. The rest of the roster is already dead — kept
   // on the list because emigrating is what put them there, and the count is the history.
   const emigratedAlive = emigrated.filter((e) => e.alive).length;
+  // "Slots left" is a GOVERNOR-only idea: that contract has a fixed supply of 36. Counting
+  // it against the whole roster would let ABBC emigrations eat Governor slots that are
+  // still open. ABBC has no published cap, so it gets no slot count rather than a guess.
+  const governorSlotsLeft = 36 - emigrated.filter((e) => e.destinationLabel === "Governor").length;
   // "At risk" = anything an opponent could act on: already under audit, killable, or
   // auditable right now. Merely 1 behind is still in the grace epoch.
   const alliesAtRisk = allies.filter((a) => a.killable || a.auditDueTimestamp !== "0" || a.auditable).length;
@@ -787,18 +814,22 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
         <div className="panel">
           <h2>Emigrated citizens ({emigrated.length})</h2>
           <div className="muted" style={{ ...sectionLabel, marginBottom: 6 }}>
-            {emigratedAlive} still held · {emigrated.length - emigratedAlive} killed · {36 - emigrated.length} slots left
+            {emigratedAlive} still held · {emigrated.length - emigratedAlive} killed · {governorSlotsLeft} Governor slots left
           </div>
           <EmigratedTable rows={emigrated} />
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.5 }}>
-            Traded to the{" "}
+            Traded away for a membership NFT — the{" "}
             {explorerBase
-              ? <a href={`${explorerBase}/address/${EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">Emigration contract</a>
-              : "Emigration contract"}{" "}
-            for a Governor NFT (36 total, first come). They've left the main game: the bot
-            never audits or kills them, and they're excluded from Rival targets. The
-            contract can't pay taxes or spend a bribe, so each one falls further behind
-            until someone else kills it — which still counts toward the{" "}
+              ? <a href={`${explorerBase}/address/${EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">Governor</a>
+              : "Governor"}{" "}
+            route (36 total, first come) or{" "}
+            {explorerBase
+              ? <a href={`${explorerBase}/address/${ABBC_EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">ABBC</a>
+              : "ABBC"}{" "}
+            (anti bot bot club). Either way they've left the main game: the bot never audits
+            or kills them, and they're excluded from Rival targets. Neither contract can pay
+            taxes or spend a bribe, so each one falls further behind until someone else kills
+            it — which still counts toward the{" "}
             {status?.citizenSupply ?? "—"} → 69 endgame, so killed emigrants stay listed.
           </p>
         </div>
