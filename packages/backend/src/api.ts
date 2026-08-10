@@ -432,7 +432,14 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (!enable) {
       runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
       scheduleJitBoundary();
+      // All three, because which one owns the boundary depends on combinedBundleActive:
+      // with a bid configured schedulePreBoundaryPay() returns immediately and the bundle
+      // scheduler is the one that matters. Arming only the pay path left the bundle to be
+      // picked up by the next refreshSnapshot — correct today, but a dependency on tick
+      // ordering that nothing states.
       schedulePreBoundaryPay();
+      schedulePreBoundaryAudit();
+      schedulePreBoundaryBundle();
       // Disarming changes what there is to wake for, exactly as arming does — re-evaluate
       // rather than leaving a wake armed for a JIT that no longer exists.
       if (runtime.strategy.awayMode) scheduleAwayWake();
@@ -478,7 +485,11 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (runtime.strategy.awayMode) scheduleAwayWake();
     else if (!runtime.running) startEngine();
     scheduleJitBoundary();
+    // Same as the disarm path above: arm every pre-boundary scheduler and let each one
+    // decide whether it owns this boundary, rather than assuming the pay path does.
     schedulePreBoundaryPay();
+    schedulePreBoundaryAudit();
+    schedulePreBoundaryBundle();
     return runtime.status();
   });
 
