@@ -537,6 +537,44 @@ function warnRaceMissed(kind: string, targetEpoch: bigint, boundarySec: bigint):
   activity.add({ kind: "info", status: "info", message: msg });
 }
 
+/**
+ * The boundary an armed pre-boundary fire is racing into, or null when nothing is armed.
+ *
+ * Keyed off the ARMED epoch rather than `currentEpoch + 1`, for the same reason the fire
+ * itself is: once the boundary passes, `currentEpoch + 1` points at the epoch AFTER the one
+ * we were racing into, so it can no longer tell us whether we are late.
+ */
+function boundaryForArmedFire(): bigint | null {
+  const s = runtime.strategy;
+  if (runtime.startTime === null) return null;
+  const epoch =
+    s.jitEnabled && s.jitTargetEpoch !== null
+      ? BigInt(s.jitTargetEpoch)
+      : runtime.currentEpoch !== null
+        ? runtime.currentEpoch + 1n
+        : null;
+  if (epoch === null) return null;
+  return runtime.startTime + (epoch - 1n) * EPOCH_DURATION_SECONDS;
+}
+
+/** A pre-boundary fire was ready but blocked by an in-flight tick until the boundary had
+ *  already passed. Distinct from warnRaceMissed (armed too late): here the timer fired ON
+ *  TIME and the engine's own tick is what cost the race, which is actionable — it points at
+ *  tick duration, not at a sleeping machine. Reported once per boundary. */
+const tickLostRaceFor = new Map<string, bigint>();
+function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
+  if (tickLostRaceFor.get(kind) === boundarySec) return;
+  tickLostRaceFor.set(kind, boundarySec);
+  const lateSec = Number(BigInt(Math.floor(Date.now() / 1000)) - boundarySec);
+  const msg =
+    `Pre-boundary ${kind} race was ready on time but a routine tick was still running, and ` +
+    `the boundary has now passed (${lateSec}s ago). The payment/audit will still go out on ` +
+    `the next tick, a block late. If this repeats, the tick is taking too long — consider ` +
+    `pinning fewer offense targets or raising the pre-boundary lead.`;
+  logger.warn(msg);
+  activity.add({ kind: "info", status: "info", message: msg });
+}
+
 /** Fire an extra tick precisely at the armed epoch's boundary (near-instant JIT pay). */
 export function scheduleJitBoundary(): void {
   if (boundaryTimer) {
@@ -670,7 +708,13 @@ export async function firePreBoundaryPay(): Promise<void> {
   if (!s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
-  if (ticking) { setTimeout(() => void firePreBoundaryPay(), 150); return; } // don't overlap nonce use
+  // Same tick-contention report as the combined fire — see warnRaceLostToTick.
+  if (ticking) {
+    const b = boundaryForArmedFire();
+    if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("payment", b);
+    setTimeout(() => void firePreBoundaryPay(), 150);
+    return;
+  }
   ticking = true;
   committedThisTickWei = new Map();
   beginBatch();
@@ -1098,7 +1142,12 @@ export async function firePreBoundaryAudit(): Promise<void> {
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
-  if (ticking) { setTimeout(() => void firePreBoundaryAudit(), 150); return; }
+  if (ticking) {
+    const b = boundaryForArmedFire();
+    if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("audit", b);
+    setTimeout(() => void firePreBoundaryAudit(), 150);
+    return;
+  }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
   committedThisTickWei = new Map();
@@ -1155,21 +1204,50 @@ export async function firePreBoundaryBundle(): Promise<void> {
   const s = runtime.strategy;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return;
-  if (ticking) { setTimeout(() => void firePreBoundaryBundle(), 150); return; }
+  // A tick is holding the nonce sequence, so wait it out rather than interleaving. But say
+  // so if the wait is what costs us the race: a WebSocket tick runs on every ~12s block and
+  // an offense sweep inside it can take seconds, so this retry loop can spin right through
+  // the boundary. Before, it did that in total silence — the only symptom being a payment
+  // that turned up a block late (the epoch-162 miss), with nothing in the log to say why.
+  if (ticking) {
+    const boundarySec = boundaryForArmedFire();
+    if (boundarySec !== null && BigInt(Math.floor(Date.now() / 1000)) >= boundarySec) {
+      warnRaceLostToTick("bundle", boundarySec);
+    }
+    setTimeout(() => void firePreBoundaryBundle(), 150);
+    return;
+  }
   ticking = true;
   committedThisTickWei = new Map();
   beginBatch();
-  const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n; // the boundary we're racing into
+  /**
+   * The epoch this fire is racing into.
+   *
+   * Derived from what JIT is ARMED for, falling back to `currentEpoch + 1` when nothing is
+   * armed (an audit-only boundary). It deliberately does NOT read `currentEpoch + 1`
+   * unconditionally: this fire can be delayed past the boundary — it retries every 150ms
+   * while a tick holds `ticking`, and a WebSocket tick runs on every ~12s block — after
+   * which a post-boundary tick advances `currentEpoch` and `currentEpoch + 1` points one
+   * epoch too far. The payment gate below then compared armed-162 against derived-163 and
+   * dropped the payment silently.
+   *
+   * That is the epoch-162 miss (tx 0x2090097f…494c): the payment left via the ordinary
+   * post-boundary JIT tick instead, landing at index 0 of the block AFTER the boundary
+   * block, with no pre-boundary entry in the activity log to explain it.
+   */
+  const armedEpoch = s.jitEnabled && s.jitTargetEpoch !== null ? BigInt(s.jitTargetEpoch) : null;
+  const targetEpoch = armedEpoch ?? (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
+  const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     let paidInBundle = new Set<string>();
     let auditQueued = false;
     // Payment first (lowest nonces): its amount is only valid top-of-block, and a
-    // just-paid auditor token is current before it audits. Only if JIT is armed for
-    // THIS boundary (jitTargetEpoch === currentEpoch + 1).
-    if (s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) === targetEpoch) {
+    // just-paid auditor token is current before it audits. `targetEpoch` IS the armed
+    // epoch when a payment is armed, so no equality check is needed — the arm is the
+    // instruction, and re-deriving the target from live state is what dropped it before.
+    if (s.preBoundaryPay && armedEpoch !== null) {
       paidInBundle = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
     }
     // Audits next (higher nonces), always allowed-to-revert here. Two independent reasons,

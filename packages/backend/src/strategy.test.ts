@@ -789,6 +789,31 @@ describe("combined boundary bundle with multiple citizens", () => {
     expect(vi.mocked(submitTx)).not.toHaveBeenCalled();
     expect(vi.mocked(queueCoinbaseBid)).not.toHaveBeenCalled();
   });
+
+  // REGRESSION (epoch 162, tx 0x2090097f…494c): the payment landed at index 0 of the block
+  // AFTER the boundary instead of in the boundary block, and the activity log showed no
+  // pre-boundary entry at all — not even a failure.
+  //
+  // Cause: the bundle fire derives its target from LIVE state at fire time
+  // (`runtime.currentEpoch + 1`), but the payment gate compares that against the epoch the
+  // JIT arm was made FOR. The fire is delayed whenever a tick is in flight
+  // (`if (ticking) retry in 150ms`), and a WS tick runs on every ~12s block, so a fire armed
+  // for boundary-5s can slip past the boundary. Once a post-boundary tick refreshes
+  // currentEpoch, targetEpoch becomes jitTargetEpoch+1 and the equality gate silently
+  // drops the payment — the one thing the race existed to send.
+  it("still pays the ARMED epoch when the fire slips past the boundary", async () => {
+    // The engine has already seen the new epoch: currentEpoch advanced to the epoch that
+    // JIT is armed FOR, so `currentEpoch + 1` is now one PAST the armed target.
+    runtime.currentEpoch = TARGET_EPOCH;
+    runtime.strategy = { ...runtime.strategy, jitTargetEpoch: Number(TARGET_EPOCH) };
+
+    await firePreBoundaryBundle();
+
+    // The armed payment must still go out. Before the fix this was 0: the gate compared
+    // 162 === 163 and dropped it without a word.
+    const pays = vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xPAYTAXES");
+    expect(pays.length).toBeGreaterThan(0);
+  });
 });
 
 // An audited citizen must NEVER be paid automatically — catching up after an audit is
