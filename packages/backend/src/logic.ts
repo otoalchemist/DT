@@ -45,12 +45,28 @@ export function isKillable(auditDueTimestamp: bigint, nowSec: bigint): boolean {
 }
 
 /**
- * Whether an owned token can be used as an audit "from" token right now. The
- * contract requires the from-token to not itself be delinquent/auditable and to
- * still have audit capacity this epoch. On-chain evidence: a token one epoch
- * behind can still audit (so it need not be strictly current — up to 1 behind is
- * fine), and each token may audit `auditLimit` times per epoch (1 for a normal
- * token, higher for auditor-role tokens).
+ * Whether an owned token SHOULD be used as an audit "from" token right now.
+ *
+ * The `!isAuditable` half is OUR policy, not a contract rule. The contract places no
+ * delinquency condition on the from-token at all — probed by simulation against mainnet
+ * state (2026-08), every case succeeding or failing only on a TARGET-side error:
+ *
+ *   0 behind        -> SUCCESS      2 behind, clear -> SUCCESS (#988 audited #99)
+ *   1 behind        -> SUCCESS      under audit     -> SUCCESS (#2036 audited #988)
+ *   3 behind AND KILLABLE -> auditor checks pass; only NotDelinquent (target-side)
+ *
+ * So the contract enforces exactly three things: you own the from-token, it has audit
+ * capacity left this epoch, and the target is actually auditable.
+ *
+ * We stay stricter on purpose. A citizen 2+ behind is itself auditable — and if it is
+ * under audit, roughly a day from being killable — so spending its slot means committing
+ * an asset that may not survive the epoch, while the audit fee is spent either way. In the
+ * normal case this costs nothing: citizens sit 1 behind at a boundary, which passes. It
+ * only bites when one has already fallen further, which is also when slots are scarcest —
+ * so if that trade ever looks wrong, relax THIS line, not the contract's.
+ *
+ * `auditsUsedThisEpoch < auditLimit` IS a contract rule: 1 for a normal token, higher for
+ * auditor-role tokens.
  */
 export function isEligibleAuditor(
   lastEpochPaid: bigint,
