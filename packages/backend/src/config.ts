@@ -4,11 +4,14 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { GAME_CONTRACT_ADDRESS } from "@dat-bot/shared";
+import { tightenPrivateFile, writePrivateFileAtomic } from "./private-file.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Walk up from packages/backend/src → monorepo root to find .env
-loadEnv({ path: path.resolve(__dirname, "../../../.env") });
+const envPath = path.resolve(__dirname, "../../../.env");
+if (fs.existsSync(envPath)) tightenPrivateFile(envPath);
+loadEnv({ path: envPath });
 
 // Load UI-saved settings (data/settings.json) as fallback for env vars.
 const settingsPath = path.resolve(__dirname, "../../../data/settings.json");
@@ -20,6 +23,7 @@ export interface AppSettings {
 export function loadSettings(): AppSettings {
   try {
     if (fs.existsSync(settingsPath)) {
+      tightenPrivateFile(settingsPath);
       return JSON.parse(fs.readFileSync(settingsPath, "utf8")) as AppSettings;
     }
   } catch {}
@@ -27,8 +31,7 @@ export function loadSettings(): AppSettings {
 }
 
 export function saveSettings(s: AppSettings): void {
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
+  writePrivateFileAtomic(settingsPath, JSON.stringify(s, null, 2), { backup: true });
 }
 
 // Inject settings into process.env before schema parse (env vars take priority).
@@ -53,12 +56,18 @@ const schema = z.object({
   RPC_WS_URL: z.string().url().optional(),
   ALCHEMY_NFT_URL: z.string().url().optional(),
   GAME_ADDRESS: z.string().default(GAME_CONTRACT_ADDRESS),
-  /** Used for bundle SIMULATION (eth_callBundle is Flashbots-specific). */
+  /** Default authenticated Flashbots endpoint used for private bundle submission. */
   FLASHBOTS_RELAY_URL: z.string().url().default("https://relay.flashbots.net"),
   /** Comma-separated builder endpoints for bundle SUBMISSION (eth_sendBundle).
    *  Only the builder that wins a slot can include your bundle, so submitting to
    *  many raises the odds. Defaults to DEFAULT_BUILDER_URLS below. */
   BUILDER_URLS: z.string().optional(),
+  /** Approved keccak256 runtime-code hashes for the configured Coinbase payer. */
+  COINBASE_PAYER_CODE_HASHES: z.string().default("").refine(
+    (csv) => csv.split(",").map((s) => s.trim()).filter(Boolean)
+      .every((hash) => /^0x[0-9a-fA-F]{64}$/.test(hash)),
+    "COINBASE_PAYER_CODE_HASHES must contain comma-separated 0x-prefixed 32-byte hashes",
+  ),
   PORT: z.coerce.number().default(8787),
   HOST: z.string().default("127.0.0.1"),
   DATA_DIR: z.string().default(path.resolve(__dirname, "../../../data")),
@@ -78,6 +87,12 @@ const schema = z.object({
 function parseIds(csv: string | undefined): bigint[] {
   if (!csv) return [];
   return csv.split(",").map((s) => s.trim()).filter(Boolean).map((s) => BigInt(s));
+}
+
+function parseCodeHashes(csv: string): `0x${string}`[] {
+  return [...new Set(
+    csv.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+  )] as `0x${string}`[];
 }
 
 export function deriveUrlsFromKey(key: string) {
@@ -147,6 +162,7 @@ function derive() {
     builderUrls: raw.BUILDER_URLS
       ? raw.BUILDER_URLS.split(",").map((s) => s.trim()).filter(Boolean)
       : [...new Set([raw.FLASHBOTS_RELAY_URL, ...DEFAULT_BUILDER_URLS])],
+    coinbasePayerCodeHashes: parseCodeHashes(raw.COINBASE_PAYER_CODE_HASHES),
     port: raw.PORT,
     host: raw.HOST,
     dataDir: raw.DATA_DIR,

@@ -1,8 +1,8 @@
 import { parseEther, formatEther, type Address } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
-import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
+import { publicClient, wsClient, getLatestBlockCached, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
-import { runtime, loadAllyTokens, loadDoNotTarget, type Wallet } from "./runtime.js";
+import { runtime, loadAllyTokensStrict, loadDoNotTarget, type Wallet } from "./runtime.js";
 import { activity } from "./activity.js";
 import { nonces } from "./nonce.js";
 import {
@@ -22,7 +22,16 @@ import {
   fetchCandidateTokenIds,
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
-import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, type TxIntent, type SubmitResult } from "./flashbots.js";
+import {
+  submitTx,
+  beginBundle,
+  flushBundle,
+  queueCoinbaseBid,
+  type BundleTxResult,
+  type SpendQuote,
+  type TxIntent,
+  type SubmitResult,
+} from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, excludedTokenSet, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 
@@ -46,6 +55,42 @@ let awayStartedEngine = false;
 let preBoundaryBundleTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
+let tickSettledWaiters: Array<() => void> = [];
+let quiescing = 0;
+
+/**
+ * Serializes API maintenance with engine starts.  A plain `stopEngine()` is not enough:
+ * a request can await password encryption or RPC validation after stopping, while a
+ * concurrent `/api/start` (or an away-mode timer) starts the old signer/client again.
+ * Holding this lease makes every unowned start fail closed until the mutation finishes.
+ */
+export interface EngineMaintenanceLease {
+  readonly id: symbol;
+  release(): void;
+}
+
+let engineMaintenanceLease: EngineMaintenanceLease | null = null;
+
+export function beginEngineMaintenance(): EngineMaintenanceLease | null {
+  if (engineMaintenanceLease) return null;
+  const id = Symbol("engine-maintenance");
+  let live = true;
+  const lease: EngineMaintenanceLease = {
+    id,
+    release: () => {
+      if (!live) return;
+      live = false;
+      if (engineMaintenanceLease === lease) engineMaintenanceLease = null;
+    },
+  };
+  engineMaintenanceLease = lease;
+  return lease;
+}
+
+export function isEngineMaintenanceActive(): boolean {
+  return engineMaintenanceLease !== null;
+}
+
 // Randomized once per engine start (see startEngine) and used to reorder the
 // rival sweep (offensePass, firePreBoundaryAudit, firePreBoundaryKill) so every
 // bot instance doesn't audit/kill candidates in the same identical order — the
@@ -53,17 +98,33 @@ let ticking = false;
 // on-chain order), so without this every user piles onto the same first few
 // targets and starves the ones later in the list.
 let engineSalt = 0;
-// Total wei committed to spend so far in the current tick (value + gas of each
-// submitted tx). Reset at the top of every tick; consulted by canSpend so the
-// min-balance floor holds across all spends in a tick, not just each in isolation.
-// Keyed by lowercased wallet address: each wallet pays its own gas from its own balance,
-// so one wallet's spending must not consume another's headroom.
-let committedThisTickWei = new Map<string, bigint>();
-const committedFor = (addr: string): bigint => committedThisTickWei.get(addr.toLowerCase()) ?? 0n;
-const commitFor = (addr: string, wei: bigint): void => {
+// Exact signed cost of transactions accepted by a relay/public RPC but not yet resolved
+// on-chain. This is keyed by payer and survives across ticks, so it both protects later
+// actions in the same tick and prevents a later tick from spending balance already
+// committed to a pending transaction.
+let outstandingSpendWei = new Map<string, bigint>();
+// Confirmed transactions whose post-spend balance has not yet been observed by
+// refreshSnapshot. Keeping them reserved closes the small receipt->balance-refresh gap.
+let confirmedUnrefreshedWei = new Map<string, bigint>();
+const outstandingFor = (addr: string): bigint => outstandingSpendWei.get(addr.toLowerCase()) ?? 0n;
+const confirmedFor = (addr: string): bigint => confirmedUnrefreshedWei.get(addr.toLowerCase()) ?? 0n;
+const committedFor = (addr: string): bigint => outstandingFor(addr) + confirmedFor(addr);
+function noteConfirmedBeforeRefresh(addr: string, wei: bigint): void {
   const k = addr.toLowerCase();
-  committedThisTickWei.set(k, (committedThisTickWei.get(k) ?? 0n) + wei);
-};
+  confirmedUnrefreshedWei.set(k, confirmedFor(k) + wei);
+}
+function reserveOutstanding(addr: string, wei: bigint): () => void {
+  const key = addr.toLowerCase();
+  outstandingSpendWei.set(key, outstandingFor(key) + wei);
+  let live = true;
+  return () => {
+    if (!live) return;
+    live = false;
+    const next = outstandingFor(key) - wei;
+    if (next > 0n) outstandingSpendWei.set(key, next);
+    else outstandingSpendWei.delete(key);
+  };
+}
 
 /**
  * Which wallet holds each owned citizen, refreshed every time owned tokens are fetched.
@@ -114,10 +175,45 @@ export async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint
   return ids;
 }
 
+interface TxLifecycleHooks {
+  /** Called only after a successful on-chain receipt. */
+  onConfirmed?: () => void;
+  /** Called when preparation, relay submission, inclusion, or receipt tracking fails. */
+  onFailed?: (reason: string) => void;
+}
+
 // Activity entries whose tx was queued into the current bundle batch (mainnet).
-// flushBatch fills in each one's txHash/bundleHash and starts receipt tracking
-// once the whole tick's txs are sent together as one atomic bundle.
-let batchEntries: { entryId: string; nonce: number }[] = [];
+// A queued transaction is only locally prepared. flushBatch moves it to relayed, and
+// trackReceipt is the only place that moves its logical action to confirmed.
+let batchEntries: {
+  entryId: string;
+  nonce: number;
+  predictedTxHash?: `0x${string}`;
+  valueWei: bigint;
+  gasWei: bigint;
+  payerAddress: Address;
+  releaseSpend: () => void;
+  hooks?: TxLifecycleHooks;
+}[] = [];
+
+async function failPrivateEntryWhenNonceSafe(
+  entry: (typeof batchEntries)[number],
+  reason: string,
+): Promise<void> {
+  try {
+    await nonces.waitUntilPrivateRetrySafe(entry.payerAddress, entry.nonce);
+  } catch (err) {
+    // An RPC/journal failure is uncertainty, not permission to create a nonce gap. Keep
+    // the reservation and logical marker live; a later process/tick can reconcile it.
+    logger.warn(
+      `private nonce ${entry.nonce} could not be reconciled after failure: ${(err as Error).message}`,
+    );
+    return;
+  }
+  activity.update(entry.entryId, { status: "skipped" });
+  entry.releaseSpend();
+  entry.hooks?.onFailed?.(reason);
+}
 
 /** Open a bundle batch for a tick so all its txs go out as one atomic multi-tx
  *  bundle (mainnet only; public/local send each tx immediately as before). */
@@ -131,34 +227,80 @@ function beginBatch(): void {
 async function flushBatch(): Promise<void> {
   const entries = batchEntries;
   batchEntries = [];
-  if (appConfig.mode !== "mainnet" || entries.length === 0) return;
+  if (appConfig.mode !== "mainnet") return;
   let results: Awaited<ReturnType<typeof flushBundle>>;
   try {
     results = await flushBundle();
   } catch (err) {
-    logger.error("bundle flush error:", (err as Error).message);
+    const reason = `bundle flush error: ${(err as Error).message}`;
+    logger.error(reason);
+    for (const entry of entries) {
+      void failPrivateEntryWhenNonceSafe(entry, reason);
+    }
     return;
   }
-  for (const { entryId, nonce } of entries) {
-    const r = results.get(nonce);
-    if (!r) continue;
-    activity.update(entryId, {
+  for (const entry of entries) {
+    // Production results are keyed by signed-tx hash, which remains unique when several
+    // wallets use the same nonce. The numeric fallback keeps older test/mocked callers
+    // compatible while they migrate.
+    const legacyResults = results as unknown as Map<number, BundleTxResult>;
+    const r = entry.predictedTxHash
+      ? results.get(entry.predictedTxHash) ?? legacyResults.get(entry.nonce)
+      : legacyResults.get(entry.nonce);
+    if (!r) {
+      const reason = "queued transaction missing from bundle flush result";
+      void failPrivateEntryWhenNonceSafe(entry, reason);
+      continue;
+    }
+    activity.update(entry.entryId, {
       status: r.ok ? "submitted" : "skipped",
       txHash: r.txHash,
       bundleHash: r.bundleHash,
     });
+    if (!r.ok) {
+      void failPrivateEntryWhenNonceSafe(entry, r.error ?? "bundle was not accepted");
+      continue;
+    }
     // Flip submitted -> included/reverted once it lands. A bundle-only tx (a revertible
     // audit riding a payment bundle) was never broadcast so it has no `txHash`, but its
     // hash is derivable from the signed tx — poll that instead of leaving it stuck.
-    if (r.txHash) void trackReceipt(entryId, r.txHash);
-    else if (r.predictedTxHash) void trackReceipt(entryId, r.predictedTxHash, false);
+    if (r.txHash) {
+      void trackReceipt(
+        entry.entryId,
+        r.txHash,
+        true,
+        entry.valueWei,
+        entry.gasWei,
+        entry.payerAddress,
+        entry.nonce,
+        entry.releaseSpend,
+        entry.hooks,
+      );
+    } else if (r.predictedTxHash) {
+      void trackReceipt(
+        entry.entryId,
+        r.predictedTxHash,
+        false,
+        entry.valueWei,
+        entry.gasWei,
+        entry.payerAddress,
+        entry.nonce,
+        entry.releaseSpend,
+        entry.hooks,
+        r.expiresAfterBlock,
+      );
+    } else {
+      void failPrivateEntryWhenNonceSafe(
+        entry,
+        "relay accepted bundle without a trackable transaction hash",
+      );
+    }
   }
 }
 
-// NOTE: the pre-boundary races now simulate at the future boundary/expiry
-// timestamp (see submitTx's simTimestamp), so they validate correctly in BOTH
-// public mode (eth_call block overrides) and mainnet mode (eth_callBundle's
-// timestamp field) — no mode gating needed.
+// NOTE: pre-boundary races simulate at the future boundary/expiry timestamp using
+// eth_call block overrides against the verified HTTP RPC (see submitTx's simTimestamp),
+// so the same validation applies in public and mainnet modes.
 
 /**
  * How early to pre-submit a boundary race, by submission path.
@@ -197,21 +339,44 @@ function fireBoundaryTick(fireProactivePay: boolean): void {
 // unix seconds. Null when no rival token is currently under a pending audit.
 let nextKillDeadlineSec: bigint | null = null;
 
-// JIT one-shot bookkeeping: tokenIds already submitted for the active target epoch.
+// JIT one-shot bookkeeping. Pending prevents duplicate sends while a receipt is in
+// flight; submitted means authoritative on-chain success (or on-chain state already
+// showed the citizen handled). Pending never counts toward auto-disarm.
 let jitSubmitted = new Set<string>();
+let jitPending = new Set<string>();
 let jitSubmittedTarget: number | null = null;
+let jitGeneration = 0;
+
+function maybeDisarmJit(target: number, selected: readonly bigint[]): void {
+  const s = runtime.strategy;
+  if (!s.jitEnabled || s.jitTargetEpoch !== target) return;
+  if (!selected.every((t) => jitSubmitted.has(t.toString()))) return;
+  runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
+  activity.add({
+    kind: "info",
+    status: "info",
+    message: `JIT payment complete for epoch ${target}; disarmed.`,
+  });
+}
 
 export function resetJitState(): void {
   jitSubmitted = new Set();
+  jitPending = new Set();
   jitSubmittedTarget = null;
+  jitGeneration++;
 }
 
-/** Clear the per-tick spend budget. Every entry point that can reach act() already does
- *  this on the way in (firePreBoundaryPay/Audit/Bundle/Kill, runManualAction, tick), which
- *  is what stops committed spend accumulating across ticks and eventually blocking all
- *  spending. Exported so a test calling a pass directly can stand in for its caller. */
+/** Reset lifecycle state between tests. Production entry points deliberately never call
+ *  this: exact spend reservations must survive every tick until receipt success/failure
+ *  or private-bundle expiry resolves them. */
 export function resetTickBudget(): void {
-  committedThisTickWei = new Map();
+  outstandingSpendWei = new Map();
+  confirmedUnrefreshedWei = new Map();
+  proactivePayPending = new Set();
+  proactivePayConfirmedFrom = new Map();
+  offensePending.clear();
+  pendingAuditCapacity.clear();
+  proactiveGeneration++;
 }
 
 /** Clear defense-mode bookkeeping. Deliberately NOT called from stopEngine: away mode
@@ -220,6 +385,8 @@ export function resetTickBudget(): void {
  *  audit clears (see the prune in maybeAutoDefendAudit). Exported for tests. */
 export function resetDefenseState(): void {
   defendSubmitted = new Set();
+  defendPending = new Set();
+  defenseGeneration++;
 }
 
 // Proactive-pay bookkeeping: tokenIds already submitted for the current epoch.
@@ -228,11 +395,56 @@ export function resetDefenseState(): void {
 // immediate-fire branch), which would otherwise call proactivePayPass twice in
 // quick succession — before the first tx has a chance to confirm and clear the
 // "delinquent" classification — and double-submit the same payment.
-let proactivePaySubmittedEpoch: bigint | null = null;
-let proactivePaySubmitted = new Set<string>();
+let proactivePayConfirmedFrom = new Map<string, string>();
+let proactivePayPending = new Set<string>();
+let proactiveGeneration = 0;
+// Suppress duplicate offense transactions while public/private inclusion is unresolved.
+// Keys include the logical eligibility epoch/deadline so a genuinely new opportunity is
+// not hidden by an older completed action.
+const offensePending = new Set<string>();
+const offenseKey = (kind: "audit" | "kill", target: string, eligibility: bigint) =>
+  `${kind}:${target}:${eligibility}`;
+// auditsUsedInEpoch is only updated once a submitted audit is mined. Until then, a later
+// tick still sees the old on-chain count and could spend the same auditor's capacity on a
+// different target at the next nonce. Keep that unconfirmed capacity reserved locally,
+// keyed by auditor AND eligibility epoch; auditor-role citizens with auditLimit > 1 can
+// therefore still use every genuinely remaining slot.
+const pendingAuditCapacity = new Map<string, bigint>();
+const auditCapacityKey = (auditor: bigint | string, epoch: bigint) =>
+  `${auditor.toString()}:${epoch}`;
+const pendingCapacityFor = (auditor: bigint | string, epoch: bigint): bigint =>
+  pendingAuditCapacity.get(auditCapacityKey(auditor, epoch)) ?? 0n;
 
-export function startEngine(): void {
-  if (timer || unwatchBlocks) return;
+/** Atomically reserve offense target suppression and, for audits, one auditor slot.
+ *  The returned hooks release both pieces together only when receipt tracking reaches an
+ *  authoritative confirmation/failure. The closure is idempotent because relay/receipt
+ *  error paths can converge on the same logical action. */
+function reserveOffenseLifecycle(
+  key: string,
+  audit?: { auditor: bigint; epoch: bigint },
+): TxLifecycleHooks | null {
+  if (offensePending.has(key)) return null;
+  offensePending.add(key);
+  const capacityKey = audit ? auditCapacityKey(audit.auditor, audit.epoch) : null;
+  if (capacityKey) {
+    pendingAuditCapacity.set(capacityKey, (pendingAuditCapacity.get(capacityKey) ?? 0n) + 1n);
+  }
+  let live = true;
+  const release = () => {
+    if (!live) return;
+    live = false;
+    offensePending.delete(key);
+    if (!capacityKey) return;
+    const next = (pendingAuditCapacity.get(capacityKey) ?? 0n) - 1n;
+    if (next > 0n) pendingAuditCapacity.set(capacityKey, next);
+    else pendingAuditCapacity.delete(capacityKey);
+  };
+  return { onConfirmed: release, onFailed: release };
+}
+
+export function startEngine(maintenanceLease?: EngineMaintenanceLease): boolean {
+  if (engineMaintenanceLease && engineMaintenanceLease !== maintenanceLease) return false;
+  if (timer || unwatchBlocks) return true;
   engineSalt = Math.floor(Math.random() * 0xffffffff);
   runtime.running = true;
   runtime.emitStatus();
@@ -247,12 +459,15 @@ export function startEngine(): void {
   }
 
   if (wsClient) {
-    // React on every new block (~100-500ms latency vs up to 12s with polling). The
-    // subscription already carries the full header, so hand it to the block cache
-    // instead of letting the tick re-fetch the same block over HTTP.
+    // React on every new block (~100-500ms latency vs up to 12s with polling). Treat the
+    // subscription only as a wake-up signal; the tick re-reads authoritative data over
+    // the separately identity-checked HTTP client.
     unwatchBlocks = wsClient.watchBlocks({
       onBlock: (block) => {
-        primeBlockCache(block);
+        // The WS transport is a latency hint only. Fee caps, target block, and spend
+        // authorization are sourced from the independently verified HTTP client; never
+        // promote an untrusted subscription header into that authoritative cache.
+        void block;
         void tick();
       },
       onError: (err) => logger.warn("Block subscription error:", (err as Error).message),
@@ -264,6 +479,7 @@ export function startEngine(): void {
     activity.add({ kind: "info", status: "info", message: "Polling every 12s (no WebSocket configured)" });
   }
   void tick();
+  return true;
 }
 
 export function stopEngine(): void {
@@ -286,6 +502,31 @@ export function stopEngine(): void {
   runtime.running = false;
   runtime.emitStatus();
   activity.add({ kind: "info", status: "info", message: "Engine paused" });
+}
+
+/** Stop scheduling work and wait until the current tick/bundle has fully flushed. This is
+ * required before locking/removing/replacing key material: stopEngine alone prevents the
+ * next tick but an in-flight tick may already hold a signer across an awaited RPC call. */
+export async function quiesceEngine(): Promise<void> {
+  quiescing++;
+  try {
+    stopEngine();
+    if (!ticking) return;
+    await new Promise<void>((resolve) => tickSettledWaiters.push(resolve));
+  } finally {
+    quiescing--;
+  }
+}
+
+export function hasActiveEngineWork(): boolean {
+  return ticking || quiescing > 0;
+}
+
+function noteTickSettled(): void {
+  if (ticking || tickSettledWaiters.length === 0) return;
+  const waiters = tickSettledWaiters;
+  tickSettledWaiters = [];
+  for (const resolve of waiters) resolve();
 }
 
 // --- away mode ---------------------------------------------------------------
@@ -471,13 +712,19 @@ function awayWake(): void {
   }
 
   if (!runtime.running) {
+    if (!startEngine()) {
+      // A key/RPC/config mutation owns the engine gate. Retry inside this same boundary
+      // window instead of pretending the wake succeeded and silently missing protection.
+      awayWakeTimer = setTimeout(() => awayWake(), 250);
+      awayWakeTimer.unref?.();
+      return;
+    }
     awayStartedEngine = true;
     activity.add({
       kind: "info",
       status: "info",
       message: `Away mode: waking ${s.awayLeadMinutes} min before the epoch boundary`,
     });
-    startEngine();
   }
   armAwayStop(stopAt, nowSec);
 }
@@ -663,13 +910,25 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
       { ...gameContract, functionName: "auditDueTimestamp" as const, args: [id] as const },
     ]),
   });
+  const target = Number(targetEpoch);
+  if (jitSubmittedTarget !== target) {
+    jitSubmitted = new Set();
+    jitPending = new Set();
+    jitSubmittedTarget = target;
+    jitGeneration++;
+  }
   for (let i = 0; i < selected.length; i++) {
     const r = results[i * 2];
     const due = results[i * 2 + 1];
     if (r?.status !== "success" || due?.status !== "success") continue;
     const lastEpochPaid = r.result as bigint;
-    if (lastEpochPaid >= targetEpoch) continue; // already current for the target
     const key = selected[i]!.toString();
+    if (lastEpochPaid >= targetEpoch) {
+      // Latest can be a one-block inclusion that disappears in a reorg. Do not persist
+      // one-shot completion here; the post-boundary pass confirms it from `safe` state.
+      continue;
+    }
+    if (jitPending.has(key)) continue;
     // Never pay a citizen that is already under audit — catching up after an audit is
     // the user's decision alone (manual "Pay to current"), on every path including JIT.
     if ((due.result as bigint) > 0n) {
@@ -690,10 +949,29 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
       continue;
     }
+    jitPending.add(key);
+    const generation = jitGeneration;
     const res = await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
       "pay-taxes",
-      { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`, race: true, simTimestamp: boundaryTs },
+      {
+        tokenId: key,
+        wallet: walletForToken(key) ?? undefined,
+        message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`,
+        race: true,
+        simTimestamp: boundaryTs,
+        lifecycle: {
+          onConfirmed: () => {
+            if (jitSubmittedTarget !== target || generation !== jitGeneration) return;
+            jitPending.delete(key);
+            jitSubmitted.add(key);
+            maybeDisarmJit(target, selected);
+          },
+          onFailed: () => {
+            if (jitSubmittedTarget === target && generation === jitGeneration) jitPending.delete(key);
+          },
+        },
+      },
     );
     if (res?.ok) paid.add(key);
   }
@@ -716,7 +994,6 @@ export async function firePreBoundaryPay(): Promise<void> {
     return;
   }
   ticking = true;
-  committedThisTickWei = new Map();
   beginBatch();
   const targetEpoch = BigInt(s.jitTargetEpoch);
   const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
@@ -731,6 +1008,7 @@ export async function firePreBoundaryPay(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    noteTickSettled();
   }
 }
 
@@ -765,17 +1043,44 @@ async function maybeQueueCoinbaseBid(kind: BidKind): Promise<void> {
   const amount = coinbaseBidFor(s, kind);
   if (amount <= 0 || !s.coinbasePayerAddress) return;
   const bidWei = parseEther(String(amount));
-  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei);
+  const primary = runtime.primary;
+  if (!primary) return;
+  let queuedSpend: (SpendQuote & { nonce: number; predictedTxHash: `0x${string}` }) | undefined;
+  const approvedCodeHashes = appConfig.coinbasePayerCodeHashes;
+  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei, {
+    approvedCodeHashes,
+    authorizeSpend: (quote) => authorizeExactSpend(primary, quote),
+    onQueued: (quote) => { queuedSpend = quote; },
+  });
   if (!queued) return;
-  // The bid is real ETH but it does NOT go through act(), so it was invisible to every
-  // spend accounting path: "spent this epoch" under-reported it, the cumulative
-  // min-balance check for the rest of the tick didn't see it, and the cached balance
-  // stayed pre-bid. At one bid per boundary that silently understated spend every day
-  // and could let a later payment slip under the floor. Account for it the same way
-  // act() does.
-  runtime.recordSpend(bidWei);
-  // The bid is paid by the primary wallet, so it consumes that wallet's headroom.
-  if (runtime.primary) commitFor(runtime.primary.account.address, bidWei);
+  // Reserve its exact value + signed gas against later transactions in this batch. Spend
+  // telemetry is recorded only once a receipt confirms the bid actually landed.
+  // TypeScript cannot observe the synchronous `onQueued` assignment across the async
+  // function boundary, so retain the declared callback payload type explicitly here.
+  const bid = queuedSpend as (SpendQuote & {
+    nonce: number;
+    predictedTxHash: `0x${string}`;
+  }) | undefined;
+  if (bid !== undefined) {
+    const spend = bid.valueWei + bid.gasWei;
+    const releaseSpend = reserveOutstanding(primary.account.address, spend);
+    const entry = activity.add({
+      kind: "info",
+      status: "planned",
+      valueWei: bid.valueWei.toString(),
+      gasWei: bid.gasWei.toString(),
+      message: `Coinbase bid ${formatEther(bid.valueWei)} ETH`,
+    });
+    batchEntries.push({
+      entryId: entry.id,
+      nonce: bid.nonce,
+      predictedTxHash: bid.predictedTxHash,
+      valueWei: bid.valueWei,
+      gasWei: bid.gasWei,
+      payerAddress: primary.account.address as Address,
+      releaseSpend,
+    });
+  }
   invalidateBalanceCache();
 }
 
@@ -806,7 +1111,7 @@ export function coinbaseBidFor(s: StrategyConfig, kind: BidKind): number {
 }
 
 export function coinbaseBidActive(s: StrategyConfig, kind: BidKind = "payment"): boolean {
-  return coinbaseBidFor(s, kind) > 0 && !!s.coinbasePayerAddress;
+  return coinbaseBidFor(s, kind) > 0 && !!s.coinbasePayerAddress && appConfig.coinbasePayerCodeHashes.length > 0;
 }
 
 /**
@@ -877,6 +1182,10 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
   candidates: { id: bigint; owner: Address }[];
   emigrated: Set<string>;
 }> {
+  // This file is a hard authorization deny-list, not an optional discovery hint. Read it
+  // before any candidate/RPC work and abort the shared offense chokepoint if it cannot be
+  // proven valid; treating a missing or malformed roster as [] could attack a teammate.
+  const allySet = new Set(loadAllyTokensStrict());
   const s = runtime.strategy;
   const citizens = runtime.citizensAddress as Address;
   // Drop any non-parseable entries so a single bad pin can't abort the whole sweep.
@@ -897,7 +1206,6 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
   // Allies are never offense candidates. The rival lists shouldn't contain one, but this
   // is the last line of defence: a stale pin, a hand-edited target list or a regenerated
   // skippers file must never get us auditing or killing a teammate's citizen.
-  const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
   // "Do not target" citizens are big-boy operators that cure at the top of the boundary
   // block, so an audit slot spent on one is normally wasted. Unlike the ally list this is
   // ADVICE, not a prohibition: it keeps them out of auto-discovery, but an explicit pin in
@@ -944,8 +1252,8 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
 }
 
 /** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
- *  auditable at `targetEpoch` (so still current now) and with full capacity
- *  (the new epoch has 0 audits used). One audit per token. */
+ *  auditable at `targetEpoch` (so still current now) and with capacity not already
+ *  reserved by an unresolved pre-boundary/regular audit for that epoch. */
 async function findPreBoundaryAuditors(
   ownedIds: bigint[],
   targetEpoch: bigint,
@@ -971,10 +1279,11 @@ async function findPreBoundaryAuditors(
     if (lep?.status !== "success" || limit?.status !== "success") continue;
     const limitV = limit.result as bigint;
     const key = ownedIds[i]!.toString();
-    // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet,
-    // so remaining capacity == auditLimit. Add one pool entry per available audit
-    // so auditor-role tokens (limit > 1) can hit multiple rivals at the boundary.
-    let ok = isEligibleAuditor(lep.result as bigint, targetEpoch, 0n, limitV);
+    // On-chain usage is zero before the epoch starts, but an earlier boundary fire can
+    // already be pending for this epoch. Count those logical reservations as used until
+    // canonical receipt resolution so a retry cannot overbook the auditor.
+    const reservedV = pendingCapacityFor(ownedIds[i]!, targetEpoch);
+    let ok = isEligibleAuditor(lep.result as bigint, targetEpoch, reservedV, limitV);
     if (!ok && paidInBundle.has(key)) {
       // Paid one epoch earlier in THIS bundle -> current by the time it audits.
       //
@@ -987,11 +1296,11 @@ async function findPreBoundaryAuditors(
       // Kept because it is the correct rule and activates the moment the pre-boundary
       // payment learns to quote catch-up amounts (which costs 2x, so it is gated on
       // maxAutoPayEpochs by design).
-      ok = isEligibleAuditor((lep.result as bigint) + 1n, targetEpoch, 0n, limitV);
+      ok = isEligibleAuditor((lep.result as bigint) + 1n, targetEpoch, reservedV, limitV);
       if (ok) needsPayment.add(key);
     }
     if (!ok) continue;
-    for (let k = 0n; k < limitV; k++) eligible.push(ownedIds[i]!);
+    for (let k = reservedV; k < limitV; k++) eligible.push(ownedIds[i]!);
   }
   return { auditors: eligible, needsPayment };
 }
@@ -1097,6 +1406,8 @@ export async function queuePreBoundaryAudits(
     // Pick the auditor first: the audit is signed by whichever wallet holds it, so the
     // affordability check has to be against THAT wallet's balance, not the primary's.
     const from = auditors[idx]!;
+    const pendingKey = offenseKey("audit", t.tokenId, targetEpoch);
+    if (offensePending.has(pendingKey)) continue;
     const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(from));
     // Fee over cap fails for every remaining target too, and here the wasted awaits eat
     // the pre-boundary lead window itself — stop rather than scan on.
@@ -1107,6 +1418,8 @@ export async function queuePreBoundaryAudits(
     // wrongly revert. Send it unsimulated — it rides allowed-to-revert, so the worst
     // case is gas on a reverted audit and the payment is never endangered.
     const viaBundlePayment = needsPayment.has(from.toString());
+    const lifecycle = reserveOffenseLifecycle(pendingKey, { auditor: from, epoch: targetEpoch });
+    if (!lifecycle) continue;
     const res = await act(
       { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
       "audit",
@@ -1120,6 +1433,7 @@ export async function queuePreBoundaryAudits(
         simTimestamp: boundaryTs,
         skipSim: viaBundlePayment,
         revertible: opts.revertible,
+        lifecycle,
       },
     );
     if (res?.ok) { idx++; queued++; }
@@ -1150,7 +1464,6 @@ export async function firePreBoundaryAudit(): Promise<void> {
   }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
-  committedThisTickWei = new Map();
   beginBatch();
   const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
@@ -1185,6 +1498,7 @@ export async function firePreBoundaryAudit(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    noteTickSettled();
   }
 }
 
@@ -1218,7 +1532,6 @@ export async function firePreBoundaryBundle(): Promise<void> {
     return;
   }
   ticking = true;
-  committedThisTickWei = new Map();
   beginBatch();
   /**
    * The epoch this fire is racing into.
@@ -1287,6 +1600,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    noteTickSettled();
   }
 }
 
@@ -1337,7 +1651,6 @@ async function firePreBoundaryKill(): Promise<void> {
   if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
-  committedThisTickWei = new Map();
   beginBatch();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   // Pre-submit kills for audits expiring within our lead + one slot of headroom.
@@ -1356,14 +1669,18 @@ async function firePreBoundaryKill(): Promise<void> {
       const due = BigInt(t.auditDueTimestamp);
       if (due === 0n || t.killable) continue; // not under audit, or already killable (normal path handles it)
       if (due <= nowSec || due - nowSec > windowSec) continue; // not imminent
+      const pendingKey = offenseKey("kill", t.tokenId, due);
+      if (offensePending.has(pendingKey)) continue;
       const guard = await canSpend(0n, true);
       if (guard.fatal) { logger.debug(`pre-boundary kill stopped early: ${guard.reason}`); break; }
       if (!guard.ok) continue;
+      const lifecycle = reserveOffenseLifecycle(pendingKey);
+      if (!lifecycle) continue;
       await act(
         { to: appConfig.gameAddress, data: encodeKill(BigInt(t.tokenId)), value: 0n, gas: PRE_BOUNDARY_OFFENSE_GAS },
         "kill",
         // Simulate one second past the audit-expiry, where kill() first becomes valid.
-        { targetTokenId: t.tokenId, message: `Pre-boundary kill #${t.tokenId} (audit expiring, deadline race)`, race: true, simTimestamp: due + 1n },
+        { targetTokenId: t.tokenId, message: `Pre-boundary kill #${t.tokenId} (audit expiring, deadline race)`, race: true, simTimestamp: due + 1n, lifecycle },
       );
       queuedKill = true;
     }
@@ -1377,6 +1694,7 @@ async function firePreBoundaryKill(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    noteTickSettled();
   }
 }
 
@@ -1425,6 +1743,10 @@ async function refreshSnapshot(): Promise<void> {
   // passing the floor on a number that predates all of its own spending.
   // getBalanceCached is per-address and 30s-lived, so this is one read per wallet per
   // 30s, not per tick.
+  // Capture only confirmations known BEFORE these balance reads start. A receipt that
+  // arrives during the reads remains reserved for the following refresh instead of being
+  // erased against a balance snapshot that may predate it.
+  const confirmedAtStart = new Map(confirmedUnrefreshedWei);
   const [snap, balances, latest] = await Promise.all([
     getGameSnapshot(),
     Promise.all(
@@ -1441,6 +1763,11 @@ async function refreshSnapshot(): Promise<void> {
   runtime.citizensAddress = snap.citizensAddress;
   runtime.startTime = snap.startTime;
   for (const b of balances) runtime.setBalance(b.address, b.wei);
+  for (const [address, confirmedAmount] of confirmedAtStart) {
+    const remainder = confirmedFor(address) - confirmedAmount;
+    if (remainder > 0n) confirmedUnrefreshedWei.set(address, remainder);
+    else confirmedUnrefreshedWei.delete(address);
+  }
   runtime.lastBlock = latest.number;
   runtime.emitStatus();
   scheduleJitBoundary();
@@ -1512,17 +1839,88 @@ async function canSpend(
   return { ok: true };
 }
 
+/**
+ * Authoritative spending decision for the exact transaction `submitTx` is about to sign.
+ * Unlike canSpend's early estimate, this quote contains the estimated/overridden gas and
+ * the dynamically resolved max fee that will actually be encoded into the transaction.
+ */
+async function authorizeExactSpend(
+  wallet: Wallet,
+  quote: SpendQuote,
+  opts: { automatic: boolean; offense?: boolean } = { automatic: true },
+): Promise<{ ok: boolean; reason?: string }> {
+  const s = runtime.strategy;
+  if (quote.account.toLowerCase() !== wallet.account.address.toLowerCase()) {
+    return { ok: false, reason: "spending guard wallet does not match transaction signer" };
+  }
+  if (nonces.hasRestoredUnaccountedReservation(wallet.account.address as Address)) {
+    return {
+      ok: false,
+      reason: "pre-restart private nonce/spend reservation is still unresolved",
+    };
+  }
+
+  if (opts.automatic) {
+    const gas = resolveGas(s, opts.offense ?? false);
+    const maxBase = BigInt(Math.round(gas.maxBaseFeeGwei * 1e9));
+    if (quote.baseFee > maxBase) {
+      return {
+        ok: false,
+        reason: `base fee ${formatEther(quote.baseFee * 1_000_000_000n)} gwei over cap`,
+      };
+    }
+    if (s.maxPaymentEth > 0) {
+      const cap = parseEther(String(s.maxPaymentEth));
+      if (quote.valueWei > cap) {
+        return {
+          ok: false,
+          reason: `payment ${formatEther(quote.valueWei)} ETH exceeds max-payment cap ${s.maxPaymentEth} ETH`,
+        };
+      }
+    }
+  }
+
+  let balance: bigint;
+  try {
+    // This is the authoritative pre-sign check. Bypass the 30s cache: an external send,
+    // a just-confirmed/reverted tx, or a receipt callback during simulation can all make
+    // wallet.balanceWei stale even though the quote itself is exact.
+    balance = await publicClient.getBalance({ address: wallet.account.address as Address });
+    runtime.setBalance(wallet.account.address, balance);
+  } catch (err) {
+    return { ok: false, reason: `could not refresh payer balance: ${(err as Error).message}` };
+  }
+  const floor = parseEther(String(s.minBalanceEth));
+  if (!canAffordSpend(
+    balance,
+    committedFor(wallet.account.address),
+    quote.valueWei,
+    quote.gasWei,
+    floor,
+  )) {
+    return {
+      ok: false,
+      reason: `exact signed cost would breach min-balance floor on ${wallet.label} (${wallet.account.address.slice(0, 10)}…)`,
+    };
+  }
+  return { ok: true };
+}
+
 // How long to wait for a submitted tx's receipt before giving up. A tx that
 // never lands (dropped, replaced, or a bundle that lost) times out and is left
 // as "submitted" rather than being force-marked one way or the other.
 const RECEIPT_TIMEOUT_MS = 3 * 60_000;
+const RECEIPT_RETRY_DELAY_MS = 5_000;
 
-/**
- * Poll for a submitted tx's receipt and flip its activity entry from "submitted"
- * to "included" (mined OK) or "reverted" (mined but failed). Fire-and-forget:
- * never awaited by the tick loop, and swallows errors/timeouts so a stuck poll
- * can't wedge the engine.
- */
+function receiptRetryDelay(): Promise<void> {
+  return new Promise((resolve) => {
+    const retry = setTimeout(resolve, RECEIPT_RETRY_DELAY_MS);
+    // Receipt tracking is background bookkeeping and must not keep an otherwise stopped
+    // local process alive solely for this backoff timer.
+    retry.unref?.();
+  });
+}
+
 /**
  * Poll for `txHash`'s receipt and flip the activity entry submitted -> included/reverted.
  *
@@ -1536,28 +1934,207 @@ async function trackReceipt(
   entryId: string,
   txHash: `0x${string}`,
   broadcast = true,
+  valueWei = 0n,
+  quotedGasWei = 0n,
+  payerAddress?: Address,
+  nonce?: number,
+  releaseSpend: () => void = () => {},
+  hooks?: TxLifecycleHooks,
+  expiresAfterBlock?: bigint,
 ): Promise<void> {
-  try {
-    const receipt = await publicClient.waitForTransactionReceipt({
-      hash: txHash,
-      timeout: RECEIPT_TIMEOUT_MS,
-    });
-    const block = receipt.blockNumber?.toString();
-    activity.update(entryId, {
-      status: receipt.status === "success" ? "included" : "reverted",
-      targetBlock: block,
-      ...(broadcast ? {} : { txHash }),
-    });
-  } catch (err) {
-    // Timed out or RPC error — leave the entry as "submitted".
-    logger.warn(`receipt tracking for ${txHash.slice(0, 10)}… failed: ${(err as Error).message}`);
+  for (;;) {
+    let stopExpiry = false;
+    try {
+      // First establish inclusion with one confirmation. Once included, a private
+      // bundle cannot "expire", so stop the eligibility race immediately; confirmation
+      // finality is handled separately below.
+      const receiptPromise = publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        timeout: RECEIPT_TIMEOUT_MS,
+        confirmations: 1,
+      });
+      // A private-only bundle cannot appear after its final target block. Stop suppressing
+      // retries promptly instead of waiting the full generic receipt timeout.
+      const expiryPromise = expiresAfterBlock === undefined
+        ? null
+        : (async (): Promise<never> => {
+            while (!stopExpiry) {
+              const head = await publicClient.getBlockNumber();
+              if (head > expiresAfterBlock) {
+                throw new Error(`bundle expired after block ${expiresAfterBlock}`);
+              }
+              await new Promise((resolve) => setTimeout(resolve, 1_000));
+            }
+            throw new Error("bundle expiry tracker stopped");
+          })();
+      const receipt = expiryPromise
+        ? await Promise.race([receiptPromise, expiryPromise])
+        : await receiptPromise;
+      stopExpiry = true;
+      const receiptHash = (receipt as typeof receipt & { transactionHash?: `0x${string}` }).transactionHash;
+      const replaced = receiptHash !== undefined && receiptHash.toLowerCase() !== txHash.toLowerCase();
+
+      let finalReceipt = receipt;
+      // Require one subsequent canonical block before committing logical success. Then
+      // re-fetch both the receipt and its block: relying on the waiter alone can retain
+      // a receipt object from an orphaned block after a one-block reorg.
+      const includedBlock = receipt.blockNumber;
+      const includedBlockHash = (receipt as typeof receipt & { blockHash?: `0x${string}` }).blockHash;
+      // Production viem receipts always carry both hashes. Lightweight tests/mocks that
+      // omit them exercise lifecycle bookkeeping without pretending to prove canonicality.
+      if (includedBlock !== undefined && receiptHash !== undefined && includedBlockHash !== undefined) {
+        while ((await publicClient.getBlockNumber()) < includedBlock + 1n) {
+          await receiptRetryDelay();
+        }
+        const canonicalHash = receiptHash;
+        const [canonicalReceipt, canonicalBlock] = await Promise.all([
+          publicClient.getTransactionReceipt({ hash: canonicalHash }),
+          publicClient.getBlock({ blockNumber: includedBlock }),
+        ]);
+        const canonicalReceiptHash = (canonicalReceipt as typeof canonicalReceipt & {
+          transactionHash?: `0x${string}`;
+          blockHash?: `0x${string}`;
+        }).transactionHash;
+        const canonicalReceiptBlockHash = (canonicalReceipt as typeof canonicalReceipt & {
+          blockHash?: `0x${string}`;
+        }).blockHash;
+        const canonicalBlockHash = (canonicalBlock as typeof canonicalBlock & { hash?: `0x${string}` }).hash;
+        if (
+          canonicalReceiptHash?.toLowerCase() !== canonicalHash.toLowerCase() ||
+          canonicalReceipt.blockNumber !== includedBlock ||
+          (includedBlockHash !== undefined && canonicalReceiptBlockHash !== includedBlockHash) ||
+          (includedBlockHash !== undefined && canonicalBlockHash !== includedBlockHash)
+        ) {
+          throw new Error("transaction inclusion was orphaned before confirmation");
+        }
+        finalReceipt = canonicalReceipt;
+      }
+      if (replaced) {
+        // viem can resolve a same-nonce replacement. Release only after its block survives
+        // the canonicality wait above; a one-block reorg could otherwise orphan the
+        // cancellation and let the original signed action land after suppression ended.
+        invalidateBalanceCache(payerAddress);
+        releaseSpend();
+        activity.update(entryId, { status: "skipped", targetBlock: finalReceipt.blockNumber?.toString() });
+        hooks?.onFailed?.("tracked transaction was replaced on-chain");
+        return;
+      }
+      const block = finalReceipt.blockNumber?.toString();
+      const confirmed = finalReceipt.status === "success";
+      const receiptWithFees = finalReceipt as typeof finalReceipt & {
+        gasUsed?: bigint;
+        effectiveGasPrice?: bigint;
+      };
+      const actualGasWei = receiptWithFees.gasUsed !== undefined &&
+          receiptWithFees.effectiveGasPrice !== undefined
+        ? receiptWithFees.gasUsed * receiptWithFees.effectiveGasPrice
+        : quotedGasWei;
+      const actualSpendWei = (confirmed ? valueWei : 0n) + actualGasWei;
+      activity.update(entryId, {
+        status: confirmed ? "included" : "reverted",
+        targetBlock: block,
+        ...(broadcast ? {} : { txHash }),
+      });
+      releaseSpend();
+      if (payerAddress) noteConfirmedBeforeRefresh(payerAddress, actualSpendWei);
+      // Both successful and reverted transactions spend gas. A pre-receipt refresh may
+      // have re-cached the old balance, so drop it and hold the actual debit reserved until
+      // refreshSnapshot observes a post-receipt balance.
+      invalidateBalanceCache(payerAddress);
+      runtime.recordSpend(actualSpendWei);
+      runtime.emitStatus();
+      if (confirmed) {
+        hooks?.onConfirmed?.();
+      } else {
+        hooks?.onFailed?.("transaction reverted on-chain");
+      }
+      return;
+    } catch (err) {
+      stopExpiry = true;
+      const reason = (err as Error).message;
+      if (broadcast) {
+        // A public tx may remain pending after viem's local wait timeout or a transient
+        // RPC failure. Treating that uncertainty as failure would release its spend and
+        // logical marker, allowing a second payment at a later nonce while this one can
+        // still land. Keep both reserved and resume polling until a receipt is authoritative.
+        let minedNonceConsumed = false;
+        if (payerAddress !== undefined && nonce !== undefined) {
+          try {
+            const tx = await publicClient.getTransaction({ hash: txHash }).catch(() => null);
+            if (!tx) {
+              const minedNonce = await publicClient.getTransactionCount({
+                address: payerAddress,
+                blockTag: "latest",
+              });
+              // Only mined nonce advancement is authoritative. Provider absence (and even
+              // pending nonce absence) cannot prove this signed tx isn't in another peer's
+              // mempool and able to land later.
+              minedNonceConsumed = minedNonce > nonce;
+            }
+          } catch {
+            // RPC uncertainty is not evidence that a transaction was dropped.
+            minedNonceConsumed = false;
+          }
+        }
+        if (!minedNonceConsumed) {
+          logger.warn(
+            `receipt tracking for public tx ${txHash.slice(0, 10)}… interrupted: ${reason}; continuing`,
+          );
+          await receiptRetryDelay();
+          continue;
+        }
+        // A mined replacement/consumption means the original hash can no longer land.
+        // Release its logical marker; the next pass re-reads authoritative action state.
+        activity.update(entryId, { status: "skipped" });
+        releaseSpend();
+        hooks?.onFailed?.("public transaction nonce was consumed by another mined transaction");
+        return;
+      }
+      // A private-only bundle has a deterministic final eligible block. A receipt RPC
+      // timeout before that block is only uncertainty, not evidence that the bundle lost;
+      // keep the reservation until we can observe that its eligibility actually expired.
+      let expired = /bundle expired after block/i.test(reason);
+      if (!expired && expiresAfterBlock !== undefined) {
+        try {
+          expired = (await publicClient.getBlockNumber()) > expiresAfterBlock;
+        } catch {
+          // RPC uncertainty cannot safely authorize a duplicate payment.
+        }
+      }
+      if (!expired) {
+        logger.warn(
+          `receipt tracking for private tx ${txHash.slice(0, 10)}… interrupted: ${reason}; continuing until bundle expiry`,
+        );
+        await receiptRetryDelay();
+        continue;
+      }
+      if (payerAddress === undefined || nonce === undefined) {
+        logger.warn(`cannot reconcile expired private tx ${txHash.slice(0, 10)}… without payer/nonce`);
+        return;
+      }
+      try {
+        await nonces.waitUntilPrivateRetrySafe(payerAddress, nonce);
+      } catch (reconcileErr) {
+        logger.warn(
+          `private nonce ${nonce} could not be reconciled after expiry: ${(reconcileErr as Error).message}`,
+        );
+        return;
+      }
+      // Eligibility is authoritatively over and no receipt landed: release suppression so
+      // the logical payment/defense can be prepared again for a later block.
+      activity.update(entryId, { status: "skipped" });
+      releaseSpend();
+      hooks?.onFailed?.(reason);
+      logger.warn(`receipt tracking for ${txHash.slice(0, 10)}… failed: ${reason}`);
+      return;
+    }
   }
 }
 
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean; normalGas?: boolean; wallet?: Wallet },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean; normalGas?: boolean; wallet?: Wallet; lifecycle?: TxLifecycleHooks },
 ): Promise<SubmitResult | null> {
   const offense = kind === "audit" || kind === "kill";
   // Which wallet signs. `ctx.tokenId` is always the citizen WE own in the action — the one
@@ -1578,6 +2155,7 @@ async function act(
       targetTokenId: ctx.targetTokenId,
       message: `${ctx.message} — skipped: no unlocked wallet holds #${ctx.tokenId ?? "?"}`,
     });
+    ctx.lifecycle?.onFailed?.("no unlocked wallet holds the owner-only action token");
     return null;
   }
   try {
@@ -1598,6 +2176,10 @@ async function act(
       revertible: ctx.revertible,
       skipSim: ctx.skipSim,
       normalGas: ctx.normalGas,
+      authorizeSpend: (quote) => authorizeExactSpend(signer, quote, {
+        automatic: !ctx.normalGas,
+        offense,
+      }),
     });
     if (!result.ok) {
       activity.add({
@@ -1608,18 +2190,19 @@ async function act(
         targetBlock: result.targetBlock?.toString(),
         message: `${ctx.message} — ${result.error ?? "failed"}`,
       });
+      ctx.lifecycle?.onFailed?.(result.error ?? "transaction failed before relay submission");
       return result;
     }
-    runtime.recordSpend(result.valueWei + result.gasWei);
+    const spendWei = result.valueWei + result.gasWei;
     // The cached balance now predates a spend — drop it so the next tick's
     // min-balance check reads the real post-spend balance rather than stale headroom.
     invalidateBalanceCache();
     // Count it against this tick's budget so later canSpend checks in the same
     // tick see the reduced headroom.
-    commitFor(signer.account.address, result.valueWei + result.gasWei);
+    const releaseSpend = reserveOutstanding(signer.account.address, spendWei);
     const entry = activity.add({
       kind,
-      status: "submitted",
+      status: result.queued ? "planned" : "submitted",
       tokenId: ctx.tokenId,
       targetTokenId: ctx.targetTokenId,
       txHash: result.txHash,
@@ -1629,18 +2212,53 @@ async function act(
       gasWei: result.gasWei.toString(),
       message: ctx.message,
     });
-    runtime.emitStatus();
     // Queued into a bundle batch (mainnet): the tx isn't sent yet, so its hashes
     // and receipt tracking are reconciled by flushBatch at end of tick.
     if (result.queued) {
-      batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+      batchEntries.push({
+        entryId: entry.id,
+        nonce: result.nonce,
+        predictedTxHash: result.predictedTxHash,
+        valueWei: result.valueWei,
+        gasWei: result.gasWei,
+        payerAddress: signer.account.address as Address,
+        releaseSpend,
+        hooks: ctx.lifecycle,
+      });
       return result;
     }
     // Watch for the receipt so the entry flips submitted -> included/reverted. A pure
     // Flashbots submission has no broadcast txHash, but the hash it will have if it lands
     // is just keccak of the signed tx — poll that so bundle-only sends resolve too.
-    if (result.txHash) void trackReceipt(entry.id, result.txHash);
-    else if (result.predictedTxHash) void trackReceipt(entry.id, result.predictedTxHash, false);
+    if (result.txHash) {
+      void trackReceipt(
+        entry.id,
+        result.txHash,
+        true,
+        result.valueWei,
+        result.gasWei,
+        signer.account.address as Address,
+        result.nonce,
+        releaseSpend,
+        ctx.lifecycle,
+      );
+    } else if (result.predictedTxHash) {
+      void trackReceipt(
+        entry.id,
+        result.predictedTxHash,
+        false,
+        result.valueWei,
+        result.gasWei,
+        signer.account.address as Address,
+        result.nonce,
+        releaseSpend,
+        ctx.lifecycle,
+        result.expiresAfterBlock,
+      );
+    } else {
+      releaseSpend();
+      ctx.lifecycle?.onFailed?.("relayed transaction has no trackable hash");
+    }
     return result;
   } catch (err) {
     activity.add({
@@ -1650,6 +2268,7 @@ async function act(
       targetTokenId: ctx.targetTokenId,
       message: `${ctx.message} — error: ${(err as Error).message}`,
     });
+    ctx.lifecycle?.onFailed?.((err as Error).message);
     return null;
   }
 }
@@ -1672,6 +2291,8 @@ async function act(
 /** Tokens already defended, keyed `tokenId:auditDueTimestamp` so that a *new* audit on
  *  the same token arms again while a retry of the same one does not double-pay. */
 let defendSubmitted = new Set<string>();
+let defendPending = new Set<string>();
+let defenseGeneration = 0;
 
 /**
  * Latest audit deadline among owned citizens Benji still intends to pay off, or null.
@@ -1749,7 +2370,9 @@ export async function maybeAutoDefendAudit(
   }
 
   const audited = statuses.filter((st) => st.auditDueTimestamp !== "0");
-  // Drop bookkeeping for audits that are over, so the set can't grow without bound.
+  // Drop only confirmed bookkeeping when an audit is over. A pending relay/receipt owns
+  // its marker until its lifecycle callback resolves it; deleting it from a transient or
+  // newer status read could permit a duplicate transaction while the first is still live.
   const liveKeys = new Set(audited.map((st) => `${st.tokenId}:${st.auditDueTimestamp}`));
   for (const k of defendSubmitted) if (!liveKeys.has(k)) defendSubmitted.delete(k);
 
@@ -1764,7 +2387,7 @@ export async function maybeAutoDefendAudit(
 
   for (const st of audited) {
     const key = `${st.tokenId}:${st.auditDueTimestamp}`;
-    if (defendSubmitted.has(key)) continue;
+    if (defendSubmitted.has(key) || defendPending.has(key)) continue;
     if (BigInt(st.bribeBalance) > 0n) continue; // free fix available; stays the user's call
 
     const value = BigInt(st.estimatedPayWei);
@@ -1785,8 +2408,9 @@ export async function maybeAutoDefendAudit(
       });
       continue;
     }
-    defendSubmitted.add(key); // before awaiting, so a rapid re-fire can't double-pay
-    const res = await act(
+    defendPending.add(key); // prevent duplicates only while relay/receipt is unresolved
+    const generation = defenseGeneration;
+    await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, 1), value },
       "pay-taxes",
       {
@@ -1797,13 +2421,18 @@ export async function maybeAutoDefendAudit(
         message:
           `Benji (Defense) Mode: paying off audited #${st.tokenId} = ${formatEther(value)} ETH ` +
           `(${Number(currentEpoch - BigInt(st.lastEpochPaid))} epoch(s) behind, no bribes held) — clears the audit`,
+        lifecycle: {
+          onConfirmed: () => {
+            if (generation !== defenseGeneration) return;
+            defendPending.delete(key);
+            defendSubmitted.add(key);
+          },
+          onFailed: () => {
+            if (generation === defenseGeneration) defendPending.delete(key);
+          },
+        },
       },
     );
-    // act() returns null when nothing was submitted (sim revert, no signer, send failed).
-    // Elsewhere leaving the token marked is fine; here it would mean one failed send is
-    // the difference between a citizen living and dying, so release it and retry next
-    // tick. A submission that DID go out stays marked, so this can't double-pay.
-    if (!res) defendSubmitted.delete(key);
   }
 }
 
@@ -1879,10 +2508,6 @@ async function proactivePayPass(
   nowSec: bigint,
 ): Promise<void> {
   const s = runtime.strategy;
-  if (proactivePaySubmittedEpoch !== currentEpoch) {
-    proactivePaySubmittedEpoch = currentEpoch;
-    proactivePaySubmitted = new Set();
-  }
   // Cap how many epochs a single auto payment covers (so it can't spend a large
   // multi-day catch-up in one shot); the on-chain estimate is read for that many.
   const epochs = cappedAutoPayEpochs(s.prepayEpochs, s.maxAutoPayEpochs);
@@ -1892,7 +2517,16 @@ async function proactivePayPass(
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const key = st.tokenId;
-    if (proactivePaySubmitted.has(key)) continue;
+    const confirmedFrom = proactivePayConfirmedFrom.get(key);
+    if (confirmedFrom !== undefined) {
+      // A receipt confirmed a payment, but this status read can still be from the block
+      // before it. Suppress until lastEpochPaid actually moves; once it does, chain state
+      // is authoritative and a future boundary may legitimately pay again.
+      if (confirmedFrom === st.lastEpochPaid) continue;
+      proactivePayConfirmedFrom.delete(key);
+    }
+    const pendingKey = `${key}:${st.lastEpochPaid}`;
+    if (proactivePayPending.has(pendingKey)) continue;
 
     const underAudit = st.auditDueTimestamp !== "0";
     if (underAudit || st.risk !== "delinquent") continue;
@@ -1915,16 +2549,37 @@ async function proactivePayPass(
       });
       continue;
     }
-    const guard = await canSpend(value, false);
+    const wallet = walletForToken(tokenId);
+    const guard = await canSpend(value, false, wallet);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: st.tokenId, message: `Defer proactive pay #${st.tokenId}: ${guard.reason}` });
       continue;
     }
-    proactivePaySubmitted.add(key); // mark before awaiting so a rapid re-fire can't double-submit
+    // Key pending work by the chain state it was prepared against. If the citizen moves
+    // to a later epoch before an old callback arrives, that stale marker cannot suppress
+    // a legitimate payment for the new state (and the callback can safely delete only its
+    // own marker rather than a newer transaction's).
+    proactivePayPending.add(pendingKey);
+    const observedLastEpochPaid = st.lastEpochPaid;
+    const generation = proactiveGeneration;
     await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, epochs), value },
       "pay-taxes",
-      { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
+      {
+        tokenId: st.tokenId,
+        wallet: wallet ?? undefined,
+        message: `Proactive pay #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH`,
+        lifecycle: {
+          onConfirmed: () => {
+            if (generation !== proactiveGeneration) return;
+            proactivePayPending.delete(pendingKey);
+            proactivePayConfirmedFrom.set(key, observedLastEpochPaid);
+          },
+          onFailed: () => {
+            if (generation === proactiveGeneration) proactivePayPending.delete(pendingKey);
+          },
+        },
+      },
     );
   }
 }
@@ -1949,7 +2604,9 @@ export async function jitPass(
   // Reset bookkeeping if the target changed.
   if (jitSubmittedTarget !== target) {
     jitSubmitted = new Set();
+    jitPending = new Set();
     jitSubmittedTarget = target;
+    jitGeneration++;
   }
 
   const selected = applyExclusions(
@@ -1959,13 +2616,34 @@ export async function jitPass(
   if (selected.length === 0) return; // nothing owned yet — stay armed
 
   const statuses = await batchGetOwnedStatuses(selected, currentEpoch, nowSec, 1);
+  const latestCurrent = statuses.filter((st) => BigInt(st.lastEpochPaid) >= BigInt(target));
+  const safelyPaid = new Set<string>();
+  if (latestCurrent.length > 0) {
+    const safeReads = await publicClient.multicall({
+      allowFailure: true,
+      blockTag: "safe",
+      contracts: latestCurrent.map((st) => ({
+        ...gameContract,
+        functionName: "lastEpochPaid" as const,
+        args: [BigInt(st.tokenId)] as const,
+      })),
+    });
+    for (let i = 0; i < latestCurrent.length; i++) {
+      const safe = safeReads[i];
+      if (safe?.status === "success" && (safe.result as bigint) >= BigInt(target)) {
+        safelyPaid.add(latestCurrent[i]!.tokenId);
+      }
+    }
+  }
   for (const st of statuses) {
     const tokenId = BigInt(st.tokenId);
     const key = st.tokenId;
-    if (jitSubmitted.has(key)) continue;
+    if (jitSubmitted.has(key) || jitPending.has(key)) continue;
 
     if (BigInt(st.lastEpochPaid) >= currentEpoch) {
-      jitSubmitted.add(key); // already current for this epoch
+      // Restart-safe completion: latest state alone may be orphaned. Only safe-tag state
+      // can disarm without a receipt lifecycle retained in this process.
+      if (safelyPaid.has(key)) jitSubmitted.add(key);
       continue;
     }
     // Never pay a citizen that is already under audit — on ANY path. Recovering an
@@ -1991,31 +2669,38 @@ export async function jitPass(
       jitSubmitted.add(key);
       continue;
     }
-    const guard = await canSpend(value, false);
+    const wallet = walletForToken(tokenId);
+    const guard = await canSpend(value, false, wallet);
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer JIT pay #${key}: ${guard.reason}` });
       continue; // retry next tick — do not mark submitted
     }
-    const res = await act(
+    jitPending.add(key);
+    const generation = jitGeneration;
+    await act(
       { to: appConfig.gameAddress, data: encodePayTaxes(tokenId, 1), value },
       "pay-taxes",
-      { tokenId: key, message: `JIT pay #${key} for epoch ${currentEpoch} = ${formatEther(value)} ETH` },
+      {
+        tokenId: key,
+        wallet: wallet ?? undefined,
+        message: `JIT pay #${key} for epoch ${currentEpoch} = ${formatEther(value)} ETH`,
+        lifecycle: {
+          onConfirmed: () => {
+            if (jitSubmittedTarget !== target || generation !== jitGeneration) return;
+            jitPending.delete(key);
+            jitSubmitted.add(key);
+            maybeDisarmJit(target, selected);
+          },
+          onFailed: () => {
+            if (jitSubmittedTarget === target && generation === jitGeneration) jitPending.delete(key);
+          },
+        },
+      },
     );
-    // Only a SUCCESSFUL submission counts as covered. act() returns the failed result
-    // object (truthy) when submission/simulation fails, so `if (res)` marked a citizen
-    // done even though nothing was sent — and because the disarm below fires once every
-    // selected token is marked, one failure ended the whole JIT session with that
-    // citizen unpaid and no retry. With several citizens that silently loses one of
-    // them. A pre-submission failure consumes no nonce and no gas, so retrying next
-    // tick is free and matches the canSpend guard above ("do not mark submitted").
-    if (res?.ok) jitSubmitted.add(key);
   }
 
-  // One-shot: disarm once every selected token has actually been paid/covered.
-  if (selected.every((t) => jitSubmitted.has(t.toString()))) {
-    runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
-    activity.add({ kind: "info", status: "info", message: `JIT payment complete for epoch ${target}; disarmed.` });
-  }
+  // One-shot: only confirmed receipts or an authoritative on-chain read count.
+  maybeDisarmJit(target, selected);
 }
 
 /**
@@ -2047,14 +2732,15 @@ async function findEligibleAuditors(ownedIds: bigint[], currentEpoch: bigint): P
     const lepV = lep.result as bigint;
     const usedV = used.result as bigint;
     const limitV = limit.result as bigint;
-    if (!isEligibleAuditor(lepV, currentEpoch, usedV, limitV)) continue;
+    const effectiveUsedV = usedV + pendingCapacityFor(ownedIds[i]!, currentEpoch);
+    if (!isEligibleAuditor(lepV, currentEpoch, effectiveUsedV, limitV)) continue;
     // Remaining capacity this epoch (>= 1 given isEligibleAuditor); one pool entry each.
-    for (let k = usedV; k < limitV; k++) eligible.push(ownedIds[i]!);
+    for (let k = effectiveUsedV; k < limitV; k++) eligible.push(ownedIds[i]!);
   }
   return eligible;
 }
 
-async function offensePass(
+export async function offensePass(
   ownedIds: bigint[],
   currentEpoch: bigint,
   nowSec: bigint,
@@ -2113,30 +2799,38 @@ async function offensePass(
     }
 
     if (s.autoKill && t.killable) {
+      const pendingKey = offenseKey("kill", t.tokenId, due);
+      if (offensePending.has(pendingKey)) continue;
       const guard = await canSpend(0n, true);
       // A fee spike fails identically for every remaining target — stop the sweep
       // instead of re-awaiting the same verdict once per rival.
       if (guard.fatal) { fatalGuard = guard.reason ?? null; break; }
       if (!guard.ok) continue;
+      const lifecycle = reserveOffenseLifecycle(pendingKey);
+      if (!lifecycle) continue;
       await act(
         { to: appConfig.gameAddress, data: encodeKill(tokenId), value: 0n },
         "kill",
-        { targetTokenId: t.tokenId, message: `Kill expired-audit #${t.tokenId}`, race: true },
+        { targetTokenId: t.tokenId, message: `Kill expired-audit #${t.tokenId}`, race: true, lifecycle },
       );
       continue;
     }
 
     if (s.autoAudit && t.auditable) {
+      const pendingKey = offenseKey("audit", t.tokenId, currentEpoch);
+      if (offensePending.has(pendingKey)) continue;
       if (auditorIdx >= auditors.length) { noAuditorSkips++; continue; } // out of usable auditor tokens
       // Auditor first, then afford-check against the wallet that actually holds it.
       const auditFrom = auditors[auditorIdx]!;
       const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(auditFrom));
       if (guard.fatal) { fatalGuard = guard.reason ?? null; break; }
       if (!guard.ok) continue;
+      const lifecycle = reserveOffenseLifecycle(pendingKey, { auditor: auditFrom, epoch: currentEpoch });
+      if (!lifecycle) continue;
       const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },
         "audit",
-        { tokenId: auditFrom.toString(), targetTokenId: t.tokenId, message: `Audit delinquent #${t.tokenId} from #${auditFrom}`, race: true },
+        { tokenId: auditFrom.toString(), targetTokenId: t.tokenId, message: `Audit delinquent #${t.tokenId} from #${auditFrom}`, race: true, lifecycle },
       );
       if (res?.ok) auditorIdx++; // consume this auditor only if the audit actually went out
     }
@@ -2171,17 +2865,6 @@ export interface ManualActionResult {
   valueWei?: string;
 }
 
-/** Wait out an in-flight tick so a manual tx can't collide with the tick's nonce
- *  reservation / open bundle. Resolves false if the tick never clears in time. */
-async function waitForIdle(timeoutMs = 5_000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (ticking) {
-    if (Date.now() > deadline) return false;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return true;
-}
-
 /**
  * Run a single user-initiated tx outside the tick loop, priced with NORMAL network
  * gas (see normalFees) rather than the configured race tips. These bypass the
@@ -2197,10 +2880,11 @@ async function runManualAction(
 ): Promise<ManualActionResult> {
   if (!runtime.unlocked || !runtime.account) return { ok: false, message: "Unlock the wallet first" };
   if (runtime.gameState !== 1) return { ok: false, message: "Game is not live" };
-  if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment" };
-
+  // Atomically claim the tick/bundle slot before the first await. The API normally
+  // quiesces first, while direct/library callers fail fast instead of racing two
+  // check-then-set awaits into the same nonce manager and global bundle.
+  if (ticking) return { ok: false, message: "Bot is busy submitting; try again in a moment" };
   ticking = true;
-  committedThisTickWei = new Map();
   beginBatch();
   try {
     await Promise.all([
@@ -2255,6 +2939,7 @@ async function runManualAction(
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    noteTickSettled();
   }
 }
 
@@ -2306,7 +2991,6 @@ async function tick(fireProactivePay = false): Promise<void> {
   if (ticking) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   ticking = true;
-  committedThisTickWei = new Map(); // fresh spend budget for this tick
   beginBatch();
   try {
     // Snapshot + nonce sync are independent RPC reads — run them together so the
@@ -2346,5 +3030,6 @@ async function tick(fireProactivePay = false): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    noteTickSettled();
   }
 }

@@ -4,7 +4,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ActivityEntry } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
-import { logger } from "./logger.js";
+import { logger, redactSensitiveText } from "./logger.js";
+import { ensurePrivateDirectory, tightenPrivateFile } from "./private-file.js";
 
 // Append-only activity log with an in-memory ring buffer, periodically flushed
 // to a JSON file. Avoids a native DB dependency. Emits to subscribers (WS).
@@ -36,6 +37,7 @@ class ActivityLog {
   private load(): void {
     try {
       if (!fs.existsSync(this.file)) return;
+      tightenPrivateFile(this.file);
       const parsed = JSON.parse(fs.readFileSync(this.file, "utf8"));
       // Guard the shape: a truncated/corrupt file previously became `entries` verbatim,
       // so a non-array would make every later .push/.slice throw on the hot path.
@@ -73,8 +75,11 @@ class ActivityLog {
     this.dirty = false;
     const payload = JSON.stringify(this.entries.slice(-MAX_ENTRIES));
     try {
-      await fsp.mkdir(path.dirname(this.file), { recursive: true });
-      await fsp.writeFile(this.file, payload);
+      const directory = path.dirname(this.file);
+      await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fsp.chmod(directory, 0o700);
+      await fsp.writeFile(this.file, payload, { mode: 0o600 });
+      await fsp.chmod(this.file, 0o600);
     } catch (err) {
       this.dirty = true; // failed — retry on the next interval rather than losing the log
       logger.warn("Could not flush activity log:", (err as Error).message);
@@ -88,8 +93,9 @@ class ActivityLog {
   flushSync(): void {
     if (!this.dirty) return;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify(this.entries.slice(-MAX_ENTRIES)));
+      ensurePrivateDirectory(path.dirname(this.file));
+      fs.writeFileSync(this.file, JSON.stringify(this.entries.slice(-MAX_ENTRIES)), { mode: 0o600 });
+      fs.chmodSync(this.file, 0o600);
       this.dirty = false;
     } catch (err) {
       logger.warn("Could not flush activity log on shutdown:", (err as Error).message);
@@ -97,7 +103,8 @@ class ActivityLog {
   }
 
   add(entry: Omit<ActivityEntry, "id" | "ts">): ActivityEntry {
-    const full: ActivityEntry = { id: randomUUID(), ts: Date.now(), ...entry };
+    const safeEntry = { ...entry, message: redactSensitiveText(entry.message) };
+    const full: ActivityEntry = { id: randomUUID(), ts: Date.now(), ...safeEntry };
     this.entries.push(full);
     this.byId.set(full.id, full);
     if (this.entries.length > MAX_ENTRIES) {
@@ -114,8 +121,8 @@ class ActivityLog {
         /* ignore listener errors */
       }
     }
-    const label = `${entry.kind}/${entry.status}`;
-    logger.info(`activity ${label}: ${entry.message}`);
+    const label = `${safeEntry.kind}/${safeEntry.status}`;
+    logger.info(`activity ${label}: ${safeEntry.message}`);
     return full;
   }
 
@@ -124,6 +131,7 @@ class ActivityLog {
   update(id: string, patch: Partial<Omit<ActivityEntry, "id" | "ts">>): ActivityEntry | null {
     const entry = this.byId.get(id);
     if (!entry) return null;
+    if (patch.message !== undefined) patch = { ...patch, message: redactSensitiveText(patch.message) };
     Object.assign(entry, patch);
     this.dirty = true;
     for (const l of this.listeners) {

@@ -1,6 +1,18 @@
 import { describe, it, expect } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
-import { encryptPrivateKey, decryptPrivateKey, normalizePrivateKey } from "./keystore.js";
+import {
+  decryptPrivateKey,
+  decryptPrivateKeyAsync,
+  encryptPrivateKey,
+  encryptPrivateKeyAsync,
+  keystorePath,
+  loadWallets,
+  normalizePrivateKey,
+  saveWallets,
+} from "./keystore.js";
 
 describe("keystore encryption", () => {
   it("round-trips a private key with the correct passphrase", () => {
@@ -29,6 +41,50 @@ describe("keystore encryption", () => {
     expect(a.kdfParams.salt).not.toBe(b.kdfParams.salt);
     expect(a.iv).not.toBe(b.iv);
     expect(a.ciphertext).not.toBe(b.ciphertext);
+  });
+
+  it("round-trips through the non-blocking scrypt variants", async () => {
+    const pk = generatePrivateKey();
+    const address = privateKeyToAccount(pk).address;
+    const file = await encryptPrivateKeyAsync(pk, "worker-pool-passphrase", address);
+    await expect(decryptPrivateKeyAsync(file, "worker-pool-passphrase")).resolves.toBe(pk);
+  });
+
+  it("atomically writes mode-0600 files in a mode-0700 directory with a backup", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dt-keystore-test-"));
+    try {
+      const firstKey = generatePrivateKey();
+      const first = encryptPrivateKey(
+        firstKey,
+        "backup-passphrase",
+        privateKeyToAccount(firstKey).address,
+      );
+      saveWallets(dir, [first]);
+      const firstContents = fs.readFileSync(keystorePath(dir), "utf8");
+
+      // Simulate a permissive pre-existing file; the next operation must tighten it.
+      fs.chmodSync(keystorePath(dir), 0o644);
+      expect(loadWallets(dir)).toHaveLength(1);
+      expect(fs.statSync(keystorePath(dir)).mode & 0o777).toBe(0o600);
+
+      const secondKey = generatePrivateKey();
+      const second = encryptPrivateKey(
+        secondKey,
+        "backup-passphrase",
+        privateKeyToAccount(secondKey).address,
+      );
+      saveWallets(dir, [first, second]);
+
+      expect(fs.readFileSync(`${keystorePath(dir)}.bak`, "utf8")).toBe(firstContents);
+      expect(fs.statSync(keystorePath(dir)).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(`${keystorePath(dir)}.bak`).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+      }
+      expect(fs.readdirSync(dir).some((name) => name.endsWith(".tmp"))).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

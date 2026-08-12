@@ -332,7 +332,7 @@ export function JitPanel({
               to bid it to the <b>top of the boundary block</b> — independent of tip. This is the lever
               sophisticated batch-auditors use to guarantee position. <b>Default 0 (off).</b> It only spends
               if the bundle wins the slot (it rides the bundle, allowed-to-revert), and never mirrors to the
-              mempool. It forwards through the shared, on-chain-verified <code>CoinbasePayer</code> contract.
+              mempool. It forwards through an operator-configured, code-hash-allowlisted <code>CoinbasePayer</code> contract.
             </p>
             {/* Two bids, because the two boundaries are not the same purchase. Shown
                 side by side with their own colours so the split is legible at a glance
@@ -384,7 +384,7 @@ export function JitPanel({
                   type="text"
                   value={config.coinbasePayerAddress}
                   readOnly
-                  title="Shared CoinbasePayer forwarder, verified on-chain to forward 100% to block.coinbase. Editable only via data/config.json."
+                  title="CoinbasePayer must be configured in data/config.json and its runtime code hash allowlisted in COINBASE_PAYER_CODE_HASHES."
                   style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, opacity: 0.7, cursor: "not-allowed" }}
                 />
               </label>

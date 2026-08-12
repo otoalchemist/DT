@@ -61,16 +61,21 @@ export function Wallets({ status }: { status: BotStatus | null }) {
     // becomes unmanageable, so make the consequence explicit rather than just "are you sure".
     const ok = window.confirm(
       `Remove ${walletLabel} (${address})?\n\n` +
-        `Its encrypted key is DELETED from the keystore. The bot will stop paying and ` +
+        `Its encrypted key is removed from the active keystore. The bot will stop paying and ` +
         `auditing with every citizen this wallet holds, and you will need the private key ` +
         `again to re-add it. Any ETH in the wallet is untouched but no longer reachable ` +
-        `from the bot.`,
+        `from the bot. An owner-only encrypted backup of the previous keystore is retained ` +
+        `until the next keystore change.`,
     );
     if (!ok) return;
+    const removalPassphrase = window.prompt(
+      "Enter the current keystore passphrase to authorize permanent key removal:",
+    );
+    if (removalPassphrase === null) return;
     setBusy(true);
     setErr(null);
     try {
-      await api.removeWallet(address);
+      await api.removeWallet(address, removalPassphrase);
       setNote(`Removed ${walletLabel}.`);
     } catch (e) {
       setErr((e as Error).message);

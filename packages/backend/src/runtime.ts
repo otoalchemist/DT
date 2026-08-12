@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import type { PrivateKeyAccount } from "viem/accounts";
 import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { activity } from "./activity.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
+import { tightenPrivateFile, writePrivateFileAtomic } from "./private-file.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
@@ -27,10 +29,19 @@ import { ownershipIndexingAvailable } from "./index-tokens.js";
  */
 const fileCache = new Map<string, { key: string; value: unknown }>();
 
+export type AllyTokenLoadResult =
+  | { ok: true; tokenIds: string[] }
+  | { ok: false; error: string };
+
+/** Derived ally-list parse, tied to readJsonCached's object identity. */
+let allyMemo: { src: unknown; out: AllyTokenLoadResult } | null = null;
+let lastAllyRosterError: string | null = null;
+let lastDoNotTargetError: string | null = null;
+
 /**
  * Read and parse a JSON file, reusing the last parse while the file is unchanged.
- * Returns null when the file is absent or unreadable, so callers keep their existing
- * "missing means empty" behaviour.
+ * Returns null when metadata cannot be read. Individual callers decide whether absence
+ * is advisory or a hard failure; notably the ally offense roster must fail closed.
  *
  * The cached value is returned BY REFERENCE, so callers must not mutate it. Every caller
  * below derives a new array/Set from it, which is why this is safe.
@@ -57,6 +68,10 @@ function readJsonCached(fileName: string): unknown | null {
  *  millisecond — fine in production (mtime+size moves) but not at test speed. */
 export function invalidateListCache(): void {
   fileCache.clear();
+  allyMemo = null;
+  dntMemo = null;
+  lastAllyRosterError = null;
+  lastDoNotTargetError = null;
 }
 
 // Curated rival token IDs ship in git (data/rival-targets.json, unlike the
@@ -93,8 +108,57 @@ export function loadRivalSkippers(): string[] {
  * get their own dashboard panel rather than appearing under "Rival targets", where a
  * delinquent ally reads as a kill candidate.
  */
+export function loadAllyTokensResult(): AllyTokenLoadResult {
+  let raw: unknown;
+  try {
+    raw = readJsonCached("ally-tokens.json");
+  } catch (err) {
+    return { ok: false, error: `could not read or parse file: ${(err as Error).message}` };
+  }
+  if (raw === null) {
+    return { ok: false, error: "file is missing or unreadable" };
+  }
+  const memo = allyMemo;
+  if (memo !== null && memo.src === raw) return memo.out;
+
+  const parsed = tokenIds.safeParse(raw);
+  const out: AllyTokenLoadResult = parsed.success
+    ? { ok: true, tokenIds: parsed.data }
+    : { ok: false, error: `invalid token list: ${parsed.error.issues[0]?.message ?? "validation failed"}` };
+  allyMemo = { src: raw, out };
+  return out;
+}
+
+function reportAllyRosterFailure(error: string): void {
+  if (lastAllyRosterError === error) return;
+  lastAllyRosterError = error;
+  logger.error(`Ally safety roster unavailable; automated offense is blocked: ${error}`);
+}
+
+/**
+ * Dashboard-safe ally read. A roster failure is reported loudly but represented as an
+ * empty list so status endpoints remain available. Automated offense must use the strict
+ * variant below: an empty fallback is unsafe there because it removes the hard block.
+ */
 export function loadAllyTokens(): string[] {
-  return loadRivalIdFile("ally-tokens.json", "ally tokens");
+  const result = loadAllyTokensResult();
+  if (!result.ok) {
+    reportAllyRosterFailure(result.error);
+    return [];
+  }
+  lastAllyRosterError = null;
+  return result.tokenIds;
+}
+
+/** Hard-safety read for the shared offense chokepoint. Never converts failure to []. */
+export function loadAllyTokensStrict(): string[] {
+  const result = loadAllyTokensResult();
+  if (!result.ok) {
+    reportAllyRosterFailure(result.error);
+    throw new Error(`Ally safety roster unavailable; refusing automated offense: ${result.error}`);
+  }
+  lastAllyRosterError = null;
+  return result.tokenIds;
 }
 
 /**
@@ -114,7 +178,10 @@ export function loadAllyTokens(): string[] {
 export function loadDoNotTarget(): { tokenIds: string[]; owners: Record<string, string[]> } {
   try {
     const raw = readJsonCached("do-not-target.json") as { owners?: Record<string, unknown> } | null;
-    if (!raw) return { tokenIds: [], owners: {} };
+    if (!raw) {
+      reportDoNotTargetFailure("file is missing or unreadable");
+      return { tokenIds: [], owners: {} };
+    }
     // Memoize the DERIVED shape against the same parsed object, not just the parse: the
     // normalize + dedupe below runs on every offense sweep and every dashboard poll, and
     // its input only changes when the file does. Identity holds because readJsonCached
@@ -130,10 +197,18 @@ export function loadDoNotTarget(): { tokenIds: string[]; owners: Record<string, 
     const tokenIds = [...new Set(Object.values(owners).flat())];
     const out = { tokenIds, owners };
     dntMemo = { src: raw, out };
+    lastDoNotTargetError = null;
     return out;
-  } catch {
+  } catch (err) {
+    reportDoNotTargetFailure((err as Error).message);
     return { tokenIds: [], owners: {} };
   }
+}
+
+function reportDoNotTargetFailure(error: string): void {
+  if (lastDoNotTargetError === error) return;
+  lastDoNotTargetError = error;
+  logger.warn(`Could not load advisory do-not-target roster; continuing without it: ${error}`);
 }
 
 /** Memo for loadDoNotTarget's derived output, tied to the identity of the parsed file. */
@@ -149,6 +224,73 @@ export function doNotTargetOwnerOf(): Record<string, string> {
   for (const [name, ids] of Object.entries(owners)) for (const id of ids) map[id] = name;
   return map;
 }
+
+const UINT256_MAX = (1n << 256n) - 1n;
+const tokenId = z
+  .string()
+  .trim()
+  .regex(/^(0|[1-9]\d*)$/, "must be a canonical decimal token ID")
+  .refine((id) => BigInt(id) <= UINT256_MAX, "token ID exceeds uint256")
+  .transform((id) => BigInt(id).toString());
+const tokenIds = z
+  .array(tokenId)
+  .max(10_000, "too many token IDs")
+  .transform((ids) => [...new Set(ids)]);
+const safeEpoch = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const ethAmount = z.number().finite().nonnegative().max(1_000_000);
+const gasGwei = z.number().finite().nonnegative().max(1_000_000);
+
+/**
+ * Authoritative strategy validation for both persisted configuration and API writes.
+ * Unknown fields are rejected, token IDs are bounded/canonicalized/de-duplicated, and
+ * every numeric control has a finite range before it can influence transaction values.
+ */
+export const strategyConfigSchema = z
+  .object({
+    enabled: z.boolean(),
+    autoDefendAudit: z.boolean(),
+    proactivePay: z.boolean(),
+    prepayEpochs: z.number().int().min(1).max(7),
+    maxAutoPayEpochs: z.number().int().min(1).max(7),
+    jitEnabled: z.boolean(),
+    jitTargetEpoch: safeEpoch.min(1).nullable(),
+    jitTokenIds: tokenIds,
+    excludedTokenIds: tokenIds,
+    preBoundaryPay: z.boolean(),
+    preBoundaryLeadMs: z.number().int().min(250).max(8_000),
+    preBoundaryLeadMainnetMs: z.number().int().min(250).max(11_000),
+    awayMode: z.boolean(),
+    awayLeadMinutes: z.number().int().min(1).max(720),
+    offenseEnabled: z.boolean(),
+    autoAudit: z.boolean(),
+    autoKill: z.boolean(),
+    endgameOnlyWithin: safeEpoch.max(1_000_000).nullable(),
+    offenseTargetTokenIds: tokenIds,
+    preBoundaryAudit: z.boolean(),
+    preBoundaryKill: z.boolean(),
+    combinedBoundaryBundle: z.boolean(),
+    maxBaseFeeGwei: gasGwei.positive(),
+    priorityFeeGwei: gasGwei,
+    minBalanceEth: ethAmount,
+    separateOffenseGas: z.boolean(),
+    offenseMaxBaseFeeGwei: gasGwei.positive(),
+    offensePriorityFeeGwei: gasGwei,
+    offenseDynamicTipEnabled: z.boolean(),
+    offenseDynamicTipMaxGwei: gasGwei.positive(),
+    racePublicMempool: z.boolean(),
+    dynamicTipEnabled: z.boolean(),
+    dynamicTipMaxGwei: gasGwei.positive(),
+    coinbaseBidEth: ethAmount,
+    coinbaseBidAuditOnlyEth: ethAmount,
+    coinbasePayerAddress: z.union([
+      z.literal(""),
+      z.string().regex(/^0x[a-fA-F0-9]{40}$/, "must be a 0x address or empty"),
+    ]),
+    maxPaymentEth: ethAmount,
+  })
+  .strict();
+
+export const strategyPatchSchema = strategyConfigSchema.partial().strict();
 
 export const DEFAULT_STRATEGY: StrategyConfig = {
   enabled: false,
@@ -172,10 +314,9 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // a defaults bump must never silently put the engine back on 24/7 polling.
   awayMode: false,
   awayLeadMinutes: 15,
-  // Offense is ON by default, focused on the curated "skippers" list (rivals that
-  // reliably fall 2+ epochs behind, so they're auditable at every boundary). The
-  // supporting settings below are pre-armed so it works out of the box.
-  offenseEnabled: true,
+  // Spending against rivals is opt-in. The curated list and supporting settings are
+  // pre-populated, but a fresh install cannot audit merely because the engine starts.
+  offenseEnabled: false,
   autoAudit: true,
   autoKill: false, // opt-in: killing an expired-audit token is free but aggressive
   endgameOnlyWithin: null,
@@ -210,10 +351,9 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // Audit-only boundaries bid separately: that bundle is smaller and losing it costs only
   // the audit fee, so it rarely warrants what a must-land payment bundle does.
   coinbaseBidAuditOnlyEth: 0,
-  // Shared CoinbasePayer forwarder (verified on-chain to forward 100% to
-  // block.coinbase). Only used when coinbaseBidEth > 0; deploy your own if you'd
-  // rather not share (see contracts/CoinbasePayer.sol).
-  coinbasePayerAddress: "0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815",
+  // No implicit third-party payer. Enabling a bid requires an explicitly configured
+  // deployment whose runtime code hash is allowlisted (see .env.example).
+  coinbasePayerAddress: "",
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 
@@ -227,16 +367,98 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
  * Tied to this constant rather than VERSION so an unrelated release doesn't reset
  * anyone's tuning.
  */
-export const DEFAULTS_VERSION = 4;
+export const DEFAULTS_VERSION = 5;
+
+/**
+ * The first persisted-defaults version whose complete schema included each field.
+ * A config stamped with an earlier version may omit ONLY these explicitly enumerated
+ * additions. Every field not listed here existed in the original persisted schema and
+ * remains required, including the spend caps and minimum-balance floor.
+ *
+ * Some fields landed while v4 was current. They are assigned to v5 here so an authentic
+ * v4 file written before those additions has a deterministic upgrade path; once stamped
+ * v5, the full current schema is mandatory.
+ */
+const LEGACY_FIELD_INTRODUCED_BY_VERSION: Partial<Record<keyof StrategyConfig, number>> = {
+  maxAutoPayEpochs: 1,
+  preBoundaryPay: 1,
+  preBoundaryLeadMs: 1,
+  preBoundaryLeadMainnetMs: 1,
+  preBoundaryAudit: 1,
+  preBoundaryKill: 1,
+  combinedBoundaryBundle: 1,
+  separateOffenseGas: 1,
+  offenseMaxBaseFeeGwei: 1,
+  offensePriorityFeeGwei: 1,
+  offenseDynamicTipEnabled: 1,
+  offenseDynamicTipMaxGwei: 1,
+  coinbaseBidEth: 1,
+  coinbasePayerAddress: 1,
+  excludedTokenIds: 4,
+  // These appeared while v4 was still the persisted stamp, so an old v4 file may omit
+  // them even though a later v4 runtime knew about them.
+  awayMode: 5,
+  awayLeadMinutes: 5,
+  autoDefendAudit: 5,
+  coinbaseBidAuditOnlyEth: 5,
+};
+
+/** Known fields removed from pre-v4 configs. Typos and all other unknown keys still fail. */
+const LEGACY_RETIRED_FIELDS = new Set([
+  "dryRun",
+  "auditSafetyBufferSeconds",
+  "autoUseBribe",
+  "offenseBoundaryScheduling",
+]);
+
+function completeLegacyStrategyConfig(
+  raw: Record<string, unknown>,
+  fromVersion: number,
+): StrategyConfig {
+  const completed: Record<string, unknown> = {};
+  const added: string[] = [];
+  for (const key of Object.keys(DEFAULT_STRATEGY) as (keyof StrategyConfig)[]) {
+    if (key in raw) {
+      completed[key] = raw[key];
+      continue;
+    }
+    const introducedBy = LEGACY_FIELD_INTRODUCED_BY_VERSION[key];
+    if (introducedBy === undefined || fromVersion >= introducedBy) {
+      throw new Error(`missing required strategy config field: ${key}`);
+    }
+    // Before the bid was split, the one configured value applied to both bundle shapes.
+    // Preserve that historical behavior instead of silently dropping audit-only bids.
+    if (
+      key === "coinbaseBidAuditOnlyEth" &&
+      typeof raw.coinbaseBidEth === "number" &&
+      raw.coinbaseBidEth > 0
+    ) {
+      completed[key] = raw.coinbaseBidEth;
+    } else {
+      completed[key] = DEFAULT_STRATEGY[key];
+    }
+    added.push(key);
+  }
+  const parsed = strategyConfigSchema.parse(completed) as StrategyConfig;
+  if (added.length > 0) {
+    logger.info(
+      `Config schema migration from defaults v${fromVersion}: added ${added.join(", ")}`,
+    );
+  }
+  return parsed;
+}
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
  * listed is PRESERVED from the user's saved config — their mode/run-state
- * (enabled, offenseEnabled, endgameOnlyWithin), wallet-side settings
+ * (enabled, endgameOnlyWithin), wallet-side settings
  * (coinbaseBidEth, coinbasePayerAddress), spend guardrails (minBalanceEth,
  * maxPaymentEth), and JIT session (jitEnabled, jitTargetEpoch, jitTokenIds).
  */
 const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
+  // Security migration: offense is now opt-in on fresh and existing installs. Users who
+  // want it can explicitly re-enable after reviewing the curated target list.
+  "offenseEnabled",
   "proactivePay", "prepayEpochs", "maxAutoPayEpochs",
   "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
   "autoAudit", "autoKill", "preBoundaryAudit", "preBoundaryKill", "combinedBoundaryBundle",
@@ -365,36 +587,53 @@ class Runtime {
       // No saved config (fresh install/extract) -> DEFAULT_STRATEGY already IS the
       // recommended set, so there's nothing to migrate.
       if (!fs.existsSync(p)) return;
-      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
-      // Meta key, not part of StrategyConfig. Absent => pre-versioning config (0).
-      const savedDefaults = typeof raw.defaultsVersion === "number" ? raw.defaultsVersion : 0;
-      // Keep only keys DEFAULT_STRATEGY still declares, so config.json doesn't carry
-      // dead fields from retired settings across upgrades (and `defaultsVersion`
-      // itself, which is file meta rather than strategy, is dropped here too).
-      const merged: Record<string, unknown> = {};
-      for (const k of Object.keys(DEFAULT_STRATEGY) as (keyof StrategyConfig)[]) {
-        merged[k] = k in raw ? raw[k] : DEFAULT_STRATEGY[k];
+      tightenPrivateFile(p);
+      const raw: unknown = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error("strategy config must be a JSON object");
       }
-      // Upgrade path for the split coinbase bid. A config written before
-      // coinbaseBidAuditOnlyEth existed has one bid that covered BOTH boundary kinds, so
-      // defaulting the new field to 0 would silently stop bidding on every audit-only
-      // night — and, worse, drop those audits back to the mempool-mirror path. Carry the
-      // old value across so behaviour is unchanged on upgrade; 0 means 0 from then on,
-      // which is what makes "bid on payments only" expressible at all.
-      if (!("coinbaseBidAuditOnlyEth" in raw) && typeof raw.coinbaseBidEth === "number" && raw.coinbaseBidEth > 0) {
-        (merged as Record<string, unknown>).coinbaseBidAuditOnlyEth = raw.coinbaseBidEth;
-        logger.info(
-          `Config upgrade: audit-only coinbase bid seeded from the existing bid (${raw.coinbaseBidEth} ETH). ` +
-            `Set it separately to bid less on offense-only boundaries.`,
+      const rawConfig = raw as Record<string, unknown>;
+      // Meta key, not part of StrategyConfig. Absent => pre-versioning config (0).
+      const savedDefaults = rawConfig.defaultsVersion === undefined
+        ? 0
+        : z.number().int().nonnegative().parse(rawConfig.defaultsVersion);
+      if (savedDefaults > DEFAULTS_VERSION) {
+        throw new Error(
+          `config defaults version ${savedDefaults} is newer than supported version ${DEFAULTS_VERSION}`,
         );
       }
-      this.strategy = merged as unknown as StrategyConfig;
+
+      const allowedKeys = new Set([...Object.keys(DEFAULT_STRATEGY), "defaultsVersion"]);
+      if (savedDefaults < 4) {
+        for (const key of LEGACY_RETIRED_FIELDS) allowedKeys.add(key);
+      }
+      const unknownKeys = Object.keys(rawConfig).filter((key) => !allowedKeys.has(key));
+      if (unknownKeys.length > 0) {
+        throw new Error(`unknown strategy config field(s): ${unknownKeys.join(", ")}`);
+      }
+      // A file already stamped with the current version must be a complete current
+      // config. Never fill a missing guardrail from DEFAULT_STRATEGY: several defaults
+      // (notably maxPaymentEth=0) are intentionally permissive and are unsafe fallbacks.
+      if (savedDefaults === DEFAULTS_VERSION) {
+        const persisted = Object.fromEntries(
+          Object.entries(rawConfig).filter(([key]) => key !== "defaultsVersion"),
+        );
+        this.strategy = strategyConfigSchema.parse(persisted) as StrategyConfig;
+      } else {
+        // Legacy completion is deliberately narrow: only fields known to have been
+        // introduced after the file's stamp may be supplied by an explicit migration.
+        this.strategy = completeLegacyStrategyConfig(rawConfig, savedDefaults);
+      }
       if (savedDefaults < DEFAULTS_VERSION) {
         this.strategy = this.applyRecommendedDefaults(this.strategy, savedDefaults);
         this.writeConfig(); // persist the migration + new stamp so it runs once
       }
     } catch (err) {
       logger.warn("Could not load strategy config:", (err as Error).message);
+      // A malformed or misspelled guardrail must never fall back to permissive
+      // defaults (for example maxPaymentEth=0 means "no cap"). Refuse startup so the
+      // operator has to correct or remove the invalid file before any key is unlocked.
+      throw new Error("Invalid strategy configuration; refusing to start");
     }
   }
 
@@ -408,31 +647,36 @@ class Runtime {
       if (JSON.stringify(out[k]) !== JSON.stringify(def)) changed.push(k);
       (out as Record<string, unknown>)[k] = def;
     }
+    // Retire only the exact historical shared payer. Preserve every operator-supplied
+    // address; all payer deployments are separately code-hash checked before a bid.
+    const retiredSharedPayer = "0xb69d1bb4613722bdab1aa77ba8f4409071f0a815";
+    if (out.coinbasePayerAddress.toLowerCase() === retiredSharedPayer) {
+      out.coinbasePayerAddress = "";
+      changed.push("coinbasePayerAddress (retired shared deployment)");
+    }
     const detail = changed.length ? `refreshed: ${changed.join(", ")}` : "already current";
     const msg =
       `Config updated to recommended defaults v${DEFAULTS_VERSION} (was v${fromVersion}) — ${detail}. ` +
-      `Kept your run mode, wallet/payer, coinbase bid, spend caps and JIT selection.`;
+      `Kept your run mode, operator-supplied payer, coinbase bid, spend caps and JIT selection.`;
     logger.info(msg);
     activity.add({ kind: "info", status: "info", message: msg });
     return out;
   }
 
   /** Write config.json, stamping the defaults version it was written against. */
-  private writeConfig(): void {
-    try {
-      fs.mkdirSync(appConfig.dataDir, { recursive: true });
-      fs.writeFileSync(
-        this.configPath(),
-        JSON.stringify({ ...this.strategy, defaultsVersion: DEFAULTS_VERSION }, null, 2),
-      );
-    } catch (err) {
-      logger.warn("Could not save strategy config:", (err as Error).message);
-    }
+  private writeConfig(strategy: StrategyConfig = this.strategy): void {
+    writePrivateFileAtomic(
+      this.configPath(),
+      JSON.stringify({ ...strategy, defaultsVersion: DEFAULTS_VERSION }, null, 2),
+    );
   }
 
   saveStrategy(next: Partial<StrategyConfig>): StrategyConfig {
-    this.strategy = { ...this.strategy, ...next };
-    this.writeConfig();
+    const validated = strategyConfigSchema.parse({ ...this.strategy, ...next }) as StrategyConfig;
+    // Persist first so a disk/permission failure cannot activate a strategy that silently
+    // disappears on restart (especially an offense or spend-limit change).
+    this.writeConfig(validated);
+    this.strategy = validated;
     this.emitStatus();
     return this.strategy;
   }

@@ -10,16 +10,46 @@ import type {
   DoNotTargetStatus,
 } from "@dat-bot/shared";
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+let sessionTokenPromise: Promise<string> | null = null;
+
+export function invalidateSessionToken(): void {
+  sessionTokenPromise = null;
+}
+
+export function getSessionToken(): Promise<string> {
+  if (!sessionTokenPromise) {
+    sessionTokenPromise = fetch("/api/session", { cache: "no-store" })
+      .then(async (res) => {
+        const body = await res.json() as { token?: string; error?: string };
+        if (!res.ok || !body.token) throw new Error(body.error ?? `HTTP ${res.status}`);
+        return body.token;
+      })
+      .catch((error) => {
+        sessionTokenPromise = null;
+        throw error;
+      });
+  }
+  return sessionTokenPromise;
+}
+
+async function req<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
+  const token = await getSessionToken();
   const res = await fetch(path, {
     ...init,
     headers: {
       ...(init?.body ? { "content-type": "application/json" } : {}),
+      ...(token ? { "x-dat-bot-session": token } : {}),
       ...(init?.headers ?? {}),
     },
   });
   const text = await res.text();
   const json = text ? JSON.parse(text) : {};
+  // A backend restart rotates the per-process token. Refresh it once without making
+  // every caller understand session lifecycle.
+  if (res.status === 403 && !retried) {
+    invalidateSessionToken();
+    return req<T>(path, init, true);
+  }
   if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
   return json as T;
 }
@@ -35,10 +65,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  removeWallet: (address: string) =>
+  removeWallet: (address: string, passphrase: string) =>
     req<{ ok: boolean; remaining: number }>(`/api/wallets/${address}`, {
       method: "DELETE",
-      body: JSON.stringify({ confirmAddress: address }),
+      body: JSON.stringify({ confirmAddress: address, passphrase }),
     }),
   createKeystore: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string }) =>
     req<{ address: string }>("/api/keystore", { method: "POST", body: JSON.stringify(body) }),

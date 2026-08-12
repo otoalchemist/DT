@@ -1,5 +1,6 @@
 import {
   randomBytes,
+  scrypt,
   scryptSync,
   createCipheriv,
   createDecipheriv,
@@ -7,6 +8,7 @@ import {
 } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { tightenPrivateFile, writePrivateFileAtomic } from "./private-file.js";
 
 // Encrypted keystore for the bot's hot-wallet private keys.
 //
@@ -51,6 +53,45 @@ function deriveKey(passphrase: string, salt: Buffer): Buffer {
   });
 }
 
+function deriveKeyAsync(passphrase: string, salt: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    scrypt(passphrase, salt, SCRYPT.keyLen, {
+      N: SCRYPT.N,
+      r: SCRYPT.r,
+      p: SCRYPT.p,
+      maxmem: 256 * 1024 * 1024,
+    }, (error, key) => {
+      if (error) reject(error);
+      else resolve(key);
+    });
+  });
+}
+
+function encryptWithKey(
+  privateKey: string,
+  address: string,
+  salt: Buffer,
+  iv: Buffer,
+  key: Buffer,
+): KeystoreFileV1 {
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(Buffer.from(privateKey.replace(/^0x/, ""), "hex")),
+    cipher.final(),
+  ]);
+  const authTag = cipher.getAuthTag();
+  return {
+    version: 1,
+    kdf: "scrypt",
+    kdfParams: { ...SCRYPT, salt: salt.toString("hex") },
+    cipher: "aes-256-gcm",
+    iv: iv.toString("hex"),
+    authTag: authTag.toString("hex"),
+    ciphertext: ciphertext.toString("hex"),
+    address,
+  };
+}
+
 /**
  * Normalize an imported private key. Accepts 64 hex chars **with or without** a
  * `0x` prefix (and surrounding whitespace), returning a `0x`-prefixed lowercase
@@ -71,31 +112,22 @@ export function encryptPrivateKey(
   const salt = randomBytes(16);
   const iv = randomBytes(12);
   const key = deriveKey(passphrase, salt);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const ciphertext = Buffer.concat([
-    cipher.update(Buffer.from(privateKey.replace(/^0x/, ""), "hex")),
-    cipher.final(),
-  ]);
-  const authTag = cipher.getAuthTag();
-  return {
-    version: 1,
-    kdf: "scrypt",
-    kdfParams: { ...SCRYPT, salt: salt.toString("hex") },
-    cipher: "aes-256-gcm",
-    iv: iv.toString("hex"),
-    authTag: authTag.toString("hex"),
-    ciphertext: ciphertext.toString("hex"),
-    address,
-  };
+  return encryptWithKey(privateKey, address, salt, iv, key);
 }
 
-/** Decrypts a keystore file; throws on wrong passphrase (auth tag mismatch). */
-export function decryptPrivateKey(
-  file: KeystoreFileV1,
+/** Non-blocking variant for request handlers; scrypt runs in the worker pool. */
+export async function encryptPrivateKeyAsync(
+  privateKey: string,
   passphrase: string,
-): `0x${string}` {
-  const salt = Buffer.from(file.kdfParams.salt, "hex");
-  const key = deriveKey(passphrase, salt);
+  address: string,
+): Promise<KeystoreFileV1> {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const key = await deriveKeyAsync(passphrase, salt);
+  return encryptWithKey(privateKey, address, salt, iv, key);
+}
+
+function decryptWithKey(file: KeystoreFileV1, key: Buffer): `0x${string}` {
   const decipher = createDecipheriv(
     "aes-256-gcm",
     key,
@@ -107,6 +139,26 @@ export function decryptPrivateKey(
     decipher.final(),
   ]);
   return ("0x" + plaintext.toString("hex")) as `0x${string}`;
+}
+
+/** Decrypts a keystore file; throws on wrong passphrase (auth tag mismatch). */
+export function decryptPrivateKey(
+  file: KeystoreFileV1,
+  passphrase: string,
+): `0x${string}` {
+  const salt = Buffer.from(file.kdfParams.salt, "hex");
+  const key = deriveKey(passphrase, salt);
+  return decryptWithKey(file, key);
+}
+
+/** Non-blocking variant for request handlers; scrypt runs in the worker pool. */
+export async function decryptPrivateKeyAsync(
+  file: KeystoreFileV1,
+  passphrase: string,
+): Promise<`0x${string}`> {
+  const salt = Buffer.from(file.kdfParams.salt, "hex");
+  const key = await deriveKeyAsync(passphrase, salt);
+  return decryptWithKey(file, key);
 }
 
 export function keystorePath(dataDir: string): string {
@@ -125,6 +177,7 @@ export function saveKeystore(dataDir: string, file: KeystoreFileV1): void {
 export function loadWallets(dataDir: string): KeystoreFileV1[] {
   const p = keystorePath(dataDir);
   if (!fs.existsSync(p)) return [];
+  tightenPrivateFile(p);
   const raw = JSON.parse(fs.readFileSync(p, "utf8")) as KeystoreFileV1 | KeystoreFileV2;
   if ((raw as KeystoreFileV2).version === 2) {
     return (raw as KeystoreFileV2).wallets ?? [];
@@ -133,10 +186,9 @@ export function loadWallets(dataDir: string): KeystoreFileV1[] {
 }
 
 export function saveWallets(dataDir: string, wallets: KeystoreFileV1[]): void {
-  fs.mkdirSync(dataDir, { recursive: true });
   const file: KeystoreFileV2 = { version: 2, wallets };
-  fs.writeFileSync(keystorePath(dataDir), JSON.stringify(file, null, 2), {
-    mode: 0o600,
+  writePrivateFileAtomic(keystorePath(dataDir), JSON.stringify(file, null, 2), {
+    backup: true,
   });
 }
 
@@ -160,6 +212,17 @@ export function passphraseMatches(dataDir: string, passphrase: string): boolean 
   if (!first) return true; // nothing to match yet
   try {
     decryptPrivateKey(first, passphrase);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function passphraseMatchesAsync(dataDir: string, passphrase: string): Promise<boolean> {
+  const first = loadWallets(dataDir)[0];
+  if (!first) return true;
+  try {
+    await decryptPrivateKeyAsync(first, passphrase);
     return true;
   } catch {
     return false;

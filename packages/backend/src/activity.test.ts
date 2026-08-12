@@ -49,6 +49,17 @@ describe("activity log", () => {
     expect(activity.update("no-such-id", { status: "included" })).toBeNull();
   });
 
+  it("redacts provider credentials before an activity reaches memory or disk", () => {
+    const entry = activity.add({
+      kind: "error",
+      status: "skipped",
+      message: "RPC failed at https://eth-mainnet.g.alchemy.com/v2/secret-api-key",
+    });
+    expect(entry.message).not.toContain("secret-api-key");
+    activity.flushSync();
+    expect(fs.readFileSync(logFile, "utf8")).not.toContain("secret-api-key");
+  });
+
   it("keeps update() working for an entry added much earlier", () => {
     const first = activity.add({ kind: "pay-taxes", status: "submitted", message: "early" });
     for (let i = 0; i < 200; i++) {

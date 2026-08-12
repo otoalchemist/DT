@@ -87,7 +87,7 @@ transactions locally with [viem](https://viem.sh). Ownership is indexed via the
 ```bash
 git clone <this-repo> && cd death-and-taxes-bot
 npm install
-cp .env.example .env        # then edit .env and set ALCHEMY_API_KEY
+install -m 600 .env.example .env  # then edit .env and set ALCHEMY_API_KEY
 npm run dev                 # starts backend (:8787) + dashboard (:5173)
 ```
 
@@ -119,6 +119,11 @@ Fund the wallet with a little ETH for taxes/audits/gas. Keep the dashboard's
 npm run build
 npm start          # backend only; serve packages/web/dist with any static host
 ```
+
+The bundled Vite development and preview servers deny framing. If you serve
+`packages/web/dist` from another static host, preserve at least
+`Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`;
+otherwise another site could iframe the local dashboard and attempt clickjacking.
 
 ### Versioning & releases
 
@@ -245,13 +250,16 @@ anyone's tuning.
 | --- | --- |
 | `ALCHEMY_API_KEY` | Derives the mainnet HTTPS/WSS RPC and NFT API endpoints. |
 | `RPC_HTTP_URL` / `RPC_WS_URL` / `ALCHEMY_NFT_URL` | Explicit overrides (any RPC). |
-| `MODE` | `mainnet` (**default** — private bundles to `BUILDER_URLS`; payments also mirror to the mempool so they still land), `public` (mempool only), or `local` (anvil fork). Also switchable at runtime from the dashboard. |
+| `MODE` | `mainnet` (**default** — private bundles to `BUILDER_URLS`; payments also mirror to the mempool so they still land), `public` (mempool only), or `local` (Anvil chain ID 31337, with an explicit local `RPC_HTTP_URL`). Also switchable between live modes at runtime from the dashboard. |
 | `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to Flashbots, **BuilderNet**, beaverbuild and Titan (all verified live). Endpoints do change — verify against each builder's docs. |
-| `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). |
+| `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). Non-loopback hosts are refused because this API has no remote-user authentication or TLS. |
+| `COINBASE_PAYER_CODE_HASHES` | Comma-separated approved Coinbase payer runtime-code hashes. Coinbase bidding fails closed when this is empty or the configured payer does not match. |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
 
 Secrets live in `.env` and `data/` (the encrypted keystore + a Flashbots
-reputation key). Both are git-ignored. **Never commit them.**
+reputation key). Both are git-ignored. **Never commit them.** The backend tightens
+`.env`, settings, keystore, and backup files to owner-only permissions; keep the
+repository and `data/` directory out of shared or cloud-synchronized locations.
 
 Strategy settings are edited from the dashboard and saved to `data/config.json`
 (also git-ignored, since it holds your live strategy). With no such file the bot
@@ -327,18 +335,21 @@ want the bot opportunistically hunting between boundaries.
   dynamic tip scaling it up in contested blocks); offense carries its own tip and
   a tighter base-fee cap. Payment gas is edited under **Just-in-time epoch
   payment → Payment gas**; offense gas under **Offense**.
-- **Simulate-before-send:** every transaction is checked first (`eth_call` in
-  public/local mode, `eth_callBundle` for bundles), so reverting transactions aren't
-  paid for and nonces aren't burned on them.
+- **Simulate-before-send:** every transaction is checked before final authorization and
+  signing (normally with `eth_call` against the identity-checked HTTP RPC), so reverting
+  transactions aren't paid for and nonces aren't burned on them. No usable signature is
+  sent to a relay before the exact spend guard and durable nonce reservation pass.
 - **Payments always land, even in `mainnet` mode.** A bundle is only included if a
   builder you sent it to wins the slot, so a bundle-only payment can silently fail
   to land — which can cost a citizen. Tax payments are therefore **always** mirrored
   to the public mempool alongside the bundle (identical tx, so only one can land).
   There's nothing to protect by hiding a tax payment: rivals already see the
   delinquency on-chain.
-- **Local-only by default.** The API binds to `127.0.0.1`; when bound to loopback
-  it also rejects requests with an unexpected `Host` header, blocking DNS-rebinding
-  from a malicious web page. Do not expose it to the internet.
+- **Local-only by design.** The API refuses non-loopback binding, rejects unexpected
+  `Host` values, and requires a random per-process session token on reads, writes, and
+  WebSockets. Mutations also enforce browser Origin/Fetch Metadata checks, while the
+  dashboard denies framing. The token is a browser barrier, not local-user authentication:
+  do not run on a shared-login host, or proxy, tunnel, or expose the API to the internet.
 
 ---
 
@@ -378,13 +389,11 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   priority tip, which scales with it), so it's the capital-efficient way to buy the
   top slot. It rides the bundle **allowed-to-revert** and is **never mirrored** to the
   mempool, so it only ever spends when the bundle wins the slot, and a misconfigured
-  payer can't drop your payment. Just set `coinbaseBidEth` (0 = off) under
-  *Just-in-time epoch payment → Coinbase bid*. A shared `coinbasePayerAddress` ships
-  as the default (`0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815` — a deployed
-  **`contracts/CoinbasePayer.sol`**, verified on-chain to forward 100% of what it
-  receives to `block.coinbase`), so you only need the bid amount. Prefer your own?
-  Deploy `CoinbasePayer.sol` once (e.g. in Remix) and paste that address instead.
-  **Off by default.**
+  payer can't drop your payment. Coinbase bidding is fail-closed: deploy the current
+  **`contracts/CoinbasePayer.sol`**, put its address in `data/config.json`, and add its
+  deployed runtime code hash to `COINBASE_PAYER_CODE_HASHES`. The bot checks both code
+  presence and the allowlisted hash before signing a bid. No shared payer is trusted by
+  default. **Off by default.**
 - **Combine payment + audit into one atomic bundle (`mainnet` only)** — when a
   pre-boundary payment and an audit are both due at the same epoch boundary, fuse
   them into a **single** bundle (sequential nonces) instead of two, so they land
@@ -469,8 +478,10 @@ MODE=local RPC_HTTP_URL=http://127.0.0.1:8545 \
 #    to warp past an audit deadline and watch the kill path fire.
 ```
 
-In `local` and `public` modes the submitter broadcasts the signed tx directly
-(anvil has no Flashbots relay); on `mainnet` it submits via the relay.
+In `local` and `public` modes the submitter broadcasts the signed transaction directly
+(Anvil has no Flashbots relay). In `mainnet` mode it submits private bundles to the
+configured builders; tax payments, and explicitly opted-in offense races, also use an
+identical public-mempool mirror so either copy can land but only one can execute.
 
 ---
 

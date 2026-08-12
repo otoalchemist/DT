@@ -13,6 +13,7 @@ release/
 data/settings.json
 data/activity.json
 data/config.json
+data/nonce-reservations.json
 # Legacy default-list sync bookkeeping; ignored so old installs can retain it harmlessly
 data/.list-sync.json
 # Legacy self-updater artifacts; ignored so old installs do not accidentally commit them
@@ -20,4 +21,8 @@ data/.update-manifest.json
 .update-backup/
 data/flashbots-signer.key
 data/*.keystore.json
+data/*.keystore.json.bak
+data/settings.json.bak
+data/.*.tmp
+data/.*.tmp.*
 keystore/

@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
+import fs from "node:fs";
+import nodePath from "node:path";
 import type { PrivateKeyAccount } from "viem/accounts";
 
 // EPOCH_DURATION_SECONDS from @dat-bot/shared is 24h; duplicated here as a
@@ -22,6 +24,11 @@ vi.mock("./chain.js", () => ({
     getBalance: vi.fn(async () => 10_000_000_000_000_000_000n), // 10 ETH
     getBlockNumber: vi.fn(async () => 100n),
     waitForTransactionReceipt: vi.fn(async () => ({ status: "success", blockNumber: 101n })),
+    getTransactionReceipt: vi.fn(async ({ hash }: { hash: `0x${string}` }) => ({
+      status: "success", blockNumber: 101n, transactionHash: hash, blockHash: "0xblock",
+    })),
+    getTransaction: vi.fn(async () => null),
+    getTransactionCount: vi.fn(async () => 0),
     // Used by findPreBoundaryAuditors (lastEpochPaid + auditLimit per owned token).
     // Default: every owned token is well-paid (lastEpochPaid huge, so never itself
     // auditable at any realistic targetEpoch) with auditLimit 1 — i.e. an eligible
@@ -44,10 +51,11 @@ vi.mock("./chain.js", () => ({
 vi.mock("./config.js", () => ({
   appConfig: {
     gameAddress: "0x000000000000000000000000000000000000aa",
-    dataDir: "C:/dat-bot-test-scratch-nonexistent",
+    dataDir: `/tmp/dat-bot-strategy-tests-${process.pid}`,
     httpUrl: "http://localhost",
     port: 8787,
     host: "127.0.0.1",
+    coinbasePayerCodeHashes: ["0x1111111111111111111111111111111111111111111111111111111111111111"],
   },
   loadSettings: vi.fn(() => ({})),
   saveSettings: vi.fn(),
@@ -74,6 +82,8 @@ vi.mock("./nonce.js", () => ({
     syncAll: vi.fn(async () => {}),
     resetAll: vi.fn(),
     retain: vi.fn(),
+    hasRestoredUnaccountedReservation: vi.fn(() => false),
+    waitUntilPrivateRetrySafe: vi.fn(async () => "retry" as const),
   },
 }));
 
@@ -134,7 +144,8 @@ const { filterLiveTokenIds, batchGetTargetStatuses, batchGetOwnedStatuses, encod
 const { publicClient, getBalanceCached } = await import("./chain.js");
 const { appConfig } = await import("./config.js");
 const { activity } = await import("./activity.js");
-const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
+const { runtime, DEFAULT_STRATEGY, invalidateListCache } = await import("./runtime.js");
+const defaultStrategyDataDir = `/tmp/dat-bot-strategy-tests-${process.pid}`;
 
 /** Install a single unlocked wallet — the shape these tests were written against.
  *  Multi-wallet routing has its own describe below. */
@@ -145,8 +156,38 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, beginEngineMaintenance, isEngineMaintenanceActive, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, offensePass, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
+
+// Isolate exact-cost reservations and receipt callbacks that intentionally persist across
+// production ticks. Each test begins from a freshly-read balance/state snapshot.
+beforeEach(() => {
+  // ally-tokens.json is a hard offense deny-list. Production ships it in data/; tests
+  // install an explicit empty roster rather than relying on the unsafe old "missing=[]"
+  // behavior.
+  fs.mkdirSync(defaultStrategyDataDir, { recursive: true });
+  fs.writeFileSync(nodePath.join(defaultStrategyDataDir, "ally-tokens.json"), "[]");
+  fs.writeFileSync(nodePath.join(defaultStrategyDataDir, "do-not-target.json"), '{"owners":{}}');
+  invalidateListCache();
+  resetTickBudget();
+  vi.mocked(publicClient.getBalance).mockResolvedValue(10_000_000_000_000_000_000n);
+  // `clearAllMocks` does not clear a queued mockResolvedValueOnce. Restore the baseline
+  // explicitly so a test whose guard correctly prevents submission cannot leak its
+  // one-shot failure into the next test.
+  vi.mocked(submitTx).mockReset().mockImplementation(async (intent: { value: bigint }) => ({
+    ok: true,
+    state: "relayed",
+    simulated: false,
+    txHash: "0xhash",
+    nonce: 0,
+    valueWei: intent.value,
+    gasWei: 0n,
+  }));
+});
+
+afterAll(() => {
+  fs.rmSync(defaultStrategyDataDir, { recursive: true, force: true });
+});
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
 // pathway: true -> one fused pay+audit bundle (firePreBoundaryBundle), false ->
@@ -263,8 +304,10 @@ describe("fetchOffenseCandidates: do-not-target is advice, pins override it", ()
       nodePath.join(tmpDir, "do-not-target.json"),
       JSON.stringify({ owners: { Graveyard: [LISTED, "909"] } }),
     );
+    fs.writeFileSync(nodePath.join(tmpDir, "ally-tokens.json"), "[]");
     priorDataDir = (appConfig as { dataDir: string }).dataDir;
     (appConfig as { dataDir: string }).dataDir = tmpDir;
+    invalidateListCache();
 
     useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount);
     runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
@@ -278,6 +321,7 @@ describe("fetchOffenseCandidates: do-not-target is advice, pins override it", ()
     const fs = await import("node:fs");
     (appConfig as { dataDir: string }).dataDir = priorDataDir;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    invalidateListCache();
     runtime.setWallets([]);
     vi.mocked(filterLiveTokenIds).mockResolvedValue([]);
     vi.mocked(fetchCandidateTokenIds).mockResolvedValue([]);
@@ -311,6 +355,16 @@ describe("fetchOffenseCandidates: do-not-target is advice, pins override it", ()
     runtime.strategy.offenseTargetTokenIds = [UNLISTED, LISTED];
     const out = await fetchOffenseCandidates();
     expect(out.map((t) => t.id.toString())).toEqual([LISTED]);
+  });
+
+  it("fails closed before candidate discovery when the ally roster is malformed", async () => {
+    fs.writeFileSync(nodePath.join(tmpDir, "ally-tokens.json"), "{ not json");
+    invalidateListCache();
+    runtime.strategy.offenseTargetTokenIds = [UNLISTED];
+
+    await expect(fetchOffenseCandidates()).rejects.toThrow(/refusing automated offense/);
+    expect(filterLiveTokenIds).not.toHaveBeenCalled();
+    expect(fetchCandidateTokenIds).not.toHaveBeenCalled();
   });
 });
 
@@ -428,6 +482,20 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
     expect(auditCalls).toHaveLength(1);
   });
 
+  it("suppresses a duplicate audit while the first transaction is still unresolved", async () => {
+    let resolveReceipt!: (receipt: unknown) => void;
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveReceipt = resolve; }) as never,
+    );
+
+    expect(await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false })).toBe(true);
+    expect(await queuePreBoundaryAudits(TARGET_EPOCH, 1n, 0n, { revertible: false })).toBe(false);
+    expect(vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT")).toHaveLength(1);
+
+    resolveReceipt({ status: "success", blockNumber: 101n });
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
   it("an EXCLUDED citizen still audits — payment opt-out is not an offense opt-out", async () => {
     // excludedTokenIds means "never PAY this citizen". It must not remove it from the
     // auditor pool: an unchecked citizen should still spend its full auditLimit on
@@ -540,6 +608,144 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
       // Both candidates were considered — the loop continued rather than breaking out.
       expect(vi.mocked(getLatestBlockCached).mock.calls.length).toBe(2);
     });
+  });
+});
+
+describe("pending audit capacity reservations", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const OWNER = "0x00000000000000000000000000000000000000dd" as const;
+  const EPOCH = 700n;
+  let auditLimit = 1n;
+
+  const stageTargets = (ids: string[]) => {
+    runtime.strategy = { ...runtime.strategy, offenseTargetTokenIds: ids };
+    vi.mocked(batchGetTargetStatuses).mockImplementation(async (tokens) =>
+      tokens.map(({ id }) => ({
+        tokenId: id.toString(),
+        owner: OWNER,
+        lastEpochPaid: (EPOCH - 2n).toString(),
+        delinquent: true,
+        epochsBehind: 2,
+        auditable: true,
+        auditDueTimestamp: "0",
+        killable: false,
+      })),
+    );
+  };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    auditLimit = 1n;
+    useWallet({ address: ADDR } as unknown as PrivateKeyAccount);
+    setTestBalance(10_000_000_000_000_000_000n);
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true,
+      autoAudit: true,
+      autoKill: false,
+      minBalanceEth: 0,
+      maxPaymentEth: 0,
+      endgameOnlyWithin: null,
+    };
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(filterLiveTokenIds).mockImplementation(async (_citizens, ids) =>
+      ids.map((id) => ({ id, owner: OWNER })),
+    );
+    vi.mocked(publicClient.multicall).mockImplementation(async ({ contracts }: any) =>
+      contracts.map((contract: { functionName: string }) => ({
+        status: "success" as const,
+        result:
+          contract.functionName === "auditLimit" ? auditLimit
+          : contract.functionName === "auditsUsedInEpoch" ? 0n
+          : EPOCH,
+      })),
+    );
+    // Prime owner routing for the regular path, which production normally does at the
+    // beginning of tick(). Keep every submitted audit unresolved until a test explicitly
+    // confirms it so later passes continue to see the logical reservation.
+    await fetchOwnedAcrossWallets(runtime.citizensAddress as `0x${string}`);
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+  });
+
+  afterEach(() => {
+    runtime.setWallets([]);
+    runtime.strategy = { ...DEFAULT_STRATEGY };
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([]);
+    vi.mocked(filterLiveTokenIds).mockResolvedValue([]);
+    vi.mocked(publicClient.waitForTransactionReceipt).mockResolvedValue(
+      { status: "success", blockNumber: 101n } as never,
+    );
+  });
+
+  it("does not reuse a regular audit's unconfirmed auditor slot for another target", async () => {
+    stageTargets(["7501"]);
+    await offensePass([1n], EPOCH, 0n);
+    stageTargets(["7502"]);
+    await offensePass([1n], EPOCH, 1n);
+
+    expect(vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT"))
+      .toHaveLength(1);
+  });
+
+  it("shares reservations across regular and pre-boundary paths while preserving auditLimit > 1", async () => {
+    auditLimit = 2n;
+    stageTargets(["7501"]);
+    await offensePass([1n], EPOCH, 0n); // reserves one of #1's two slots
+
+    stageTargets(["7502", "7503"]);
+    const queued = await queuePreBoundaryAudits(EPOCH, 1n, 2n, { revertible: false });
+
+    expect(queued).toBe(true);
+    const audits = vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT");
+    expect(audits).toHaveLength(2); // one regular + exactly one genuinely free slot
+    expect(vi.mocked(encodeAudit).mock.calls.map(([, target]) => target.toString()))
+      .toEqual(["7501", "7502"]);
+  });
+
+  it("releases target suppression and auditor capacity together after confirmation", async () => {
+    let confirmFirst!: (receipt: unknown) => void;
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementationOnce(
+      () => new Promise((resolve) => { confirmFirst = resolve; }) as never,
+    );
+    stageTargets(["7501"]);
+    expect(await queuePreBoundaryAudits(EPOCH, 0n, 2n, { revertible: false })).toBe(true);
+
+    stageTargets(["7502"]);
+    expect(await queuePreBoundaryAudits(EPOCH, 1n, 2n, { revertible: false })).toBe(false);
+
+    // Lightweight receipt intentionally omits hashes: it exercises lifecycle release
+    // without pretending to model the separate canonical-block verification tests.
+    confirmFirst({ status: "success", blockNumber: 101n });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(await queuePreBoundaryAudits(EPOCH, 2n, 2n, { revertible: false })).toBe(true);
+  });
+
+  it("releases a reserved slot when owner routing cannot resolve the auditor signer", async () => {
+    // queuePreBoundaryAudits discovers ownership itself, so model an index race: the
+    // first lookup finds #1 for the capacity pool but a concurrent refresh clears the
+    // owner map during canSpend. act() then fails before submitTx and must still run the
+    // lifecycle failure hook.
+    const { getLatestBlockCached } = await import("./chain.js");
+    vi.mocked(getLatestBlockCached).mockImplementationOnce(async () => {
+      vi.mocked(fetchOwnedTokenIds).mockResolvedValue([]);
+      await fetchOwnedAcrossWallets(runtime.citizensAddress as `0x${string}`);
+      return { baseFeePerGas: 10_000_000_000n, number: 100n, gasUsed: 0n, gasLimit: 30_000_000n } as never;
+    });
+    stageTargets(["7501"]);
+    expect(await queuePreBoundaryAudits(EPOCH, 0n, 2n, { revertible: false })).toBe(false);
+
+    // Restore routing and change the target. If the early return leaked #1's capacity,
+    // this second call would incorrectly find zero auditor slots.
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    await fetchOwnedAcrossWallets(runtime.citizensAddress as `0x${string}`);
+    stageTargets(["7502"]);
+    expect(await queuePreBoundaryAudits(EPOCH, 1n, 2n, { revertible: false })).toBe(true);
+    expect(vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT"))
+      .toHaveLength(1);
   });
 });
 
@@ -943,6 +1149,169 @@ describe("audited citizens are never auto-paid", () => {
     const disarmed = saveSpy.mock.calls.some(([patch]) => (patch as any).jitEnabled === false);
     expect(disarmed).toBe(false);
     saveSpy.mockRestore();
+  });
+
+  it("a relayed JIT payment stays armed until a successful receipt confirms it", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000,
+    };
+    useWallet({ address: "0x1111111111111111111111111111111111111111" }, 10_000_000_000_000_000_000n);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([{
+      tokenId: "1", lastEpochPaid: "149", currentEpoch: "150",
+      auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+      hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+    }]);
+    let resolveReceipt!: (receipt: unknown) => void;
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveReceipt = resolve; }) as never,
+    );
+    const saveSpy = vi.spyOn(runtime, "saveStrategy");
+
+    await jitPass([1n], 150n, 0n);
+    expect(saveSpy.mock.calls.some(([p]) => (p as any).jitEnabled === false)).toBe(false);
+
+    resolveReceipt({ status: "success", blockNumber: 101n });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(saveSpy.mock.calls.some(([p]) => (p as any).jitEnabled === false)).toBe(true);
+    saveSpy.mockRestore();
+  });
+
+  it("does not disarm from a latest-only payment that safe state has not confirmed", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
+    };
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([{
+      tokenId: "1", lastEpochPaid: "150", currentEpoch: "150",
+      auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+      hasLifeInsurance: false, risk: "safe", estimatedPayWei: "0",
+    }]);
+    vi.mocked(publicClient.multicall).mockResolvedValueOnce([
+      { status: "success", result: 149n }, // latest inclusion is absent from safe state
+    ] as never);
+    const saveSpy = vi.spyOn(runtime, "saveStrategy");
+
+    await jitPass([1n], 150n, 0n);
+    expect(saveSpy.mock.calls.some(([p]) => (p as any).jitEnabled === false)).toBe(false);
+
+    vi.mocked(publicClient.multicall).mockResolvedValueOnce([
+      { status: "success", result: 150n },
+    ] as never);
+    await jitPass([1n], 150n, 1n);
+    expect(saveSpy.mock.calls.some(([p]) => (p as any).jitEnabled === false)).toBe(true);
+    saveSpy.mockRestore();
+  });
+
+  it("does not complete or duplicate a publicly relayed JIT payment before inclusion", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000,
+    };
+    useWallet({ address: "0x1111111111111111111111111111111111111111" }, 10_000_000_000_000_000_000n);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([{
+      tokenId: "1", lastEpochPaid: "149", currentEpoch: "150",
+      auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+      hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+    }]);
+    let resolveReceipt!: (receipt: unknown) => void;
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveReceipt = resolve; }) as never,
+    );
+    const saveSpy = vi.spyOn(runtime, "saveStrategy");
+
+    await jitPass([1n], 150n, 0n);
+    await jitPass([1n], 150n, 1n);
+    expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(1);
+    expect(saveSpy.mock.calls.some(([p]) => (p as any).jitEnabled === false)).toBe(false);
+
+    resolveReceipt({ status: "success", blockNumber: 101n });
+    await new Promise((resolve) => setImmediate(resolve));
+    saveSpy.mockRestore();
+  });
+
+  it("keeps public-tx suppression and spend reserved across a receipt wait timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      runtime.strategy = {
+        ...DEFAULT_STRATEGY,
+        enabled: true, offenseEnabled: false,
+        jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: [], excludedTokenIds: [],
+        minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000,
+      };
+      useWallet({ address: "0x1111111111111111111111111111111111111111" }, 10_000_000_000_000_000_000n);
+      vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+      await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+      vi.mocked(batchGetOwnedStatuses).mockResolvedValue([{
+        tokenId: "1", lastEpochPaid: "149", currentEpoch: "150",
+        auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+        hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+      }]);
+      let resolveReceipt!: (receipt: unknown) => void;
+      vi.mocked(publicClient.waitForTransactionReceipt)
+        .mockRejectedValueOnce(new Error("timed out"))
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveReceipt = resolve; }) as never);
+
+      await jitPass([1n], 150n, 0n);
+      await vi.advanceTimersByTimeAsync(0);
+      await jitPass([1n], 150n, 1n);
+      expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(1);
+
+      // Let background tracking resume and terminate it cleanly with a real receipt.
+      await vi.advanceTimersByTimeAsync(5_000);
+      resolveReceipt({ status: "success", blockNumber: 101n });
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pending transaction's exact spend reserved across later ticks", async () => {
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      enabled: true, offenseEnabled: false,
+      jitEnabled: true, jitTargetEpoch: 150, jitTokenIds: ["10"], excludedTokenIds: [],
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000,
+    };
+    useWallet({ address: "0x1111111111111111111111111111111111111111" }, 10_000_000_000_000_000n);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n, 20n]);
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+    vi.mocked(batchGetOwnedStatuses).mockImplementation(async (ids: bigint[]) => ids.map((id) => ({
+      tokenId: id.toString(), lastEpochPaid: "149", currentEpoch: "150",
+      auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+      hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+    })) as never);
+    let resolveReceipt!: (receipt: unknown) => void;
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveReceipt = resolve; }) as never,
+    );
+    vi.mocked(submitTx).mockImplementation(async (intent: { value: bigint }) => ({
+      ok: true, state: "relayed", simulated: false, txHash: "0xpending", nonce: 0,
+      valueWei: intent.value, gasWei: 4_000_000_000_000_000n,
+    }));
+
+    await jitPass([10n, 20n], 150n, 0n);
+    expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(1);
+
+    // A new tick targets a different citizen from the same wallet. Its cached balance is
+    // unchanged, but the first tx already reserves 0.005 ETH; the second estimated spend
+    // no longer fits and must not be submitted while the first receipt remains pending.
+    runtime.strategy = { ...runtime.strategy, jitTokenIds: ["20"] };
+    await jitPass([10n, 20n], 150n, 1n);
+    expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(1);
+
+    resolveReceipt({ status: "success", blockNumber: 101n });
+    await new Promise((resolve) => setImmediate(resolve));
+    resetJitState();
   });
 
   it("skips an excluded citizen on the JIT path", async () => {
@@ -1378,7 +1747,10 @@ describe("bundle-only txs still resolve submitted -> included", () => {
   it("flips the bundle-only entry to included and only then attaches its tx hash", async () => {
     vi.mocked(flushBundle).mockResolvedValue(
       new Map<number, any>([
-        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+        [1, {
+          ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle",
+          expiresAfterBlock: 99n,
+        }],
       ]) as never,
     );
 
@@ -1401,7 +1773,10 @@ describe("bundle-only txs still resolve submitted -> included", () => {
   it("marks it reverted when the receipt says the tx failed", async () => {
     vi.mocked(flushBundle).mockResolvedValue(
       new Map<number, any>([
-        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+        [1, {
+          ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle",
+          expiresAfterBlock: 99n,
+        }],
       ]) as never,
     );
     vi.mocked(publicClient.waitForTransactionReceipt).mockResolvedValue({ status: "reverted", blockNumber: 101n } as never);
@@ -1412,10 +1787,13 @@ describe("bundle-only txs still resolve submitted -> included", () => {
     expect(vi.mocked(activity.update).mock.calls.at(-1)?.[1]).toMatchObject({ status: "reverted" });
   });
 
-  it("leaves the entry submitted when the bundle never lands (receipt times out)", async () => {
+  it("releases a relayed entry when the bundle never lands (receipt times out)", async () => {
     vi.mocked(flushBundle).mockResolvedValue(
       new Map<number, any>([
-        [1, { ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle" }],
+        [1, {
+          ok: true, predictedTxHash: PREDICTED_HASH, bundleHash: "0xbundle",
+          expiresAfterBlock: 99n,
+        }],
       ]) as never,
     );
     vi.mocked(publicClient.waitForTransactionReceipt).mockRejectedValue(new Error("timed out"));
@@ -1423,12 +1801,90 @@ describe("bundle-only txs still resolve submitted -> included", () => {
     await firePreBoundaryBundle();
     await settle();
 
-    // No status past "submitted" — and crucially no txHash was ever attached, so the UI
-    // cannot link to a tx that was never mined.
+    // It never becomes included and the derived hash is never exposed as a mined tx link;
+    // timeout resolves the pending lifecycle as skipped so the logical action can retry.
     for (const [, patch] of vi.mocked(activity.update).mock.calls) {
       expect(patch.status).not.toBe("included");
       expect(patch.txHash).toBeUndefined();
     }
+    expect(vi.mocked(activity.update).mock.calls.at(-1)?.[1]).toMatchObject({ status: "skipped" });
+  });
+});
+
+describe("queued JIT bundle lifecycle restores retry eligibility", () => {
+  const ADDR = "0x1111111111111111111111111111111111111111" as const;
+  const TARGET_EPOCH = 200n;
+  const PREDICTED_HASH = "0xpredicted" as const;
+  let priorMode: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetJitState();
+    priorMode = (appConfig as { mode?: string }).mode;
+    (appConfig as { mode?: string }).mode = "mainnet";
+    useWallet({ address: ADDR } as unknown as PrivateKeyAccount, 100_000_000_000_000_000_000n);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      preBoundaryPay: true, jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH),
+      jitTokenIds: [], minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000,
+      coinbaseBidEth: 0,
+    };
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
+      contracts.map((c: any) => ({
+        status: "success" as const,
+        result: c.functionName === "auditDueTimestamp" ? 0n : TARGET_EPOCH - 1n,
+      }))) as never);
+    vi.mocked(submitTx).mockImplementation(async (intent: { value: bigint }) => ({
+      ok: true, state: "queued", simulated: true, queued: true, nonce: 0,
+      predictedTxHash: PREDICTED_HASH, valueWei: intent.value, gasWei: 1n,
+    }));
+    vi.mocked(queueCoinbaseBid).mockResolvedValue(false);
+  });
+
+  afterEach(() => {
+    (appConfig as { mode?: string }).mode = priorMode;
+    runtime.setWallets([]);
+    runtime.running = false;
+    resetJitState();
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([1n]);
+    vi.mocked(publicClient.getBlockNumber).mockResolvedValue(100n);
+    vi.mocked(publicClient.waitForTransactionReceipt).mockResolvedValue({ status: "success", blockNumber: 101n } as never);
+  });
+
+  it("retries after the batch flush throws", async () => {
+    vi.mocked(flushBundle).mockRejectedValueOnce(new Error("relay unavailable"));
+    await firePreBoundaryPay();
+    await firePreBoundaryPay();
+    expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries when a queued transaction is missing from the flush result", async () => {
+    vi.mocked(flushBundle).mockResolvedValue(new Map());
+    await firePreBoundaryPay();
+    await firePreBoundaryPay();
+    expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries after an accepted private bundle passes its last eligible block", async () => {
+    vi.mocked(flushBundle).mockResolvedValue(new Map<number, any>([[0, {
+      ok: true, state: "relayed", predictedTxHash: PREDICTED_HASH,
+      bundleHash: "0xbundle", expiresAfterBlock: 101n,
+    }]]) as never);
+    vi.mocked(publicClient.waitForTransactionReceipt).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    vi.mocked(publicClient.getBlockNumber).mockResolvedValue(102n);
+
+    await firePreBoundaryPay();
+    await new Promise((resolve) => setImmediate(resolve));
+    await firePreBoundaryPay();
+    expect(vi.mocked(submitTx)).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -1558,6 +2014,58 @@ describe("multi-wallet: actions are signed by the wallet that owns the citizen",
     const pays = signersByData().filter((c) => c.data === "0xPAYTAXES");
     expect(pays.some((p) => p.signer === B)).toBe(true);
     expect(pays.some((p) => p.signer === A)).toBe(false);
+  });
+
+  it("applies the final dynamic-fee guard to the actual secondary-wallet payer", async () => {
+    runtime.setWallets([
+      { account: acctA, label: "A", balanceWei: 100_000_000_000_000_000_000n },
+      { account: acctB, label: "B", balanceWei: 10_000_000_000_000_000n },
+    ]);
+    vi.mocked(fetchOwnedTokenIds).mockImplementation(async (_c: unknown, addr: string) =>
+      addr.toLowerCase() === B.toLowerCase() ? [20n] : [],
+    );
+    await fetchOwnedAcrossWallets("0x000000000000000000000000000000000000cc");
+    runtime.strategy = {
+      ...runtime.strategy,
+      jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH), jitTokenIds: ["20"],
+      minBalanceEth: 0,
+    };
+    vi.mocked(publicClient.getBalance).mockImplementation(async ({ address }: any) =>
+      address.toLowerCase() === B.toLowerCase()
+        ? 10_000_000_000_000_000n
+        : 100_000_000_000_000_000_000n,
+    );
+    vi.mocked(batchGetOwnedStatuses).mockResolvedValue([{
+      tokenId: "20", lastEpochPaid: (TARGET_EPOCH - 1n).toString(), currentEpoch: TARGET_EPOCH.toString(),
+      auditDueTimestamp: "0", secondsUntilKillable: null, bribeBalance: "0",
+      hasLifeInsurance: false, risk: "delinquent", estimatedPayWei: "1000000000000000",
+    }]);
+    const authorizations: { account: string; ok: boolean }[] = [];
+    vi.mocked(submitTx).mockImplementation(async (intent: { value: bigint }, opts: any) => {
+      const quote = {
+        account: opts.account.address,
+        valueWei: intent.value,
+        gasWei: 20_000_000_000_000_000n,
+        gas: 200_000n,
+        maxFeePerGas: 100_000_000_000n,
+        maxPriorityFeePerGas: 80_000_000_000n,
+        baseFee: 10_000_000_000n,
+      };
+      const authorization = await opts.authorizeSpend(quote);
+      authorizations.push({ account: quote.account, ok: authorization.ok });
+      return {
+        ok: authorization.ok, simulated: false, nonce: 0, valueWei: intent.value,
+        gasWei: quote.gasWei, error: authorization.reason,
+      };
+    });
+
+    resetJitState();
+    await jitPass([20n], TARGET_EPOCH, 0n);
+    expect(authorizations).toEqual([{ account: B, ok: false }]);
+    expect(vi.mocked(activity.add).mock.calls.some(([entry]) =>
+      (entry as any).tokenId === "20" && (entry as any).status === "skipped" &&
+      /exact signed cost/.test((entry as any).message ?? ""),
+    )).toBe(true);
   });
 });
 
@@ -2111,6 +2619,17 @@ describe("benji (defense) mode: auto-paying an audited citizen", () => {
     runtime.strategy = { ...runtime.strategy, maxPaymentEth: 0 }; // spike passes
     await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
     expect(paid()).toHaveLength(1);
+  });
+
+  it("retries a defense payment after an authoritative reverted receipt", async () => {
+    vi.mocked(publicClient.waitForTransactionReceipt)
+      .mockResolvedValueOnce({ status: "reverted", blockNumber: 101n } as never)
+      .mockResolvedValue({ status: "success", blockNumber: 102n } as never);
+
+    await maybeAutoDefendAudit(OWNED, EPOCH, 0n);
+    await new Promise((resolve) => setImmediate(resolve));
+    await maybeAutoDefendAudit(OWNED, EPOCH, 1n);
+    expect(paid()).toHaveLength(2);
   });
 
   it("pays one audit once, but arms again for a NEW audit on the same citizen", async () => {

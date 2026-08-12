@@ -6,7 +6,7 @@ import nodePath from "node:path";
 // Same idiom as strategy.test.ts: mock config so the real env-schema
 // parse (which rejects vitest's MODE=test) never runs. dataDir is repointed per test.
 vi.mock("./config.js", () => ({
-  appConfig: { dataDir: "C:/dat-bot-test-scratch-nonexistent" },
+  appConfig: { dataDir: `/tmp/dat-bot-list-cache-tests-${process.pid}` },
   loadSettings: vi.fn(() => ({})),
   saveSettings: vi.fn(),
   deriveUrlsFromKey: vi.fn(),
@@ -15,7 +15,13 @@ vi.mock("./config.js", () => ({
 vi.mock("./activity.js", () => ({ activity: { add: vi.fn() } }));
 
 const { appConfig } = await import("./config.js");
-const { loadAllyTokens, loadDoNotTarget, invalidateListCache } = await import("./runtime.js");
+const {
+  loadAllyTokens,
+  loadAllyTokensResult,
+  loadAllyTokensStrict,
+  loadDoNotTarget,
+  invalidateListCache,
+} = await import("./runtime.js");
 
 /**
  * The curated lists are cached in memory and invalidated on the file's mtime+size, because
@@ -83,14 +89,35 @@ describe("list cache: serves repeat reads without re-parsing, but never goes sta
 
   it("returns empty for a missing file, then sees it once created", () => {
     expect(loadAllyTokens()).toEqual([]);
+    expect(loadAllyTokensResult()).toMatchObject({ ok: false });
+    expect(() => loadAllyTokensStrict()).toThrow(/refusing automated offense/);
     writeAllies(["84"]);
     expect(loadAllyTokens()).toEqual(["84"]);
+    expect(loadAllyTokensStrict()).toEqual(["84"]);
   });
 
-  it("returns empty and does not throw on malformed JSON", () => {
+  it("keeps dashboard reads available but blocks offense on malformed JSON", () => {
     fs.writeFileSync(nodePath.join(tmpDir, "ally-tokens.json"), "{ not json");
-    // The offense sweep calls this every block; a throw here would abort the whole sweep.
     expect(loadAllyTokens()).toEqual([]);
+    expect(loadAllyTokensResult()).toMatchObject({ ok: false });
+    expect(() => loadAllyTokensStrict()).toThrow(/refusing automated offense/);
+  });
+
+  it("blocks offense when the roster path cannot be read as a file", () => {
+    fs.mkdirSync(nodePath.join(tmpDir, "ally-tokens.json"));
+    expect(loadAllyTokensResult()).toMatchObject({ ok: false });
+    expect(() => loadAllyTokensStrict()).toThrow(/refusing automated offense/);
+  });
+
+  it("blocks offense when the roster has an invalid token id", () => {
+    writeAllies(["84", "0084"]);
+    expect(loadAllyTokens()).toEqual([]);
+    expect(() => loadAllyTokensStrict()).toThrow(/invalid token list/);
+  });
+
+  it("canonicalizes and de-duplicates a valid hard-safety roster", () => {
+    writeAllies(["84", " 99 ", "84"]);
+    expect(loadAllyTokensStrict()).toEqual(["84", "99"]);
   });
 
   it("caches the DERIVED do-not-target shape, not just the parse", () => {

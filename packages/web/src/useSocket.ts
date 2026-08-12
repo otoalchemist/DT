@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { BotStatus, ActivityEntry } from "@dat-bot/shared";
+import { getSessionToken, invalidateSessionToken } from "./api.js";
 
 interface LiveState {
   status: BotStatus | null;
@@ -19,33 +20,42 @@ export function useSocket(): LiveState {
     let closed = false;
     let retry: ReturnType<typeof setTimeout>;
 
-    const connect = () => {
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${location.host}/ws`);
-      ref.current = ws;
-      ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
+    const connect = async () => {
+      try {
+        const token = await getSessionToken();
+        if (closed) return;
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        const ws = new WebSocket(`${proto}://${location.host}/ws?session=${encodeURIComponent(token)}`);
+        ref.current = ws;
+        ws.onopen = () => setConnected(true);
+        ws.onclose = () => {
+          invalidateSessionToken();
+          setConnected(false);
+          if (!closed) retry = setTimeout(() => void connect(), 2000);
+        };
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "status") setStatus(msg.data);
+          else if (msg.type === "activity-batch") setActivity(msg.data);
+          else if (msg.type === "activity")
+            setActivity((prev) => {
+              // Upsert by id: a receipt-tracking update re-emits the same entry id.
+              const idx = prev.findIndex((e) => e.id === msg.data.id);
+              if (idx >= 0) {
+                const next = prev.slice();
+                next[idx] = msg.data;
+                return next;
+              }
+              return [...prev, msg.data].slice(-300);
+            });
+        };
+      } catch {
         setConnected(false);
-        if (!closed) retry = setTimeout(connect, 2000);
-      };
-      ws.onmessage = (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === "status") setStatus(msg.data);
-        else if (msg.type === "activity-batch") setActivity(msg.data);
-        else if (msg.type === "activity")
-          setActivity((prev) => {
-            // Upsert by id: a receipt-tracking update re-emits the same entry id.
-            const idx = prev.findIndex((e) => e.id === msg.data.id);
-            if (idx >= 0) {
-              const next = prev.slice();
-              next[idx] = msg.data;
-              return next;
-            }
-            return [...prev, msg.data].slice(-300);
-          });
-      };
+        invalidateSessionToken();
+        if (!closed) retry = setTimeout(() => void connect(), 2000);
+      }
     };
-    connect();
+    void connect();
 
     return () => {
       closed = true;

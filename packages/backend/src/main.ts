@@ -6,6 +6,7 @@ import { buildServer } from "./api.js";
 import { getChainId } from "./chain.js";
 import { prewarmTargets } from "./service.js";
 import { activity } from "./activity.js";
+import { beginEngineMaintenance, quiesceEngine } from "./strategy.js";
 
 async function main(): Promise<void> {
   logger.info(`DeathAndTaxes bot v${VERSION} starting in ${appConfig.mode} mode`);
@@ -37,13 +38,26 @@ async function main(): Promise<void> {
     );
   }
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    let maintenance = beginEngineMaintenance();
+    while (!maintenance) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      maintenance = beginEngineMaintenance();
+    }
     logger.info("Shutting down...");
-    await app.close();
-    // The periodic flush is async now, so a pending write may not have had a turn before
-    // exit — persist synchronously here or the last few seconds of activity are lost.
-    activity.flushSync();
-    process.exit(0);
+    try {
+      await quiesceEngine();
+      await app.close();
+      // The periodic flush is async now, so a pending write may not have had a turn before
+      // exit — persist synchronously here or the last few seconds of activity are lost.
+      activity.flushSync();
+      process.exit(0);
+    } finally {
+      maintenance.release();
+    }
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

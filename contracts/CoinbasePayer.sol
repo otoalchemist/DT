@@ -11,12 +11,13 @@ pragma solidity ^0.8.20;
  * Deploy this ONCE (e.g. in Remix: paste, compile with 0.8.20+, Deploy), then put
  * the deployed address in the bot's config (Just-in-time panel → Coinbase bid).
  * No constructor args. Costs nothing to hold — it never keeps funds in the normal
- * path. `withdraw()` recovers any ETH that got stuck (e.g. a builder whose coinbase
- * rejected the transfer); only the deployer can call it.
+ * path. `withdraw()` recovers ETH forced into the contract by another contract;
+ * only the deployer can call it.
  *
- * SAFETY: the forward uses a low-level call and IGNORES failure, so the bid tx can
- * never revert and drag your payment down. In the bot the bid is additionally
- * marked allowed-to-revert in the bundle as a second layer of protection.
+ * SAFETY: a failed forward REVERTS, returning the bid to its sender rather than
+ * trapping it for the deployer to withdraw. The bot marks this bid transaction as
+ * allowed-to-revert, so a rejecting builder cannot invalidate mandatory payments
+ * earlier in the bundle.
  */
 contract CoinbasePayer {
     address public immutable owner;
@@ -25,7 +26,7 @@ contract CoinbasePayer {
         owner = msg.sender;
     }
 
-    /// Forward all received ETH to the block builder. Never reverts.
+    /// Forward all received ETH to the block builder or return it to the sender.
     receive() external payable {
         _forward();
     }
@@ -35,20 +36,15 @@ contract CoinbasePayer {
         _forward();
     }
 
-    /// Send this call's ETH to `block.coinbase`, discarding the result so it can
-    /// NEVER revert (a failed forward must not drag down the payment bundle).
-    /// Inline assembly is used purely to drop the call's success flag without a
-    /// compiler warning — the high-level `.call` leaves the return value unused,
-    /// which is intentional but warns. Equivalent to:
-    ///   (bool ok, ) = block.coinbase.call{value: msg.value}("");  // ok ignored
+    /// Send this call's ETH to `block.coinbase`. A failed transfer must revert:
+    /// otherwise the bid remains in this contract and becomes withdrawable by the
+    /// deployer, while the sender receives neither builder priority nor its ETH back.
     function _forward() private {
-        assembly {
-            // call(gas, addr, value, inOffset, inSize, outOffset, outSize)
-            pop(call(gas(), coinbase(), callvalue(), 0, 0, 0, 0))
-        }
+        (bool ok, ) = block.coinbase.call{value: msg.value}("");
+        require(ok, "coinbase transfer failed");
     }
 
-    /// Recover ETH stuck here (only if a forward ever failed). Deployer only.
+    /// Recover ETH forced into this contract by another contract. Deployer only.
     function withdraw() external {
         require(msg.sender == owner, "not owner");
         (bool ok, ) = owner.call{value: address(this).balance}("");

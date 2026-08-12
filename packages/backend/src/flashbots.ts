@@ -7,12 +7,17 @@ import {
   type PrivateKeyAccount,
 } from "viem/accounts";
 import { mainnet } from "viem/chains";
-import { publicClient, getLatestBlockCached } from "./chain.js";
+import { ANVIL_CHAIN_ID, publicClient, getLatestBlockCached } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { nonces } from "./nonce.js";
 import { effectiveTipGwei, resolveGas } from "./logic.js";
 import { logger } from "./logger.js";
+import {
+  ensurePrivateDirectory,
+  tightenPrivateFile,
+  writePrivateFileAtomic,
+} from "./private-file.js";
 
 export interface TxIntent {
   to: Address;
@@ -24,10 +29,16 @@ export interface TxIntent {
 
 export interface SubmitResult {
   ok: boolean;
+  /** Submission lifecycle at return time. A queued tx has only been prepared locally;
+   *  relayed means a builder or public RPC accepted it. Neither is confirmation. */
+  state?: "queued" | "relayed";
   simulated: boolean;
   txHash?: Hex;
   bundleHash?: string;
   targetBlock?: bigint;
+  /** Private-bundle eligibility ends after this block. Absent when public broadcast can
+   *  remain pending beyond the bundle window. */
+  expiresAfterBlock?: bigint;
   nonce: number;
   valueWei: bigint;
   gasWei: bigint;
@@ -40,17 +51,37 @@ export interface SubmitResult {
   predictedTxHash?: Hex;
 }
 
+/** Exact worst-case cost of the transaction that is about to be signed. */
+export interface SpendQuote {
+  account: Address;
+  valueWei: bigint;
+  gasWei: bigint;
+  gas: bigint;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  baseFee: bigint;
+}
+
+export type SpendAuthorization = (
+  quote: SpendQuote,
+) => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string };
+
 // --- Flashbots reputation signer (identity only; holds no funds) ---
 
 function reputationSigner(): PrivateKeyAccount {
+  ensurePrivateDirectory(appConfig.dataDir);
   const p = path.join(appConfig.dataDir, "flashbots-signer.key");
   let pk: Hex;
   if (fs.existsSync(p)) {
-    pk = fs.readFileSync(p, "utf8").trim() as Hex;
+    tightenPrivateFile(p);
+    const loaded = fs.readFileSync(p, "utf8").trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(loaded)) {
+      throw new Error(`Invalid Flashbots reputation key at ${p}`);
+    }
+    pk = loaded as Hex;
   } else {
     pk = generatePrivateKey();
-    fs.mkdirSync(appConfig.dataDir, { recursive: true });
-    fs.writeFileSync(p, pk, { mode: 0o600 });
+    writePrivateFileAtomic(p, pk);
     logger.info("Generated a new Flashbots reputation key.");
   }
   return privateKeyToAccount(pk);
@@ -62,8 +93,7 @@ function getSigner(): PrivateKeyAccount {
   return _signer;
 }
 
-/** POST a bundle RPC to one builder/relay. `url` defaults to the Flashbots relay
- *  (the only endpoint that implements eth_callBundle for simulation). */
+/** POST an authenticated bundle RPC to one builder/relay. */
 async function flashbotsRpc(
   method: string,
   params: unknown[],
@@ -155,6 +185,8 @@ async function signTx(
   maxFeePerGas: bigint,
   maxPriorityFeePerGas: bigint,
 ): Promise<Hex> {
+  assertSigningChain();
+  const chainId = runtime.chainId!;
   return account.signTransaction({
     to: intent.to,
     data: intent.data,
@@ -163,15 +195,29 @@ async function signTx(
     nonce,
     maxFeePerGas,
     maxPriorityFeePerGas,
-    chainId: mainnet.id,
+    chainId,
     type: "eip1559",
   });
 }
 
+function assertSigningChain(): void {
+  const chainId = runtime.chainId;
+  if (chainId === null) throw new Error("Chain identity has not been verified");
+  if (appConfig.mode === "local" && chainId !== ANVIL_CHAIN_ID) {
+    throw new Error(
+      `Refusing to sign a local transaction for chain ${chainId}; expected Anvil chain ${ANVIL_CHAIN_ID}`,
+    );
+  }
+  if (appConfig.mode !== "local" && chainId !== mainnet.id) {
+    throw new Error(`Refusing to sign a live transaction for chain ${chainId}; expected chain 1`);
+  }
+}
+
 /**
- * Build, simulate, and submit a single tx.
- * - mainnet: submits as a Flashbots bundle (block+1, block+2) after eth_callBundle sim.
- * - local: broadcasts the raw tx to the node (anvil).
+ * Build, simulate, authorize, and submit a single tx.
+ * - mainnet: simulates unsigned against the verified HTTP RPC, then submits a signed
+ *   bundle for block+1/block+2 (and, where requested, an identical public mirror).
+ * - public/local: broadcasts the raw transaction to the configured node.
  */
 const RELAY_TIMEOUT_MS = 10_000;
 // Bundle submission is time-critical and fans out to several builders: a slow or
@@ -246,6 +292,7 @@ async function simulateAtTimestamp(
 interface QueuedTx {
   signed: Hex;
   nonce: number;
+  account: Address;
   race: boolean;
   /** Allowed to revert without invalidating the bundle (eth_sendBundle
    *  revertingTxHashes). Used for the coinbase bid so a misconfigured payer can
@@ -262,6 +309,7 @@ export function beginBundle(): void {
 
 export interface BundleTxResult {
   ok: boolean;
+  state: "relayed" | "failed";
   txHash?: Hex;
   bundleHash?: string;
   error?: string;
@@ -275,6 +323,8 @@ export interface BundleTxResult {
    * bundle landed. Polling this hash resolves them.
    */
   predictedTxHash?: Hex;
+  /** Last block for which the private bundle remains eligible. */
+  expiresAfterBlock?: bigint;
 }
 
 /**
@@ -284,10 +334,10 @@ export interface BundleTxResult {
  * caller can fill in each activity entry's hashes and start receipt tracking.
  * Always closes the batching window, even on error.
  */
-export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
+export async function flushBundle(): Promise<Map<Hex, BundleTxResult>> {
   const queue = bundleQueue;
   bundleQueue = null;
-  const out = new Map<number, BundleTxResult>();
+  const out = new Map<Hex, BundleTxResult>();
   if (!queue || queue.length === 0) return out;
 
   // A bundle executes its txs in the given order, and each ACCOUNT's txs must appear in
@@ -304,6 +354,12 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   // never drop a mandatory payment. A tx hash is keccak(signed tx).
   const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
   const targetBlock = (await publicClient.getBlockNumber()) + 1n;
+  // The batched target is chosen later than each tx's preliminary quote. Extend every
+  // payer's durable journal to the actual final eligible block before any signed bytes
+  // are exposed to a builder or public RPC.
+  for (const address of new Set(queue.map((q) => q.account.toLowerCase() as Address))) {
+    nonces.for(address).markEligibleThrough(targetBlock + 1n);
+  }
 
   // One multi-tx bundle, fanned out to every builder for the next two blocks.
   const acceptedBy = new Set<string>();
@@ -323,12 +379,19 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     q.race
       ? publicClient
           .sendRawTransaction({ serializedTransaction: q.signed })
-          .then((h) => ({ nonce: q.nonce, txHash: h as Hex | undefined }))
+          .then((h) => ({ predictedTxHash: keccak256(q.signed), txHash: h as Hex | undefined }))
           .catch((err) => {
-            logger.warn(`public broadcast (nonce ${q.nonce}) failed:`, (err as Error).message);
-            return { nonce: q.nonce, txHash: undefined as Hex | undefined };
+            // The node may accept and gossip raw bytes before the HTTP response is lost.
+            // Its hash is deterministic, so retain that hash as an ambiguous public send
+            // and receipt-track it rather than preparing a duplicate logical action.
+            const predictedTxHash = keccak256(q.signed);
+            logger.warn(
+              `public broadcast (nonce ${q.nonce}) response failed; tracking ${predictedTxHash.slice(0, 10)}…:`,
+              (err as Error).message,
+            );
+            return { predictedTxHash, txHash: predictedTxHash as Hex | undefined };
           })
-      : Promise.resolve({ nonce: q.nonce, txHash: undefined as Hex | undefined }),
+      : Promise.resolve({ predictedTxHash: keccak256(q.signed), txHash: undefined as Hex | undefined }),
   );
 
   const [settled, mirrors] = await Promise.all([
@@ -351,15 +414,18 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     );
   }
 
-  const txHashByNonce = new Map(mirrors.map((m) => [m.nonce, m.txHash]));
+  const txHashBySignedHash = new Map(mirrors.map((m) => [m.predictedTxHash, m.txHash]));
   for (const q of queue) {
-    const txHash = txHashByNonce.get(q.nonce);
-    out.set(q.nonce, {
+    const predictedTxHash = keccak256(q.signed);
+    const txHash = txHashBySignedHash.get(predictedTxHash);
+    out.set(predictedTxHash, {
       ok: bundleOk || txHash !== undefined,
+      state: bundleOk || txHash !== undefined ? "relayed" : "failed",
       txHash,
       // Known for every tx whether or not it was broadcast — see BundleTxResult.
-      predictedTxHash: keccak256(q.signed),
+      predictedTxHash,
       bundleHash,
+      expiresAfterBlock: targetBlock + 1n,
       error: !bundleOk && txHash === undefined ? "no bundle accepted" : undefined,
     });
   }
@@ -379,16 +445,53 @@ const COINBASE_BID_GAS = 60_000n;
  * payment), and never mirrored to the mempool (coinbase is only meaningful in the
  * winning block). Returns whether it queued.
  */
-export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<boolean> {
+export async function queueCoinbaseBid(
+  payer: Address,
+  bidWei: bigint,
+  opts: {
+    /** Runtime bytecode hashes explicitly approved by the operator. Empty fails closed. */
+    approvedCodeHashes?: readonly Hex[];
+    /** Mandatory final payer-specific guard over the exact value and signed gas. */
+    authorizeSpend: SpendAuthorization;
+    onQueued?: (queued: SpendQuote & { nonce: number; predictedTxHash: Hex }) => void;
+  },
+): Promise<boolean> {
   if (bundleQueue === null || appConfig.mode !== "mainnet" || bidWei <= 0n) return false;
   // One bid buys position for the WHOLE bundle however many wallets contributed txs to
   // it, so it comes from the primary wallet rather than being split or duplicated.
   const account = runtime.primary?.account;
   if (!account) return false;
   try {
+    const approved = new Set((opts.approvedCodeHashes ?? []).map((h) => h.toLowerCase()));
+    if (approved.size === 0) throw new Error("no approved CoinbasePayer code hash configured");
+    const code = await publicClient.getCode({ address: payer });
+    if (!code || code === "0x") throw new Error("CoinbasePayer address has no deployed code");
+    const codeHash = keccak256(code);
+    if (!approved.has(codeHash.toLowerCase())) {
+      throw new Error(`CoinbasePayer code hash ${codeHash} is not approved`);
+    }
+
     const latest = await getLatestBlockCached();
-    const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(false, latest);
-    const nonce = nonces.for(account.address).reserve();
+    const { maxFeePerGas, maxPriorityFeePerGas, baseFee } = computeFees(false, latest);
+    const quote: SpendQuote = {
+      account: account.address,
+      valueWei: bidWei,
+      gasWei: COINBASE_BID_GAS * maxFeePerGas,
+      gas: COINBASE_BID_GAS,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      baseFee,
+    };
+    if (typeof opts.authorizeSpend !== "function") {
+      throw new Error("Coinbase bid requires an exact spending authorization");
+    }
+    const authorization = await opts.authorizeSpend(quote);
+    if (!authorization.ok) {
+      throw new Error(authorization.reason ?? "Coinbase bid rejected by spending guardrail");
+    }
+    assertSigningChain();
+    const provisionalTarget = (latest.number ?? (await publicClient.getBlockNumber())) + 1n;
+    const nonce = nonces.for(account.address).reserve(provisionalTarget + 1n);
     const signed = await signTx(
       account,
       { to: payer, data: "0x", value: bidWei },
@@ -397,7 +500,8 @@ export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<
       maxFeePerGas,
       maxPriorityFeePerGas,
     );
-    bundleQueue.push({ signed, nonce, race: false, revertible: true });
+    bundleQueue.push({ signed, nonce, account: account.address, race: false, revertible: true });
+    opts.onQueued?.({ ...quote, nonce, predictedTxHash: keccak256(signed) });
     logger.info(`coinbase bid queued: ${formatEther(bidWei)} ETH to builder via ${payer.slice(0, 10)}… (nonce ${nonce})`);
     return true;
   } catch (err) {
@@ -430,6 +534,9 @@ export async function submitTx(
      *  this has to be the wallet holding the citizen involved — not simply "the" wallet.
      *  Defaults to the primary for wallet-agnostic sends (e.g. the coinbase bid). */
     account?: PrivateKeyAccount;
+    /** Final payer-specific guard, evaluated with the exact gas and dynamic fee fields
+     *  immediately before any transaction is signed. */
+    authorizeSpend: SpendAuthorization;
   },
 ): Promise<SubmitResult> {
   const account = opts.account ?? runtime.primary?.account;
@@ -462,6 +569,18 @@ export async function submitTx(
     gasWei,
   };
 
+  if (typeof opts.authorizeSpend !== "function") {
+    return { ...base, error: "transaction requires an exact spending authorization", targetBlock };
+  }
+  const quote: SpendQuote = {
+    account: account.address,
+    valueWei: intent.value,
+    gasWei,
+    gas,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    baseFee: latest.baseFeePerGas ?? 0n,
+  };
   // --- Simulation ---
   if (opts.skipSim) {
     // Depends on an earlier tx in this bundle; any standalone sim would misjudge it.
@@ -480,37 +599,22 @@ export async function submitTx(
       logger.warn(`timestamp-override sim unavailable (${(err as Error).message}); sending unsimulated`);
     }
   } else if (appConfig.mode === "mainnet") {
-    // Flashbots bundle simulation needs a signed tx — use peeked nonce (not consumed yet).
-    const simSigned = await signTx(account, intent, nonceManager.peek(), gas, maxFeePerGas, maxPriorityFeePerGas);
+    // Never hand a relay an externally usable signature before the exact spend guard and
+    // durable nonce reservation pass. Simulate unsigned against our verified HTTP RPC;
+    // future-timestamp/dependent bundle actions use their dedicated paths above.
     try {
-      const sim = await flashbotsRpcWithTimeout("eth_callBundle", [
-        { txs: [simSigned], blockNumber: toHex(targetBlock), stateBlockNumber: "latest" },
-      ]);
-      const results = sim?.results ?? [];
-      const failed = results.find((r: any) => r.error || r.revert);
-      if (failed) {
-        return { ...base, simulated: true, error: `sim revert: ${failed.error ?? failed.revert}`, targetBlock };
-      }
+      await publicClient.call({
+        account: account.address,
+        to: intent.to,
+        data: intent.data,
+        value: intent.value,
+        gas,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      });
       base.simulated = true;
     } catch (err) {
-      // The relay being slow/down must NOT block a payment — that can cost a
-      // citizen, and mainnet is the default mode. Fall back to a plain eth_call
-      // against our own RPC instead of skipping the tx entirely.
-      logger.warn(`relay sim unavailable (${(err as Error).message}); falling back to eth_call`);
-      try {
-        await publicClient.call({
-          account: account.address,
-          to: intent.to,
-          data: intent.data,
-          value: intent.value,
-          gas,
-          maxFeePerGas,
-          maxPriorityFeePerGas,
-        });
-        base.simulated = true;
-      } catch (e2) {
-        return { ...base, simulated: true, error: `sim revert: ${(e2 as Error).message}`, targetBlock };
-      }
+      return { ...base, simulated: true, error: `sim revert: ${(err as Error).message}`, targetBlock };
     }
   } else if (appConfig.mode === "public") {
     // Plain eth_call — no nonce needed, no relay round-trip.
@@ -530,23 +634,64 @@ export async function submitTx(
     }
   }
 
+  // Simulation can take seconds and receipt callbacks/balance refreshes may change the
+  // payer's available headroom while it runs. Authorize the exact quote once, at the
+  // final decision point immediately before consuming a nonce and signing for relay.
+  const finalAuthorization = await opts.authorizeSpend(quote);
+  if (!finalAuthorization.ok) {
+    return {
+      ...base,
+      error: finalAuthorization.reason ?? "rejected by final spending guardrail",
+      targetBlock,
+    };
+  }
+
   // Simulation passed — now officially consume the nonce and sign for real.
-  const nonce = nonceManager.reserve();
+  assertSigningChain();
+  const nonce = nonceManager.reserve(
+    appConfig.mode === "mainnet" ? targetBlock + 1n : undefined,
+  );
   base.nonce = nonce;
   const signed = await signTx(account, intent, nonce, gas, maxFeePerGas, maxPriorityFeePerGas);
 
   // --- Submission ---
   if (appConfig.mode === "local" || appConfig.mode === "public") {
-    const txHash = await publicClient.sendRawTransaction({ serializedTransaction: signed });
-    return { ...base, ok: true, txHash, targetBlock };
+    const predictedTxHash = keccak256(signed);
+    let txHash: Hex;
+    try {
+      txHash = await publicClient.sendRawTransaction({ serializedTransaction: signed });
+    } catch (err) {
+      // A transport error does not prove the node rejected the raw bytes; it can fail
+      // after acceptance/gossip. Keep the deterministic hash live so strategy suppresses
+      // duplicates and tracks the possible receipt until mined nonce state resolves it.
+      logger.warn(
+        `raw transaction response failed; tracking ${predictedTxHash.slice(0, 10)}… as ambiguously broadcast:`,
+        (err as Error).message,
+      );
+      txHash = predictedTxHash;
+    }
+    return { ...base, ok: true, state: "relayed", txHash, targetBlock };
   }
 
   // mainnet: if a batching window is open (beginBundle), queue this tx so the
   // whole tick's txs go out as ONE atomic multi-tx bundle with valid sequential
   // nonces (see flushBundle). Hashes are filled in by the caller after flush.
   if (bundleQueue !== null) {
-    bundleQueue.push({ signed, nonce, race: opts.race ?? false, revertible: opts.revertible ?? false });
-    return { ...base, ok: true, queued: true, targetBlock };
+    bundleQueue.push({
+      signed,
+      nonce,
+      account: account.address,
+      race: opts.race ?? false,
+      revertible: opts.revertible ?? false,
+    });
+    return {
+      ...base,
+      ok: true,
+      state: "queued",
+      queued: true,
+      predictedTxHash: keccak256(signed),
+      targetBlock,
+    };
   }
 
   // No batch open: fan this single-tx bundle out to EVERY configured builder for
@@ -572,11 +717,17 @@ export async function submitTx(
   // and the loser is dropped as a duplicate). Fire it CONCURRENTLY with the
   // bundles — awaiting relay round-trips first would delay the broadcast by
   // 100-200ms+ per builder, which is exactly the margin a boundary race runs on.
+  const predictedTxHash = keccak256(signed);
   const broadcast: Promise<Hex | undefined> = opts.race
     ? publicClient.sendRawTransaction({ serializedTransaction: signed }).catch((err) => {
-        // "nonce too low"/"already known" just means a bundle landed first — not fatal.
-        logger.warn("public broadcast failed:", (err as Error).message);
-        return undefined;
+        // The RPC can fail after accepting/gossiping the exact bytes. Retain the
+        // deterministic hash so lifecycle/spend suppression continues even if every
+        // relay response also fails.
+        logger.warn(
+          `public broadcast response failed; tracking ${predictedTxHash.slice(0, 10)}…:`,
+          (err as Error).message,
+        );
+        return predictedTxHash;
       })
     : Promise.resolve(undefined);
 
@@ -596,10 +747,12 @@ export async function submitTx(
   return {
     ...base,
     ok: bundleHashes.length > 0 || txHash !== undefined,
+    state: bundleHashes.length > 0 || txHash !== undefined ? "relayed" : undefined,
     bundleHash: bundleHashes[0],
     txHash,
-    predictedTxHash: keccak256(signed),
+    predictedTxHash,
     targetBlock,
+    expiresAfterBlock: txHash === undefined && bundleHashes.length > 0 ? targetBlock + 1n : undefined,
     error: bundleHashes.length === 0 && txHash === undefined ? "no bundle accepted" : undefined,
   };
 }

@@ -2,16 +2,35 @@
 
 - Date: 2026-08-11
 - Repository: Death & Taxes Bot
-- Review type: Read-only static review
+- Review type: Read-only static review with remediation follow-up
 - Reviewed snapshot: `ead9edf` (line references describe that snapshot)
+- Remediation branch: `union69skipbot`
+- Remediation verification: 2026-08-12
 
-> Post-review status: the automatic code updater, curated-list synchronizer, and
-> background release check described in finding 6 were subsequently removed on the
-> `union69skipbot` branch. The other findings remain open unless addressed separately.
+> The Priority findings and Additional hardening sections below are preserved as the
+> historical record of what was observed in `ead9edf`; their line links describe that
+> snapshot, not the current branch. The current remediation status is recorded separately
+> below.
 
 ## Overall assessment
 
-This bot should not be run with meaningful funds until the API-control and transaction-lifecycle issues below are fixed. The default loopback binding helps, and key encryption is generally sensible, but the local wallet API is browser-reachable and several bookkeeping bugs can suppress critical retries.
+At the reviewed snapshot, this bot should not have been run with meaningful funds: its local wallet API was browser-reachable and transaction bookkeeping could suppress critical retries. The `union69skipbot` branch now contains code-level mitigations for every finding family in this report. That is a material improvement, but it does not turn hot-wallet automation into a zero-risk system or replace controlled mainnet validation and a formal audit.
+
+## Remediation status on `union69skipbot`
+
+| Finding | Current branch status |
+| --- | --- |
+| 1. Non-loopback wallet API | **Mitigated in code.** Startup now refuses any non-loopback `HOST`. Every API route except the session bootstrap requires a random per-process bearer token, destructive key operations require the existing passphrase, keystore replacement/removal creates an atomic owner-only backup, and replacing active keys stops and locks the engine. Remote service mode is deliberately unavailable rather than relying on unauthenticated plain HTTP. |
+| 2. Localhost CSRF and WebSocket access | **Mitigated in code.** API requests enforce the expected Host; all reads and writes require the non-safelisted session header; mutations reject non-loopback Origin values and unsafe Fetch Metadata, and any supplied request body must be JSON. WebSocket upgrades require a loopback Origin and the session token and are connection-limited. API responses are marked `no-store`. |
+| 3. Queued transactions marked complete | **Mitigated in code; operational validation remains important.** Transactions now have distinct planned/queued, relayed, included, reverted, and skipped outcomes. Bundle-flush failures and expiry feed lifecycle failure hooks; JIT, proactive-pay, defense, and offense markers become final only after canonically rechecked receipt or safe on-chain state. Ambiguous public-RPC responses remain reserved and tracked by their deterministic transaction hash instead of immediately permitting a duplicate. Reverted receipts account for gas without treating the intended action as successful. |
+| 4. Private-bundle nonce reuse | **Mitigated in code; operational validation remains important.** Each private reservation records its last eligible block; unresolved sequences block later ticks from creating a nonce gap, and release requires the authoritative head to pass that block plus a reorg margin as well as a minimum time grace. Reservations are atomically journaled in an owner-only file; restart restores unresolved state and fails closed on a corrupt or legacy-ambiguous journal. Regression coverage includes idle-before-reservation, stalled heads, cross-tick expiry, restart, pending-only state, and corrupt journals. |
+| 5. Spending guardrails | **Mitigated in code.** The final pre-sign authorization uses the actual signing wallet, exact value and encoded gas price, a fresh payer balance, committed pending spend, configured balance floor, base-fee limit, and payment cap. Multi-wallet owner actions use the token holder. Coinbase bids include bid value and gas, fail closed without an allowlisted deployed runtime-code hash, and the updated forwarder reverts if payment to `block.coinbase` fails. No shared payer is enabled by default. |
+| 6. Mutable upstream updates | **Removed.** Automatic code replacement, curated-list synchronization, and background release checks were deleted. Updates are now an explicit operator-managed action. |
+| 7. Stale example targets | **Mitigated in code and data.** The example is complete for the current defaults version, disables offense, has no pinned offense targets or Coinbase payer, and is checked by a regression test. Runtime and API strategy data are strictly validated, bounded, canonicalized, and reject unknown or missing fields instead of silently accepting misspelled or defaulted guardrails. Missing, unreadable, malformed, or invalid ally-roster data blocks automated offense. |
+
+The branch also adds fail-closed RPC identity checks: live signing requires Ethereum chain ID 1, the mainnet genesis hash, the canonical game address, and its approved runtime-code hash; local mode requires Anvil chain ID 31337 and contract code. A separately configured WebSocket endpoint is identity-checked and is used only as a tick notification, not as the authoritative fee/block cache.
+
+Secret-bearing files and the data directory are tightened to owner-only permissions, writes are atomic where safety state is involved, passphrase KDF work is asynchronous and rate-limited, and API/activity/log errors are redacted before disclosure or persistence. Focused regression tests were added for these controls. These mitigations cannot guarantee builder inclusion, RPC availability or honesty after startup, correct external contract behavior, or protection from malware already running as the same OS user. Public-transaction lifecycle reservations remain process-local: restart quarantines a pending-nonce gap once the provider exposes it, but a crash before that observation can lose logical context. Receipt canonicality is rechecked after one subsequent block; this reduces one-block reorg risk but is not economic finality.
 
 ## Priority findings
 
@@ -91,8 +110,6 @@ Remediation applied after the review:
 
 This removes the automatic mutable-branch execution and targeting path. Manual updates still depend on the provenance of the selected Git commit or release, so immutable, signed release artifacts remain the stronger long-term distribution model.
 
-Post-review verification completed successfully with a full workspace build and all 223 backend tests passing.
-
 Recommended remediation:
 
 - Distribute immutable release artifacts.
@@ -134,41 +151,42 @@ Recommended remediation:
 
 ## Effect of running locally on a personal machine
 
-Running the bot locally materially reduces some network and multi-user risks, but it does not correct transaction-lifecycle, nonce, guardrail, configuration, or upstream trust defects.
+Running the bot locally materially reduces remote network and multi-user exposure. It was never, by itself, a correction for transaction-lifecycle, nonce, spending, configuration, or upstream trust defects. The current branch addresses those defects in code, so locality is now an additional containment layer rather than the primary mitigation.
 
 In this section, "running locally" means that the process runs on a personal computer while transacting on Ethereum mainnet. It does not mean the bot's `MODE=local`, which targets an Anvil fork and has a different risk profile.
 
-| Finding | Effect of local operation |
-| --- | --- |
-| 1. Unauthenticated non-loopback API | **Largely mitigated** when `HOST=127.0.0.1`, ports 8787 and 5173 are not forwarded, proxied, or tunneled, and inbound access is blocked. Other processes running as the user can still reach the API. |
-| 2. Localhost CSRF and WebSocket access | **Not mitigated by ordinary local use.** A malicious website opened on the same computer can contact localhost. A dedicated machine used for no general web browsing materially reduces this risk. |
-| 3. Queued transactions marked complete | **Not mitigated.** This is internal transaction bookkeeping and can be triggered by ordinary relay or RPC failures. |
-| 4. Private-bundle nonce reuse | **Not mitigated in mainnet mode.** Public submission mode avoids this particular private-bundle path, but introduces separate inclusion, privacy, and front-running tradeoffs. |
-| 5. Spending guardrail gaps | **Partially mitigated at most.** Using only one wallet removes the wrong-secondary-wallet case, but Coinbase bid, payer-validation, gas-budget, and balance-floor issues remain. |
-| 6. Mutable upstream updates | **Mitigated by the post-review code change, not by locality.** The `union69skipbot` branch no longer performs automatic code, list, or release checks. A manual `git pull` or replacement release still trusts its source, but gives the operator an opportunity to pin and review the exact change. |
-| 7. Stale example configuration | **Not mitigated.** Avoid copying `data/config.example.json`; allowing the runtime to use its current defaults avoids this specific stale template. |
-| Plaintext secret-file permissions | **Substantially reduced** on a single-user system with a private home directory and full-disk encryption, but not against malware, another OS account, permissive backups, or cloud synchronization. |
-| Unlock guessing and event-loop denial of service | **Reduced** by loopback-only access and the absence of untrusted local processes, but not eliminated. |
-| Chain, RPC, builder, and `CoinbasePayer` trust | **Not mitigated.** These risks involve remote services, signed transaction behavior, or on-chain code. |
+| Finding or control | Current code mitigation | What local personal-machine operation still changes |
+| --- | --- | --- |
+| 1. Wallet-control API exposure | The server refuses non-loopback binding, validates Host, requires a per-process token, reauthenticates destructive key changes, and preserves an encrypted backup. | A non-forwarded loopback port blocks ordinary remote clients. It does **not** authenticate local OS accounts or processes: anything already running on the host can reach the session bootstrap and API. Do not proxy, tunnel, or port-forward 8787, and avoid running the bot on a shared-login machine. |
+| 2. Browser CSRF and WebSocket reads | Mutations require the session header, reject cross-site Origin/Fetch Metadata, and constrain request content type; reads require the session header; sockets require session plus loopback Origin and have a connection cap. | A dedicated machine with little or no unrelated browsing remains useful defense in depth, but browser isolation is no longer the only barrier. Same-user malware or a compromised local browser/profile remains in the trust boundary. |
+| 3. Transaction lifecycle | Queueing, relay acceptance, receipt confirmation, reversion, failure, and uncertainty are now distinct. Critical logical markers are confirmation-gated and uncertain public transactions remain reserved and tracked. | Locality provides essentially no additional protection from relay rejection, provider outages, reorgs, or bookkeeping defects. These controls still need realistic operational validation; a minimally funded wallet limits consequences. |
+| 4. Private nonce lifecycle | Per-wallet reservations persist their final eligible block, require a reorg and time margin, quarantine restart uncertainty, and block higher-nonce work until authoritative reconciliation. | Running on a personal machine does not make private bundles visible to the public pending nonce. Reliable storage reduces loss of the journal, but backups or restores must not roll this safety file backward. |
+| 5. Spending guardrails | Exact payer-specific authorization runs immediately before signing with a fresh balance and pending commitments. Coinbase payer code must match an operator allowlist and failed forwarding reverts. | A dedicated, minimally funded wallet is still the strongest loss cap. One-wallet use reduces complexity but is no longer required to avoid the former secondary-wallet accounting bug. Locality does not make a remote builder or deployed payer trustworthy. |
+| 6. Upstream updates | Automatic code, list, and release-update paths were removed. | Locality did not supply this fix. Manual Git/release updates still require provenance checking, but the operator can pin and review the exact commit or artifact before installation. |
+| 7. Example and runtime configuration | The example is non-targeting and opt-in; strict schemas reject missing, unknown, malformed, duplicate, oversized, and out-of-range data. Automated offense also fails closed unless the hard ally roster is readable and valid. | Locality adds no configuration correctness. Review every setting that enables automatic spending or offense before starting the engine. |
+| Secret files | The data directory is tightened to `0700`; secret and safety files use `0600`, with atomic writes and owner-only backups where appropriate. | A single-user account and full-disk encryption improve at-rest protection. They do not protect an unlocked session from same-user malware, permissive backup/cloud-sync access, or a stolen machine while unlocked. |
+| Unlock guessing and event-loop denial of service | Scrypt runs asynchronously; expensive password attempts are serialized and use escalating cooldowns. | Loopback-only access removes remote guessing. A hostile same-user process can still cause local contention, although the API limiter now bounds the KDF path. |
+| Chain and RPC identity | HTTP and configured WebSocket endpoints are checked against the expected chain; live mode also pins genesis, game address, and runtime code. Signing asserts the expected chain mode. | Local operation does not eliminate remote-provider or builder availability and censorship risks. The WebSocket is only a latency signal, so it cannot directly poison the authoritative block/fee cache. |
 
-The main distinction is that a personal machine blocks ordinary remote network clients, but the browser itself is a local client. The unauthenticated WebSocket can reveal whether the wallet is unlocked, after which a malicious page can send bodyless `/api/start`, `/api/stop`, or `/api/lock` requests. Host firewalls also commonly permit loopback traffic, so they should not be treated as CSRF protection.
+The per-process token is a browser-request barrier, not an operating-system credential. Any process or local account able to connect to the host's loopback interface can bootstrap an API session; code executing as the bot's user can additionally read process-owned files and steal keys after unlock. Host firewalls also commonly allow loopback traffic, so avoid shared-login hosts and keep strong OS account hygiene, malware prevention, and software provenance controls.
 
-Even with strict loopback binding, no unrelated browsing, one minimally funded wallet, disabled Coinbase bids, restrictive file permissions, and reviewed manual updates, findings 3 and 4 remain significant. They can cause missed defensive payments without any attacker and require code changes rather than deployment hardening.
+`MODE=local` is different: it is a dry-run path that now refuses any chain other than Anvil's chain ID 31337 and requires game-contract code at the configured address. When it points to a genuine local fork it does not spend mainnet funds, but it also cannot fully reproduce live builder, relay, mempool, latency, or reorg behavior.
 
 ## Immediate operating precautions
 
-Until fixes are available:
+Even with the code mitigations above:
 
-1. Keep `HOST=127.0.0.1`; never expose port 8787 directly.
-2. Use a dedicated burner funded only with the amount at risk.
-3. Avoid leaving the wallet unlocked while browsing untrusted sites.
-4. Leave Coinbase bidding disabled unless its balance handling and payer are independently verified.
-5. Do not seed configuration from the current `data/config.example.json`; let the runtime create current defaults.
-6. Apply reviewed, pinned updates manually; automatic code and list updates have been removed on this branch.
-7. Restrict `.env`, the data directory, and all secret files to the current OS account.
+1. Keep the API unproxied and untunneled on loopback; the server intentionally refuses remote binding.
+2. Use a dedicated wallet funded only with the amount at risk, and keep the configured balance floor meaningful.
+3. Lock the wallet when idle and keep the bot's OS account free of unreviewed software. Separate browsing remains worthwhile defense in depth.
+4. Leave Coinbase bidding disabled unless the deployed payer is independently verified and its exact runtime-code hash is allowlisted.
+5. Start from the current non-targeting example or runtime defaults, then explicitly review every feature that enables automatic payment, defense, or offense.
+6. Apply reviewed, pinned updates manually; automatic code and list updates have been removed.
+7. Keep `.env`, the data directory, safety journal, backups, and keystore out of shared or cloud-synchronized locations; use full-disk encryption and protected backups.
+8. Test configuration in `MODE=local` before mainnet use, while recognizing that local mode cannot reproduce builder and relay behavior.
 
 ## Scope and limitations
 
-This was a read-only static review of the TypeScript backend, React frontend, Solidity forwarder, updater and launcher scripts, configuration and data files, and dependency-lock structure. No files were changed during the review itself.
+The original snapshot review was a read-only static review of the TypeScript backend, React frontend, Solidity forwarder, updater and launcher scripts, configuration and data files, and dependency-lock structure. No files were changed during that review. This follow-up records the subsequent branch remediation based on code inspection and an independent re-review. On 2026-08-12, the workspace build completed and all 311 backend tests passed, including focused coverage for the added security controls.
 
-Tests and builds were not run because dependencies were not installed. Current dependency-advisory status was not verified against an online advisory service. This review does not constitute a formal audit of the external Death & Taxes contracts, deployed `CoinbasePayer` bytecode, RPC providers, builders, or upstream GitHub account security.
+This remains a high-level review, not a formal audit or proof of correctness. Current dependency-advisory status was not verified against an online advisory service. The review does not audit the external Death & Taxes contracts, deployed `CoinbasePayer` bytecode, RPC providers, builders, the host operating system, backup infrastructure, or upstream GitHub account security. Mainnet behavior under relay failure, delayed receipts, provider inconsistency, reorgs, and process interruption should still be validated conservatively before increasing wallet funding.

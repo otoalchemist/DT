@@ -439,8 +439,9 @@ export interface StrategyConfig {
    * firePreBoundaryAudit).
    */
   coinbaseBidAuditOnlyEth: number;
-  /** Address of the deployed CoinbasePayer forwarder used for coinbaseBidEth. Its
-   *  receive() forwards ETH to block.coinbase. Empty = coinbase bidding disabled. */
+  /** Address of an operator-approved CoinbasePayer used for coinbaseBidEth. Its
+   *  receive() forwards ETH to block.coinbase. The backend also requires its runtime
+   *  hash in COINBASE_PAYER_CODE_HASHES. Empty = coinbase bidding disabled. */
   coinbasePayerAddress: string;
 
   /** Hard cap (ETH) on the value of any single transaction (payments in
