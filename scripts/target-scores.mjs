@@ -323,6 +323,9 @@ async function main() {
   // Hoisted: the density calculation below needs the per-(block, sender) coinbase totals,
   // not just the per-token sums.
   const cbByBlockSender = new Map();
+  /** "blk:sender" -> Set of tx hashes that paid the coinbase, so a separate payer tx can
+   *  be counted into the bundle gas its bid actually bought. */
+  const cbTxByBlockSender = new Map();
   let tracingOk = true;
   if (bidBlocks.length > 0) {
     const minerOf = new Map();
@@ -345,6 +348,11 @@ async function main() {
         const s = senderOfTx.get(tr.transactionHash) || (tr.action?.from || "").toLowerCase();
         const k = `${b}:${s}`;
         cbByBlockSender.set(k, (cbByBlockSender.get(k) ?? 0n) + val);
+        // Remember WHICH tx carried the bid. When a rival bids from a separate payer tx
+        // (rather than inside the payTaxes call), that tx's gas is part of the bundle the
+        // bid bought position for — but it emits no TaxesPaid, so the density denominator
+        // below would miss it and overstate how hard the rival is to beat.
+        (cbTxByBlockSender.get(k) ?? cbTxByBlockSender.set(k, new Set()).get(k)).add(tr.transactionHash);
       }
     }
     if (tracingOk) {
@@ -397,6 +405,33 @@ async function main() {
         g.tips += (m.eff - (bf.get(m.blk.toString()) ?? 0n)) * m.gasUsed;
       }
       group.set(k, g);
+    }
+    // Fold in each bundle's separate payer tx. Without this the bid is measured over the
+    // whole bundle while the gas is measured over only the payTaxes calls, which inflates
+    // every separate-payer bidder: #2711 at blk 25735198 read 596.8 gwei/gas (0.042 over
+    // 82,875) when the bundle it actually bought was 110,820 gas — 469.0 gwei/gas. That is
+    // a 28% overstatement of the bid needed to beat it. Rivals who bid from INSIDE the
+    // payTaxes call are unaffected: their gas was already whole.
+    const extraHashes = [];
+    for (const [k, g] of group) {
+      for (const h of cbTxByBlockSender.get(k) ?? []) if (!g.txs.has(h)) extraHashes.push([k, h]);
+    }
+    if (extraHashes.length > 0) {
+      const rcs = new Map();
+      for (let i = 0; i < extraHashes.length; i += 60) {
+        const slice = extraHashes.slice(i, i + 60);
+        const m = await batch(slice.map(([, h], j) => ({ jsonrpc: "2.0", id: i + j, method: "eth_getTransactionReceipt", params: [h] })));
+        for (const r of m) if (r.result) rcs.set(r.result.transactionHash, r.result);
+      }
+      for (const [k, h] of extraHashes) {
+        const rc = rcs.get(h); if (!rc) continue;
+        const g = group.get(k); if (!g || g.txs.has(h)) continue;
+        g.txs.add(h);
+        const gas = BigInt(rc.gasUsed);
+        g.gas += gas;
+        // Its priority fee is builder revenue too, so it belongs in the numerator.
+        g.tips += (BigInt(rc.effectiveGasPrice) - (bf.get(BigInt(rc.blockNumber).toString()) ?? 0n)) * gas;
+      }
     }
     for (const l of payLogs) {
       const tok = BigInt(l.topics[1]).toString();
