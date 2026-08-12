@@ -3,6 +3,11 @@
 - Date: 2026-08-11
 - Repository: Death & Taxes Bot
 - Review type: Read-only static review
+- Reviewed snapshot: `ead9edf` (line references describe that snapshot)
+
+> Post-review status: the automatic code updater, curated-list synchronizer, and
+> background release check described in finding 6 were subsequently removed on the
+> `union69skipbot` branch. The other findings remain open unless addressed separately.
 
 ## Overall assessment
 
@@ -71,11 +76,22 @@ Recommended remediation:
 - Pass the actual token-holder wallet to every owner-specific guard.
 - Validate the Coinbase payer's deployed bytecode or approved code hash.
 
-### 6. High-impact supply-chain trust gap
+### 6. High-impact supply-chain trust gap — remediated on this branch
 
-The launchers automatically replace executable code from mutable `master`; verification checks only project shape and a self-declared version, not a signature or trusted digest ([update.mjs:33](../scripts/update.mjs#L33), [update.mjs:421](../scripts/update.mjs#L421), [start.command:18](../start.command#L18)). A repository or maintainer compromise becomes code execution in a process that later holds decrypted keys.
+At review time, the launchers automatically replaced executable code from mutable `master`; verification checked only project shape and a self-declared version, not a signature or trusted digest. A repository or maintainer compromise could therefore become code execution in a process that later held decrypted keys.
 
-Safety and target lists are independently replaced from mutable `master`, allowing targeting behavior to change without a release ([list-sync.ts:35](../packages/backend/src/list-sync.ts#L35)).
+Safety and target lists were independently replaced from mutable `master`, allowing targeting behavior to change without a release.
+
+Remediation applied after the review:
+
+- Deleted the executable updater and removed it from both launchers and npm scripts.
+- Deleted startup and dashboard-triggered curated-list synchronization.
+- Deleted the background release check and update-available dashboard state.
+- Kept the bundled list files as local inputs; changing code or lists now requires an explicit operator-managed Git or release update.
+
+This removes the automatic mutable-branch execution and targeting path. Manual updates still depend on the provenance of the selected Git commit or release, so immutable, signed release artifacts remain the stronger long-term distribution model.
+
+Post-review verification completed successfully with a full workspace build and all 223 backend tests passing.
 
 Recommended remediation:
 
@@ -129,7 +145,7 @@ In this section, "running locally" means that the process runs on a personal com
 | 3. Queued transactions marked complete | **Not mitigated.** This is internal transaction bookkeeping and can be triggered by ordinary relay or RPC failures. |
 | 4. Private-bundle nonce reuse | **Not mitigated in mainnet mode.** Public submission mode avoids this particular private-bundle path, but introduces separate inclusion, privacy, and front-running tradeoffs. |
 | 5. Spending guardrail gaps | **Partially mitigated at most.** Using only one wallet removes the wrong-secondary-wallet case, but Coinbase bid, payer-validation, gas-budget, and balance-floor issues remain. |
-| 6. Mutable upstream updates | **Not mitigated merely by locality.** This repository is a Git checkout, so its code and list auto-updaters skip by default unless forced. Extracted archive installations remain exposed to the default update behavior. Manual `git pull` still trusts the upstream repository but gives the operator an opportunity to review changes. |
+| 6. Mutable upstream updates | **Mitigated by the post-review code change, not by locality.** The `union69skipbot` branch no longer performs automatic code, list, or release checks. A manual `git pull` or replacement release still trusts its source, but gives the operator an opportunity to pin and review the exact change. |
 | 7. Stale example configuration | **Not mitigated.** Avoid copying `data/config.example.json`; allowing the runtime to use its current defaults avoids this specific stale template. |
 | Plaintext secret-file permissions | **Substantially reduced** on a single-user system with a private home directory and full-disk encryption, but not against malware, another OS account, permissive backups, or cloud synchronization. |
 | Unlock guessing and event-loop denial of service | **Reduced** by loopback-only access and the absence of untrusted local processes, but not eliminated. |
@@ -148,7 +164,7 @@ Until fixes are available:
 3. Avoid leaving the wallet unlocked while browsing untrusted sites.
 4. Leave Coinbase bidding disabled unless its balance handling and payer are independently verified.
 5. Do not seed configuration from the current `data/config.example.json`; let the runtime create current defaults.
-6. Consider disabling automatic code and list updates and applying reviewed releases manually.
+6. Apply reviewed, pinned updates manually; automatic code and list updates have been removed on this branch.
 7. Restrict `.env`, the data directory, and all secret files to the current OS account.
 
 ## Scope and limitations

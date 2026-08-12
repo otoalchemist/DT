@@ -502,11 +502,6 @@ export interface WalletStatus {
 export interface BotStatus {
   /** The bot's release version (see VERSION in constants). */
   version: string;
-  /** Released version on master, or null if it has never been read (offline, blocked,
-   *  or checked too early). Advisory: the bot never self-installs from this. */
-  latestVersion: string | null;
-  /** True only when `latestVersion` is strictly newer than `version`. */
-  updateAvailable: boolean;
   running: boolean;
   unlocked: boolean;
   /** The PRIMARY wallet's address — the single headline identity, and the wallet that

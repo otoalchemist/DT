@@ -18,5 +18,4 @@ Notes:
     packages/shared/src/constants.ts, or run `git describe --tags`.
   - DO NOT commit substituted values here. Doing so freezes the file at whatever
     version was current then, and every later archive reports that stale version —
-    which is exactly what happened between v0.5.0 and v1.0.0. The updater reads
-    constants.ts instead, precisely because this file could not be trusted.
+    which is exactly what happened between v0.5.0 and v1.0.0.

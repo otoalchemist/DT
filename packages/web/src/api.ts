@@ -78,15 +78,6 @@ export const api = {
   // otherwise only updates inside an engine tick, so it never moves in away mode) and
   // drops the ownership caches so follow-up GETs refetch instead of serving SWR-stale.
   refreshChain: () => req<BotStatus>("/api/refresh", { method: "POST" }),
-  // Re-pull the curated default lists (rivals, skippers, allies, do-not-target) from the
-  // repo's master branch. The bot does this at startup; this is the no-restart path, for
-  // when a list changes mid-session. `repointed` is true when the offense pins were moved
-  // onto a refreshed skippers list (only happens if they were tracking the default).
-  refreshLists: () =>
-    req<{
-      outcomes: { file: string; result: "updated" | "unchanged" | "local-edit" | "failed"; ids?: number; reason?: string }[];
-      repointed: boolean;
-    }>("/api/refresh-lists", { method: "POST" }),
   // Full emigration history from the contract's event log — never in `targets`.
   // Includes emigrants already killed (alive: false), so the count doesn't shrink.
   emigrated: () => req<EmigratedTokenStatus[]>("/api/emigrated"),

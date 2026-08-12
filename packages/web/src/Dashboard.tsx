@@ -189,9 +189,6 @@ export function Dashboard({
   const [allies, setAllies] = useState<TargetTokenStatus[]>([]);
   const [doNotTarget, setDoNotTarget] = useState<DoNotTargetStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
-  // Result of a manual default-list re-pull, shown until the next press. Separate from
-  // `err` because an update is good news, not a failure.
-  const [listNote, setListNote] = useState<string | null>(null);
 
   useEffect(() => {
     api.getConfig().then((c) => { setConfig(c); setSavedConfig(c); }).catch(() => {});
@@ -221,24 +218,8 @@ export function Dashboard({
   const refresh = useCallback(async (force = false) => {
     try {
       if (force) {
-        // A manual press also re-pulls the curated lists from master, so a user who
-        // notices a roster is out of date has a way to fix it without restarting. Not
-        // done on the 20s poll — that would hit GitHub every 20 seconds to re-fetch
-        // files that change a few times a week.
-        const lists = await api.refreshLists().catch(() => null);
-        if (lists?.outcomes.some((o) => o.result === "updated")) {
-          const files = lists.outcomes.filter((o) => o.result === "updated").map((o) => o.file);
-          setListNote(
-            `Default lists updated from master: ${files.join(", ")}` +
-              (lists.repointed ? " — offense targets re-pointed at the new skippers list." : "."),
-          );
-        } else {
-          setListNote(null);
-        }
         const s = await api.refreshChain().catch(() => null);
         if (s) pushStatus(s);
-        // Pins may have moved, so the Config view's saved baseline is now stale.
-        if (lists?.repointed) await api.getConfig().then(onConfigSaved).catch(() => {});
       }
       // A failed read must NOT blank the panel. These used to catch to [], which was then
       // written to state — so one dropped request (a laptop suspending, a brief RPC
@@ -268,7 +249,7 @@ export function Dashboard({
     } catch (e) {
       setErr((e as Error).message);
     }
-  }, [pushStatus, onConfigSaved]);
+  }, [pushStatus]);
 
   // Poll on-chain views only while the tab is actually being looked at. Each cycle costs
   // several RPC round-trips per endpoint, so a dashboard left open in a background tab
@@ -461,18 +442,6 @@ export function Dashboard({
                   {" "}· ⚠ backend v{status.version}
                 </span>
               )}
-              {/* Distinct from the badge above: that one means backend and dashboard
-                  disagree with each OTHER, this one means both are behind the release.
-                  Worth its own line — a stale bot silently misses fixes it already has
-                  waiting, and the launcher's updater cannot say so while running. */}
-              {status?.updateAvailable && status.latestVersion && (
-                <span
-                  className="version-warn"
-                  title={`You are running v${status.version}; v${status.latestVersion} has been released. Restart the bot to pick it up — the launcher installs it automatically. (If you run from a git clone, use "git pull" instead; the auto-updater deliberately skips checkouts.)`}
-                >
-                  {" "}· ⚠ update available: v{status.latestVersion}
-                </span>
-              )}
             </small>
           </div>
           <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>
@@ -496,7 +465,7 @@ export function Dashboard({
             <button
               className="ghost"
               onClick={() => void refresh(true)}
-              // Redundant ONLY when both halves are already self-updating: the dashboard
+              // Redundant only when both halves are already refreshed automatically: the dashboard
               // polls every 20s whenever away mode is off, and the engine tick rewrites
               // the header stats (epoch, balance, block) every block while running. With
               // the engine stopped those stats go stale even though the lists keep
@@ -505,7 +474,7 @@ export function Dashboard({
               title={
                 selfRefreshing
                   ? "Already refreshing: the dashboard polls every 20s and the running engine updates epoch/balance each block."
-                  : "Read on-chain data once, now — the header stats only update while the engine runs. Also re-pulls the curated default lists (rivals, skippers, allies, do-not-target) from master."
+                  : "Read on-chain data once, now — the header stats only update while the engine runs."
               }
             >
               Refresh data
@@ -670,7 +639,6 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
             </table>
           )}
           {err && <p className="err">{err}</p>}
-          {listNote && <p className="muted" style={{ fontSize: 12 }}>{listNote}</p>}
         </div>
 
         <div className="spacer" />

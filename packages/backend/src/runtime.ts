@@ -6,7 +6,6 @@ import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { activity } from "./activity.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
-import { versionState } from "./version-check.js";
 
 // Central mutable runtime state. Single hot wallet, single strategy config.
 
@@ -17,10 +16,10 @@ import { versionState } from "./version-check.js";
  * do-not-target lists on every offense sweep (once per block with a WebSocket), and
  * readTargets reads them again on every dashboard poll — each read a synchronous
  * readFileSync + JSON.parse (measured at 0.19 ms for the pair). They only change when the
- * startup sync rewrites them or the user edits one by hand.
+ * user edits one by hand or installs a release containing updated files.
  *
- * Keyed on mtimeMs + size rather than a TTL so a hand edit or a list-sync write is picked
- * up on the very next read, with no staleness window — the whole point of the files being
+ * Keyed on mtimeMs + size rather than a TTL so a hand edit is picked up on the very next
+ * read, with no staleness window — the whole point of the files being
  * user-editable. `statSync` is ~an order of magnitude cheaper than reading and parsing.
  *
  * Deliberately NOT keyed on content hash: hashing means reading the file, which is the
@@ -219,42 +218,6 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
 };
 
 /**
- * Re-seed the shipped defaults from the list files on disk, after the startup sync in
- * list-sync.ts has refreshed them.
- *
- * DEFAULT_STRATEGY captures `loadRivalSkippers()` at import time, which is BEFORE the
- * sync runs, so without this the freshly-downloaded skippers list would reach every
- * consumer that reads the file live (offense filters, the panels, /api/rival-skippers)
- * but not the one place that snapshots it: the pinned offense targets.
- *
- * `previousSkippers` is the list as it was before the sync. The user's saved pins are
- * only re-pointed at the new list when they still match the old one exactly — i.e. they
- * were tracking the curated default and never customised. A hand-edited target box is
- * the user's own strategy and is left alone; they can re-adopt with the one-click
- * "skippers" template in the Config UI.
- *
- * Returns true when the saved pins were re-pointed, so startup can say so.
- */
-export function adoptRefreshedLists(previousSkippers: string[]): boolean {
-  const fresh = loadRivalSkippers();
-  DEFAULT_STRATEGY.offenseTargetTokenIds = fresh;
-
-  // Compared by canonical BigInt string so a pure formatting difference ("0084" vs "84")
-  // between two versions of the file doesn't read as the user having customised. A
-  // non-numeric entry can't be canonicalised, so it's compared literally rather than
-  // throwing and taking startup down.
-  const canon = (id: string) => { try { return BigInt(id).toString(); } catch { return id; } };
-  const sameIds = (a: string[], b: string[]) =>
-    a.length === b.length && a.every((id, i) => canon(id) === canon(b[i] ?? ""));
-
-  if (sameIds(fresh, previousSkippers)) return false; // list didn't change; nothing to do
-  if (!sameIds(runtime.strategy.offenseTargetTokenIds, previousSkippers)) return false; // customised
-
-  runtime.saveStrategy({ offenseTargetTokenIds: fresh });
-  return true;
-}
-
-/**
  * Bump ONLY when the recommended defaults change (gas tuning, behaviour flags, or
  * the curated rival-target list in data/rival-targets.json).
  *
@@ -281,7 +244,7 @@ const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
   "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
   "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
   "racePublicMempool", "dynamicTipEnabled", "dynamicTipMaxGwei",
-  // Re-pulls the curated skippers list shipped in data/rival-skippers.json.
+  // Re-applies the curated skippers list shipped in data/rival-skippers.json.
   "offenseTargetTokenIds",
 ];
 
@@ -489,11 +452,8 @@ class Runtime {
   }
 
   status(): BotStatus {
-    const ver = versionState();
     return {
       version: VERSION,
-      latestVersion: ver.latest,
-      updateAvailable: ver.behind,
       running: this.running,
       unlocked: this.unlocked,
       // The primary address stays the single headline identity; `wallets` carries the

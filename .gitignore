@@ -13,10 +13,9 @@ release/
 data/settings.json
 data/activity.json
 data/config.json
-# Hashes of the last auto-synced default lists (local sync bookkeeping, see list-sync.ts)
+# Legacy default-list sync bookkeeping; ignored so old installs can retain it harmlessly
 data/.list-sync.json
-# Self-updater bookkeeping: what the last update installed, and the files it replaced
-# (see scripts/update.mjs). Both are local state about THIS install.
+# Legacy self-updater artifacts; ignored so old installs do not accidentally commit them
 data/.update-manifest.json
 .update-backup/
 data/flashbots-signer.key

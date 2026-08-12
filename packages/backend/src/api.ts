@@ -4,7 +4,7 @@ import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
 import { publicClient, reinitClients, accountFromPrivateKey, getChainId, getBalanceCached, invalidateBalanceCache, getLatestBlockCached } from "./chain.js";
-import { runtime, loadRivalSkippers, loadDefaultRivalTargets, adoptRefreshedLists } from "./runtime.js";
+import { runtime, loadRivalSkippers, loadDefaultRivalTargets } from "./runtime.js";
 import { nonces } from "./nonce.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
@@ -28,7 +28,6 @@ import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readDoNotTarget, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
-import { syncDefaultLists } from "./list-sync.js";
 
 const strategyPatch = z
   .object({
@@ -115,26 +114,6 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/rival-skippers", async () => ({
     tokenIds: loadRivalSkippers(),
   }));
-
-  // Re-pull the curated lists from master without a restart. The startup sync is the
-  // normal path; this exists because a list can change mid-session (the game moves
-  // faster than restarts), and re-downloading the bot to get it is exactly what the
-  // auto-update removes. Same guards as startup — a git checkout and locally-edited
-  // files are left alone, and an empty remote list is rejected.
-  app.post("/api/refresh-lists", async (_req, reply) => {
-    try {
-      const before = loadRivalSkippers();
-      const outcomes = await syncDefaultLists();
-      const repointed = adoptRefreshedLists(before);
-      // Panels read the list files live, but their rows are built from cached
-      // ownership/status sets, so a new list wouldn't show until the next natural
-      // refresh without this.
-      if (outcomes.some((o) => o.result === "updated")) invalidateLiveCandidates();
-      return { outcomes, repointed };
-    } catch (err) {
-      return reply.code(500).send({ error: (err as Error).message });
-    }
-  });
 
   // --- on-demand rival scoring (dashboard "Analyze targets") ---
   // The scan takes minutes, so POST starts it in the background and the UI polls GET.

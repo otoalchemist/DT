@@ -162,61 +162,33 @@ download time via `git archive` `export-subst`), so even the unversioned
 `DT-master.zip` from the green button is identifiable — it reads e.g.
 `v0.5.0-3-g<sha>`.
 
-#### Self-update — the bot updates its own code at launch
+#### Updating manually
 
-The launchers (`start.bat` / `start.command`) check `master` for a newer version
-**before the app boots** and install it if there is one. Downloading a new ZIP and
-hand-copying your `data/` folder across is no longer part of running the bot.
+The bot does not check for, download, or install code or data-file updates. The
+launchers start the version already on disk, and the dashboard makes no outbound
+version check. This keeps changes to executable code and strategy inputs under the
+operator's control.
 
-It runs *before* startup on purpose: a Node process can't safely replace the code it
-is currently executing, so the app only ever starts on one coherent tree.
-
-**What it never touches:** `data/` (your encrypted keystore, API key, `config.json`,
-activity log) and `.env`. Those are yours; an update replaces only the shipped code.
-
-Also, it:
-
-- **Skips a git checkout entirely** — there `git pull` is the update path and
-  overwriting the working tree would destroy uncommitted work. `BOT_AUTO_UPDATE=force`
-  opts in if you're testing the updater itself.
-- **Refuses a tree that isn't this project.** A truncated download or an HTML error
-  page is rejected rather than written over a working install: the archive must
-  contain the expected files and identify as `death-and-taxes-bot`.
-- **Never installs an older version.** Only a strictly newer one is applied, so a
-  local build ahead of `master` is left alone.
-- **Backs up every file it replaces** to `.update-backup/`, so a bad update is
-  recoverable by hand.
-- **Reinstalls dependencies only when the lockfile actually changed**, so an ordinary
-  code update stays a couple of seconds rather than minutes.
-- **Never blocks startup.** Offline, GitHub down, a 20s timeout — it says so and
-  starts the version you already have.
-- **Won't rewrite the launcher underneath itself.** `cmd.exe` and `bash` both read a
-  script incrementally as they run it, so overwriting `start.bat`/`start.command`
-  mid-launch makes the shell resume at a stale byte offset and skip the rest silently
-  (Windows also refuses the atomic rename that would avoid this). A launcher change is
-  therefore *staged* and applied by the next `npm run update`, which the log tells you
-  to run. Launcher edits are rare — they're a few lines of glue around these scripts.
-
-Works the same on Windows and macOS: the archive keeps CRLF for `start.bat` and LF plus
-the executable bit for `start.command`, both verified after a real update.
-
-Check or run it by hand:
+For a git checkout, stop the bot, review the upstream changes, and update explicitly:
 
 ```bash
-npm run update:check   # report only; exit code 10 means an update is available
-npm run update         # apply it
+git pull --ff-only
+npm install
+npm run build
 ```
 
-Set `BOT_AUTO_UPDATE=off` in `.env` to disable it.
+For a ZIP install, download a trusted versioned release, extract it into a new
+directory, and review it before starting it. Copy `.env` and only the local state you
+intend to preserve (`data/settings.json`, `data/activity.json`, `data/config.json`,
+`data/flashbots-signer.key`, and `data/*.keystore.json`). Reconcile any locally
+edited curated-list files deliberately instead of copying the whole old `data/`
+directory over the new release. Keep a secure backup of the local files: they contain
+the encrypted keystore, runtime configuration, and other state. Using a fresh
+directory also avoids retaining code files removed by a later release.
 
-> One bootstrap caveat: a build from **before** this feature existed has no updater to
-> run, so it can't self-update. Those installs need one final manual download — after
-> which every future update is automatic.
-
-#### Auto-updating default lists — no re-download needed
-
-The four curated list files are the bot's shared game intelligence, and they change
-as the game is played — far more often than the code does:
+The four curated list files are part of each release and change only through a
+manual update. They are the bot's shared game intelligence and may change as the
+game is played:
 
 | File | What it is |
 | --- | --- |
@@ -225,36 +197,19 @@ as the game is played — far more often than the code does:
 | `data/ally-tokens.json` | Teammates. **Never** audited or killed. |
 | `data/do-not-target.json` | Big-boy operators that cure at the top of the boundary block, so an audit slot spent there is wasted. |
 
-**At every startup the bot fetches these from `master` and refreshes its local
-copies**, so a roster change reaches everyone on their next restart — no new
-download, no hand-merging into a `data/` folder. Pressing **Refresh data** in the
-dashboard does the same thing without a restart. It's best-effort and time-boxed
-(8s): if the fetch fails you keep the copy you have, and the bot starts normally.
-
-Three things it will not do, because each would destroy something:
-
-- **It never touches a git checkout.** In a clone the lists are managed by git, so
-  the sync is skipped entirely (`LIST_AUTO_UPDATE=force` opts in for testing it).
-- **It never overwrites a list you edited.** The hash of each file it writes is
-  recorded in `data/.list-sync.json`; if the file no longer matches, it's yours and
-  the sync leaves it alone and says so. To go back to the shared copy, delete the
-  file and restart.
-- **It never adopts an empty list.** An empty `ally-tokens.json` would let the
-  offense engine audit teammates, so a payload that arrives empty or malformed is
-  treated as a failed fetch, not as an instruction.
-
-Your **offense targets** follow the refreshed skippers list only if they were still
-tracking the default. Once you've customised the target box it's yours; re-adopt any
-time with the one-click *skippers* template in the Config panel.
-
-Set `LIST_AUTO_UPDATE=off` in `.env` to disable the whole thing.
+Review list changes carefully, especially `ally-tokens.json` and
+`do-not-target.json`, because they affect whom the offense engine may target. In a
+git checkout, local edits to tracked list files may need to be reconciled during a
+pull. In a ZIP install, choose deliberately whether to keep your locally edited
+copies or adopt those from the new release. Once you've customised the offense
+target box, you can re-adopt the shipped `rival-skippers.json` list with the
+one-click *skippers* template in the Config panel.
 
 #### `DEFAULTS_VERSION` — pushing new defaults to existing users
 
 `DEFAULTS_VERSION` (in `packages/backend/src/runtime.ts`) is **separate from
-`VERSION`** and is what makes updated recommended *settings* reach people who
-already run the bot. (The list files above no longer need it — they update
-themselves.)
+`VERSION`** and is what applies updated recommended *settings* after an operator
+manually installs a new release.
 
 Users keep their `data/` folder across updates (it holds the wallet keystore and
 API key), so their `data/config.json` survives — and saved values win per-field,
@@ -274,9 +229,8 @@ anyone's tuning.
 2. **Bump `DEFAULTS_VERSION`** in `packages/backend/src/runtime.ts` **if — and only
    if — you changed a recommended default** (gas tuning or a behaviour flag).
    Skipping this means existing users silently stay on the old settings; bumping it
-   needlessly resets their tuning. **Editing a list file no longer needs a bump or
-   even a release** — commit it to `master` and every bot picks it up on its next
-   start (see *Auto-updating default lists* above).
+   needlessly resets their tuning. Curated list changes ship with a release and do
+   not require a defaults-version bump.
 3. Mirror any default changes into `data/config.example.json` (docs only, but keep
    it honest).
 4. `npm run build && npm test`, then commit.
@@ -295,7 +249,6 @@ anyone's tuning.
 | `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to Flashbots, **BuilderNet**, beaverbuild and Titan (all verified live). Endpoints do change — verify against each builder's docs. |
 | `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). |
 | `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
-| `LIST_AUTO_UPDATE` | `on` (**default**) refreshes the curated default lists from `master` at startup; `off` disables it; `force` syncs even in a git checkout. See [Auto-updating default lists](#auto-updating-default-lists--no-re-download-needed). |
 
 Secrets live in `.env` and `data/` (the encrypted keystore + a Flashbots
 reputation key). Both are git-ignored. **Never commit them.**

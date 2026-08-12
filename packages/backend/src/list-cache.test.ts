@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 
-// Same idiom as list-sync.test.ts / strategy.test.ts: mock config so the real env-schema
+// Same idiom as strategy.test.ts: mock config so the real env-schema
 // parse (which rejects vitest's MODE=test) never runs. dataDir is repointed per test.
 vi.mock("./config.js", () => ({
   appConfig: { dataDir: "C:/dat-bot-test-scratch-nonexistent" },
@@ -23,9 +23,9 @@ const { loadAllyTokens, loadDoNotTarget, invalidateListCache } = await import(".
  * on every offense sweep (once per block with a WebSocket) and readTargets reads them again
  * on every dashboard poll, each a synchronous readFileSync + JSON.parse.
  *
- * The risk the cache introduces is staleness: these files are meant to be user-editable and
- * are rewritten by the startup sync, so a cached parse that outlived its file would mean the
- * bot auditing a token the user just added to the ally list. These tests pin that it doesn't.
+ * The risk the cache introduces is staleness: these files are meant to be user-editable, so
+ * a cached parse that outlived its file would mean the bot auditing a token the user just
+ * added to the ally list. These tests pin that it doesn't.
  */
 describe("list cache: serves repeat reads without re-parsing, but never goes stale", () => {
   let tmpDir: string;
@@ -61,7 +61,7 @@ describe("list cache: serves repeat reads without re-parsing, but never goes sta
   it("picks up an edit immediately — a new ally must never be audited", () => {
     writeAllies(["84"]);
     expect(loadAllyTokens()).toEqual(["84"]);
-    // A hand edit (or a list-sync write). Size changes here, so the key moves even if the
+    // A hand edit. Size changes here, so the key moves even if the
     // filesystem's mtime resolution is coarse.
     writeAllies(["84", "99", "100"]);
     expect(loadAllyTokens()).toEqual(["84", "99", "100"]);
