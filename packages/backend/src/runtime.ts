@@ -188,20 +188,27 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // bot sends separate bundles so audits keep their mempool fallback — so leaving it
   // on is safe and means a later bid "just works" without a second toggle to find.
   combinedBoundaryBundle: true,
-  // Payment gas — tuned to win the boundary bundle race. Measured rivals tip up to
-  // ~29 gwei at the boundary (and one outlier at ~90), so a 20.1 gwei static tip
-  // clears the common field with margin and the dynamic tip can escalate to 69.1 in
-  // a contested block. The base-fee cap is generous (boundary blocks run near-empty
-  // at <1 gwei; the cap only guards against a fee spike).
+  // Payment gas — tuned to win the boundary bundle race. The base-fee cap is generous
+  // (boundary blocks run near-empty at <1 gwei; the cap only guards against a spike).
   maxBaseFeeGwei: 69.1,
-  priorityFeeGwei: 20.1,
+  // 120 gwei static. Measured across recent boundaries: tip is what the value-sorting
+  // builders rank on once bids are equal, and it is the ONLY lever on a solo-built block
+  // — vanilla geth orders by priority fee and ignores coinbase transfers entirely, which
+  // is ~10% of boundaries. 120 gwei/gas clears the common field outright (rivals defended
+  // at 80-114 gwei/gas over the last six boundaries) before a wei of bid is spent.
+  //
+  // NOTE this sits ABOVE dynamicTipMaxGwei (69.1), which makes the dynamic tip inert:
+  // dynamicTipGwei() clamps its ceiling up to the static base, so it returns 120 flat
+  // rather than escalating. Harmless — you get the static tip — but there is no
+  // escalation headroom in a contested block until that ceiling is raised too.
+  priorityFeeGwei: 120,
   minBalanceEth: 0.01,
   // Offense (audit/kill) bids its own gas, independent of payments — it's a race
   // against rivals where a payment isn't. Matched to the payment ceilings so an
   // audit isn't the weak link at a contested boundary.
   separateOffenseGas: true,
   offenseMaxBaseFeeGwei: 69.1,
-  offensePriorityFeeGwei: 20.1,
+  offensePriorityFeeGwei: 120, // matched to the payment tip; see the note there
   offenseDynamicTipEnabled: true,
   offenseDynamicTipMaxGwei: 69.1,
   racePublicMempool: true,
@@ -264,6 +271,13 @@ export function adoptRefreshedLists(previousSkippers: string[]): boolean {
  * Tied to this constant rather than VERSION so an unrelated release doesn't reset
  * anyone's tuning.
  */
+// NOT bumped for the 120 gwei tip default (v1.3.4). Deliberate: priorityFeeGwei and
+// offensePriorityFeeGwei are RECOMMENDED_FIELDS, so bumping this would OVERWRITE every
+// existing user's tip with 120 — a ~6x spend increase on every transaction, applied
+// without them asking. It would also reset the rest of their gas tuning in that list
+// (base-fee caps, dynamic tip ceilings, pre-boundary lead) back to shipped values.
+// Leaving it at 4 means 120 reaches NEW installs only; existing users keep what they set
+// and can opt in themselves.
 export const DEFAULTS_VERSION = 4;
 
 /**
