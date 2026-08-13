@@ -236,4 +236,28 @@ describe("payments are revert-tolerant when several share a bundle", () => {
     await firePreBoundaryBundle();
     expect(paymentCalls()).toHaveLength(4);
   });
+
+  it("names every unpaid citizen when a fee spike stops the sweep", async () => {
+    // The fee cap fails identically for every remaining citizen, so the loop stops rather
+    // than re-awaiting the same verdict. But an unpaid citizen at a boundary is AUDITABLE,
+    // so which ones went unpaid must reach the activity feed — a debug line is not enough.
+    const { getLatestBlockCached } = await import("./chain.js");
+    const { activity } = await import("./activity.js");
+    ownCitizens(4);
+    // The fixture sets maxBaseFeeGwei 1000 so other tests never hit the cap; drop it here so
+    // the spike genuinely exceeds it.
+    runtime.strategy = { ...runtime.strategy, maxBaseFeeGwei: 69.1 };
+    vi.mocked(getLatestBlockCached).mockResolvedValue({
+      baseFeePerGas: 500_000_000_000n, number: 100n, gasUsed: 0n, gasLimit: 30_000_000n,
+    } as never); // 500 gwei, far over the 69.1 cap
+
+    await firePreBoundaryBundle();
+
+    expect(paymentCalls()).toHaveLength(0); // nothing sent, which is the cap working
+    const msgs = vi.mocked(activity.add).mock.calls.map(([e]) => (e as { message: string }).message);
+    const deferred = msgs.find((m) => /Deferred \d+ pre-boundary payment/.test(m));
+    expect(deferred).toBeDefined();
+    // Every owing citizen is named, so the operator knows exactly who is exposed.
+    for (const id of [1000, 1001, 1002, 1003]) expect(deferred).toContain(String(id));
+  });
 });

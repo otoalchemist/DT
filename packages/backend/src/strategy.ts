@@ -714,7 +714,22 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
 
   for (const { id, key, value } of owing) {
     const guard = await canSpend(value, false, walletForToken(key)); // max-base-fee, floor, max-payment caps
-    if (guard.fatal) { logger.debug(`pre-boundary pay stopped early: ${guard.reason}`); break; }
+    if (guard.fatal) {
+      // Fee over cap fails identically for every remaining citizen, so stop re-awaiting the
+      // same verdict. But say WHICH citizens went unpaid, in ONE entry rather than a debug
+      // line: an unpaid citizen at a boundary is auditable, and the operator needs to know
+      // exactly who. (The offense sweeps can stay silent here — a skipped audit costs an
+      // opportunity; a skipped payment can cost a citizen.)
+      const remaining = owing.slice(owing.findIndex((o) => o.key === key)).map((o) => o.key);
+      activity.add({
+        kind: "pay-taxes",
+        status: "skipped",
+        message:
+          `Deferred ${remaining.length} pre-boundary payment(s) for epoch ${targetEpoch} — ${guard.reason}. ` +
+          `Unpaid: #${remaining.join(", #")}. They are auditable at this boundary until paid.`,
+      });
+      break;
+    }
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
       continue;
