@@ -340,10 +340,10 @@ export function JitPanel({
             <div className="row wrap" style={{ gap: 12, alignItems: "stretch", marginBottom: 10 }}>
               <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--accent)", paddingLeft: 10 }}>
                 <label className="field" style={{ marginBottom: 4 }}>
-                  {/* "(+ audits)" because the name otherwise reads as a payment-only bid,
-                      when in fact this is the one that covers a combined bundle. */}
-                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>Payment armed</span>{" "}
-                  <span style={{ opacity: 0.8 }}>(+ audits)</span> bid (ETH)
+                  {/* Named for the EPOCH, not the transaction: this bid covers the whole
+                      bundle on a boundary that carries a payment, audits included. */}
+                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>Payment + Audit Epoch</span>{" "}
+                  Bid (ETH)
                   <input
                     type="number" min={0} step={0.001}
                     value={config.coinbaseBidEth}
@@ -361,7 +361,7 @@ export function JitPanel({
               </div>
               <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10 }}>
                 <label className="field" style={{ marginBottom: 4 }}>
-                  <span style={{ color: "var(--green)", fontWeight: 600 }}>Audit only</span> bid (ETH)
+                  <span style={{ color: "var(--green)", fontWeight: 600 }}>Audit Only Epoch</span> Bid (ETH)
                   <input
                     type="number" min={0} step={0.001}
                     value={config.coinbaseBidAuditOnlyEth}
@@ -405,9 +405,9 @@ export function JitPanel({
               <p className="muted" style={{ fontSize: 10, margin: "4px 0 0 0", lineHeight: 1.5 }}>
                 While away mode is on, the engine notices a citizen would be auditable at the
                 coming boundary, arms itself, and the bundle pays and audits together on the{" "}
-                <span style={{ color: "var(--accent)" }}>payment bid</span>. JIT then disarms
-                itself as it always has, so quiet epochs fall back to offense on the{" "}
-                <span style={{ color: "var(--green)" }}>audit-only bid</span>.
+                <span style={{ color: "var(--accent)" }}>Payment + Audit Epoch</span> bid. JIT then
+                disarms itself as it always has, so quiet epochs fall back to offense on the{" "}
+                <span style={{ color: "var(--green)" }}>Audit Only Epoch</span> bid.
                 <br />
                 <b>That spends ETH with no keypress</b>, so the bids above are the ceiling you
                 are agreeing to each time you go away. It never arms for a citizen that is

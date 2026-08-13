@@ -547,7 +547,7 @@ export function Dashboard({
                     ? `Away/Autonomous ON — the engine idles at zero RPC between epochs, starts itself ${leadMinutes} min before the boundary, runs through it, then stops 5 min after. The dashboard also stops its 20s polling; use Refresh data to read on demand.
 
 ` +
-                      `Autonomous: it arms payments itself when a citizen falls behind, paying on the payment bid and dropping back to the audit-only bid on quiet epochs. Both bids are set under Coinbase bid — while this is on, they are spent without a keypress.` +
+                      `Autonomous: it arms payments itself when a citizen falls behind, paying on the "Payment + Audit Epoch" bid and dropping back to the "Audit Only Epoch" bid on quiet epochs. Both are set under Coinbase bid — while this is on, they are spent without a keypress.` +
                       `
 
 Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a boundary. Click to turn off.`
