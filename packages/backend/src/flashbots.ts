@@ -13,6 +13,7 @@ import { runtime } from "./runtime.js";
 import { nonces } from "./nonce.js";
 import { effectiveTipGwei, resolveGas } from "./logic.js";
 import { logger } from "./logger.js";
+import { recordRaceSubmission } from "./race-timing.js";
 
 export interface TxIntent {
   to: Address;
@@ -251,13 +252,34 @@ interface QueuedTx {
    *  revertingTxHashes). Used for the coinbase bid so a misconfigured payer can
    *  never drop the payment from the bundle. */
   revertible?: boolean;
+  /** Bundle shape, for race telemetry only (see race-timing.ts). Recorded so the
+   *  analysis can separate "what we paid" from "when we sent it" — never used to
+   *  build or submit the bundle. */
+  gasLimit?: bigint;
+  priorityFeeWei?: bigint;
+  /** Set only on the coinbase-bid tx, so the flat bid is distinguishable from a
+   *  payment's value. */
+  bidWei?: bigint;
 }
 let bundleQueue: QueuedTx[] | null = null;
+
+/**
+ * The boundary this batch is racing into, in unix seconds. Set by the pre-boundary fires,
+ * which are the only callers that know it; null for an ordinary tick's batch. Used solely
+ * to compute the lead time in race telemetry.
+ */
+let raceBoundaryTs: bigint | null = null;
+
+/** Tell the open batch which boundary it is racing into (telemetry only). */
+export function setRaceBoundary(ts: bigint | null): void {
+  raceBoundaryTs = ts;
+}
 
 /** Open a batching window: subsequent mainnet submitTx calls queue their signed
  *  tx instead of sending, until flushBundle() emits them as one bundle. */
 export function beginBundle(): void {
   bundleQueue = [];
+  raceBoundaryTs = null; // a stale boundary must not leak into the next batch
 }
 
 export interface BundleTxResult {
@@ -305,6 +327,10 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
   const targetBlock = (await publicClient.getBlockNumber()) + 1n;
 
+  // Stamped here, immediately before the fan-out, so it measures OUR send time and not
+  // how long the builders took to acknowledge (telemetry only — see race-timing.ts).
+  const submittedAtMs = Date.now();
+
   // One multi-tx bundle, fanned out to every builder for the next two blocks.
   const acceptedBy = new Set<string>();
   const bundleHashes: string[] = [];
@@ -350,6 +376,29 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
       `batched bundle (${queue.length} tx) accepted by ${acceptedBy.size}/${appConfig.builderUrls.length} builders: ${[...acceptedBy].join(", ")}`,
     );
   }
+
+  // Race telemetry: WHEN we sent, against the position we end up with. `submittedAtMs` is
+  // stamped before the fan-out above, so it measures our own send time rather than how long
+  // the builders took to ack. The outcome is filled in later from the receipt (see
+  // race-timing.ts) — this is the one input into boundary position that is invisible to
+  // on-chain analysis, because only the sender knows it.
+  const bidWeiTotal = queue.reduce((s, q) => s + (q.bidWei ?? 0n), 0n);
+  const gasTotal = queue.reduce((s, q) => s + (q.gasLimit ?? 0n), 0n);
+  // Tip is uniform across a batch (one computeFees per tick), so the max is the tip.
+  const tipWei = queue.reduce((s, q) => (q.priorityFeeWei ?? 0n) > s ? (q.priorityFeeWei ?? 0n) : s, 0n);
+  recordRaceSubmission({
+    submittedAtMs,
+    targetBlock: targetBlock.toString(),
+    boundaryTs: raceBoundaryTs === null ? null : Number(raceBoundaryTs),
+    leadMs: raceBoundaryTs === null ? null : Number(raceBoundaryTs) * 1000 - submittedAtMs,
+    acceptedBy: [...acceptedBy],
+    builderCount: appConfig.builderUrls.length,
+    txCount: queue.length,
+    gasLimitTotal: gasTotal.toString(),
+    tipGwei: Number(tipWei) / 1e9,
+    bidWei: bidWeiTotal.toString(),
+    txHashes: queue.map((q) => keccak256(q.signed)),
+  });
 
   const txHashByNonce = new Map(mirrors.map((m) => [m.nonce, m.txHash]));
   for (const q of queue) {
@@ -397,7 +446,8 @@ export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<
       maxFeePerGas,
       maxPriorityFeePerGas,
     );
-    bundleQueue.push({ signed, nonce, race: false, revertible: true });
+    bundleQueue.push({ signed, nonce, race: false, revertible: true,
+      gasLimit: COINBASE_BID_GAS, priorityFeeWei: maxPriorityFeePerGas, bidWei });
     logger.info(`coinbase bid queued: ${formatEther(bidWei)} ETH to builder via ${payer.slice(0, 10)}… (nonce ${nonce})`);
     return true;
   } catch (err) {
@@ -545,7 +595,8 @@ export async function submitTx(
   // whole tick's txs go out as ONE atomic multi-tx bundle with valid sequential
   // nonces (see flushBundle). Hashes are filled in by the caller after flush.
   if (bundleQueue !== null) {
-    bundleQueue.push({ signed, nonce, race: opts.race ?? false, revertible: opts.revertible ?? false });
+    bundleQueue.push({ signed, nonce, race: opts.race ?? false, revertible: opts.revertible ?? false,
+      gasLimit: gas, priorityFeeWei: maxPriorityFeePerGas });
     return { ...base, ok: true, queued: true, targetBlock };
   }
 

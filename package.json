@@ -22,7 +22,8 @@
     "update:check": "node scripts/update.mjs --check",
     "rival-skippers": "node scripts/rival-skippers.mjs",
     "rival-builder-bids": "node scripts/rival-builder-bids.mjs",
-    "target-scores": "node scripts/target-scores.mjs"
+    "target-scores": "node scripts/target-scores.mjs",
+    "race-timing": "node scripts/race-timing.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

@@ -15,6 +15,8 @@ data/activity.json
 data/config.json
 # Hashes of the last auto-synced default lists (local sync bookkeeping, see list-sync.ts)
 data/.list-sync.json
+# Race telemetry: local experiment data about this install’s own submissions
+data/race-timing.jsonl
 # Self-updater bookkeeping: what the last update installed, and the files it replaced
 # (see scripts/update.mjs). Both are local state about THIS install.
 data/.update-manifest.json

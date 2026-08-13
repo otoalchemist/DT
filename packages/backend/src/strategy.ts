@@ -22,9 +22,10 @@ import {
   fetchCandidateTokenIds,
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
-import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, type TxIntent, type SubmitResult } from "./flashbots.js";
+import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, setRaceBoundary, type TxIntent, type SubmitResult } from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, excludedTokenSet, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
+import { recordRaceOutcome } from "./race-timing.js";
 
 const TICK_MS = 12_000; // fallback poll interval when WebSocket unavailable
 const GAS_GUESS = 200_000n; // for pre-flight spend-cap checks only
@@ -720,6 +721,8 @@ export async function firePreBoundaryPay(): Promise<void> {
   beginBatch();
   const targetEpoch = BigInt(s.jitTargetEpoch);
   const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
+  // Telemetry only: lets the flush record how early this race was sent (race-timing.ts).
+  setRaceBoundary(boundaryTs);
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     const paid = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
@@ -1155,6 +1158,8 @@ export async function firePreBoundaryAudit(): Promise<void> {
   const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
+  // Telemetry only: lets the flush record how early this race was sent (race-timing.ts).
+  setRaceBoundary(boundaryTs);
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     // Allowed-to-revert ONLY when a coinbase bid will fire, because `revertible` also
@@ -1239,6 +1244,8 @@ export async function firePreBoundaryBundle(): Promise<void> {
   const targetEpoch = armedEpoch ?? (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
+  // Telemetry only: lets the flush record how early this race was sent (race-timing.ts).
+  setRaceBoundary(boundaryTs);
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     let paidInBundle = new Set<string>();
@@ -1543,6 +1550,14 @@ async function trackReceipt(
       timeout: RECEIPT_TIMEOUT_MS,
     });
     const block = receipt.blockNumber?.toString();
+    // Race telemetry: the position half of the timing experiment. Joined to the submission
+    // row by tx hash, so "how early did we send" can be regressed against "where did we
+    // land" — the one variable on-chain analysis cannot see (see race-timing.ts).
+    recordRaceOutcome(txHash, {
+      blockNumber: receipt.blockNumber,
+      transactionIndex: Number(receipt.transactionIndex),
+      status: receipt.status === "success" ? "included" : "reverted",
+    });
     activity.update(entryId, {
       status: receipt.status === "success" ? "included" : "reverted",
       targetBlock: block,

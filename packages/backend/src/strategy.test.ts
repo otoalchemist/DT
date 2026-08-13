@@ -95,6 +95,9 @@ vi.mock("./flashbots.js", () => ({
   beginBundle: vi.fn(),
   flushBundle: vi.fn(async () => new Map()),
   queueCoinbaseBid: vi.fn(async () => false),
+  // Telemetry hook (race-timing.ts) — a no-op here, but it must exist on the mock or every
+  // pre-boundary fire throws before doing any work.
+  setRaceBoundary: vi.fn(),
 }));
 
 vi.mock("./contract.js", () => ({

@@ -470,6 +470,45 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   run's lifetime, but different across restarts and across users. Always on, not
   configurable.
 
+## Race timing telemetry — is position bought, or just timed?
+
+Everything else about boundary position is measurable from public chain data: tips, bids,
+gas, and the tx index you ended up at. **Submission timing is not** — only the sending bot
+knows when it pressed send. That gap matters, because measurement across 21 boundary blocks
+on Titan/BuilderNet found price explains position poorly:
+
+| finding | figure |
+| --- | --- |
+| density (`(tip+bid)/gas`) → tx index correlation | **−0.22** (weak) |
+| high tip alone vs. coinbase bid alone | median idx **11 vs 12** — Mann-Whitney `p=0.52`, no difference |
+| doing *neither* | median idx **26** |
+| bidding above ~0.02 ETH | **no measurable improvement** |
+
+So the step from *nothing* → *something* is worth roughly 15 positions, and spending more
+beyond that buys little. Which leaves arrival time as the main untested candidate.
+
+**Every bundle flush now appends a row to `data/race-timing.jsonl`** recording how early it
+was sent (`leadMs`, the gap to the epoch boundary), the bundle shape, which builders
+accepted it, and — filled in once the receipt lands — the block and **tx index** it reached.
+Analyse it with:
+
+```bash
+npm run race-timing
+```
+
+which reports the `leadMs` → index correlation, position by lead-time band, the same
+correlation for tip and bid as controls, a per-builder split (ordering policy differs), and
+**whether the builder that won the slot even had your bundle** — a high "did NOT" count
+means the loss is *coverage*, not price or timing.
+
+The file is gitignored (it's local data about your own submissions) and writes are async and
+best-effort: telemetry must never delay a race or break a submission. Rows appear only in
+`mainnet` mode, and only pre-boundary fires carry a `leadMs` — an ordinary tick has no
+boundary to measure against. Expect one row per boundary, so give it several days before
+reading much into the numbers; the script says so when the sample is under 10.
+
+---
+
 ## Race post-mortem
 
 Compare your transaction against a rival's to diagnose *why* you lost a race —
