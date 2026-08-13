@@ -673,7 +673,7 @@ describe("combined boundary bundle with multiple citizens", () => {
   // atomic, so a reverting audit would normally invalidate it and take the PAYMENT down
   // too — losing a citizen its tax at the exact boundary it needed it. flushBundle builds
   // revertingTxHashes from the `revertible` flag, so this is the flag that decides it.
-  it("marks payments MANDATORY and audits allowed-to-revert, so a failed audit can't drop a payment", async () => {
+  it("keeps a failed audit from dropping the payments, and one bad payment from dropping its siblings", async () => {
     await firePreBoundaryBundle();
 
     const opts = (data: string) =>
@@ -683,15 +683,23 @@ describe("combined boundary bundle with multiple citizens", () => {
 
     const pays = opts("0xPAYTAXES");
     const audits = opts("0xAUDIT");
-    expect(pays.length).toBeGreaterThan(0);
+    expect(pays.length).toBeGreaterThan(1); // 3 citizens here, so siblings exist
     expect(audits.length).toBeGreaterThan(0);
 
-    // Payments are NOT revertible -> absent from revertingTxHashes -> the builder must
-    // include them successfully or drop the whole bundle. That is the guarantee.
-    for (const p of pays) expect(p.revertible).toBeFalsy();
     // Audits ARE revertible -> a defended or already-audited target reverts harmlessly
-    // beside the payment instead of invalidating the bundle.
+    // beside the payments instead of invalidating the bundle. Unchanged guarantee.
     for (const a of audits) expect(a.revertible).toBe(true);
+
+    // Payments are ALSO revertible once there are siblings to protect. This used to assert
+    // the opposite: payments were mandatory, so ONE citizen reverting in-block
+    // (AlreadyCurrent, or audited earlier in the same block) dropped the whole bundle and
+    // sent every healthy payment to the mempool — missing the boundary block, which is
+    // where ~10 rival audits land against citizens exactly 2 epochs behind.
+    for (const p of pays) expect(p.revertible).toBe(true);
+
+    // ...and they KEEP the mempool mirror, which is what makes that safe. Revert-tolerant
+    // WITHOUT a mirror would turn "lands a block late" into "never lands".
+    for (const p of pays) expect(p.race).toBe(true);
   });
 
   it("orders payments BEFORE audits, so a paid citizen is current when it audits", async () => {

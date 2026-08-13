@@ -383,6 +383,19 @@ want the bot opportunistically hunting between boundaries.
   to the public mempool alongside the bundle (identical tx, so only one can land).
   There's nothing to protect by hiding a tax payment: rivals already see the
   delinquency on-chain.
+- **One bad payment can't drop the others.** When a boundary bundle carries **two or
+  more** payments, each is marked allowed-to-revert (`revertingTxHashes`). Without
+  that, a single citizen reverting in-block — `AlreadyCurrent`, or audited earlier in
+  the same block — invalidates the whole bundle, and every healthy payment falls to
+  the mempool and *misses the boundary block*. That block is where the audits happen:
+  measured across 12 boundaries, ~10 rival audits land per boundary block (~4.7 at
+  index ≤ 20), against citizens that are exactly 2 epochs behind and therefore
+  auditable. Roughly 28% of holders run 2+ citizens, so this is the common case, not a
+  corner. Revert-tolerance is **not** applied to a lone payment: there are no siblings
+  to protect, and it would only land a bundle containing a reverted tx — paying the
+  coinbase bid on a boundary that otherwise costs nothing, since a dropped bundle takes
+  the bundle-only bid with it. Payments keep their mempool mirror either way, which is
+  what makes this safe rather than a trade for a worse failure.
 - **Local-only by default.** The API binds to `127.0.0.1`; when bound to loopback
   it also rejects requests with an unexpected `Host` header, blocking DNS-rebinding
   from a malicious web page. Do not expose it to the internet.

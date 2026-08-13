@@ -655,6 +655,10 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
   );
   if (selected.length === 0) return paid;
 
+  // Two passes: decide WHO owes a payment first, because whether a payment may be
+  // revert-tolerant depends on how many siblings share the bundle (see tolerateReverts).
+  const owing: { id: bigint; key: string; value: bigint }[] = [];
+
   const results = await publicClient.multicall({
     allowFailure: true,
     // auditDueTimestamp rides the SAME multicall as lastEpochPaid, so guarding against
@@ -686,15 +690,47 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
     // advances the citizen a single epoch regardless of how far behind it is.
     const value = preBoundaryTaxWei(lastEpochPaid, targetEpoch, 1, BASE_TAX_RATE_WEI);
     if (value === 0n) continue;
+    owing.push({ id: selected[i]!, key, value });
+  }
+
+  /**
+   * Whether a reverting payment is allowed to keep the bundle alive.
+   *
+   * `eth_sendBundle` drops a bundle when any tx NOT in `revertingTxHashes` reverts, so with
+   * payments mandatory ONE citizen reverting in-block (`AlreadyCurrent`, or audited earlier
+   * in the same block) takes every healthy sibling payment down with it. Those siblings then
+   * fall to the mempool and miss the boundary block — which is where ~10 rival audits land,
+   * against citizens that are exactly 2 epochs behind and therefore auditable.
+   *
+   * Only worth it with SIBLINGS to protect. With a single payment there is nothing to save,
+   * and revert-tolerance would instead land a bundle whose only payment reverted — paying the
+   * coinbase bid on a boundary that today costs nothing, because a dropped bundle takes the
+   * bundle-only bid with it. So below two payments, mandatory is strictly better.
+   *
+   * Payments keep their mempool mirror either way (`bundleOnly` is never set for them): that
+   * is what makes this safe rather than a trade of one failure mode for a worse one.
+   */
+  const tolerateReverts = owing.length >= 2;
+
+  for (const { id, key, value } of owing) {
     const guard = await canSpend(value, false, walletForToken(key)); // max-base-fee, floor, max-payment caps
+    if (guard.fatal) { logger.debug(`pre-boundary pay stopped early: ${guard.reason}`); break; }
     if (!guard.ok) {
       activity.add({ kind: "pay-taxes", status: "skipped", tokenId: key, message: `Defer pre-boundary pay #${key}: ${guard.reason}` });
       continue;
     }
     const res = await act(
-      { to: appConfig.gameAddress, data: encodePayTaxes(selected[i]!, 1), value, gas: PRE_BOUNDARY_GAS },
+      { to: appConfig.gameAddress, data: encodePayTaxes(id, 1), value, gas: PRE_BOUNDARY_GAS },
       "pay-taxes",
-      { tokenId: key, message: `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)`, race: true, simTimestamp: boundaryTs },
+      {
+        tokenId: key,
+        message:
+          `Pre-boundary pay #${key} for epoch ${targetEpoch} = ${formatEther(value)} ETH (boundary race)` +
+          (tolerateReverts ? ` (1 of ${owing.length}, revert-tolerant)` : ""),
+        race: true,
+        simTimestamp: boundaryTs,
+        revertible: tolerateReverts,
+      },
     );
     if (res?.ok) paid.add(key);
   }
@@ -1123,6 +1159,10 @@ export async function queuePreBoundaryAudits(
         simTimestamp: boundaryTs,
         skipSim: viaBundlePayment,
         revertible: opts.revertible,
+        // Preserves the previous behaviour now that the mirror is no longer derived from
+        // `revertible`: a revert-tolerant audit stays bundle-only, because mirroring it adds
+        // a second mempool nonce that can demote the payment sharing its bundle.
+        bundleOnly: opts.revertible,
       },
     );
     if (res?.ok) { idx++; queued++; }
@@ -1572,7 +1612,7 @@ async function trackReceipt(
 async function act(
   intent: TxIntent,
   kind: "pay-taxes" | "use-bribe" | "audit" | "kill",
-  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; skipSim?: boolean; normalGas?: boolean; wallet?: Wallet },
+  ctx: { tokenId?: string; targetTokenId?: string; message: string; race?: boolean; simTimestamp?: bigint; revertible?: boolean; bundleOnly?: boolean; skipSim?: boolean; normalGas?: boolean; wallet?: Wallet },
 ): Promise<SubmitResult | null> {
   const offense = kind === "audit" || kind === "kill";
   // Which wallet signs. `ctx.tokenId` is always the citizen WE own in the action — the one
@@ -1604,10 +1644,18 @@ async function act(
       // front-runnable (rivals already see the delinquency on-chain).
       // OFFENSE stays opt-in (racePublicMempool): a visible pending audit lets the
       // target escape by paying first, so privacy is worth something there.
-      // A `revertible` tx (an audit riding a payment bundle in combined mode) never
-      // mirrors — mirroring would add a second mempool nonce that demotes the
-      // payment, and the audit only wants to ride the winning bundle.
-      race: ctx.revertible ? false : offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
+      // Whether this tx also goes to the public mempool.
+      //
+      // Derived from `bundleOnly`, NOT from `revertible` — those are different questions and
+      // conflating them made one unrepresentable: a PAYMENT needs to be revert-tolerant (so
+      // one bad citizen can't drop its siblings from the bundle) while KEEPING its mirror
+      // (so losing the slot still lands it, a block late). Deriving the mirror from
+      // `revertible` forced a choice between those, and the wrong one costs a citizen.
+      //
+      // Audits riding a payment bundle and the coinbase bid stay bundle-only: mirroring an
+      // audit adds a second mempool nonce that can demote the payment, and a bundle-only bid
+      // is only meaningful in the block it wins.
+      race: ctx.bundleOnly ? false : offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
       offense,
       simTimestamp: ctx.simTimestamp,
       revertible: ctx.revertible,
