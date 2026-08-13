@@ -4,7 +4,7 @@
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.3.2" as const;
+export const VERSION = "1.3.3" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
@@ -135,8 +135,23 @@ export type GameStateValue = (typeof GameState)[keyof typeof GameState];
  */
 export const GAS_PER_PAYMENT = 82_875;
 export const GAS_PER_AUDIT = 130_409;
-/** The CoinbasePayer forwarder tx that carries the bid. Fixed overhead per bundle. */
-export const GAS_COINBASE_BID_TX = 60_000;
+/**
+ * The CoinbasePayer forwarder tx that carries the bid. Fixed overhead per bundle.
+ *
+ * MEASURED gas used, not the gas LIMIT. Those are different numbers with different jobs
+ * and this constant previously held the wrong one: flashbots.ts signs the bid tx with
+ * COINBASE_BID_GAS = 60,000, which is a deliberate limit — headroom in case a builder's
+ * coinbase is a contract with a costly receive path, and unused gas is refunded, so it
+ * costs nothing to over-provide. But builders SIMULATE a bundle and order it on gas
+ * actually used, so pricing density against the limit inflated every bundle by ~30,000
+ * gas and every beatBid figure with it (a lone audit read 0.0855 where 0.0716 was right).
+ *
+ * 21 real CoinbasePayer txs used 27,895–30,550 (mean 29,159). The spread tracks the
+ * destination coinbase rather than the base fee — some fee recipients are contracts. The
+ * MAX is used deliberately: over-pricing a bid slightly is a rounding error, under-pricing
+ * it loses the boundary, and the asymmetry is not close.
+ */
+export const GAS_COINBASE_BID_TX = 30_550;
 
 /**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.

@@ -81,9 +81,13 @@ const GAME = "0xa448c7f618087dda1a3b128cad8a424fbae4b71f";
 const EMIGRATION = "0xe56d011262d4738dc8307fb8a4ae48b2bfc20e7c"; // citizens here have left the game
 const EPOCH_DURATION = 86400n;
 // Our own bundle shape, for pricing what it costs to out-rank a rival's defense.
-// Gas measured from real on-chain game txs: payTaxes ~82,875, audit ~130,409, plus the
-// fixed 60,000 for the CoinbasePayer tx.
-const OUR_BUNDLE_GAS = 82_875 + 130_409 + 60_000;
+// Gas MEASURED from real on-chain txs: payTaxes ~82,875, audit ~130,409, CoinbasePayer
+// 27,895–30,550 over 21 samples (max used — under-pricing a bid loses the boundary,
+// over-pricing it is a rounding error). Deliberately NOT the 60,000 gas LIMIT the bid tx
+// is signed with: builders simulate and order on gas USED, so pricing against the limit
+// inflated every bundle by ~30,000 gas. Keep in sync with GAS_* in shared/constants.ts —
+// duplicated because this script runs standalone and cannot import the package.
+const OUR_BUNDLE_GAS = 82_875 + 130_409 + 30_550;
 // The tip we would actually bid on an audit. Mirrors resolveGas(): the offense tip only
 // applies when separateOffenseGas is on, otherwise audits ride the payment tip. Read from
 // the live config rather than hardcoded, because pricing against a tip the bot won't bid
