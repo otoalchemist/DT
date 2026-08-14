@@ -190,3 +190,30 @@ Even with the code mitigations above:
 The original snapshot review was a read-only static review of the TypeScript backend, React frontend, Solidity forwarder, updater and launcher scripts, configuration and data files, and dependency-lock structure. No files were changed during that review. This follow-up records the subsequent branch remediation based on code inspection and an independent re-review. On 2026-08-12, the workspace build completed and all 311 backend tests passed, including focused coverage for the added security controls.
 
 This remains a high-level review, not a formal audit or proof of correctness. Current dependency-advisory status was not verified against an online advisory service. The review does not audit the external Death & Taxes contracts, deployed `CoinbasePayer` bytecode, RPC providers, builders, the host operating system, backup infrastructure, or upstream GitHub account security. Mainnet behavior under relay failure, delayed receipts, provider inconsistency, reorgs, and process interruption should still be validated conservatively before increasing wallet funding.
+
+
+gm gm. 
+my two cents. I think any bot for the dao should be isolated and hosted independantly. This is my main recommendation.
+
+having 2 different bots running on the same infra is higher risk. 
+I've used a model to patch some items raised in a general security scan and can submit a PR for you to review. 
+Any changes come with risk and need to be monitored closely as things get setup.
+
+in general:
+1. The owner of the AWS account would be the highest risk access
+2. access to the server should be locked down tightly 
+3. we should generate a new wallet on the server so the key never gets transmitted. 
+4. that wallet should be funded periodically.  
+5. there should be no single point of failure for access (AWS account is an exception here, thus the higher risk)
+6. this could be setup on linux and would only need to run for a few mins a day around the UTC boundary. but even if it weas 24x7 It would cost next to nothing. Now issues with windows, just more expensive and harder to access (from my perspective but I live on the the CLI)
+
+I've got a version of the app that addresses some of the security concerns my scan flagged. 
+That would need to be test carefully - but should hopefully work without issue. 
+Otherwise the latest stable is good - but I do think we should turn off the auto update stuff (my version removed this). 
+
+Not trying to be a pain in the ass or make work. 
+my suggestions are just to  mitigate risk and avoid a work case scenario Fuck I hate being responsible for other peoples bags. personal opsec is stressfull enoough
+
+
+
+
