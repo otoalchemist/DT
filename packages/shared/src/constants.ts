@@ -4,7 +4,7 @@
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.4.0" as const;
+export const VERSION = "1.4.1" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
