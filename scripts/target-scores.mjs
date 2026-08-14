@@ -34,13 +34,21 @@
 //             reliable; a gap means it escalates, and beatMax is what you must be
 //             willing to pay to be sure. #5347 reads "-" / 0.0471 — nothing needed today,
 //             but it has bid its way to 192 gwei/gas and could again.
-//             Both price a 1-payment + 1-audit bundle at our 20.1 gwei tip against
-//             DENSITY — (coinbase bid + priority tips) / gas, the value-per-gas a builder
-//             actually sorts on, not the tip: #6749 tips 0.5 gwei but bids to ~149.
+//             Both price THE BUNDLE YOU PLAN TO SEND (--payments / --audits / --tip,
+//             default 1+1 at the configured tip) against DENSITY — (coinbase bid +
+//             priority tips) / gas, the value-per-gas a builder actually sorts on, not
+//             the tip: #6749 tips 0.5 gwei but bids to ~149. A bid buys position for the
+//             WHOLE bundle, so carrying 7 audits instead of 1 costs ~5x the bid to reach
+//             the same density — set the flags to match what you will actually send.
 //             A shared bid is spread over the whole bundle it bought position for.
-//             "-" = nothing needed, our tip already out-ranks it. "?" = it reaches
-//             top-of-block anyway, so something unobservable buys that position.
-//             "·" = no payment seen in that window.
+//             "-" = nothing needed, our tip already out-ranks it. "·" = no payment seen
+//             in that window. "?" = the number would be a lie: either it reaches
+//             top-of-block anyway (something unobservable buys that position), or a block
+//             was seen ordering its bundle AHEAD of a denser one, which falsifies the
+//             density model where this rival races. Treat "?" as "price unknown, and
+//             out-bidding may not be the lever" — a bundle router that batches 11 game
+//             actions into ~1.05M gas divides its bid across 12x the gas of a lone
+//             payment, so it reads WEAK here while still taking the slot.
 //             A ceiling, not a forecast: off-chain builder deals are invisible at any
 //             window length, and a peak from 8 epochs ago may never be repeated.
 //   aud       times ANY player successfully audited it in the window (proven catchable)
@@ -62,6 +70,8 @@
 //   node scripts/target-scores.mjs                    # score every rival, ranked table
 //   node scripts/target-scores.mjs --auditable-next   # only weak links auditable next boundary
 //   node scripts/target-scores.mjs --epochs 20        # widen the cadence look-back
+//   node scripts/target-scores.mjs --payments 6 --audits 7   # price the bundle you'll send
+//   node scripts/target-scores.mjs --audits 2 --tip 120      # ...and at a different tip
 //   node scripts/target-scores.mjs --curated          # only data/rival-targets.json (old scope)
 //   node scripts/target-scores.mjs --promote          # add newly-observed skippers to the list
 //   node scripts/target-scores.mjs --json             # machine-readable dump (full set)
@@ -87,19 +97,9 @@ const EPOCH_DURATION = 86400n;
 // is signed with: builders simulate and order on gas USED, so pricing against the limit
 // inflated every bundle by ~30,000 gas. Keep in sync with GAS_* in shared/constants.ts —
 // duplicated because this script runs standalone and cannot import the package.
-const OUR_BUNDLE_GAS = 82_875 + 130_409 + 30_550;
-// The tip we would actually bid on an audit. Mirrors resolveGas(): the offense tip only
-// applies when separateOffenseGas is on, otherwise audits ride the payment tip. Read from
-// the live config rather than hardcoded, because pricing against a tip the bot won't bid
-// misstates every beat figure — the difference is charged across the whole bundle gas.
-const OUR_TIP_GWEI = (() => {
-  try {
-    const c = JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf8"));
-    const tip = c.separateOffenseGas ? c.offensePriorityFeeGwei : c.priorityFeeGwei;
-    if (typeof tip === "number" && tip >= 0) return tip;
-  } catch {}
-  return 20.1; // DEFAULT_STRATEGY.offensePriorityFeeGwei
-})();
+const GAS_PER_PAYMENT = 82_875;
+const GAS_PER_AUDIT = 130_409;
+const GAS_BID_TX = 30_550;
 const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI, 0.00069 ETH
 const TAXES_PAID = "0xa13146c03f92fd93f0bccebeff87928581da5e13079c83238adc89e466ebfaca";
 const AUDITED = "0xee1e30708b892ceb30b2a542bccb9a10c605f220dd821cc582226d1fbeea4f6f";
@@ -123,6 +123,41 @@ const curatedOnly = args.includes("--curated");
 // otherwise strictly read-only, and that file feeds the bot's default target list, so
 // writing it stays an explicit opt-in rather than a side effect of looking at the data.
 const promote = args.includes("--promote");
+
+/** Numeric flag: `--name 5`. Returns `dflt` when absent or unparseable. */
+function numArg(name, dflt, { min = 0 } = {}) {
+  const i = args.indexOf(name);
+  if (i < 0 || args[i + 1] === undefined) return dflt;
+  const v = Number(args[i + 1]);
+  return Number.isFinite(v) && v >= min ? v : dflt;
+}
+
+// THE BUNDLE WE PLAN TO SEND. A coinbase bid buys position for the WHOLE bundle, so what
+// it costs to out-rank a rival scales with the gas we are carrying — the same rival that
+// costs 0.03 ETH to beat on a 1-pay/1-audit bundle costs ~0.24 on a 9-pay/11-audit one.
+// Pricing every operator against a fixed 1+1 shape was therefore wrong for anyone holding
+// more than one citizen, which is most of them. Mirrors the payments/audits fields the
+// dashboard already exposes (TargetScores.tsx), so the CLI and the panel agree.
+//
+// Defaults stay 1+1 so existing invocations print what they always did.
+const PLAN_PAYMENTS = numArg("--payments", 1);
+const PLAN_AUDITS = numArg("--audits", 1);
+const OUR_BUNDLE_GAS = PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT + GAS_BID_TX;
+// The tip we would actually bid on an audit. Mirrors resolveGas(): the offense tip only
+// applies when separateOffenseGas is on, otherwise audits ride the payment tip. Read from
+// the live config rather than hardcoded, because pricing against a tip the bot won't bid
+// misstates every beat figure — the difference is charged across the whole bundle gas.
+// `--tip` overrides it, for asking "what would this cost if I tipped differently?".
+const OUR_TIP_GWEI = (() => {
+  const override = numArg("--tip", null);
+  if (override !== null) return override;
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf8"));
+    const tip = c.separateOffenseGas ? c.offensePriorityFeeGwei : c.priorityFeeGwei;
+    if (typeof tip === "number" && tip >= 0) return tip;
+  } catch {}
+  return 20.1; // DEFAULT_STRATEGY.offensePriorityFeeGwei
+})();
 const epochsArg = (() => { const i = args.indexOf("--epochs"); return i >= 0 && args[i + 1] ? BigInt(args[i + 1]) : 10n; })();
 
 function resolveRpc() {
@@ -289,12 +324,19 @@ async function main() {
   // landed (offset 0 = paid in the boundary block itself). This is the audit window — a
   // rival that always pays at +0/+1 can only be caught in the boundary block; one that
   // pays 30+ blocks in is catchable comfortably mid-epoch. Reported as fastest / median.
+  /** Blocks after that epoch's boundary a block sits, or null if before the window. */
+  const blockOffset = (blk) => {
+    for (let E = ce; E >= firstEpoch; E--) {
+      const fb = epochFirstBlock.get(E.toString());
+      if (fb !== undefined && blk >= fb) { const off = Number(blk - fb); return off >= 0 ? off : null; }
+    }
+    return null;
+  };
   const payOff = {}; // token -> [offsets]
   for (const l of payLogs) {
     const tok = BigInt(l.topics[1]).toString(); const m = meta.get(l.transactionHash); if (!m) continue;
-    let off = null;
-    for (let E = ce; E >= firstEpoch; E--) { const fb = epochFirstBlock.get(E.toString()); if (fb !== undefined && m.blk >= fb) { off = Number(m.blk - fb); break; } }
-    if (off !== null && off >= 0) (payOff[tok] ??= []).push(off);
+    const off = blockOffset(m.blk);
+    if (off !== null) (payOff[tok] ??= []).push(off);
   }
   const median = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); const h = s.length >> 1; return s.length % 2 ? s[h] : Math.round((s[h - 1] + s[h]) / 2); };
 
@@ -330,6 +372,11 @@ async function main() {
   /** "blk:sender" -> Set of tx hashes that paid the coinbase, so a separate payer tx can
    *  be counted into the bundle gas its bid actually bought. */
   const cbTxByBlockSender = new Map();
+  /** blk -> Set of tx hashes that touched the game or paid the builder, i.e. everyone who
+   *  was racing. Used only to falsify the density model, never to price a bid. */
+  const competitorTxs = new Map();
+  /** "blk:sender" for senders that actually touched the game in that block. */
+  const gameSenders = new Set();
   let tracingOk = true;
   if (bidBlocks.length > 0) {
     const minerOf = new Map();
@@ -345,6 +392,25 @@ async function main() {
       catch { tracingOk = false; break; } // no tracing on this RPC — report unknown
       const senderOfTx = new Map();
       for (const tr of traces) if (tr.type === "call" && (tr.traceAddress?.length ?? 0) === 0 && tr.transactionHash) senderOfTx.set(tr.transactionHash, (tr.action?.from || "").toLowerCase());
+      // Everyone who was RACING in this block, not just the rivals we score. The
+      // falsification check below compares a rival's bundle against whatever actually beat
+      // it, and the bundle that beats it often makes no tax payment at all — a pure audit
+      // bundle emits no TaxesPaid, so it never reaches payLogs and would be invisible.
+      // That is exactly the case that motivated this: in block 25749548 a router at 95.7
+      // gwei/gas took index 8 ahead of a 296.9 gwei/gas bundle of seven audits and no
+      // payments. Collect any tx that touched the game or paid the builder.
+      for (const tr of traces) {
+        if (!tr.transactionHash) continue;
+        const dst = (tr.action?.to || "").toLowerCase();
+        if (dst !== GAME && dst !== miner) continue;
+        (competitorTxs.get(b.toString()) ?? competitorTxs.set(b.toString(), new Set()).get(b.toString()))
+          .add(tr.transactionHash);
+        // Only a sender that actually touched the GAME is racing us. A coinbase-paying tx
+        // alone is not enough: an unrelated MEV searcher deep in the block pays the builder
+        // too, and comparing against one flagged #553 — a 0.1 gwei rival already audited
+        // three times — as "unknown defense", which is the opposite of the truth.
+        if (dst === GAME) gameSenders.add(`${b}:${senderOfTx.get(tr.transactionHash) || (tr.action?.from || "").toLowerCase()}`);
+      }
       for (const tr of traces) {
         if (tr.type !== "call" || !tr.transactionHash) continue;
         const to = (tr.action?.to || "").toLowerCase(); const val = tr.action?.value ? BigInt(tr.action.value) : 0n;
@@ -396,18 +462,35 @@ async function main() {
   const bidDensity = {};    // token -> peak gwei/gas, whole window
   const recentDensity = {}; // token -> peak gwei/gas, last 2 epochs
   const bidWindow = {};     // token -> { wei, pays } over the whole window
+  // token -> true when a block was observed ordering this token's bundle AHEAD of a
+  // higher-density one, i.e. the density model was falsified where this token was racing.
+  const densityContradicted = {};
+  // token -> peak density on BOUNDARY-BLOCK payments only (offset 0). bidDensity peaks over
+  // every payment in the window, but a mid-epoch payment is not a race — nobody is
+  // contesting position at offset 30, so a high tip there says nothing about what the rival
+  // will mount when it matters. This is the same measurement narrowed to the block that
+  // actually decides whether an audit lands.
+  const boundaryDensity = {};
+  // The bar to LEAD a boundary block: the strongest bundle present in each race, whoever
+  // it belonged to. Distinct from any single rival's defense — out-ranking one rival is
+  // not the same as winning the slot, and in the race we studied a bundle measuring 95.7
+  // took index 8 while a 296.9 one took index 9. Percentiles of this are what a coinbase
+  // bid should actually be sized against.
+  const raceBars = []; // one peak density per boundary block observed
   if (tracingOk) {
-    const group = new Map(); // "blk:sender" -> { gas, tips, txs }
+    const group = new Map(); // "blk:sender" -> { gas, tips, txs, minIdx }
     for (const l of payLogs) {
       const m = meta.get(l.transactionHash);
       if (!m) continue;
       const k = `${m.blk}:${m.from}`;
-      const g = group.get(k) ?? { gas: 0n, tips: 0n, txs: new Set() };
+      const g = group.get(k) ?? { gas: 0n, tips: 0n, txs: new Set(), minIdx: Infinity };
       if (!g.txs.has(l.transactionHash)) {
         g.txs.add(l.transactionHash);
         g.gas += m.gasUsed;
         g.tips += (m.eff - (bf.get(m.blk.toString()) ?? 0n)) * m.gasUsed;
       }
+      // Best position this group reached, for the falsification check below.
+      g.minIdx = Math.min(g.minIdx, m.idx);
       group.set(k, g);
     }
     // Fold in each bundle's separate payer tx. Without this the bid is measured over the
@@ -437,6 +520,91 @@ async function main() {
         g.tips += (BigInt(rc.effectiveGasPrice) - (bf.get(BigInt(rc.blockNumber).toString()) ?? 0n)) * gas;
       }
     }
+    // Where the block itself FALSIFIES the density model.
+    //
+    // beatBid assumes builders order by density, so "measures below our tip" is reported as
+    // "free to out-rank" (a "-" in the beat columns). Block 25749548 is the counter-example:
+    // a router bundle measuring 95.7 gwei/gas took index 8 while a 296.9 gwei/gas bundle
+    // took index 9 — 3.1x the density, one slot later, same block, same builder. The
+    // operator behind the losing bundle paid 0.1 ETH and had all seven of its audits revert
+    // against targets the router had already cured.
+    //
+    // A "-" priced off a model the block just falsified is worse than no number at all, so
+    // flag any group that landed AHEAD of another group in the same block with strictly
+    // higher density. That is observed contradiction, not assumption, and it drives the
+    // same "?" the top-of-block heuristic below already produces.
+    //
+    // Deliberately NOT keyed on absolute tx index: the old `bestIdx <= 1` test was
+    // calibrated on whole-block position and silently missed this router at index 8 of a
+    // 395-tx block, which was third among game participants and first among audit
+    // competitors. Rank against the rivals actually racing you, not against the block.
+    // Build every racer's bundle from receipts, independently of the rival-payment view
+    // above. Kept separate on purpose: `group` defines the DENSITY we price bids against
+    // and its semantics are settled, so this must not move those numbers — it only decides
+    // whether to trust them.
+    const compHashes = [];
+    for (const [blk, set] of competitorTxs) for (const h of set) compHashes.push([blk, h]);
+    const compRc = new Map();
+    for (let i = 0; i < compHashes.length; i += 60) {
+      const slice = compHashes.slice(i, i + 60);
+      const res = await batch(slice.map(([, h], j) => ({ jsonrpc: "2.0", id: i + j, method: "eth_getTransactionReceipt", params: [h] })));
+      for (const r of res) if (r.result) compRc.set(r.result.transactionHash.toLowerCase(), r.result);
+    }
+    const comp = new Map(); // "blk:sender" -> { gas, tips, cb, minIdx }
+    for (const rc of compRc.values()) {
+      const blk = BigInt(rc.blockNumber).toString();
+      const k = `${blk}:${(rc.from || "").toLowerCase()}`;
+      const c = comp.get(k) ?? { gas: 0n, tips: 0n, cb: 0n, minIdx: Infinity };
+      const gas = BigInt(rc.gasUsed);
+      c.gas += gas;
+      c.tips += (BigInt(rc.effectiveGasPrice) - (bf.get(blk) ?? 0n)) * gas;
+      c.minIdx = Math.min(c.minIdx, Number(BigInt(rc.transactionIndex)));
+      comp.set(k, c);
+    }
+    for (const [k, wei] of cbByBlockSender) { const c = comp.get(k); if (c) c.cb = wei; }
+
+    const compDensity = new Map();
+    const byBlock = new Map(); // blk -> ["blk:sender"], game participants only
+    for (const [k, c] of comp) {
+      if (c.gas === 0n || c.minIdx === Infinity || !gameSenders.has(k)) continue;
+      compDensity.set(k, Number(((c.cb + c.tips) * 1000n) / c.gas) / 1000 / 1e9);
+      const blk = k.slice(0, k.indexOf(":"));
+      (byBlock.get(blk) ?? byBlock.set(blk, []).get(blk)).push(k);
+    }
+    // MARGIN keeps this to real evidence: near-ties are not falsification, only a
+    // materially denser bundle LOSING position is, and 1.5x is well outside the rounding in
+    // these figures. Restricting to game participants does the rest of the work — an
+    // earlier revision compared against every coinbase-paying tx and flagged five easy
+    // rivals (#553 tips 0.1 gwei, sits at index 88, already audited three times) purely
+    // because some unrelated searcher deep in the block out-priced them. A "?" on a target
+    // like that hides a free kill behind a warning, which is worse than the wrong number
+    // it replaced.
+    //
+    // Deliberately NOT also gated on finishing in the top N of the block: that guard turned
+    // out inert on 8 epochs of real data once non-game senders were excluded, and its only
+    // live effect would have been to suppress a genuine winner that placed 4th or later.
+    const MARGIN = 1.5;
+    const contradicted = new Set();
+    for (const [, keys] of byBlock) {
+      if (keys.length < 2) continue;
+      for (const a of keys) {
+        const ca = comp.get(a), da = compDensity.get(a);
+        for (const b of keys) {
+          if (a === b) continue;
+          if (ca.minIdx < comp.get(b).minIdx && compDensity.get(b) > da * MARGIN) { contradicted.add(a); break; }
+        }
+      }
+    }
+
+    // The lead bar, one figure per BOUNDARY block: the strongest bundle anyone brought.
+    // Only offset-0 blocks count — a mid-epoch payment block has no race in it, so its
+    // peak would drag the percentiles down and understate what winning costs. Two
+    // participants minimum, otherwise "strongest" is just "the only one".
+    for (const [blkStr, keys] of byBlock) {
+      if (keys.length < 2 || blockOffset(BigInt(blkStr)) !== 0) continue;
+      raceBars.push(Math.max(...keys.map((k) => compDensity.get(k))));
+    }
+
     for (const l of payLogs) {
       const tok = BigInt(l.topics[1]).toString();
       const m = meta.get(l.transactionHash);
@@ -447,8 +615,12 @@ async function main() {
       const bidWei = cbByBlockSender.get(k) ?? 0n;
       const gweiPerGas = Number(((bidWei + g.tips) * 1000n) / g.gas) / 1000 / 1e9;
       bidDensity[tok] = Math.max(bidDensity[tok] ?? 0, gweiPerGas);
+      if (contradicted.has(k)) densityContradicted[tok] = true;
       if (m.blk >= bidWindowStart) {
         recentDensity[tok] = Math.max(recentDensity[tok] ?? 0, gweiPerGas);
+      }
+      if (blockOffset(m.blk) === 0) {
+        boundaryDensity[tok] = Math.max(boundaryDensity[tok] ?? 0, gweiPerGas);
       }
       if (bidWei > 0n) {
         const w = (bidWindow[tok] ??= { wei: 0n, pays: 0 });
@@ -457,6 +629,17 @@ async function main() {
       }
     }
   }
+
+  /**
+   * The coinbase bid our PLANNED bundle needs to reach `gwei` gwei/gas.
+   *
+   * Our density is bid/gas + tip, so matching a bar costs (bar - tip) * gas. Returns 0 when
+   * the tip alone already clears it — which is a real answer, not a missing one: against a
+   * rival defending below our tip there is nothing to buy. Whether that also WINS is a
+   * separate question, and the reason the lead bar below exists.
+   */
+  const priceBid = (gwei) =>
+    gwei > OUR_TIP_GWEI ? +(((gwei - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4) : 0;
 
   // Score each live, non-emigrated rival.
   const rows = [];
@@ -509,12 +692,16 @@ async function main() {
     // What a coinbase bid would have to cover to out-rank this token's best observed
     // defense. The bar is its DENSITY, not its tip: a bidder's tip can be near zero while
     // the bid puts it hundreds of gwei/gas ahead. Take the stronger of the two signals,
-    // then let our own tip cover what it can. Sized for one payment + one audit + the
-    // payer tx (measured on-chain: 82,875 + 130,409 + 60,000 gas) at the default 20.1 gwei
-    // tip. Rough by nature — it cannot see off-chain builder deals, and a bid observed in
-    // the 2-epoch window may not be repeated.
-    const priceBid = (gwei) =>
-      gwei > OUR_TIP_GWEI ? +(((gwei - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4) : 0;
+    // then let our own tip cover what it can. Sized for the bundle actually planned
+    // (--payments / --audits, default 1+1) using the MEASURED gas of each action, not the
+    // 60,000 gas LIMIT the payer tx is signed with: builders order on gas used, so pricing
+    // against the limit inflated every figure here by ~30,000 gas.
+    //
+    // Rough by nature — it cannot see off-chain builder deals, a bid observed in the
+    // 2-epoch window may not be repeated, and `densityContradicted` above marks the blocks
+    // where the ordering assumption underneath all of this did not hold at all.
+    //
+    // (Defined once above the loop — the lead-bar pricing after it needs the same formula.)
     // Ceiling: the strongest defense seen anywhere in the window. maxTip is the floor
     // here so a tip-only defender is still priced when tracing is unavailable.
     const defenseGwei = Math.max(dd.maxTip, bidDensity[t] ?? 0);
@@ -523,13 +710,21 @@ async function main() {
     // no payment in that span, which is a different statement from "it defends weakly".
     const defenseRecentGwei = recentDensity[t] ?? null;
     const beatBidRecentEth = defenseRecentGwei === null ? null : priceBid(defenseRecentGwei);
-    // The measurement is contradicted by the outcome: it reached the top of the block
-    // while measuring BELOW our own tip, which cannot happen on merit. Something bought
-    // that position where we can't see it — a bid older than the 2-epoch trace window
-    // (the roster's 0.08 ETH bidders read 3.1 gwei here for exactly that reason), or an
-    // off-chain builder deal. Reporting "no bid needed" for these would be a lie, so the
-    // column says unknown instead.
-    const defenseUnexplained = bestIdx !== null && bestIdx <= 1 && beatBidEth === 0;
+    // The measurement is contradicted by the outcome, so "no bid needed" would be a lie and
+    // the column says unknown instead. Two independent ways that happens:
+    //
+    //   1. It reached the TOP OF THE BLOCK while measuring below our own tip, which cannot
+    //      happen on merit. Something bought that position where we can't see it — a bid
+    //      older than the trace window (the roster's 0.08 ETH bidders read 3.1 gwei here for
+    //      exactly that reason), or an off-chain builder deal.
+    //   2. A block was observed placing its bundle AHEAD of a higher-density one. That is
+    //      the density model failing directly, and it is not rare: over 8 epochs the density
+    //      rank matched the actual rank in 27% of cases. Case 1 alone missed the router at
+    //      index 8 of a 395-tx block that beat a 3.1x denser bundle, because index 8 is not
+    //      "top of block" by any absolute threshold — it was simply first among the rivals
+    //      that mattered.
+    const defenseUnexplained =
+      beatBidEth === 0 && ((bestIdx !== null && bestIdx <= 1) || densityContradicted[t] === true);
     const offs = payOff[t] ?? [];
     const payBlkMin = offs.length ? Math.min(...offs) : null; // fastest cure after a boundary
     const payBlkMed = median(offs);                            // typical audit window
@@ -553,6 +748,11 @@ async function main() {
       payBlkMin, payBlkMed, audited: aud,
       beatBidEth, defenseUnexplained,
       beatBidRecentEth, defenseRecentGwei: defenseRecentGwei === null ? null : +defenseRecentGwei.toFixed(1),
+      // Defense measured ONLY on boundary-block payments — what it mounts in the block that
+      // decides an audit, rather than its peak across quiet mid-epoch payments. null = it
+      // was never seen paying in a boundary block in this window.
+      defenseBoundaryGwei: boundaryDensity[t] === undefined ? null : +boundaryDensity[t].toFixed(1),
+      beatBoundaryEth: boundaryDensity[t] === undefined ? null : priceBid(boundaryDensity[t]),
       // The density that beatBidEth is priced against, in gwei/gas — max(tip, bid density).
       defenseGwei: +defenseGwei.toFixed(1),
       doNotTarget, dntReason, dntOwner, uncatchable,
@@ -568,7 +768,64 @@ async function main() {
   }
 
   const hoursToBoundary = Number(nextBoundary - nowSec) / 3600;
-  if (asJson) { console.log(JSON.stringify({ epoch: Number(ce), hoursToNextBoundary: +hoursToBoundary.toFixed(1), epochTaxEth: eth(epochTax), rows }, null, 2)); return; }
+
+  // What it costs to LEAD a boundary block with the planned bundle, rather than to
+  // out-rank one named rival. beat2ep/beatMax answer "can my tip alone beat this rival's
+  // own defense" — a different and much weaker question: in the race we studied, matching
+  // the rival that actually won cost 0.0000 (its density was below our tip) and would have
+  // lost anyway, because the slot went to the strongest bundle in the block, not to the
+  // rival we were chasing. This prices that bar instead.
+  //
+  // Calibration, deliberately stated rather than implied: over 14 observed races the
+  // densest bundle took index 0 only about half the time. p50 is "typical block", p90 is
+  // "most blocks"; neither is a guarantee, and no bid figure can be.
+  const bars = [...raceBars].sort((a, b) => a - b);
+  const pctile = (p) => (bars.length === 0 ? null : bars[Math.min(bars.length - 1, Math.floor((bars.length - 1) * p))]);
+  const leadBar = bars.length === 0 ? null : {
+    blocks: bars.length,
+    p50: +pctile(0.5).toFixed(1), p75: +pctile(0.75).toFixed(1),
+    p90: +pctile(0.9).toFixed(1), max: +pctile(1).toFixed(1),
+  };
+  const leadBidEth = leadBar === null ? null : {
+    p50: priceBid(leadBar.p50), p75: priceBid(leadBar.p75),
+    p90: priceBid(leadBar.p90), max: priceBid(leadBar.max),
+  };
+  if (asJson) {
+    // The beat* figures are only meaningful alongside the bundle they were priced for, so
+    // emit it rather than leaving a consumer to assume the old fixed 1+1 shape.
+    const plan = {
+      payments: PLAN_PAYMENTS, audits: PLAN_AUDITS,
+      tipGwei: OUR_TIP_GWEI, bundleGas: OUR_BUNDLE_GAS,
+    };
+    console.log(JSON.stringify({
+      epoch: Number(ce), hoursToNextBoundary: +hoursToBoundary.toFixed(1),
+      epochTaxEth: eth(epochTax), plan, leadBar, leadBidEth, rows,
+    }, null, 2));
+    return;
+  }
+
+  /**
+   * The bid to LEAD a boundary block, as opposed to out-ranking one named rival.
+   *
+   * Printed in both table modes because it is the figure `coinbaseBidEth` should actually
+   * be set from: beat2ep/beatMax say what it costs to out-price a specific target, and a
+   * rival can win the slot while measuring below your tip (observed: 95.7 gwei/gas took
+   * index 8 against a 296.9 bundle at index 9). Leading the block is the thing that makes
+   * an audit land.
+   */
+  function printLead() {
+    if (leadBar === null || leadBidEth === null) {
+      console.log(`lead = (no boundary races with 2+ participants in this window — widen --epochs)`);
+      return;
+    }
+    console.log(
+      `lead = bid for YOUR bundle to be the densest in a boundary block, over ${leadBar.blocks} observed race(s):\n` +
+        `  typical block (p50) ${leadBar.p50} gwei/gas -> ${leadBidEth.p50} ETH · most blocks (p90) ${leadBar.p90} -> ${leadBidEth.p90} ETH · strongest seen ${leadBar.max} -> ${leadBidEth.max} ETH`,
+    );
+    console.log(
+      `  this is the bar to CLEAR, not a guarantee: across the same races the densest bundle took index 0 about half the time, so treat p90 as buying margin against that noise`,
+    );
+  }
 
   // Skips as clean/caught out of attempted. "3/1 of 4" = crossed delinquent 4 times,
   // got away with 3, was audited during 1. 0 attempts prints as "-".
@@ -672,8 +929,11 @@ async function main() {
     console.log("beh 1 = becomes auditable next boundary · beh 2+ = already auditable · afrd NO = owner can't cover the catch-up · score 0 = uncatchable");
     console.log("clean/caught of N = skips (boundaries crossed 2+ behind) survived / caught by an audit, out of attempted — all-clean = proven-safe cadence, caught often = soft target");
     console.log("beat2ep = bid to out-rank its defense over the LAST 2 EPOCHS (likely cost next boundary) · beatMax = same against its PEAK over the whole window (what it can mount again)");
+    console.log("  '?' = the density model was falsified where this rival races (it out-ran a denser bundle, or tops the block while measuring below our tip) — out-bidding may not be the lever");
     console.log(`  '-' = no bid needed, our ${OUR_TIP_GWEI} gwei tip already out-ranks it · '?' = tops the block anyway, so something unobservable buys that position · '·' = no payment seen in that window`);
-    console.log(`  both price a 1-pay + 1-audit bundle at our ${OUR_TIP_GWEI} gwei tip against DENSITY ((bid + tips)/gas, what builders sort on) — a bidder's tip can be ~0 while its density is hundreds of gwei/gas`);
+    console.log(`  both price YOUR bundle — ${PLAN_PAYMENTS} payment(s) + ${PLAN_AUDITS} audit(s) + payer = ${OUR_BUNDLE_GAS.toLocaleString()} gas @ ${OUR_TIP_GWEI} gwei tip — against DENSITY ((bid + tips)/gas, what builders sort on); a bidder's tip can be ~0 while its density is hundreds of gwei/gas`);
+    console.log(`  change the shape with --payments N --audits M --tip G: the bid buys position for the WHOLE bundle, so carrying more costs proportionally more to reach the same density`);
+    printLead();
     console.log("payBlk = blocks after the epoch boundary they paid (fastest / median) — the audit window; 0 = pays in the boundary block, '-' = no payment seen in window");
     console.log("bid = coinbase bid over the LAST 2 EPOCHS (ETH x bid-backed payments) — buys top-of-block, so a bidder is near-unauditable; shared when one operator co-pays several citizens; '?' = RPC has no tracing");
   }
@@ -682,6 +942,10 @@ async function main() {
     const best = [...rows].filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);
     console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
     console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted · score 0 = uncatchable or under audit");
+    // The beat columns are meaningless without the bundle they were priced for, and this
+    // is the default output — most runs never see the fuller legend under --auditable-next.
+    console.log(`beat2ep/beatMax priced for ${PLAN_PAYMENTS} payment(s) + ${PLAN_AUDITS} audit(s) + payer = ${OUR_BUNDLE_GAS.toLocaleString()} gas @ ${OUR_TIP_GWEI} gwei tip · change with --payments N --audits M --tip G`);
+    printLead();
   }
 }
 main().catch((e) => { console.error("target-scores failed:", e.message); process.exit(1); });
