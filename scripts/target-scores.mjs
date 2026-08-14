@@ -664,6 +664,11 @@ async function main() {
     // Big boys are SCORED like any other rival now. The roster used to be do-not-target and
     // forced score 0; the team attacks them, so suppressing their score would hide the very
     // targets being pushed on. The operator tag is attribution only.
+    const bigBoyOwner = bigBoyOwnerOf.get(t) ?? null;
+    // Retired flag, always false. The evidence-based "can't catch it" veto used to grey rows
+    // that topped the block and had never been audited; BeatMax prices that as a cost instead.
+    // Still emitted so a dashboard holding an older cached scan keeps parsing.
+    const uncatchable = false;
 
     let score = 0;
     if (!under) {
@@ -849,7 +854,7 @@ async function main() {
     .sort((a, b) => a.bigBoyOwner.localeCompare(b.bigBoyOwner) || Number(a.token) - Number(b.token));
   const listedSet = new Set(pool);
   const listed = listedAll.filter((r) => listedSet.has(r));
-  const targetable = pool.filter((r) => r.bigBoyOwner === null);
+  const targetable = pool;
   const skippers = targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
   const others = targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
   const scope = auditableNext
