@@ -15,11 +15,11 @@ vi.mock("./config.js", () => ({
 vi.mock("./activity.js", () => ({ activity: { add: vi.fn() } }));
 
 const { appConfig } = await import("./config.js");
-const { loadAllyTokens, invalidateListCache } = await import("./runtime.js");
+const { loadAllyTokens, loadDoNotTarget, invalidateListCache } = await import("./runtime.js");
 
 /**
  * The curated lists are cached in memory and invalidated on the file's mtime+size, because
- * they sit on the hot path: fetchOffenseCandidates reads the ally list
+ * they sit on the hot path: fetchOffenseCandidates reads the ally and do-not-target lists
  * on every offense sweep (once per block with a WebSocket) and readTargets reads them again
  * on every dashboard poll, each a synchronous readFileSync + JSON.parse.
  *
@@ -93,7 +93,35 @@ describe("list cache: serves repeat reads without re-parsing, but never goes sta
     expect(loadAllyTokens()).toEqual([]);
   });
 
+  it("caches the DERIVED do-not-target shape, not just the parse", () => {
+    fs.writeFileSync(
+      nodePath.join(tmpDir, "do-not-target.json"),
+      JSON.stringify({ owners: { Graveyard: ["4335", "909"], Hedo: ["1575"] } }),
+    );
+    const first = loadDoNotTarget();
+    expect(first.tokenIds).toEqual(["4335", "909", "1575"]);
+    // Same object identity => the normalize + dedupe was memoized, not redone.
+    expect(loadDoNotTarget()).toBe(first);
+  });
 
+  it("de-duplicates a do-not-target id listed under two operators", () => {
+    fs.writeFileSync(
+      nodePath.join(tmpDir, "do-not-target.json"),
+      JSON.stringify({ owners: { A: ["4335", "909"], B: ["4335"] } }),
+    );
+    expect(loadDoNotTarget().tokenIds).toEqual(["4335", "909"]);
+  });
 
+  it("re-derives do-not-target after the file changes", () => {
+    const p = nodePath.join(tmpDir, "do-not-target.json");
+    fs.writeFileSync(p, JSON.stringify({ owners: { A: ["4335"] } }));
+    expect(loadDoNotTarget().tokenIds).toEqual(["4335"]);
+    fs.writeFileSync(p, JSON.stringify({ owners: { A: ["4335"], B: ["711", "796"] } }));
+    expect(loadDoNotTarget().tokenIds).toEqual(["4335", "711", "796"]);
+  });
 
+  it("survives a do-not-target file with no owners key", () => {
+    fs.writeFileSync(nodePath.join(tmpDir, "do-not-target.json"), JSON.stringify({}));
+    expect(loadDoNotTarget()).toEqual({ tokenIds: [], owners: {} });
+  });
 });

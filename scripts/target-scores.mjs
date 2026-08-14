@@ -58,7 +58,7 @@
 //             near-unauditable however strapped it looks. Shared when one operator co-pays
 //             several citizens in a block. "?" = RPC has no trace_block.
 //   score     composite audit-attractiveness (higher = better target). 0 = under audit,
-//             bid-backed top-of-block. NOTE a 0 can also
+//             on the do-not-target roster, or bid-backed top-of-block. NOTE a 0 can also
 //             mean simply "catchable but not weak" (rich, defends hard, never yet
 //             audited) — those stay in the paste lists, ranked last.
 //
@@ -204,6 +204,12 @@ async function main() {
   const allySet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "ally-tokens.json"), "utf8")).map(String));
   const curatedSet = new Set(JSON.parse(fs.readFileSync(path.join(dataDir, "rival-targets.json"), "utf8")).map(String));
   // "Do not target" — big-boy operators we never audit, grouped by who runs them.
+  const dntOwners = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, "do-not-target.json"), "utf8")).owners ?? {}; }
+    catch { return {}; }
+  })();
+  const dntOwnerOf = new Map();
+  for (const [name, ids] of Object.entries(dntOwners)) for (const id of ids) dntOwnerOf.set(String(id), name);
 
   const ce = BigInt(await call(SEL.currentEpoch, 0n).then((x) => x));
   const startTime = BigInt(await rpc("eth_call", [{ to: GAME, data: SEL.startTime }, "latest"]));
@@ -655,18 +661,26 @@ async function main() {
     const dd = defense[t] ?? { maxTip: 0, bestIdx: Infinity, pays: 0 };
     const bestIdx = dd.bestIdx === Infinity ? null : dd.bestIdx;
     const aud = auditedCount[t] ?? 0;
+    // DO NOT TARGET. Two independent reasons, both meaning an audit slot spent here is
+    // wasted: it is on the curated roster of big-boy operators, or the history shows it
+    // reaches top-of-block and nobody has ever audited it. The curated list is the wider
+    // net — several listed tokens land at index 2-15 and HAVE been audited, so evidence
+    // alone would never have flagged them.
+    const dntOwner = dntOwnerOf.get(t) ?? null;
     // The evidence-based "can't catch it" veto (tops the block + never audited + bid-backed)
     // has been RETIRED. It grayed out genuinely reachable rivals: a coinbase bid outranks a
     // tip, but the BeatMax column already prices the exact bid that beats a rival's peak
     // defense — so "bid-backed and topping the block" is a cost to out-bid, not a wall.
     // #6749 is the case in point: flagged uncatchable while BeatMax said 0.0353 ETH beats it.
-    // The curated do-not-target roster has been RETIRED: the big-boy operators are now
-    // attacked as a coordinated team, so no row is excluded on membership. A self-curing
-    // operator still surfaces on the evidence — payBlk 0 and a high defence density — which
-    // is a measurement to weigh, not a standing instruction.
+    // Only the CURATED roster (data/do-not-target.json) now grays a row; everything else stays
+    // a live, scored target, and the operator decides with BeatMax/Beat2ep whether it's worth
+    // the bid. `uncatchable` is kept (always false) only for the shared-type / older-cache shape.
+    const uncatchable = false;
+    const doNotTarget = dntOwner !== null;
+    const dntReason = dntOwner !== null ? "listed" : null;
 
     let score = 0;
-    if (!under) {
+    if (!under && !doNotTarget) {
       if (!affordNext) score += 3;                                  // can't cover next catch-up
       score += Math.max(0, Math.min(1, (10 - runway) / 10)) * 2;    // low runway
       score += Math.max(0, Math.min(1, (30 - dd.maxTip) / 30)) * 1.5; // weak tip
@@ -741,7 +755,7 @@ async function main() {
       beatBoundaryEth: boundaryDensity[t] === undefined ? null : priceBid(boundaryDensity[t]),
       // The density that beatBidEth is priced against, in gwei/gas — max(tip, bid density).
       defenseGwei: +defenseGwei.toFixed(1),
-      uncatchable,
+      doNotTarget, dntReason, dntOwner, uncatchable,
       score: +score.toFixed(2),
       // Coinbase bidding over the last 2 epochs — the "are they bidding right now"
       // signal. null = RPC has no tracing (unknown).
@@ -841,7 +855,15 @@ async function main() {
   // target sections entirely — they are not candidates, so ranking them among candidates
   // only invites a misread. Evidence-flagged rows STAY in place (greyed by a 0 score):
   // that flag is a judgement the data might revise, not a standing instruction.
-  const targetable = pool;
+  // Follows the same --auditable-next filter as the sections above. It was built from
+  // `rows` on the reasoning that the roster is reference material, but that listed paid-up
+  // big boys beside delinquent ones under a filter claiming to show only what is
+  // auditable. The header reports the hidden count instead.
+  const listedAll = rows.filter((r) => r.dntOwner !== null)
+    .sort((a, b) => a.dntOwner.localeCompare(b.dntOwner) || Number(a.token) - Number(b.token));
+  const listedSet = new Set(pool);
+  const listed = listedAll.filter((r) => listedSet.has(r));
+  const targetable = pool.filter((r) => r.dntOwner === null);
   const skippers = targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
   const others = targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
   const scope = auditableNext
@@ -853,13 +875,26 @@ async function main() {
   console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list, ${scope} ===`);
   console.log(header); others.forEach((r) => console.log(fmt(r)));
 
+  // DO NOT TARGET — the curated big-boy roster. Their live state
+  // still matters (a big boy drifting delinquent is worth knowing about), they are just
+  // never offered as candidates. Pinning one by hand in the Strategy targets box still
+  // audits it: the roster keeps them out of auto-discovery, it does not veto the user.
+  if (listed.length > 0) {
+    const hidden = listedAll.length - listed.length;
+    console.log(
+      `\n=== DO NOT TARGET (${listed.length}${hidden > 0 ? ` of ${listedAll.length}` : ""})` +
+        ` — big boys, excluded from the sections above ===`,
+    );
+    console.log("operator     " + header);
+    for (const r of listed) console.log(`${r.dntOwner.padEnd(12)} ` + fmt(r));
+  }
 
   // Rivals this scan saw skipping that the saved list doesn't know about yet. The list is
   // a snapshot — only as current as the last regeneration — so a rival that started
   // skipping recently sits in the wrong section until someone notices. Surface them every
   // run, and let --promote write them in.
   const newlyObserved = rows
-    .filter((r) => r.skipperSource === "observed")
+    .filter((r) => r.skipperSource === "observed" && r.dntOwner === null)
     .sort((a, b) => b.crossings - a.crossings || Number(a.token) - Number(b.token));
   if (newlyObserved.length > 0) {
     console.log(`\n--- newly observed skippers (${newlyObserved.length}) — attempted a skip, not yet on data/rival-skippers.json ---`);
@@ -868,7 +903,7 @@ async function main() {
     }
     if (promote) {
       const merged = [...new Set([...skipperSet, ...newlyObserved.map((r) => r.token)])]
-        .filter((t) => !allySet.has(t))
+        .filter((t) => !dntOwnerOf.has(t) && !allySet.has(t))
         .sort((a, b) => Number(a) - Number(b));
       fs.writeFileSync(path.join(dataDir, "rival-skippers.json"), JSON.stringify(merged, null, 2) + "\n");
       console.log(`  -> promoted ${newlyObserved.length}; data/rival-skippers.json now holds ${merged.length}`);
@@ -883,6 +918,10 @@ async function main() {
   console.log(`\n--- paste (ranked, catchable only) ---`);
   console.log(`skippers    : ${ids(skippers) || "(none)"}`);
   console.log(`non-skippers: ${ids(others) || "(none)"}`);
+  // Big boys as a paste too. Not a target list — it's there so the roster can be dropped
+  // into the targets box deliberately (the roster is advice, and a pin overrides it), or
+  // just copied out to compare against data/do-not-target.json.
+  console.log(`big boys   : ${listed.map((r) => r.token).join(",") || "(none)"}`);
 
   if (auditableNext) {
     const best = pool.filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);

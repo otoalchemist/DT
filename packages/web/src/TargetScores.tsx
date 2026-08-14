@@ -8,10 +8,11 @@ import { api } from "./api.js";
  * cached backend-side, so the table survives a page reload without re-scanning.
  */
 /**
- * Greying is now only the legacy evidence flag from an older cached scan — the curated
- * do-not-target roster it also covered has been retired, so a fresh scan never sets it.
+ * Do Not Target: either the curated big-boy roster or the evidence heuristic (tops the
+ * block, never audited). Falls back to `uncatchable`, the pre-rename field, so rows still
+ * cached by an older backend keep greying correctly instead of silently going live.
  */
-const dnt = (r: TargetScoreRow): boolean => r.uncatchable ?? false;
+const dnt = (r: TargetScoreRow): boolean => r.doNotTarget ?? r.uncatchable ?? false;
 
 /** The bundle the user plans to send, and the tip they'll send it with. */
 interface Plan { payments: number; audits: number; tipGwei: number }
@@ -74,7 +75,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Coinbase bid (ETH) to out-rank this rival in a BOUNDARY BLOCK specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without bidding. — = your tip already out-ranks its boundary defense. · = re-run the scan to populate this.">BeatBnd</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
-            <th style={cell} title="Weak-link score, higher is a better target. 0 = under audit, or not a weak link">Score</th>
+            <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
           </tr>
         </thead>
         <tbody>
@@ -82,6 +83,15 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <tr key={r.token} style={dnt(r) || r.under ? { opacity: 0.45 } : undefined}>
               <td style={{ ...cell, fontFamily: "monospace" }}>
                 #{r.token}
+                {r.dntOwner ? (
+                  <span
+                    className="badge"
+                    style={{ fontSize: 9, marginLeft: 6, fontFamily: "inherit" }}
+                    title={`Do Not Target — run by ${r.dntOwner}. Excluded from auto-discovery; pin it in the Strategy targets box to audit it anyway.`}
+                  >
+                    {r.dntOwner}
+                  </span>
+                ) : null}
               </td>
               <td style={cell}>
                 {r.under
@@ -262,9 +272,20 @@ export function TargetScores({
   const pool = rows
     ? (onlyAuditableNext ? rows.filter((r) => r.behind >= 1 && !r.under) : rows)
     : null;
-  // Every live rival is a candidate now that the do-not-target roster is retired: the
-  // big-boy operators are attacked as a coordinated team, so nothing is held back.
-  const targetable = pool;
+  // Listed do-not-target rivals are pulled out of the two candidate sections entirely —
+  // ranking a non-candidate among candidates only invites a misread. Their own section is
+  // built from the FULL row set, not the auditable-next pool, because it's a reference
+  // roster: a big boy that isn't delinquent today should still be listed.
+  const targetable = pool ? pool.filter((r) => !r.dntOwner) : null;
+  // Follows the same auditable-next filter as the two sections above. It used to be built
+  // from the full row set on the reasoning that the roster is reference material, but that
+  // put paid-up big boys beside delinquent ones under a filter that claims to show only
+  // what is auditable. The header reports how many are hidden instead.
+  const listedAll = rows
+    ? rows.filter((r) => !!r.dntOwner)
+        .sort((a, b) => a.dntOwner!.localeCompare(b.dntOwner!) || Number(a.token) - Number(b.token))
+    : [];
+  const listed = pool ? listedAll.filter((r) => pool.includes(r)) : listedAll;
   const skippers = targetable ? targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score) : [];
   const others = targetable ? targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score) : [];
   // Reachable, not "score > 0": a 0.00 can now mean catchable-but-not-weak (rich, defends
@@ -410,6 +431,21 @@ export function TargetScores({
           </div>
           <ScoreTable rows={others} empty="No non-skippers match." plan={plan} />
 
+          {listed.length > 0 && (
+            <>
+              <div className="spacer" />
+              <div
+                className="muted"
+                style={{ fontSize: 11, marginBottom: 4 }}
+                title="Curated in data/do-not-target.json. Kept out of auto-discovery because these operators cure at the top of the boundary block, so an audit slot spent here is normally wasted. Follows the same auditable filter as the lists above; the count shows how much of the roster is hidden by it."
+              >
+                DO NOT TARGET ({listed.length}
+                {listed.length !== listedAll.length ? ` of ${listedAll.length}` : ""}) · big boys
+                — excluded from the lists above
+              </div>
+              <ScoreTable rows={listed} empty="None listed." plan={plan} />
+            </>
+          )}
 
           <div style={{ marginTop: 10, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
             <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PASTE (ranked, reachable only)</div>
@@ -418,11 +454,22 @@ export function TargetScores({
               <input readOnly value={pasteIds(skippers)} onFocus={(e) => e.currentTarget.select()}
                 style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }} />
             </label>
-            <label className="field" style={{ marginBottom: 0 }}>
+            <label className="field" style={{ marginBottom: listed.length > 0 ? 6 : 0 }}>
               non-skippers
               <input readOnly value={pasteIds(others)} onFocus={(e) => e.currentTarget.select()}
                 style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }} />
             </label>
+            {listed.length > 0 && (
+              <label className="field">
+                big boys
+                {/* Deliberately NOT filtered by score — every big boy scores 0 by
+                    definition, so the catchable-only rule would empty this. It isn't a
+                    ranked target list; it's the roster, ready to paste when you mean to
+                    override it. */}
+                <input readOnly value={listed.map((r) => r.token).join(",")} onFocus={(e) => e.currentTarget.select()}
+                  style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }} />
+              </label>
+            )}
           </div>
 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>

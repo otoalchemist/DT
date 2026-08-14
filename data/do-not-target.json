@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "Citizens we never audit, grouped by the operator who runs them ('big boys').",
+    "These are curated by the user, not derived: an operator with deep reserves and a",
+    "standing builder relationship cures at the top of the boundary block whatever the",
+    "on-chain history suggests, so spending a scarce auditor slot on one is wasted.",
+    "This is the authority — rival-targets.json, rival-skippers.json and the target",
+    "analysis all exclude these, and scripts/rival-skippers.mjs reads it instead of",
+    "keeping its own exclusion list. Allies live separately in ally-tokens.json."
+  ],
+  "owners": {
+    "Graveyard": ["4335", "909", "711", "75", "796", "272", "274"],
+    "ZombieRob": ["3470", "6403", "5757", "2169"],
+    "Hedo": ["1575", "1661", "4650", "4957", "6737", "5761"]
+  }
+}
