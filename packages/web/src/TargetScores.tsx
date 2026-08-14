@@ -277,8 +277,13 @@ export function TargetScores({
   // overwriting a figure someone entered deliberately.
   const [paymentsEdit, setPaymentsEdit] = useState<number | null>(null);
   const [auditsEdit, setAuditsEdit] = useState<number | null>(null);
+  // The tip is editable too, so the panel answers "if I set 200 gwei, what bid do I still
+  // need?" rather than only pricing against whatever is saved in config. null = follow config,
+  // so changing the saved tip keeps flowing through until the field is touched.
+  const [tipEdit, setTipEdit] = useState<number | null>(null);
   const payments = paymentsEdit ?? ownedCitizens;
   const audits = auditsEdit ?? auditCapacity;
+  const tip = tipEdit ?? tipGwei;
   const pollRef = useRef<number | null>(null);
 
   const load = async () => {
@@ -305,7 +310,7 @@ export function TargetScores({
     catch (e) { setErr((e as Error).message); }
   };
 
-  const plan = { payments, audits, tipGwei };
+  const plan = { payments, audits, tipGwei: tip };
   const planGas = bundleGas(payments, audits);
   const running = state?.running ?? false;
   const rows = state?.rows ?? null;
@@ -313,11 +318,11 @@ export function TargetScores({
     ? (onlyAuditableNext ? rows.filter((r) => r.behind >= 1 && !r.under) : rows)
     : null;
   // Big boys also get their OWN reference section below, listing every one of them —
-  // ranking a non-candidate among candidates only invites a misread. Their own section is
-  // built from the FULL row set, not the auditable-next pool, because it's a reference
-  // Big boys are ranked alongside everyone else now — they are real candidates, so filtering
-  // them out of the scored lists would hide the targets the team is actually pushing on.
-  const targetable = pool;
+  // Big boys are kept OUT of the two ranked sections and shown only in their own, below.
+  // They are still full offense targets — this is presentation: mixing a multi-citizen
+  // operator defending at ~100 gwei/gas into a list sorted by weak-link score buries the
+  // genuinely weak rivals that score exists to surface.
+  const targetable = pool ? pool.filter((r) => !r.bigBoyOwner) : null;
   // Follows the same auditable-next filter as the two sections above. It used to be built
   // from the full row set on the reasoning that the roster is reference material, but that
   // put paid-up big boys beside delinquent ones under a filter that claims to show only
@@ -394,13 +399,22 @@ export function TargetScores({
                 onChange={(e) => setAuditsEdit(Math.max(0, Math.min(99, Math.floor(Number(e.target.value) || 0))))}
               />
             </label>
+            <label className="field" style={{ marginBottom: 0, width: 92 }}>
+              Tip (gwei)
+              <input
+                type="number" min={0} max={2000} step={1} value={tip}
+                {...selectOnFocus}
+                title="The priority fee to price against. Defaults to your configured offense tip; change it to ask 'if I bid this tip instead, what bid do I still need?'. Every Beat column and the lead figures below re-price live."
+                onChange={(e) => setTipEdit(Math.max(0, Math.min(2000, Math.floor(Number(e.target.value) || 0))))}
+              />
+            </label>
             <span
               className="muted"
               style={{ fontSize: 11, lineHeight: 1.5 }}
               title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus 30,550 for the CoinbasePayer transaction that carries the bid. That last figure is gas USED, not the 60,000 limit the payer tx is signed with — builders simulate and order on what a bundle actually burns, so pricing against the limit overstated every bundle by ~30,000 gas."
             >
-              bundle {planGas.toLocaleString()} gas @ {tipGwei} gwei tip
-              {paymentsEdit === null && auditsEdit === null ? (
+              bundle {planGas.toLocaleString()} gas @ {tip} gwei tip
+              {paymentsEdit === null && auditsEdit === null && tipEdit === null ? (
                 <> · from your wallet: {ownedCitizens} citizen{ownedCitizens === 1 ? "" : "s"},{" "}
                   {auditCapacity} audit slot{auditCapacity === 1 ? "" : "s"}</>
               ) : (
@@ -408,11 +422,11 @@ export function TargetScores({
                   {" "}·{" "}
                   <button
                     type="button"
-                    onClick={() => { setPaymentsEdit(null); setAuditsEdit(null); }}
+                    onClick={() => { setPaymentsEdit(null); setAuditsEdit(null); setTipEdit(null); }}
                     style={{ padding: "1px 8px", fontSize: 11, borderRadius: 5, border: "1px solid #555" }}
                     title={`Back to what this wallet set actually holds: ${ownedCitizens} citizen(s) and ${auditCapacity} audit slot(s).`}
                   >
-                    reset to my wallet
+                    reset to my wallet + configured tip
                   </button>
                 </>
               )}
@@ -438,11 +452,11 @@ export function TargetScores({
               {([["typical", "p50"], ["most blocks", "p90"], ["strongest seen", "max"]] as const).map(
                 ([label, k]) => {
                   const bar = state.leadBar![k];
-                  const bid = bidToBeat(bar, tipGwei, payments, audits);
+                  const bid = bidToBeat(bar, tip, payments, audits);
                   return (
                     <span
                       key={k}
-                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it: a ${tipFor(bar)} gwei priority fee on its own, or keep your ${tipGwei} gwei tip and add ${bid.toFixed(4)} ETH of bid for ${payments} payment(s) + ${audits} audit(s). The tip route works on every builder; the bid route is flat (so cheaper on a small bundle) but buys nothing on a solo-built block.`}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it: a ${tipFor(bar)} gwei priority fee on its own, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid for ${payments} payment(s) + ${audits} audit(s). The tip route works on every builder; the bid route is flat (so cheaper on a small bundle) but buys nothing on a solo-built block.`}
                     >
                       {label}{" "}
                       <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>
@@ -483,11 +497,11 @@ export function TargetScores({
               <div
                 className="muted"
                 style={{ fontSize: 11, marginBottom: 4 }}
-                title="Curated in data/big-boys.json, grouped by operator. Full targets — they also appear in the ranked lists above; this section is the roster in one place. Follows the same auditable filter as the lists above; the count shows how much of the roster is hidden by it."
+                title="Curated in data/big-boys.json, grouped by operator. These are FULL TARGETS — the engine audits them like any other rival. They are listed here rather than in the ranked sections above because their weak-link scores sit low (deep reserves, hard defense) and would pad the lists that exist to surface weak rivals. Read the Beat boundary column here to price a coordinated push. Follows the same auditable filter as the lists above; the count shows how much of the roster that filter hides."
               >
                 BIG BOYS ({listed.length}
                 {listed.length !== listedAll.length ? ` of ${listedAll.length}` : ""}) ·
-                the roster in one place — also ranked in the lists above
+                full targets — kept separate from the ranked sections above
               </div>
               <ScoreTable rows={listed} empty="None listed." plan={plan} />
             </>
@@ -534,8 +548,9 @@ export function TargetScores({
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
             the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-
-            unauditable) · greyed rows are already under audit. A big-boy tag is attribution
-            only — they are ranked and targeted like any other rival.
+            unauditable) · greyed rows are already under audit. Big boys are full targets but
+            are listed in their own section rather than mixed into the ranked lists, because
+            their scores sit low and would crowd out the weak rivals the score exists to find.
           </p>
         </>
       )}

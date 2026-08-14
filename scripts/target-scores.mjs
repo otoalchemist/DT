@@ -897,13 +897,17 @@ async function main() {
   // that flag is a judgement the data might revise, not a standing instruction.
   // Follows the same --auditable-next filter as the sections above. It was built from
   // `rows` on the reasoning that the roster is reference material, but that listed paid-up
-  // big boys beside delinquent ones under a filter claiming to show only what is
-  // auditable. The header reports the hidden count instead.
+  // Follows the same --auditable-next filter as the sections above, so the header reports
+  // how many of the roster that filter hides.
   const listedAll = rows.filter((r) => r.bigBoyOwner !== null)
     .sort((a, b) => a.bigBoyOwner.localeCompare(b.bigBoyOwner) || Number(a.token) - Number(b.token));
   const listedSet = new Set(pool);
   const listed = listedAll.filter((r) => listedSet.has(r));
-  const targetable = pool;
+  // Big boys are kept OUT of the two ranked sections and shown only in their own, below.
+  // They are still full offense targets — this is presentation: mixing a 6-citizen operator
+  // defending at ~100 gwei/gas into a list sorted by weak-link score buries the genuinely
+  // weak rivals the score exists to surface.
+  const targetable = pool.filter((r) => r.bigBoyOwner === null);
   const skippers = targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score);
   const others = targetable.filter((r) => !r.skipper).sort((a, b) => b.score - a.score);
   const scope = auditableNext
@@ -915,15 +919,15 @@ async function main() {
   console.log(`\n=== OTHER RIVALS (${others.length}) — not on the skippers list, ${scope} ===`);
   console.log(header); others.forEach((r) => console.log(fmt(r)));
 
-  // BIG BOYS — the curated roster in one place. Their live state
-  // still matters (a big boy drifting delinquent is worth knowing about), they are just
-  // never offered as candidates. Pinning one by hand in the Strategy targets box still
-  // audits it: the roster keeps them out of auto-discovery, it does not veto the user.
+  // BIG BOYS — the heavyweight operators, kept in their own section rather than mixed into
+  // the ranked lists above. They ARE targets and the engine will audit them; separating them
+  // is about readability, since their scores sit low (deep reserves, hard defense) and would
+  // otherwise pad the lists that are meant to surface weak links.
   if (listed.length > 0) {
     const hidden = listedAll.length - listed.length;
     console.log(
-      `\n=== DO NOT TARGET (${listed.length}${hidden > 0 ? ` of ${listedAll.length}` : ""})` +
-        ` — the roster; also ranked above ===`,
+      `\n=== BIG BOYS (${listed.length}${hidden > 0 ? ` of ${listedAll.length}` : ""})` +
+        ` — full targets, kept separate from the ranked sections above ===`,
     );
     console.log("operator     " + header);
     for (const r of listed) console.log(`${r.bigBoyOwner.padEnd(12)} ` + fmt(r));
