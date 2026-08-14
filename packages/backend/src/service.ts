@@ -175,6 +175,9 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
 
   const pinned: TargetTokenStatus[] = [];
   const actionable: TargetTokenStatus[] = [];
+  // Live rivals with nothing to act on (fully paid up). Returned so the pane can report a
+  // count and reconcile against the live supply — see the else branch below.
+  const current: TargetTokenStatus[] = [];
   let ownedSkipped = 0;
   let emigratedSkipped = 0;
   let allySkipped = 0;
@@ -208,6 +211,14 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
       dntSkipped++;
     } else if (t.delinquent || t.killable || t.auditDueTimestamp !== "0") {
       actionable.push(t);
+    } else {
+      // Fully paid up: nothing to do about it, but it IS a live citizen. This branch used
+      // to be absent, so a current unlisted rival fell out of every panel and the right-hand
+      // pane could not be reconciled against "citizens left" — e.g. 81 live reading as 74.
+      // Returned so the UI can COUNT them without rendering a row per token (they are not
+      // actionable, so the rows would be noise). Kept out of the outputLimit accounting
+      // below, so they can never displace an actionable rival.
+      current.push(t);
     }
   }
   if (ownedSkipped > 0) {
@@ -236,7 +247,10 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
         `(lowest priority dropped first)`,
     );
   }
-  return [...pinned, ...actionable.slice(0, room)];
+  // Fully-current rivals are appended AFTER the cap so they can never displace an
+  // actionable row. The UI renders no row for them; it counts them (they are identifiable
+  // by !delinquent && !killable && auditDueTimestamp === "0").
+  return [...pinned, ...actionable.slice(0, room), ...current];
 }
 
 /**

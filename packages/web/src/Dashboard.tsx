@@ -366,7 +366,15 @@ export function Dashboard({
 
   const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
   const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
-  const otherTargets = targets.filter((t) => !pinnedSet.has(t.tokenId));
+  // "Others" is the actionable tail only. Fully paid-up rivals now come back from
+  // readTargets too (they used to be dropped, which made the pane impossible to reconcile
+  // against citizens-left), but they get a count rather than a row each: there is nothing
+  // to do about a current rival, so listing them would be noise.
+  const otherAll = targets.filter((t) => !pinnedSet.has(t.tokenId));
+  const otherTargets = otherAll.filter(
+    (t) => t.delinquent || t.killable || t.auditDueTimestamp !== "0",
+  );
+  const currentRivals = otherAll.length - otherTargets.length;
   // How much offense the coming boundary actually offers.
   //
   // A citizen already under audit cannot be audited again, so it never counts however far
@@ -776,6 +784,15 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
           <div className="spacer" />
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
           <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
+          {currentRivals > 0 && (
+            <p
+              className="muted"
+              style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}
+              title="Live rivals that are fully paid up — nothing to audit, so they get no row. Counted here so the panel adds up to the citizens still in the game."
+            >
+              + {currentRivals} rival{currentRivals === 1 ? "" : "s"} fully paid up (no row — nothing to act on)
+            </p>
+          )}
 
           <div className="spacer" />
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>
