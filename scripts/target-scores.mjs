@@ -42,13 +42,23 @@
 //             the same density — set the flags to match what you will actually send.
 //             A shared bid is spread over the whole bundle it bought position for.
 //             "-" = nothing needed, our tip already out-ranks it. "·" = no payment seen
-//             in that window. "?" = the number would be a lie: either it reaches
-//             top-of-block anyway (something unobservable buys that position), or a block
-//             was seen ordering its bundle AHEAD of a denser one, which falsifies the
-//             density model where this rival races. Treat "?" as "price unknown, and
-//             out-bidding may not be the lever" — a bundle router that batches 11 game
-//             actions into ~1.05M gas divides its bid across 12x the gas of a lone
-//             payment, so it reads WEAK here while still taking the slot.
+//             in that window. "?" and "!" both mean no price can be quoted, for two
+//             DIFFERENT reasons — do not read them as the same thing:
+//               "?" it reached top-of-block while measuring below our tip, but nothing
+//                   denser was present to out-rank. Usually "it was the only bidder that
+//                   block". The price is unknown; the model still holds.
+//               "!" a block was seen ordering its bundle AHEAD of a materially denser one.
+//                   That falsifies the density ordering the whole beat column rests on, so
+//                   out-bidding may not be the lever here at all. This is the one to act on.
+//             Measured over 10 boundary blocks (647 sender-groups): density predicts
+//             ordering 87% of the time when computed per contiguous SENDER GROUP, and only
+//             75% per individual tx — the group is the unit builders sort on. Accuracy is
+//             very uneven by builder: BuilderNet 99%, solo geth 100%, Titan 80%,
+//             Builder+ 79%. So a "!" concentrated on Titan/Builder+ blocks is expected
+//             noise; one on BuilderNet is a real anomaly.
+//             A bundle router earns "!" for a structural reason: batching 11 game actions
+//             into ~1.05M gas divides its bid across 12x the gas of a lone payment, so it
+//             reads WEAK here while still taking the slot.
 //             A ceiling, not a forecast: off-chain builder deals are invisible at any
 //             window length, and a peak from 8 epochs ago may never be repeated.
 //   aud       times ANY player successfully audited it in the window (proven catchable)
@@ -730,6 +740,22 @@ async function main() {
     //      that mattered.
     const defenseUnexplained =
       beatBidEth === 0 && ((bestIdx !== null && bestIdx <= 1) || densityContradicted[t] === true);
+    /**
+     * WHY the measurement and the outcome disagree. These collapsed into one "?" before, and
+     * they call for opposite responses:
+     *
+     *  "outranked-denser" — a block was observed placing its bundle AHEAD of a materially
+     *    denser one. The density model failed outright, so out-bidding is NOT reliably the
+     *    lever. This is the one worth acting on. Hedo is the case in point: their router's
+     *    0.1 ETH in-call payment IS traced and their density genuinely measures ~96 gwei/gas,
+     *    below a 130 gwei tip — and they still took position ahead of a 297 gwei/gas bundle.
+     *  "reached-top" — it hit index 0/1 while measuring below our tip, but nothing denser was
+     *    present to out-rank. Often just "it was the only bidder that block", so it is a much
+     *    weaker signal than the first.
+     */
+    const unexplainedReason = !defenseUnexplained
+      ? null
+      : densityContradicted[t] === true ? "outranked-denser" : "reached-top";
     const offs = payOff[t] ?? [];
     const payBlkMin = offs.length ? Math.min(...offs) : null; // fastest cure after a boundary
     const payBlkMed = median(offs);                            // typical audit window
@@ -751,7 +777,7 @@ async function main() {
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
       payBlkMin, payBlkMed, audited: aud,
-      beatBidEth, defenseUnexplained,
+      beatBidEth, defenseUnexplained, unexplainedReason,
       // The two levers, per rival. Same bar, priced both ways: a tip that needs no builder
       // cooperation, or a flat bid that is cheaper in ETH on a small bundle but dead on a
       // solo-built block.
@@ -858,10 +884,17 @@ async function main() {
     (r.crossings === 0 ? "-" : `${r.skipClean}/${r.skipCaught} of ${r.crossings}`).padStart(11);
   const payBlkCol = (r) => (r.payBlkMin === null ? "-" : `${r.payBlkMin}/${r.payBlkMed}`).padStart(9);
   // What a coinbase bid must cover to out-rank this rival's best observed defense.
-  // "-" = nothing needed, our tip already out-ranks it · "?" = tops the block anyway, so
-  // something unobservable buys that position · "·" = no payment seen in that window.
+  // "-" = nothing needed, our tip already out-ranks it · "·" = no payment seen in that
+  // window · "?" / "!" = no price can be quoted, for two DIFFERENT reasons worth telling
+  // apart (see unexplainedReason): "?" it reached top-of-block with nothing denser present
+  // to out-rank, so the price is merely unknown; "!" a block was seen ordering its bundle
+  // AHEAD of a denser one, so the density model itself is falsified here and out-bidding
+  // may not be the lever at all. "!" is the one to act on.
   const beatCol = (r) =>
-    (r.beatBidEth > 0 ? r.beatBidEth.toFixed(4) : r.defenseUnexplained ? "?" : "-").padStart(7);
+    (r.beatBidEth > 0
+      ? r.beatBidEth.toFixed(4)
+      : !r.defenseUnexplained ? "-"
+      : r.unexplainedReason === "outranked-denser" ? "!" : "?").padStart(7);
   const beatNowCol = (r) =>
     (r.beatBidRecentEth === null ? "·" : r.beatBidRecentEth > 0 ? r.beatBidRecentEth.toFixed(4) : "-").padStart(7);
   const bidCol = (r) => (r.bidEth === null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "-").padStart(8);

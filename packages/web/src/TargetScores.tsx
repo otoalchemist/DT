@@ -199,10 +199,20 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                     );
                   }
                   return r.defenseUnexplained ? (
-                    <span
-                      style={{ color: "var(--amber)" }}
-                      title={`Measures only ~${r.defenseGwei} gwei/gas — below your tip — yet the blocks contradict that. Either it reached tx index ${r.bestIdx} anyway, or a block was seen placing its bundle ahead of a materially denser one. A bundle router reads weak here for exactly this reason: batching many actions into one large tx divides its bid across far more gas while still taking the slot. Treat "no bid needed" as unproven, and note that out-bidding may not be the lever.`}
-                    >?</span>
+                    // Two causes, opposite responses — so two glyphs, not one shared "?".
+                    // "outranked-denser" means the density ordering itself failed here and
+                    // no bid can be quoted honestly; "reached-top" only means nothing
+                    // denser happened to be in the block, which is far weaker evidence.
+                    r.unexplainedReason === "outranked-denser" ? (
+                      <span
+                        style={{ color: "var(--amber)" }}
+                        title={`Density model falsified here. It measures only ~${r.defenseGwei} gwei/gas — below your ${plan.tipGwei} gwei tip — yet a block was seen placing its bundle AHEAD of a materially denser one. Out-bidding may not be the lever against this rival at all, so treat any bid figure as unproven. A bundle router reads weak here for exactly this reason: batching many actions into one large tx divides its bid across far more gas while still taking the slot. Note density predicts ordering ~99% of the time on BuilderNet but only ~80% on Titan/Builder+, so where this rival races matters.`}
+                      >!</span>
+                    ) : (
+                      <span
+                        title={`Price unknown, model intact. It measures only ~${r.defenseGwei} gwei/gas — below your ${plan.tipGwei} gwei tip — but still reached tx index ${r.bestIdx}. Nothing denser was present to out-rank, so this is consistent with it simply being the only bidder that block rather than with it out-ranking you. Weaker signal than "!": no bid is quoted because none was tested, not because bidding fails.`}
+                      >?</span>
+                    )
                   ) : (
                     <span className="muted" title={`Defends at ~${r.defenseGwei} gwei/gas — your ${plan.tipGwei} gwei tip already out-ranks that, so no bid is needed.`}>—</span>
                   );
@@ -541,7 +551,14 @@ export function TargetScores({
             ignores coinbase transfers outright, so a bid buys nothing there. The bid is flat,
             so it is cheaper in ETH on a small bundle while the tip is charged per transaction.
             <b> Beat boundary is the one to read for a boundary race</b>: it measures defense
-            only in blocks that actually decided an audit. Beat 2ep vs Beat max shows whether
+            only in blocks that actually decided an audit. In a Beat cell, <b>!</b> and
+            <b> ?</b> both mean no price can be quoted, but for opposite reasons: <b>!</b> = a
+            block was seen ordering that rival's bundle <i>ahead of a denser one</i>, so
+            out-bidding may not be the lever at all; <b>?</b> = it reached top-of-block with
+            nothing denser present to out-rank, so the price is merely untested. Density
+            predicts ordering ~87% of the time overall, but ~99% on BuilderNet versus ~80% on
+            Titan and Builder+, so a <b>!</b> says as much about where a rival races as about
+            the rival. Beat 2ep vs Beat max shows whether
             a defender is steady or escalating · Beh 1 = auditable next boundary · Skip =
             skips survived / skips that drew an audit, out of attempted (a skip = a boundary
             entered 2+ behind) ·

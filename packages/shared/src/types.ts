@@ -188,6 +188,20 @@ export interface TargetScoreRow {
    */
   defenseUnexplained?: boolean;
   /**
+   * WHICH of those two observations set it — they call for opposite responses, so the UI
+   * must not collapse them into one glyph.
+   *
+   *  "outranked-denser" — a block ordered its bundle ahead of a materially denser one, so
+   *    the density model is falsified where this rival races and out-bidding is NOT
+   *    reliably the lever. Actionable.
+   *  "reached-top" — it hit index 0/1 while measuring below our tip, but nothing denser was
+   *    present to out-rank. Often just "it was the only bidder that block", so this is a
+   *    much weaker signal: the price is unknown rather than the model being wrong.
+   *
+   * undefined on rows cached before this field existed, or when nothing is unexplained.
+   */
+  unexplainedReason?: "outranked-denser" | "reached-top" | null;
+  /**
    * Which section the scan put it in. "observed" = it attempted a skip during the window
    * but is not yet in data/rival-skippers.json, so the saved list is behind the data.
    */
