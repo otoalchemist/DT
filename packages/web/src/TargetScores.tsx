@@ -72,6 +72,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments) — the 'are they bidding right now' signal, deliberately narrower than the window BeatBid is priced against. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
             <th style={cell} title="Coinbase bid (ETH) to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to BeatMax: equal means a steady defender and this number is reliable; a gap means it escalates. — = nothing needed, your tip already out-ranks it. · = it made no payment in the last 2 epochs. Priced for the bundle set above.">Beat2ep</th>
             <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for the bundle you set above, at your configured offense tip. Peak, not recent: what you must clear is the strongest defense it has actually mounted. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A ceiling, not a forecast — off-chain builder deals stay invisible. — = peak defense already at or below your tip. Both columns scale with bundle gas: a bid buys position for everything you carry, so adding uncontested payments raises what the contested audits cost.">BeatMax</th>
+            <th style={cell} title="Coinbase bid (ETH) to out-rank this rival in a BOUNDARY BLOCK specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without bidding. — = your tip already out-ranks its boundary defense. · = re-run the scan to populate this.">BeatBnd</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
@@ -162,10 +163,37 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                   return r.defenseUnexplained ? (
                     <span
                       style={{ color: "var(--amber)" }}
-                      title={`Measures only ~${r.defenseGwei} gwei/gas, below your tip — yet it reaches tx index ${r.bestIdx}. Something is buying that position where we cannot see it: a bid older than the 2-epoch trace window, or an off-chain builder deal. Treat "no bid needed" as unproven.`}
+                      title={`Measures only ~${r.defenseGwei} gwei/gas — below your tip — yet the blocks contradict that. Either it reached tx index ${r.bestIdx} anyway, or a block was seen placing its bundle ahead of a materially denser one. A bundle router reads weak here for exactly this reason: batching many actions into one large tx divides its bid across far more gas while still taking the slot. Treat "no bid needed" as unproven, and note that out-bidding may not be the lever.`}
                     >?</span>
                   ) : (
                     <span className="muted" title={`Defends at ~${r.defenseGwei} gwei/gas — your ${plan.tipGwei} gwei tip already out-ranks that, so no bid is needed.`}>—</span>
+                  );
+                })()}
+              </td>
+              <td style={cell}>
+                {(() => {
+                  // undefined = row cached before this field existed; null = measured, and
+                  // it never paid in a boundary block at all. Those are opposite meanings,
+                  // so they must not collapse into one placeholder.
+                  if (r.defenseBoundaryGwei === undefined) {
+                    return <span className="muted" title="Re-run Analyze targets to measure boundary-block defense">·</span>;
+                  }
+                  if (r.defenseBoundaryGwei === null) {
+                    return (
+                      <span
+                        className="badge"
+                        style={{ fontSize: 9, color: "var(--green)", borderColor: "var(--green)" }}
+                        title={`Never seen paying in a boundary block${r.payBlkMin === null ? "" : ` — earliest was ${r.payBlkMin} blocks in`}. It stays auditable until the owner notices, so you can take it mid-epoch without winning a race and without bidding anything.`}
+                      >free</span>
+                    );
+                  }
+                  const bid = beatFor(r.defenseBoundaryGwei, plan);
+                  return bid !== null && bid > 0 ? (
+                    <span title={`Defends at ~${r.defenseBoundaryGwei} gwei/gas in boundary blocks. Priced for ${plan.payments} payment(s) + ${plan.audits} audit(s) at a ${plan.tipGwei} gwei tip.`}>
+                      {bid.toFixed(4)}
+                    </span>
+                  ) : (
+                    <span className="muted" title={`Defends at ~${r.defenseBoundaryGwei} gwei/gas in boundary blocks — your ${plan.tipGwei} gwei tip already out-ranks that.`}>—</span>
                   );
                 })()}
               </td>
@@ -328,7 +356,7 @@ export function TargetScores({
             <span
               className="muted"
               style={{ fontSize: 11, lineHeight: 1.5 }}
-              title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus a fixed 60,000 for the CoinbasePayer transaction that carries the bid."
+              title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus 30,550 for the CoinbasePayer transaction that carries the bid. That last figure is gas USED, not the 60,000 limit the payer tx is signed with — builders simulate and order on what a bundle actually burns, so pricing against the limit overstated every bundle by ~30,000 gas."
             >
               bundle {planGas.toLocaleString()} gas @ {tipGwei} gwei tip
               {paymentsEdit === null && auditsEdit === null ? (
@@ -348,10 +376,49 @@ export function TargetScores({
                 </>
               )}
               <br />
-              Beat2ep / BeatMax below are priced for this bundle — a bid buys position for
-              all of it, so both scale with what you carry.
+              Beat2ep / BeatMax / BeatBnd below are priced for this bundle — a bid buys
+              position for all of it, so they scale with what you carry.
             </span>
           </div>
+
+          {/*
+            The bar to LEAD a boundary block, as distinct from out-ranking any one rival.
+            Kept next to the bundle controls because it re-prices with them, and stated with
+            its calibration: the densest bundle took index 0 only about half the time, so a
+            figure presented as "the winning bid" would repeat the mistake this whole panel
+            exists to correct.
+          */}
+          {state?.leadBar ? (
+            <div
+              className="row wrap"
+              style={{ gap: 8, alignItems: "baseline", marginBottom: 10, fontSize: 11 }}
+            >
+              <span className="muted">Bid to LEAD a boundary block:</span>
+              {([["typical", "p50"], ["most blocks", "p90"], ["strongest seen", "max"]] as const).map(
+                ([label, k]) => {
+                  const bar = state.leadBar![k];
+                  const bid = bidToBeat(bar, tipGwei, payments, audits);
+                  return (
+                    <span
+                      key={k}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Matching it with ${payments} payment(s) + ${audits} audit(s) at a ${tipGwei} gwei tip costs ${bid.toFixed(4)} ETH.`}
+                    >
+                      {label}{" "}
+                      <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>
+                        {bid > 0 ? `${bid.toFixed(4)} ETH` : "your tip already leads"}
+                      </strong>
+                    </span>
+                  );
+                },
+              )}
+              <span
+                className="muted"
+                title="Leading on density is the bar to clear, not a guarantee of the slot: across the same races the densest bundle took index 0 only about half the time. Treat the p90 figure as buying margin against that, and note that a rival can win while measuring below your tip — the ? markers below are where that was actually observed."
+              >
+                · a bar to clear, not a guaranteed slot ({state.leadBar.blocks} races)
+              </span>
+            </div>
+          ) : null}
 
           <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
             RIVAL SKIPPERS ({skippers.length})

@@ -3,7 +3,7 @@ import path from "node:path";
 import { appConfig } from "./config.js";
 import { runtime } from "./runtime.js";
 import { logger } from "./logger.js";
-import type { TargetScoreRow, TargetScoresState } from "@dat-bot/shared";
+import type { LeadBar, TargetScoreRow, TargetScoresState } from "@dat-bot/shared";
 
 /**
  * On-demand rival scoring for the dashboard, driven by scripts/target-scores.mjs.
@@ -26,6 +26,7 @@ let hoursToNextBoundary: number | null = null;
 let epochTaxEth: number | null = null;
 let rows: TargetScoreRow[] | null = null;
 let error: string | null = null;
+let leadBar: LeadBar | null = null;
 
 /** Scripts live next to data/ at the repo root, wherever DATA_DIR points. */
 function scriptPath(): string {
@@ -42,6 +43,7 @@ export function getTargetScores(): TargetScoresState {
     epochTaxEth,
     rows,
     error,
+    leadBar,
     // Stale once a new epoch has begun since the scan: every rival's "behind" count
     // shifted, so the ranking is describing the previous epoch.
     stale: computedAtEpoch !== null && cur !== null && cur > computedAtEpoch,
@@ -84,6 +86,11 @@ export function startTargetScores(): TargetScoresState {
     try {
       const parsed = JSON.parse(out);
       rows = parsed.rows as TargetScoreRow[];
+      // The script also emits leadBidEth, but priced for ITS bundle — we spawn it with a
+      // bare --json, so that is always the default 1 payment + 1 audit. The bar in gwei/gas
+      // is the shape-independent figure; the dashboard prices it for the bundle the
+      // operator has set, exactly as it already does for beatBid*.
+      leadBar = (parsed.leadBar as LeadBar | null | undefined) ?? null;
       computedAtEpoch = parsed.epoch as number;
       hoursToNextBoundary = parsed.hoursToNextBoundary as number;
       epochTaxEth = parsed.epochTaxEth as number;

@@ -164,11 +164,27 @@ export interface TargetScoreRow {
   beatBidRecentEth?: number | null;
   defenseRecentGwei?: number | null;
   /**
-   * True when beatBidEth is 0 but the rival still reached tx index <= 1 — it topped the
-   * block while measuring below our own tip, which cannot happen on merit. Something is
-   * buying that position outside what we can observe (a bid older than the 2-epoch trace
-   * window, or an off-chain builder deal), so "no bid needed" would be wrong and the UI
-   * shows unknown instead.
+   * Defense measured on BOUNDARY-BLOCK payments only (offset 0), rather than peaking over
+   * every payment in the window. A payment made 1,300 blocks into an epoch is not a race —
+   * nobody is contesting position there — so a high tip on one says nothing about what the
+   * rival will mount in the block that actually decides an audit.
+   *
+   * null is the informative case: it was never seen paying in a boundary block at all, so
+   * it stays auditable for as long as it takes them to notice. Those are catchable without
+   * winning any race, at any bid. (undefined instead means the row predates this field.)
+   */
+  defenseBoundaryGwei?: number | null;
+  /**
+   * True when beatBidEth is 0 — our tip alone out-ranks its measured defense — but the
+   * blocks say otherwise, so "no bid needed" would be a lie and the UI shows unknown.
+   * Either of two observations sets it:
+   *  - it reached tx index <= 1 while measuring below our tip, which cannot happen on
+   *    merit, so something outside what we can see bought that position (a bid older than
+   *    the trace window, or an off-chain builder deal); or
+   *  - a block was observed placing its bundle AHEAD of a materially denser one, which
+   *    falsifies the density ordering the whole beat calculation rests on. This is how a
+   *    bundle router that batches many actions into one large tx reads as a weak defender
+   *    while still taking the slot: its bid is divided across far more gas.
    */
   defenseUnexplained?: boolean;
   /**
@@ -197,6 +213,27 @@ export interface TargetScoreRow {
   score: number;
 }
 
+/**
+ * How strong the STRONGEST bundle in a boundary block has been, in gwei/gas.
+ *
+ * Out-ranking one named rival (beatBid*) and winning the slot are different questions, and
+ * conflating them is expensive: in the race that motivated this, matching the rival that
+ * actually won cost nothing at all — its density sat below our own tip — and would still
+ * have lost, because the slot went to the densest bundle present rather than to the rival
+ * we were chasing. These percentiles are that bar.
+ *
+ * Deliberately raw gwei/gas, not ETH: the bid depends on how much gas you carry, so the
+ * dashboard prices it for the bundle the operator has actually set.
+ */
+export interface LeadBar {
+  /** Boundary blocks with 2+ participants observed in the window. */
+  blocks: number;
+  p50: number;
+  p75: number;
+  p90: number;
+  max: number;
+}
+
 /** State of the on-demand rival scan behind the dashboard's "Analyze targets" button. */
 export interface TargetScoresState {
   running: boolean;
@@ -209,6 +246,8 @@ export interface TargetScoresState {
   error: string | null;
   /** True once the epoch rolled since the scan — every "behind" count has shifted. */
   stale: boolean;
+  /** null when the scan predates this, or saw no boundary race it could measure. */
+  leadBar?: LeadBar | null;
 }
 
 export type ActivityKind =
