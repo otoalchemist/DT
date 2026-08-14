@@ -243,16 +243,16 @@ describe("fetchOffenseCandidates: pinned targets bypass the enumeration cap", ()
   });
 });
 
-// The "do not target" roster (data/do-not-target.json) is ADVICE, not a prohibition — the
-// opposite of the ally list. It keeps big-boy operators out of auto-discovery, where an
-// audit slot would be wasted on a target that cures at index 0, but an explicit pin in the
-// Strategy targets box has to override it: deciding a big boy is worth attacking today is
-// the user's call, and the roster can't make it. Getting this backwards would silently
-// swallow a deliberate order.
-describe("fetchOffenseCandidates: do-not-target is advice, pins override it", () => {
+// The big-boy roster (data/big-boys.json) is ATTRIBUTION, not a filter. It used to be
+// do-not-target and kept those operators out of auto-discovery; the team attacks them in a
+// coordinated push now, so the engine must treat them as ordinary candidates. The ally list
+// is the ONE hard block left, and a pin cannot override it — attacking a teammate is never an
+// intended order, so a stale pin must not be able to authorise one.
+describe("fetchOffenseCandidates: big boys are targets, allies never are", () => {
   const RIVAL = "0x00000000000000000000000000000000000000dd" as `0x${string}`;
-  const LISTED = "4335";   // Graveyard
-  const UNLISTED = "1612";
+  const BIGBOY = "4335";  // Graveyard, on the big-boy roster
+  const PLAIN = "1612";   // on no roster
+  const ALLY = "84";
   let tmpDir: string;
   let priorDataDir: string;
 
@@ -261,11 +261,12 @@ describe("fetchOffenseCandidates: do-not-target is advice, pins override it", ()
     const fs = await import("node:fs");
     const os = await import("node:os");
     const nodePath = await import("node:path");
-    tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "dat-dnt-"));
+    tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "dat-bigboys-"));
     fs.writeFileSync(
-      nodePath.join(tmpDir, "do-not-target.json"),
-      JSON.stringify({ owners: { Graveyard: [LISTED, "909"] } }),
+      nodePath.join(tmpDir, "big-boys.json"),
+      JSON.stringify({ owners: { Graveyard: [BIGBOY, "909"] } }),
     );
+    fs.writeFileSync(nodePath.join(tmpDir, "ally-tokens.json"), JSON.stringify([ALLY]));
     priorDataDir = (appConfig as { dataDir: string }).dataDir;
     (appConfig as { dataDir: string }).dataDir = tmpDir;
 
@@ -286,34 +287,29 @@ describe("fetchOffenseCandidates: do-not-target is advice, pins override it", ()
     vi.mocked(fetchCandidateTokenIds).mockResolvedValue([]);
   });
 
-  it("drops a listed rival that only turns up through auto-discovery", async () => {
-    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([BigInt(LISTED), BigInt(UNLISTED)]);
+  it("KEEPS a big boy found through auto-discovery — the roster no longer filters", async () => {
+    // This asserted the opposite before the policy change: the roster used to drop it.
+    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([BigInt(BIGBOY), BigInt(PLAIN)]);
     const out = await fetchOffenseCandidates();
-    expect(out.map((t) => t.id.toString())).toEqual([UNLISTED]);
+    expect(out.map((t) => t.id.toString()).sort()).toEqual([BIGBOY, PLAIN].sort());
   });
 
-  it("KEEPS a listed rival that the user pinned by hand", async () => {
-    runtime.strategy.offenseTargetTokenIds = [LISTED];
+  it("keeps a big boy the user pinned by hand", async () => {
+    runtime.strategy.offenseTargetTokenIds = [BIGBOY];
     const out = await fetchOffenseCandidates();
-    // The whole point: an explicit pin still gets audited.
-    expect(out.map((t) => t.id.toString())).toEqual([LISTED]);
-  });
-
-  it("keeps pinned listed rivals alongside unlisted ones", async () => {
-    runtime.strategy.offenseTargetTokenIds = [LISTED, UNLISTED];
-    const out = await fetchOffenseCandidates();
-    expect(out.map((t) => t.id.toString()).sort()).toEqual([UNLISTED, LISTED].sort());
+    expect(out.map((t) => t.id.toString())).toEqual([BIGBOY]);
   });
 
   it("still drops an ALLY even when pinned — that block is absolute", async () => {
-    // Contrast with the roster: attacking a teammate is never an intended instruction, so
-    // a pin must not be able to authorise it.
-    const fs = await import("node:fs");
-    const nodePath = await import("node:path");
-    fs.writeFileSync(nodePath.join(tmpDir, "ally-tokens.json"), JSON.stringify([UNLISTED]));
-    runtime.strategy.offenseTargetTokenIds = [UNLISTED, LISTED];
+    runtime.strategy.offenseTargetTokenIds = [ALLY, BIGBOY];
     const out = await fetchOffenseCandidates();
-    expect(out.map((t) => t.id.toString())).toEqual([LISTED]);
+    expect(out.map((t) => t.id.toString())).toEqual([BIGBOY]);
+  });
+
+  it("drops an ally found through auto-discovery too", async () => {
+    vi.mocked(fetchCandidateTokenIds).mockResolvedValue([BigInt(ALLY), BigInt(PLAIN)]);
+    const out = await fetchOffenseCandidates();
+    expect(out.map((t) => t.id.toString())).toEqual([PLAIN]);
   });
 });
 

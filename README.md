@@ -223,7 +223,7 @@ as the game is played — far more often than the code does:
 | `data/rival-targets.json` | The curated rival roster (the "reset to default" list). |
 | `data/rival-skippers.json` | Rivals that pay on a ~2-epoch cadence, so they're auditable at every boundary. Seeds the offense targets. |
 | `data/ally-tokens.json` | Teammates. **Never** audited or killed. |
-| `data/do-not-target.json` | Big-boy operators that cure at the top of the boundary block, so an audit slot spent there is wasted. |
+| `data/big-boys.json` | The heavyweight operators, grouped by who runs them. **Full targets** — the tag is attribution, and they get their own dashboard section so they aren't listed twice. |
 
 **At every startup the bot fetches these from `master` and refreshes its local
 copies**, so a roster change reaches everyone on their next restart — no new

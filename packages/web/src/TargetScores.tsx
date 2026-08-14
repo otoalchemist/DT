@@ -8,11 +8,11 @@ import { api } from "./api.js";
  * cached backend-side, so the table survives a page reload without re-scanning.
  */
 /**
- * Do Not Target: either the curated big-boy roster or the evidence heuristic (tops the
- * block, never audited). Falls back to `uncatchable`, the pre-rename field, so rows still
- * cached by an older backend keep greying correctly instead of silently going live.
+ * Rows to dim. Big boys are NOT dimmed — they used to be, when the roster meant "do not
+ * target", and dimming them now would misreport a strategy that attacks them. Only
+ * `uncatchable` survives, the legacy flag from a scan cached by an older backend.
  */
-const dnt = (r: TargetScoreRow): boolean => r.doNotTarget ?? r.uncatchable ?? false;
+const dimmed = (r: TargetScoreRow): boolean => r.uncatchable ?? false;
 
 /** The bundle the user plans to send, and the tip they'll send it with. */
 interface Plan { payments: number; audits: number; tipGwei: number }
@@ -75,21 +75,21 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Coinbase bid (ETH) to out-rank this rival in a BOUNDARY BLOCK specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without bidding. — = your tip already out-ranks its boundary defense. · = re-run the scan to populate this.">BeatBnd</th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
-            <th style={cell} title="Weak-link score, higher is a better target. 0 = do-not-target or under audit">Score</th>
+            <th style={cell} title="Weak-link score, higher is a better target. 0 = under audit, or not a weak link">Score</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={r.token} style={dnt(r) || r.under ? { opacity: 0.45 } : undefined}>
+            <tr key={r.token} style={dimmed(r) || r.under ? { opacity: 0.45 } : undefined}>
               <td style={{ ...cell, fontFamily: "monospace" }}>
                 #{r.token}
-                {r.dntOwner ? (
+                {r.bigBoyOwner ? (
                   <span
                     className="badge"
                     style={{ fontSize: 9, marginLeft: 6, fontFamily: "inherit" }}
-                    title={`Do Not Target — run by ${r.dntOwner}. Excluded from auto-discovery; pin it in the Strategy targets box to audit it anyway.`}
+                    title={`Big boy — run by ${r.bigBoyOwner}. A full target like any other rival; the tag is attribution.`}
                   >
-                    {r.dntOwner}
+                    {r.bigBoyOwner}
                   </span>
                 ) : null}
               </td>
@@ -272,18 +272,19 @@ export function TargetScores({
   const pool = rows
     ? (onlyAuditableNext ? rows.filter((r) => r.behind >= 1 && !r.under) : rows)
     : null;
-  // Listed do-not-target rivals are pulled out of the two candidate sections entirely —
+  // Big boys also get their OWN reference section below, listing every one of them —
   // ranking a non-candidate among candidates only invites a misread. Their own section is
   // built from the FULL row set, not the auditable-next pool, because it's a reference
-  // roster: a big boy that isn't delinquent today should still be listed.
-  const targetable = pool ? pool.filter((r) => !r.dntOwner) : null;
+  // Big boys are ranked alongside everyone else now — they are real candidates, so filtering
+  // them out of the scored lists would hide the targets the team is actually pushing on.
+  const targetable = pool;
   // Follows the same auditable-next filter as the two sections above. It used to be built
   // from the full row set on the reasoning that the roster is reference material, but that
   // put paid-up big boys beside delinquent ones under a filter that claims to show only
   // what is auditable. The header reports how many are hidden instead.
   const listedAll = rows
-    ? rows.filter((r) => !!r.dntOwner)
-        .sort((a, b) => a.dntOwner!.localeCompare(b.dntOwner!) || Number(a.token) - Number(b.token))
+    ? rows.filter((r) => !!r.bigBoyOwner)
+        .sort((a, b) => a.bigBoyOwner!.localeCompare(b.bigBoyOwner!) || Number(a.token) - Number(b.token))
     : [];
   const listed = pool ? listedAll.filter((r) => pool.includes(r)) : listedAll;
   const skippers = targetable ? targetable.filter((r) => r.skipper).sort((a, b) => b.score - a.score) : [];
@@ -291,7 +292,7 @@ export function TargetScores({
   // Reachable, not "score > 0": a 0.00 can now mean catchable-but-not-weak (rich, defends
   // hard, never yet audited), which belongs at the bottom of the list rather than off it.
   const pasteIds = (list: TargetScoreRow[]) =>
-    list.filter((r) => !r.under && !dnt(r)).map((r) => r.token).join(",");
+    list.filter((r) => !r.under && !dimmed(r)).map((r) => r.token).join(",");
 
   return (
     <div className="panel">
@@ -437,11 +438,11 @@ export function TargetScores({
               <div
                 className="muted"
                 style={{ fontSize: 11, marginBottom: 4 }}
-                title="Curated in data/do-not-target.json. Kept out of auto-discovery because these operators cure at the top of the boundary block, so an audit slot spent here is normally wasted. Follows the same auditable filter as the lists above; the count shows how much of the roster is hidden by it."
+                title="Curated in data/big-boys.json, grouped by operator. Full targets — they also appear in the ranked lists above; this section is the roster in one place. Follows the same auditable filter as the lists above; the count shows how much of the roster is hidden by it."
               >
-                DO NOT TARGET ({listed.length}
-                {listed.length !== listedAll.length ? ` of ${listedAll.length}` : ""}) · big boys
-                — excluded from the lists above
+                BIG BOYS ({listed.length}
+                {listed.length !== listedAll.length ? ` of ${listedAll.length}` : ""}) ·
+                the roster in one place — also ranked in the lists above
               </div>
               <ScoreTable rows={listed} empty="None listed." plan={plan} />
             </>
@@ -479,8 +480,8 @@ export function TargetScores({
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
             the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-
-            unauditable) · greyed rows are Do Not Target or already under audit. DNT is
-            advice, not a veto: pin one in the Strategy targets box and it still gets audited.
+            unauditable) · greyed rows are already under audit. A big-boy tag is attribution
+            only — they are ranked and targeted like any other rival.
           </p>
         </>
       )}

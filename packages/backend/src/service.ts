@@ -4,10 +4,10 @@ import {
   EMIGRATION_CONTRACT_ADDRESS,
   type OwnedTokenStatus,
   type TargetTokenStatus,
-  type DoNotTargetStatus,
+  type BigBoyStatus,
   type EmigratedTokenStatus,
 } from "@dat-bot/shared";
-import { runtime, loadAllyTokens, loadDoNotTarget } from "./runtime.js";
+import { runtime, loadAllyTokens, loadBigBoys } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { fetchEmigrationRoster } from "./emigration.js";
@@ -126,10 +126,10 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   const pinnedSet = new Set(runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x).toString()));
   // Normalised the same way pins are, so "0084" and "84" both match (see excludedTokenSet).
   const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
-  // Big boys have their own panel section (readDoNotTarget), so listing them here too
-  // showed the same citizens twice — and "Others" reads as a shortlist of things to
-  // consider attacking, which is the opposite of what the roster means.
-  const dntSet = new Set(loadDoNotTarget().tokenIds.map((x) => BigInt(x).toString()));
+  // Big boys get their OWN panel section (readBigBoys), so they are routed there instead of
+  // into "Others" — listing them twice was the original reason for this split and still is.
+  // They are full offense candidates now; this is presentation only.
+  const bigBoySet = new Set(loadBigBoys().tokenIds.map((x) => BigInt(x).toString()));
 
   // The cached live set already contains EVERY live token (Alchemy owner index), so a
   // live pinned rival is included by definition — no separate pin liveness check needed.
@@ -181,7 +181,7 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   let ownedSkipped = 0;
   let emigratedSkipped = 0;
   let allySkipped = 0;
-  let dntSkipped = 0;
+  let bigBoySkipped = 0;
   for (const t of allStatuses) {
     if (isOurs(t)) {
       ownedSkipped++;
@@ -203,12 +203,11 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
       continue;
     }
     if (pinnedSet.has(t.tokenId)) {
-      // Pin checked BEFORE the roster: the do-not-target list is advice, and an explicit
-      // pin overrides it (the engine will audit a pinned big boy), so a pinned one still
-      // belongs under "My rivals" rather than being filtered away.
+      // Pin checked BEFORE the big-boy roster, so a pinned big boy shows under "My rivals"
+      // (what the bot will actually go after) rather than in the roster section.
       pinned.push(t);
-    } else if (dntSet.has(t.tokenId)) {
-      dntSkipped++;
+    } else if (bigBoySet.has(t.tokenId)) {
+      bigBoySkipped++;
     } else if (t.delinquent || t.killable || t.auditDueTimestamp !== "0") {
       actionable.push(t);
     } else {
@@ -224,9 +223,9 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   if (ownedSkipped > 0) {
     logger.debug(`readTargets: excluded ${ownedSkipped} token(s) we own from the rival list`);
   }
-  if (dntSkipped > 0) {
+  if (bigBoySkipped > 0) {
     logger.debug(
-      `readTargets: ${dntSkipped} do-not-target citizen(s) routed to their own section rather than Others`,
+      `readTargets: ${bigBoySkipped} big-boy citizen(s) routed to their own section rather than Others`,
     );
   }
   if (emigratedSkipped > 0) {
@@ -275,13 +274,13 @@ export async function readAllies(): Promise<TargetTokenStatus[]> {
 }
 
 /**
- * The "do not target" roster (data/do-not-target.json), each row tagged with the operator
- * who runs it. Same live-status read as the rivals panel — these ARE rivals, we just never
- * attack them — so the panel can still show how delinquent a big boy is getting without
- * inviting an audit that would only waste a slot.
+ * The big-boy roster (data/big-boys.json), each row tagged with the operator who runs it.
+ * Same live-status read as the rivals panel, because these ARE rivals and full targets — the
+ * roster exists so the panel can group them by operator and so they aren't listed twice
+ * (readTargets routes them here instead of into "Others").
  */
-export async function readDoNotTarget(): Promise<DoNotTargetStatus[]> {
-  const { tokenIds, owners } = loadDoNotTarget();
+export async function readBigBoys(): Promise<BigBoyStatus[]> {
+  const { tokenIds, owners } = loadBigBoys();
   if (tokenIds.length === 0) return [];
   const operatorOf = new Map<string, string>();
   for (const [name, ids] of Object.entries(owners)) {

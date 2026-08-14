@@ -25,7 +25,7 @@ import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
-  readDoNotTarget, invalidateLiveCandidates, prewarmTargets } from "./service.js";
+  readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 import { syncDefaultLists } from "./list-sync.js";
@@ -587,12 +587,12 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
   });
 
-  // "Do not target" rivals (data/do-not-target.json) — big-boy operators we never audit.
-  // Still rivals, so they keep a live status read; they just get their own panel and are
-  // excluded from every offense path.
-  app.get("/api/do-not-target", async (_req, reply) => {
+  // The "big boys" (data/big-boys.json) — heavyweight operators, tagged by who runs them.
+  // Full offense candidates; the roster only gives them their own panel section so they
+  // aren't listed twice.
+  app.get("/api/big-boys", async (_req, reply) => {
     try {
-      return await readDoNotTarget();
+      return await readBigBoys();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
     }

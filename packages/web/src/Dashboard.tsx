@@ -9,7 +9,7 @@ import {
   type OwnedTokenStatus,
   type TargetTokenStatus,
   type EmigratedTokenStatus,
-  type DoNotTargetStatus,
+  type BigBoyStatus,
 } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { Config } from "./Config.js";
@@ -129,16 +129,18 @@ function EmigratedTable({ rows }: { rows: EmigratedTokenStatus[] }) {
 }
 
 /**
- * The "do not target" roster, grouped under the operator who runs each citizen. Same
- * status columns as the rivals table — these ARE rivals, and a big boy drifting delinquent
- * is worth seeing — but the operator tag is the point: it's what turns a list of bare ids
- * into "that's Graveyard's, leave it".
+ * The big boys, grouped under the operator who runs each citizen. Same status columns as the
+ * rivals table — they ARE rivals and full targets — and the operator tag is the point: it
+ * turns a list of bare ids into "that one is Graveyard's" when reading the board.
+ *
+ * Deliberately NOT greyed. This roster used to be do-not-target and every row was dimmed to
+ * say "don't bother"; the team attacks them now, so dimming would misreport the strategy.
  */
-function DoNotTargetTable({ rows }: { rows: DoNotTargetStatus[] }) {
+function BigBoysTable({ rows }: { rows: BigBoyStatus[] }) {
   if (rows.length === 0) {
-    return <p className="muted" style={{ fontSize: 12 }}>None listed (see data/do-not-target.json).</p>;
+    return <p className="muted" style={{ fontSize: 12 }}>None listed (see data/big-boys.json).</p>;
   }
-  const byOperator = new Map<string, DoNotTargetStatus[]>();
+  const byOperator = new Map<string, BigBoyStatus[]>();
   for (const r of rows) {
     const list = byOperator.get(r.operator) ?? [];
     list.push(r);
@@ -187,7 +189,7 @@ export function Dashboard({
   const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
   const [emigrated, setEmigrated] = useState<EmigratedTokenStatus[]>([]);
   const [allies, setAllies] = useState<TargetTokenStatus[]>([]);
-  const [doNotTarget, setDoNotTarget] = useState<DoNotTargetStatus[]>([]);
+  const [bigBoys, setBigBoys] = useState<BigBoyStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
   // Result of a manual default-list re-pull, shown until the next press. Separate from
   // `err` because an update is good news, not a failure.
@@ -247,19 +249,19 @@ export function Dashboard({
       // pressed, which reads as "the bot lost my citizens". Keep the last good rows and
       // report the failure instead.
       const keep = <T,>(p: Promise<T>): Promise<T | null> => p.then((v) => v, () => null);
-      const [t, g, e, a, dnt] = await Promise.all([
+      const [t, g, e, a, bb] = await Promise.all([
         keep(api.tokens()),
         keep(api.targets()),
         keep(api.emigrated()),
         keep(api.allies()),
-        keep(api.doNotTarget()),
+        keep(api.bigBoys()),
       ]);
       if (t) setTokens(t);
       if (g) setTargets(g);
       if (e) setEmigrated(e);
       if (a) setAllies(a);
-      if (dnt) setDoNotTarget(dnt);
-      const failed = [t, g, e, a, dnt].filter((v) => v === null).length;
+      if (bb) setBigBoys(bb);
+      const failed = [t, g, e, a, bb].filter((v) => v === null).length;
       setErr(
         failed === 0
           ? null
@@ -384,12 +386,12 @@ export function Dashboard({
   const auditableNextIn = (rows: TargetTokenStatus[]) =>
     rows.filter((t) => t.auditDueTimestamp === "0" && t.epochsBehind >= 1).length;
 
-  // The whole board. readTargets drops UNPINNED roster members, so the big boys have to
-  // be added back — but a PINNED one is already in `targets` (readTargets checks the pin
-  // before the roster, so it lands under My rivals). Concatenating blindly counted those
-  // twice, so dedupe by tokenId.
+  // Big boys are routed to their own section by readTargets, so add them back for the
+  // board-wide count — but a PINNED one is already in `targets` (readTargets checks the pin
+  // first, so it lands under My rivals). Concatenating blindly counted those twice, so
+  // dedupe by tokenId.
   const board = new Map<string, TargetTokenStatus>();
-  for (const t of [...targets, ...doNotTarget]) board.set(t.tokenId, t);
+  for (const t of [...targets, ...bigBoys]) board.set(t.tokenId, t);
   const totalAuditableNext = auditableNextIn([...board.values()]);
 
   // What the bot will actually go after. With pins, that is exactly the My rivals
@@ -513,7 +515,7 @@ export function Dashboard({
               title={
                 selfRefreshing
                   ? "Already refreshing: the dashboard polls every 20s and the running engine updates epoch/balance each block."
-                  : "Read on-chain data once, now — the header stats only update while the engine runs. Also re-pulls the curated default lists (rivals, skippers, allies, do-not-target) from master."
+                  : "Read on-chain data once, now — the header stats only update while the engine runs. Also re-pulls the curated default lists (rivals, skippers, allies, big boys) from master."
               }
             >
               Refresh data
@@ -746,9 +748,9 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
           <div
             style={{ display: "flex", gap: 14, alignItems: "baseline", margin: "0 0 10px 0", fontSize: 12, flexWrap: "wrap" }}
             title={
-              `My target audits: what the bot will actually go after at the coming boundary. A big boy counts only when you pin it — the roster is kept out of auto-discovery, and a pin is the override.` +
+              `My target audits: what the bot will actually go after at the coming boundary. Big boys count like any other rival — the roster only groups them in their own panel.` +
               (pinnedSet.size === 0
-                ? ` Your target list is blank, which means "audit every delinquent rival discovered" — so this is every rival EXCEPT the big boys.`
+                ? ` Your target list is blank, which means "audit every delinquent rival discovered" — big boys included.`
                 : ``) +
               `\n\nTotal: every delinquent rival on the board, pinned or not, big boys included.` +
               `\n\nBoth count citizens 1+ epoch behind (they roll one deeper when the epoch turns) and exclude any already under audit, which cannot be audited again until it resolves.` +
@@ -796,15 +798,15 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
 
           <div className="spacer" />
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>
-            Do Not Target · big boys ({doNotTarget.length})
+            Big Boys ({bigBoys.length})
           </div>
-          <DoNotTargetTable rows={doNotTarget} />
+          <BigBoysTable rows={bigBoys} />
           <p className="muted" style={{ fontSize: 11, margin: "6px 0 0 0", lineHeight: 1.5 }}>
-            From <code>data/do-not-target.json</code>, tagged with the operator who runs
-            them. These cure at the top of the boundary block, so an audit slot spent here
-            is normally wasted — they're kept out of auto-discovery and out of the target
-            analysis rankings. Unlike allies this is <b>advice, not a block</b>: pin one in
-            the Strategy targets box and the bot will still audit it.
+            From <code>data/big-boys.json</code>, tagged with the operator who runs them.
+            The heavyweight operators, attacked as a coordinated team — they are <b>full
+            targets</b>, scored and ranked like any other rival. The roster only gives them
+            their own section here so they aren't listed twice. Several defend at the top of
+            the boundary block, so check <b>Analyze targets</b> for what beating one costs.
           </p>
         </div>
 

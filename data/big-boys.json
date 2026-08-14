@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "The 'big boys' — the heavyweight operators, grouped by whoever runs them.",
+    "These ARE targets: the team attacks them in a coordinated push, so nothing here is",
+    "excluded from offense and no row is greyed. The grouping is for attribution — it turns",
+    "a list of bare ids into 'that block is Graveyard's' when reading the board.",
+    "Was data/do-not-target.json, when the policy was to leave them alone.",
+    "Allies — the one list that IS a hard block on offense — live in ally-tokens.json."
+  ],
+  "owners": {
+    "Graveyard": [
+      "4335",
+      "909",
+      "711",
+      "75",
+      "796",
+      "272",
+      "274"
+    ],
+    "ZombieRob": [
+      "3470",
+      "6403",
+      "5757",
+      "2169"
+    ],
+    "Hedo": [
+      "1575",
+      "1661",
+      "4650",
+      "4957",
+      "6737",
+      "5761"
+    ]
+  }
+}

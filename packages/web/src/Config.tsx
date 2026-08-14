@@ -136,13 +136,12 @@ export function Config({
   // The "skippers" subset — rivals that pay on a ~2-epoch cadence — offered as a
   // one-click focused target list.
   const [skippers, setSkippers] = useState<string[]>([]);
-  // The "big boys" roster (data/do-not-target.json). Offered as a template because the
-  // roster is advice, not a block: pinning one is how you deliberately go after it.
-  // The do-not-target roster kept GROUPED by operator, not flattened. Each big-boy
-  // operator is a different proposition — one is actively hunting, two have not audited
-  // in months — so "target the roster" was never really one decision.
-  const [dntByOperator, setDntByOperator] = useState<Record<string, string[]>>({});
-  const bigBoys = Object.values(dntByOperator).flat();
+  // The big-boy roster (data/big-boys.json), kept GROUPED by operator rather than
+  // flattened. Each operator is a different proposition — one is actively hunting, two have
+  // not audited in months — so "target the big boys" was never one decision. Offered as
+  // per-operator templates so a coordinated push can name exactly who it is going after.
+  const [bigBoysByOperator, setBigBoysByOperator] = useState<Record<string, string[]>>({});
+  const bigBoys = Object.values(bigBoysByOperator).flat();
 
   // The raw text of the targets box, kept separately from the parsed id list.
   //
@@ -164,11 +163,11 @@ export function Config({
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
     api.rivalSkippers().then((r) => setSkippers(r.tokenIds)).catch(() => {});
     api
-      .doNotTarget()
+      .bigBoys()
       .then((rows) => {
         const byOp: Record<string, string[]> = {};
         for (const r of rows) (byOp[r.operator] ??= []).push(r.tokenId);
-        setDntByOperator(byOp);
+        setBigBoysByOperator(byOp);
       })
       .catch(() => {});
   }, []);
@@ -299,15 +298,15 @@ export function Config({
           title="Rivals that pay on a ~2-epoch cadence, so they are delinquent at every second boundary." />
         <GroupToggle label="Non-skippers" ids={nonSkippers} on={groupOn(nonSkippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
           title="The curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)." />
-        {Object.keys(dntByOperator).sort().map((op) => (
+        {Object.keys(bigBoysByOperator).sort().map((op) => (
           <GroupToggle
             key={op}
             label={op}
-            ids={dntByOperator[op]!}
-            on={groupOn(dntByOperator[op]!)}
+            ids={bigBoysByOperator[op]!}
+            on={groupOn(bigBoysByOperator[op]!)}
             onClick={toggleGroup}
             disabled={!cfg.offenseEnabled}
-            title={`Big-boy operator "${op}" (data/do-not-target.json). Normally excluded because they cure at the top of the boundary block — selecting them here is the deliberate override that makes the bot audit them anyway.`}
+            title={`Big-boy operator "${op}" (data/big-boys.json). Pins every citizen they run, for a coordinated push against that operator specifically. Several defend at the top of the boundary block — check Analyze targets for what beating them costs.`}
           />
         ))}
         <button

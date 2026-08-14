@@ -81,20 +81,25 @@ const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cad
  * Allies (data/ally-tokens.json) are excluded automatically below — they're teammates,
  * never targets — so they don't need listing here.
  *
- * The roster itself now lives in data/do-not-target.json, grouped by operator, so the
+ * The roster itself lives in data/big-boys.json, grouped by operator, so the
  * dashboard, the target analysis and this generator all read ONE list. It previously
  * lived here as a hardcoded set, which meant a token removed from targeting in the UI
  * could be silently re-emitted as a skipper by the next regeneration.
  */
-function loadDoNotTarget() {
+function loadSelfCurers() {
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dataDir, "do-not-target.json"), "utf8"));
+    const raw = JSON.parse(fs.readFileSync(path.join(dataDir, "big-boys.json"), "utf8"));
     return new Set(Object.values(raw.owners ?? {}).flat().map((x) => BigInt(x).toString()));
   } catch {
     return new Set();
   }
 }
-const EXCLUDED = loadDoNotTarget();
+const EXCLUDED = loadSelfCurers();
+// NOTE this stays an exclusion even though the big boys are now TARGETED. It is an accuracy
+// filter, not a policy one: the detection samples lastEpochPaid at the last block of the
+// prior epoch, so a self-curer looks 2+ behind for an instant and reads as a skipper while
+// never actually being auditable. Emitting them here would seed everyone's default target
+// list with guaranteed reverts. Pin them deliberately via the per-operator buttons instead.
 
 /** Allied citizens must never be emitted as skippers. Read from the shared roster so
  *  adding an ally in one place is enough — no second list to keep in sync. */

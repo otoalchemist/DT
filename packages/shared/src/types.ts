@@ -49,11 +49,11 @@ export interface TargetTokenStatus {
 }
 
 /**
- * A "do not target" rival (data/do-not-target.json) — one of the big-boy operators we
- * deliberately never audit — carrying the name of whoever runs it, so the panel can group
- * and tag them instead of showing bare ids.
+ * A "big boy" rival (data/big-boys.json) — one of the heavyweight operators — carrying the
+ * name of whoever runs it, so the panel can group and tag them instead of showing bare ids.
+ * They are ordinary targets; the tag is attribution, not an exclusion.
  */
-export interface DoNotTargetStatus extends TargetTokenStatus {
+export interface BigBoyStatus extends TargetTokenStatus {
   /** Operator name the token is listed under, e.g. "Graveyard". */
   operator: string;
 }
@@ -193,21 +193,14 @@ export interface TargetScoreRow {
    */
   skipperSource?: "listed" | "observed" | "both";
   /**
-   * Do not target: an audit slot spent here is wasted, so the row is greyed and scored 0.
-   * Two independent reasons, distinguished by `dntReason`:
-   *  - "listed"   — on the curated big-boy roster (data/do-not-target.json). A standing
-   *                 instruction; `dntOwner` names the operator.
-   *  - "evidence" — the history shows it reaches top-of-block (best tx index <= 1) and
-   *                 nobody has ever audited it in the window. A judgement the next scan
-   *                 may revise, not an instruction.
-   * Neither is a veto: pinning one in the Strategy targets box still audits it.
+   * Operator that runs this citizen, when it is on the big-boy roster (data/big-boys.json).
+   * Attribution only — a big boy is scored and ranked like any other rival. It replaces the
+   * old doNotTarget/dntReason pair from when the roster excluded them from offense.
    */
-  doNotTarget?: boolean;
-  dntReason?: "listed" | "evidence" | null;
-  dntOwner?: string | null;
+  bigBoyOwner?: string | null;
   /**
-   * @deprecated Superseded by `doNotTarget` (which also covers the curated roster). Kept
-   * so rows cached by a backend from before the rename still grey correctly.
+   * @deprecated The evidence-based "can't catch it" veto, retired. A fresh scan never sets
+   * it; kept so rows cached by an older backend still parse and grey as they did.
    */
   uncatchable: boolean;
   score: number;

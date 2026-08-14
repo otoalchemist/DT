@@ -8,7 +8,7 @@ import { activity } from "./activity.js";
 /**
  * Startup auto-update for the curated default lists.
  *
- * The four list files (rival-targets, rival-skippers, ally-tokens, do-not-target) ship
+ * The four list files (rival-targets, rival-skippers, ally-tokens, big-boys) ship
  * in git and are the bot's shared game intelligence — they change as the game is played,
  * far more often than the code does. But a user's `data/` folder survives every update
  * (it holds the keystore and the API key), so a new list only reached them by
@@ -28,8 +28,8 @@ import { activity } from "./activity.js";
  *    `data/.list-sync.json`; if the file on disk no longer matches, the user edited it and
  *    it becomes theirs. Their curation outranks ours.
  *  3. **An empty list is never adopted.** A truncated response that parsed as `[]` would
- *    disarm the ally block (the bot would audit teammates) and empty the do-not-target
- *    roster (wasted audit slots). Upstream can change a list; it cannot clear one.
+ *    disarm the ally block, which would have the offense engine auditing teammates.
+ *    Upstream can change a list; it cannot clear one.
  */
 
 /** Raw master-branch base. Cache-busted per request — raw.githubusercontent caches ~5m. */
@@ -63,7 +63,7 @@ function isIdArray(parsed: unknown): boolean {
   );
 }
 
-/** `{ owners: { <operator>: [ids] } }` with at least one id — the do-not-target shape. */
+/** `{ owners: { <operator>: [ids] } }` with at least one id — the big-boys shape. */
 function isOwnerMap(parsed: unknown): boolean {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
   const owners = (parsed as { owners?: unknown }).owners;
@@ -80,7 +80,7 @@ const SYNCED_LISTS: SyncedList[] = [
   { file: "rival-targets.json", label: "rival targets", validate: isIdArray },
   { file: "rival-skippers.json", label: "rival skippers", validate: isIdArray },
   { file: "ally-tokens.json", label: "ally tokens", validate: isIdArray },
-  { file: "do-not-target.json", label: "do-not-target roster", validate: isOwnerMap },
+  { file: "big-boys.json", label: "big-boy roster", validate: isOwnerMap },
 ];
 
 type Manifest = Record<string, string>;
@@ -176,7 +176,7 @@ async function syncOne(spec: SyncedList, manifest: Manifest, signal: AbortSignal
 
   // Written VERBATIM, not re-serialized: raw.githubusercontent serves the exact committed
   // bytes, so the local file stays byte-identical to master. Re-serializing would reflow
-  // the hand-maintained formatting (and the `_comment` block in do-not-target.json),
+  // the hand-maintained formatting (and the `_comment` block in big-boys.json),
   // which then reads as a change on every first sync even when nothing moved.
   if (localText === text) {
     manifest[spec.file] = hash(text); // adopt it so later edits are detectable

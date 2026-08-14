@@ -2,7 +2,7 @@ import { parseEther, formatEther, type Address } from "viem";
 import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
-import { runtime, loadAllyTokens, loadDoNotTarget, type Wallet } from "./runtime.js";
+import { runtime, loadAllyTokens, type Wallet } from "./runtime.js";
 import { activity } from "./activity.js";
 import { nonces } from "./nonce.js";
 import {
@@ -952,39 +952,19 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
   // is the last line of defence: a stale pin, a hand-edited target list or a regenerated
   // skippers file must never get us auditing or killing a teammate's citizen.
   const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
-  // "Do not target" citizens are big-boy operators that cure at the top of the boundary
-  // block, so an audit slot spent on one is normally wasted. Unlike the ally list this is
-  // ADVICE, not a prohibition: it keeps them out of auto-discovery, but an explicit pin in
-  // the Strategy targets box overrides it, because deciding a big boy is worth attacking
-  // today is exactly the kind of call the user makes and the roster can't. Allies stay a
-  // hard block — attacking a teammate is never intended.
-  const dntSet = new Set(loadDoNotTarget().tokenIds.map((x) => BigInt(x).toString()));
+  // The big-boy roster (data/big-boys.json) is NOT consulted here any more. It used to be
+  // do-not-target and kept those operators out of auto-discovery; the team now attacks them
+  // in a coordinated push, so they are ordinary candidates and the roster survives only to
+  // tag and group them in the dashboard. Allies remain the one hard block.
   const pinnedSet = new Set(pinnedIds.map((x) => x.toString()));
   const emigrated = new Set<string>();
   const inGame: { id: bigint; owner: Address }[] = [];
   let allySkipped = 0;
-  let dntSkipped = 0;
-  const dntPinned: string[] = [];
   for (const t of liveRaw) {
     const key = t.id.toString();
     if (isEmigrated(t.owner)) emigrated.add(key);
     else if (allySet.has(key)) allySkipped++;
-    else if (dntSet.has(key) && !pinnedSet.has(key)) dntSkipped++;
-    else {
-      if (dntSet.has(key)) dntPinned.push(key);
-      inGame.push(t);
-    }
-  }
-  if (dntSkipped > 0) {
-    logger.debug(`offense candidates: skipped ${dntSkipped} do-not-target citizen(s) (not pinned)`);
-  }
-  if (dntPinned.length > 0) {
-    // Deliberate override — say so plainly rather than letting it look like the roster
-    // silently failed to apply.
-    logger.info(
-      `offense candidates: targeting ${dntPinned.length} DO-NOT-TARGET citizen(s) ` +
-        `(#${dntPinned.join(", #")}) — explicitly pinned, so the roster is overridden`,
-    );
+    else inGame.push(t);
   }
   if (emigrated.size > 0) {
     logger.debug(

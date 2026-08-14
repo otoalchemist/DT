@@ -7,7 +7,7 @@ import type {
   EmigratedTokenStatus,
   PostMortemResult,
   TargetScoresState,
-  DoNotTargetStatus,
+  BigBoyStatus,
 } from "@dat-bot/shared";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -71,14 +71,14 @@ export const api = {
     }),
   targets: () => req<TargetTokenStatus[]>("/api/targets"),
   allies: () => req<TargetTokenStatus[]>("/api/allies"),
-  // Big-boy operators we never auto-target (data/do-not-target.json), each tagged with
-  // the operator who runs it. Still rivals — an explicit pin overrides the roster.
-  doNotTarget: () => req<DoNotTargetStatus[]>("/api/do-not-target"),
+  // The big boys (data/big-boys.json), each tagged with the operator who runs it. They are
+  // ordinary targets — the roster is for grouping and attribution.
+  bigBoys: () => req<BigBoyStatus[]>("/api/big-boys"),
   // Force-refresh chain state: re-reads snapshot/balance/block into runtime (which
   // otherwise only updates inside an engine tick, so it never moves in away mode) and
   // drops the ownership caches so follow-up GETs refetch instead of serving SWR-stale.
   refreshChain: () => req<BotStatus>("/api/refresh", { method: "POST" }),
-  // Re-pull the curated default lists (rivals, skippers, allies, do-not-target) from the
+  // Re-pull the curated default lists (rivals, skippers, allies, big boys) from the
   // repo's master branch. The bot does this at startup; this is the no-restart path, for
   // when a list changes mid-session. `repointed` is true when the offense pins were moved
   // onto a refreshed skippers list (only happens if they were tracking the default).
