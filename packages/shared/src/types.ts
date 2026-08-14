@@ -49,16 +49,6 @@ export interface TargetTokenStatus {
 }
 
 /**
- * A "do not target" rival (data/do-not-target.json) — one of the big-boy operators we
- * deliberately never audit — carrying the name of whoever runs it, so the panel can group
- * and tag them instead of showing bare ids.
- */
-export interface DoNotTargetStatus extends TargetTokenStatus {
-  /** Operator name the token is listed under, e.g. "Graveyard". */
-  operator: string;
-}
-
-/**
  * A citizen that emigrated — traded to the Emigration contract for a Governor NFT.
  *
  * Sourced from the contract's `Emigrated` event log, NOT from current ownership, so the
@@ -193,21 +183,8 @@ export interface TargetScoreRow {
    */
   skipperSource?: "listed" | "observed" | "both";
   /**
-   * Do not target: an audit slot spent here is wasted, so the row is greyed and scored 0.
-   * Two independent reasons, distinguished by `dntReason`:
-   *  - "listed"   — on the curated big-boy roster (data/do-not-target.json). A standing
-   *                 instruction; `dntOwner` names the operator.
-   *  - "evidence" — the history shows it reaches top-of-block (best tx index <= 1) and
-   *                 nobody has ever audited it in the window. A judgement the next scan
-   *                 may revise, not an instruction.
-   * Neither is a veto: pinning one in the Strategy targets box still audits it.
-   */
-  doNotTarget?: boolean;
-  dntReason?: "listed" | "evidence" | null;
-  dntOwner?: string | null;
-  /**
-   * @deprecated Superseded by `doNotTarget` (which also covers the curated roster). Kept
-   * so rows cached by a backend from before the rename still grey correctly.
+   * @deprecated Always false. Kept so rows cached by an older backend still parse. The
+   * curated do-not-target roster it fed has been retired — every live rival is a target now.
    */
   uncatchable: boolean;
   score: number;

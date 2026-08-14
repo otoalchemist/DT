@@ -61,40 +61,14 @@ const STRONG_CROSSINGS = 4;  // ...OR cross this many times total (frequent, cad
  * The detection above samples lastEpochPaid at the LAST BLOCK OF THE PRIOR EPOCH, so a
  * token that is 2+ behind at that instant looks like a skipper. That is a false positive
  * for anyone who then self-cures at the TOP of the new epoch's first block: they are
- * never auditable in practice, and pinning them wastes a scarce auditor slot (one owned
- * token audits at most `auditLimit` times per epoch) on a race that cannot be won.
+ * never auditable in practice, and an audit aimed at one wastes a scarce auditor slot.
  *
- * 1575/1661/4650/4957/6737 are one operator: a batch-payer contract
- * (0x5c50b6dc6a42c9fe6993b0801ef7a2a3fe8ea676, senders 0x28ead8f1…/0x08a24cdd…) that pays
- * all five citizens in a single tx and pays the block builder directly in that same tx.
- * Measured over epochs 137-146: an escalating coinbase bid (0.010 -> 0.015 -> 0.005 ->
- * 0.030 -> 0.080 ETH) buying transaction index 0, and ZERO successful audits against any
- * of the five by ANY player across the whole window. Re-check with
- * scripts/rival-builder-bids-style tracing before removing an entry from this list.
- *
- * 272/711/909/4335 belong to 0x91bAec4D1Bc7D17D6de74499075A8A64604a52Fd (7 citizens,
- * ~73 ETH, ~100-epoch runway), excluded by operator decision. They defended at 80-112
- * gwei and cured in the boundary block itself (payBlk 0/0), so they were unwinnable in
- * practice regardless. Verified with ownerOf at epoch 151; that wallet also holds
- * #75/#274/#796, which were never on either list.
- *
- * Allies (data/ally-tokens.json) are excluded automatically below — they're teammates,
- * never targets — so they don't need listing here.
- *
- * The roster itself now lives in data/do-not-target.json, grouped by operator, so the
- * dashboard, the target analysis and this generator all read ONE list. It previously
- * lived here as a hardcoded set, which meant a token removed from targeting in the UI
- * could be silently re-emitted as a skipper by the next regeneration.
+ * The curated do-not-target roster that used to filter those out has been RETIRED — the
+ * big-boy operators are now attacked as a coordinated team, so they are ordinary targets.
+ * Only allies are excluded here, and a self-curing operator shows up in the target
+ * analysis (payBlk 0, high defence density) rather than in a standing list.
  */
-function loadDoNotTarget() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dataDir, "do-not-target.json"), "utf8"));
-    return new Set(Object.values(raw.owners ?? {}).flat().map((x) => BigInt(x).toString()));
-  } catch {
-    return new Set();
-  }
-}
-const EXCLUDED = loadDoNotTarget();
+
 
 /** Allied citizens must never be emitted as skippers. Read from the shared roster so
  *  adding an ally in one place is enough — no second list to keep in sync. */
@@ -262,9 +236,9 @@ async function main() {
     const qualifies =
       total >= MIN_CROSSINGS || streak >= MIN_PARITY_STREAK || total >= STRONG_CROSSINGS;
     if (!qualifies) continue;
-    // Matched the cadence but is a known top-of-block self-curer (EXCLUDED), or is an
+    // Matched the cadence but is an
     // ally — a teammate's citizen is never a target however delinquent it looks.
-    if (EXCLUDED.has(token) || ALLIES.has(token)) {
+    if (ALLIES.has(token)) {
       excluded.push({ token, total, streak, ally: ALLIES.has(token) });
       continue;
     }
@@ -277,7 +251,7 @@ async function main() {
     );
     excluded
       .sort((a, b) => Number(a.token) - Number(b.token))
-      .forEach((d) => console.error(`  #${d.token}: ${d.total}x, parity ${d.streak}  [${d.ally ? "ALLY" : "EXCLUDED"}]`));
+      .forEach((d) => console.error(`  #${d.token}: ${d.total}x, parity ${d.streak}  [ALLY]`));
   }
   skippers.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const out = skippers.map((x) => x.toString());

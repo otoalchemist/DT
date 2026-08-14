@@ -20,8 +20,17 @@ const { recordRaceSubmission, recordRaceOutcome } = await import("./race-timing.
 
 const FILE = nodePath.join(tmpRoot, "race-timing.jsonl");
 // Real delay, not setImmediate: the writes are genuine async disk I/O (fs/promises), so
-// microtask draining does not wait for them to land.
-const flush = async () => { await new Promise((r) => setTimeout(r, 60)); };
+// microtask draining does not wait for them to land. Polls for the expected row count
+// instead of sleeping a fixed 60ms, which flaked under full-suite load when the disk was
+// busy — a fixed sleep makes the test a race against the machine.
+const settle = async (want?: number) => {
+  for (let i = 0; i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+    if (want === undefined) continue;
+    try { if (read().length >= want) return; } catch { /* file not written yet */ }
+  }
+};
+const flush = async () => { await settle(); };
 const read = () => fs.readFileSync(FILE, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 
 const HASH = "0xabc0000000000000000000000000000000000000000000000000000000000001";

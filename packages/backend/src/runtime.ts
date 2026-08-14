@@ -14,7 +14,7 @@ import { versionState } from "./version-check.js";
  * Parsed-list cache, keyed by file and invalidated on mtime+size.
  *
  * These four files are read on the HOT PATH: fetchOffenseCandidates reads the ally and
- * do-not-target lists on every offense sweep (once per block with a WebSocket), and
+ * list on every offense sweep (once per block with a WebSocket), and
  * readTargets reads them again on every dashboard poll — each read a synchronous
  * readFileSync + JSON.parse (measured at 0.19 ms for the pair). They only change when the
  * startup sync rewrites them or the user edits one by hand.
@@ -96,59 +96,6 @@ export function loadRivalSkippers(): string[] {
  */
 export function loadAllyTokens(): string[] {
   return loadRivalIdFile("ally-tokens.json", "ally tokens");
-}
-
-/**
- * "Do not target" (data/do-not-target.json) — rival citizens we deliberately never audit,
- * grouped by the operator who runs them.
- *
- * These are still RIVALS (unlike allies): they're just not worth attacking. An operator
- * with deep reserves and a standing builder relationship cures at the top of the boundary
- * block regardless of how delinquent it looks, so an audit aimed at one burns a scarce
- * auditor slot on a race that cannot be won. The list is curated rather than derived —
- * the evidence heuristic in the target analysis catches only the ones that have already
- * demonstrated top-of-block cures, which is a strict subset.
- *
- * Returns the flat id list plus the owner grouping, so the UI can tag each id with who
- * runs it.
- */
-export function loadDoNotTarget(): { tokenIds: string[]; owners: Record<string, string[]> } {
-  try {
-    const raw = readJsonCached("do-not-target.json") as { owners?: Record<string, unknown> } | null;
-    if (!raw) return { tokenIds: [], owners: {} };
-    // Memoize the DERIVED shape against the same parsed object, not just the parse: the
-    // normalize + dedupe below runs on every offense sweep and every dashboard poll, and
-    // its input only changes when the file does. Identity holds because readJsonCached
-    // returns the cached parse by reference.
-    const memo = dntMemo;
-    if (memo && memo.src === raw) return memo.out;
-    const owners: Record<string, string[]> = {};
-    for (const [name, ids] of Object.entries(raw.owners ?? {})) {
-      if (!Array.isArray(ids)) continue;
-      owners[name] = ids.map(String).filter((id) => /^\d+$/.test(id));
-    }
-    // De-duplicated across owners: a token listed twice must not be counted twice.
-    const tokenIds = [...new Set(Object.values(owners).flat())];
-    const out = { tokenIds, owners };
-    dntMemo = { src: raw, out };
-    return out;
-  } catch {
-    return { tokenIds: [], owners: {} };
-  }
-}
-
-/** Memo for loadDoNotTarget's derived output, tied to the identity of the parsed file. */
-let dntMemo: {
-  src: object;
-  out: { tokenIds: string[]; owners: Record<string, string[]> };
-} | null = null;
-
-/** Flat lookup of tokenId -> operator name, for tagging rows in the UI. */
-export function doNotTargetOwnerOf(): Record<string, string> {
-  const { owners } = loadDoNotTarget();
-  const map: Record<string, string> = {};
-  for (const [name, ids] of Object.entries(owners)) for (const id of ids) map[id] = name;
-  return map;
 }
 
 export const DEFAULT_STRATEGY: StrategyConfig = {

@@ -25,7 +25,6 @@ const { syncDefaultLists } = await import("./list-sync.js");
 const ALLIES = "ally-tokens.json";
 const SKIPPERS = "rival-skippers.json";
 const TARGETS = "rival-targets.json";
-const DNT = "do-not-target.json";
 const MANIFEST = ".list-sync.json";
 
 /** Remote payloads keyed by filename; anything unset 404s. */
@@ -52,7 +51,6 @@ beforeEach(() => {
     [ALLIES]: JSON.stringify(["84", "99"]),
     [SKIPPERS]: JSON.stringify(["206", "388"]),
     [TARGETS]: JSON.stringify(["206", "388", "553"]),
-    [DNT]: JSON.stringify({ owners: { Graveyard: ["4335", "909"] } }),
   };
 
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
@@ -81,7 +79,7 @@ describe("syncDefaultLists: refreshing shipped lists", () => {
   it("creates a list that the carried-over data/ folder never had", async () => {
     // A data/ folder from before a list existed: no local file at all.
     await syncDefaultLists();
-    expect(JSON.parse(read(DNT))).toEqual({ owners: { Graveyard: ["4335", "909"] } });
+    expect(JSON.parse(read(ALLIES))).toEqual(["84", "99"]);
   });
 
   it("reports 'unchanged' when the local copy already matches master", async () => {
@@ -93,7 +91,7 @@ describe("syncDefaultLists: refreshing shipped lists", () => {
   it("records hashes so the next run can tell a local edit from its own write", async () => {
     await syncDefaultLists();
     const manifest = JSON.parse(read(MANIFEST));
-    expect(Object.keys(manifest).sort()).toEqual([ALLIES, DNT, SKIPPERS, TARGETS].sort());
+    expect(Object.keys(manifest).sort()).toEqual([ALLIES, SKIPPERS, TARGETS].sort());
   });
 });
 
@@ -160,7 +158,7 @@ describe("syncDefaultLists: never overwrites the user's own curation", () => {
 
 describe("syncDefaultLists: a bad payload never disarms a safety list", () => {
   // The failure that matters: an ally list that arrives empty would let the offense
-  // engine audit teammates, and an empty do-not-target roster burns audit slots. So an
+  // engine audit teammates. So an
   // empty list is treated as a broken fetch, not as an instruction.
   it("rejects an empty ally list and keeps the local one", async () => {
     write(ALLIES, ids(["84", "99"]));
@@ -170,12 +168,6 @@ describe("syncDefaultLists: a bad payload never disarms a safety list", () => {
     expect(out.find((o) => o.file === ALLIES)).toMatchObject({ result: "failed" });
   });
 
-  it("rejects a do-not-target payload with no ids in any owner group", async () => {
-    write(DNT, JSON.stringify({ owners: { Graveyard: ["4335"] } }, null, 2) + "\n");
-    remote[DNT] = JSON.stringify({ owners: { Graveyard: [] } });
-    await syncDefaultLists();
-    expect(JSON.parse(read(DNT))).toEqual({ owners: { Graveyard: ["4335"] } });
-  });
 
   it("rejects malformed JSON", async () => {
     write(SKIPPERS, ids(["206"]));
@@ -192,12 +184,6 @@ describe("syncDefaultLists: a bad payload never disarms a safety list", () => {
     expect(JSON.parse(read(SKIPPERS))).toEqual(["206"]);
   });
 
-  it("rejects an array where the owner-map shape is required", async () => {
-    write(DNT, JSON.stringify({ owners: { Graveyard: ["4335"] } }, null, 2) + "\n");
-    remote[DNT] = JSON.stringify(["4335"]);
-    await syncDefaultLists();
-    expect(JSON.parse(read(DNT))).toEqual({ owners: { Graveyard: ["4335"] } });
-  });
 
   it("keeps every local list when the network is down", async () => {
     write(ALLIES, ids(["84"]));

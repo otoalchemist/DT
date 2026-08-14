@@ -4,10 +4,9 @@ import {
   EMIGRATION_CONTRACT_ADDRESS,
   type OwnedTokenStatus,
   type TargetTokenStatus,
-  type DoNotTargetStatus,
   type EmigratedTokenStatus,
 } from "@dat-bot/shared";
-import { runtime, loadAllyTokens, loadDoNotTarget } from "./runtime.js";
+import { runtime, loadAllyTokens } from "./runtime.js";
 import { getGameSnapshot, batchGetOwnedStatuses, batchGetTargetStatuses, filterLiveTokenIds } from "./contract.js";
 import { fetchOwnedTokenIds, fetchCandidateTokenIds, fetchLiveCitizens } from "./index-tokens.js";
 import { fetchEmigrationRoster } from "./emigration.js";
@@ -126,10 +125,6 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   const pinnedSet = new Set(runtime.strategy.offenseTargetTokenIds.map((x) => BigInt(x).toString()));
   // Normalised the same way pins are, so "0084" and "84" both match (see excludedTokenSet).
   const allySet = new Set(loadAllyTokens().map((x) => BigInt(x).toString()));
-  // Big boys have their own panel section (readDoNotTarget), so listing them here too
-  // showed the same citizens twice — and "Others" reads as a shortlist of things to
-  // consider attacking, which is the opposite of what the roster means.
-  const dntSet = new Set(loadDoNotTarget().tokenIds.map((x) => BigInt(x).toString()));
 
   // The cached live set already contains EVERY live token (Alchemy owner index), so a
   // live pinned rival is included by definition — no separate pin liveness check needed.
@@ -181,7 +176,6 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   let ownedSkipped = 0;
   let emigratedSkipped = 0;
   let allySkipped = 0;
-  let dntSkipped = 0;
   for (const t of allStatuses) {
     if (isOurs(t)) {
       ownedSkipped++;
@@ -203,12 +197,9 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
       continue;
     }
     if (pinnedSet.has(t.tokenId)) {
-      // Pin checked BEFORE the roster: the do-not-target list is advice, and an explicit
-      // pin overrides it (the engine will audit a pinned big boy), so a pinned one still
-      // belongs under "My rivals" rather than being filtered away.
+      // Pinned rivals always show, even while fully paid up, so the operator can watch a
+      // chosen target rather than losing sight of it between boundaries.
       pinned.push(t);
-    } else if (dntSet.has(t.tokenId)) {
-      dntSkipped++;
     } else if (t.delinquent || t.killable || t.auditDueTimestamp !== "0") {
       actionable.push(t);
     } else {
@@ -223,11 +214,6 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   }
   if (ownedSkipped > 0) {
     logger.debug(`readTargets: excluded ${ownedSkipped} token(s) we own from the rival list`);
-  }
-  if (dntSkipped > 0) {
-    logger.debug(
-      `readTargets: ${dntSkipped} do-not-target citizen(s) routed to their own section rather than Others`,
-    );
   }
   if (emigratedSkipped > 0) {
     logger.debug(`readTargets: excluded ${emigratedSkipped} emigrated citizen(s) from the rival list`);
@@ -272,30 +258,6 @@ export async function readAllies(): Promise<TargetTokenStatus[]> {
   const live = (await getLiveCandidates(snap.citizensAddress)).filter((t) => want.has(t.id.toString()));
   const rows = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
   return rows.sort((a, b) => actionableRank(a) - actionableRank(b) || b.epochsBehind - a.epochsBehind);
-}
-
-/**
- * The "do not target" roster (data/do-not-target.json), each row tagged with the operator
- * who runs it. Same live-status read as the rivals panel — these ARE rivals, we just never
- * attack them — so the panel can still show how delinquent a big boy is getting without
- * inviting an audit that would only waste a slot.
- */
-export async function readDoNotTarget(): Promise<DoNotTargetStatus[]> {
-  const { tokenIds, owners } = loadDoNotTarget();
-  if (tokenIds.length === 0) return [];
-  const operatorOf = new Map<string, string>();
-  for (const [name, ids] of Object.entries(owners)) {
-    for (const id of ids) operatorOf.set(BigInt(id).toString(), name);
-  }
-  const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const want = new Set(tokenIds.map((x) => BigInt(x).toString()));
-  const live = (await getLiveCandidates(snap.citizensAddress)).filter((t) => want.has(t.id.toString()));
-  const rows = await batchGetTargetStatuses(live, snap.currentEpoch, nowSec);
-  return rows
-    .map((r) => ({ ...r, operator: operatorOf.get(BigInt(r.tokenId).toString()) ?? "?" }))
-    // Group by operator, then most-delinquent first within each group.
-    .sort((a, b) => a.operator.localeCompare(b.operator) || b.epochsBehind - a.epochsBehind);
 }
 
 /**

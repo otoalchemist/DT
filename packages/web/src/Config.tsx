@@ -136,13 +136,6 @@ export function Config({
   // The "skippers" subset — rivals that pay on a ~2-epoch cadence — offered as a
   // one-click focused target list.
   const [skippers, setSkippers] = useState<string[]>([]);
-  // The "big boys" roster (data/do-not-target.json). Offered as a template because the
-  // roster is advice, not a block: pinning one is how you deliberately go after it.
-  // The do-not-target roster kept GROUPED by operator, not flattened. Each big-boy
-  // operator is a different proposition — one is actively hunting, two have not audited
-  // in months — so "target the roster" was never really one decision.
-  const [dntByOperator, setDntByOperator] = useState<Record<string, string[]>>({});
-  const bigBoys = Object.values(dntByOperator).flat();
 
   // The raw text of the targets box, kept separately from the parsed id list.
   //
@@ -163,14 +156,6 @@ export function Config({
   useEffect(() => {
     api.defaultRivalTargets().then((r) => setDefaultRivals(r.tokenIds)).catch(() => {});
     api.rivalSkippers().then((r) => setSkippers(r.tokenIds)).catch(() => {});
-    api
-      .doNotTarget()
-      .then((rows) => {
-        const byOp: Record<string, string[]> = {};
-        for (const r of rows) (byOp[r.operator] ??= []).push(r.tokenId);
-        setDntByOperator(byOp);
-      })
-      .catch(() => {});
   }, []);
 
   // True when the current target list already equals `list` (same ids, same order).
@@ -293,23 +278,11 @@ export function Config({
         </button>
         {/* Groups TOGGLE and combine — lit when every id in the group is selected.
             Each is additive, so "skippers + non-skippers" is two clicks instead of
-            re-typing a list by hand. The roster is split per operator because they are
-            not one decision: they defend differently and only one of them attacks. */}
+            re-typing a list by hand. */}
         <GroupToggle label="Rival Skippers" ids={skippers} on={groupOn(skippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
           title="Rivals that pay on a ~2-epoch cadence, so they are delinquent at every second boundary." />
         <GroupToggle label="Non-skippers" ids={nonSkippers} on={groupOn(nonSkippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
           title="The curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)." />
-        {Object.keys(dntByOperator).sort().map((op) => (
-          <GroupToggle
-            key={op}
-            label={op}
-            ids={dntByOperator[op]!}
-            on={groupOn(dntByOperator[op]!)}
-            onClick={toggleGroup}
-            disabled={!cfg.offenseEnabled}
-            title={`Big-boy operator "${op}" (data/do-not-target.json). Normally excluded because they cure at the top of the boundary block — selecting them here is the deliberate override that makes the bot audit them anyway.`}
-          />
-        ))}
         <button
           type="button"
           onClick={() => set("offenseTargetTokenIds", [])}
@@ -323,7 +296,6 @@ export function Config({
           <span className="muted" style={{ fontSize: 11 }}>
             {defaultRivals.length} default{skippers.length > 0 ? ` · ${skippers.length} skippers` : ""}
             {nonSkippers.length > 0 ? ` · ${nonSkippers.length} non-skippers` : ""}
-            {bigBoys.length > 0 ? ` · ${bigBoys.length} big boys` : ""}
           </span>
         )}
       </div>
