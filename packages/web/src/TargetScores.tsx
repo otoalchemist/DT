@@ -32,6 +32,43 @@ function beatFor(densityGwei: number | null | undefined, plan: Plan): number | n
 }
 
 /**
+ * The same bar as a PRIORITY FEE instead of a bid — the other lever, and the only one that
+ * works everywhere.
+ *
+ * Density is tip + bid/gas, so a bundle with no bid has density equal to its tip: the bar in
+ * gwei/gas IS the tip that clears it, and unlike a bid it does not scale with bundle size.
+ * It also survives the ~1 boundary in 10 built by a solo validator on vanilla geth/reth,
+ * which sort by priority fee and ignore coinbase transfers outright — a bid buys nothing
+ * there. +1 because clearing a bar means passing it, not matching it.
+ */
+function tipFor(densityGwei: number | null | undefined): number | null {
+  if (densityGwei === null || densityGwei === undefined) return null;
+  return Math.ceil(densityGwei) + 1;
+}
+
+/** The tip lever, rendered under a bid cell so both ways past a rival sit together. */
+function TipLine({ density, plan }: { density: number | null | undefined; plan: Plan }) {
+  const tip = tipFor(density);
+  if (tip === null) return null;
+  const enough = plan.tipGwei >= tip;
+  return (
+    <>
+      <br />
+      <span
+        style={{ fontSize: 10, color: enough ? "var(--green)" : "var(--muted, #888)" }}
+        title={
+          enough
+            ? `Your ${plan.tipGwei} gwei tip already exceeds the ${tip} gwei this bar needs, so no bid is required on any builder — including the ~1 boundary in 10 built by a solo validator that ignores coinbase bids entirely.`
+            : `Or skip the bid: a ${tip} gwei priority fee clears this bar on its own. Unlike a bid it does not scale with bundle size, and it is the ONLY lever on the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which ignores coinbase transfers.`
+        }
+      >
+        {tip}gw tip
+      </span>
+    </>
+  );
+}
+
+/**
  * Make a small numeric field behave like one you can just retype: focus or click it and
  * the value is selected, so the next keystroke replaces it instead of appending.
  *
@@ -70,9 +107,9 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments) — the 'are they bidding right now' signal, deliberately narrower than the window BeatBid is priced against. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
-            <th style={cell} title="Coinbase bid (ETH) to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to BeatMax: equal means a steady defender and this number is reliable; a gap means it escalates. — = nothing needed, your tip already out-ranks it. · = it made no payment in the last 2 epochs. Priced for the bundle set above.">Beat2ep</th>
-            <th style={cell} title="Coinbase bid (ETH) needed to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder actually sorts on — for the bundle you set above, at your configured offense tip. Peak, not recent: what you must clear is the strongest defense it has actually mounted. Density, not tip: a bidder's tip can be near zero while its bid puts it hundreds of gwei/gas ahead. A ceiling, not a forecast — off-chain builder deals stay invisible. — = peak defense already at or below your tip. Both columns scale with bundle gas: a bid buys position for everything you carry, so adding uncontested payments raises what the contested audits cost.">BeatMax</th>
-            <th style={cell} title="Coinbase bid (ETH) to out-rank this rival in a BOUNDARY BLOCK specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without bidding. — = your tip already out-ranks its boundary defense. · = re-run the scan to populate this.">BeatBnd</th>
+            <th style={cell} title="What it takes to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to Beat/max: equal means a steady defender and the figure is reliable; a gap means it escalates. — = nothing needed. · = no payment in the last 2 epochs. Each cell shows BOTH ways past this rival: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid at all. Green means your current tip already clears it. The tip route works on every builder — including the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which sorts by priority fee and ignores coinbase transfers outright, where a bid buys nothing. The bid route is flat, so it is cheaper in ETH on a small bundle while the tip is charged per transaction.">Beat 2ep<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
+            <th style={cell} title="What it takes to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder sorts on. Peak, not recent: what you must clear is the strongest defense it has actually mounted. A ceiling, not a forecast — off-chain builder deals stay invisible. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids; bid is flat so it is cheaper on a small bundle.">Beat max<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
+            <th style={cell} title="THE COLUMN FOR A BOUNDARY RACE: what it takes to out-rank this rival in a boundary block specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without spending anything. · = re-run the scan to populate this. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids; bid is flat so it is cheaper on a small bundle.">Beat boundary<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = under audit, or not a weak link">Score</th>
@@ -144,6 +181,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                   }
                   return <span className="muted" title={`Defended at ~${r.defenseRecentGwei} gwei/gas lately — your ${plan.tipGwei} gwei tip already out-ranks that.`}>—</span>;
                 })()}
+                <TipLine density={r.defenseRecentGwei} plan={plan} />
               </td>
               <td style={cell}>
                 {(() => {
@@ -169,6 +207,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                     <span className="muted" title={`Defends at ~${r.defenseGwei} gwei/gas — your ${plan.tipGwei} gwei tip already out-ranks that, so no bid is needed.`}>—</span>
                   );
                 })()}
+                <TipLine density={r.defenseGwei} plan={plan} />
               </td>
               <td style={cell}>
                 {(() => {
@@ -196,6 +235,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                     <span className="muted" title={`Defends at ~${r.defenseBoundaryGwei} gwei/gas in boundary blocks — your ${plan.tipGwei} gwei tip already out-ranks that.`}>—</span>
                   );
                 })()}
+                <TipLine density={r.defenseBoundaryGwei} plan={plan} />
               </td>
               <td style={cell}>{r.bribes || ""}</td>
               <td style={cell}>{r.audited || ""}</td>
@@ -394,7 +434,7 @@ export function TargetScores({
               className="row wrap"
               style={{ gap: 8, alignItems: "baseline", marginBottom: 10, fontSize: 11 }}
             >
-              <span className="muted">Bid to LEAD a boundary block:</span>
+              <span className="muted">To LEAD a boundary block:</span>
               {([["typical", "p50"], ["most blocks", "p90"], ["strongest seen", "max"]] as const).map(
                 ([label, k]) => {
                   const bar = state.leadBar![k];
@@ -402,12 +442,17 @@ export function TargetScores({
                   return (
                     <span
                       key={k}
-                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Matching it with ${payments} payment(s) + ${audits} audit(s) at a ${tipGwei} gwei tip costs ${bid.toFixed(4)} ETH.`}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it: a ${tipFor(bar)} gwei priority fee on its own, or keep your ${tipGwei} gwei tip and add ${bid.toFixed(4)} ETH of bid for ${payments} payment(s) + ${audits} audit(s). The tip route works on every builder; the bid route is flat (so cheaper on a small bundle) but buys nothing on a solo-built block.`}
                     >
                       {label}{" "}
                       <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>
                         {bid > 0 ? `${bid.toFixed(4)} ETH` : "your tip already leads"}
                       </strong>
+                      {bid > 0 ? (
+                        <span className="muted" style={{ fontSize: 10 }}>
+                          {" "}or {tipFor(bar)}gw tip
+                        </span>
+                      ) : null}
                     </span>
                   );
                 },
@@ -474,9 +519,18 @@ export function TargetScores({
           </div>
 
           <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.6 }}>
-            Beat2ep / BeatMax = bid needed to out-rank its defense recently vs at its peak
-            (a gap means it escalates), priced for the payments/audits you set above · Beh 1 = auditable next boundary · Skip = skips survived / skips that drew an audit,
-            out of attempted (a skip = a boundary entered 2+ behind) ·
+            <b>The three Beat columns each show two levers</b>: the top figure is the flat
+            coinbase <b>bid</b> at your configured tip, the small figure under it is the
+            <b> priority fee</b> that clears the same bar with no bid at all (green = your
+            current tip already clears it). The tip works on <i>every</i> builder — including
+            the ~1 boundary in 10 built by a solo validator, which sorts on priority fee and
+            ignores coinbase transfers outright, so a bid buys nothing there. The bid is flat,
+            so it is cheaper in ETH on a small bundle while the tip is charged per transaction.
+            <b> Beat boundary is the one to read for a boundary race</b>: it measures defense
+            only in blocks that actually decided an audit. Beat 2ep vs Beat max shows whether
+            a defender is steady or escalating · Beh 1 = auditable next boundary · Skip =
+            skips survived / skips that drew an audit, out of attempted (a skip = a boundary
+            entered 2+ behind) ·
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
             (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
             the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-

@@ -641,6 +641,20 @@ async function main() {
   const priceBid = (gwei) =>
     gwei > OUR_TIP_GWEI ? +(((gwei - OUR_TIP_GWEI) * OUR_BUNDLE_GAS) / 1e9).toFixed(4) : 0;
 
+  /**
+   * The same bar expressed as a TIP instead of a bid — the other lever, and the one that
+   * works everywhere.
+   *
+   * Density is tip + bid/gas, so a bundle carrying no bid has density equal to its tip: the
+   * bar in gwei/gas IS the priority fee that clears it, and unlike the bid it does not scale
+   * with bundle size. It also survives the ~10% of boundaries built by a solo validator on
+   * vanilla geth/reth, which order by priority fee and ignore coinbase transfers outright —
+   * on those blocks a bid buys literally nothing and only the tip counts.
+   *
+   * +1 gwei because clearing the bar means going PAST it, not matching it.
+   */
+  const priceTip = (gwei) => (gwei === null ? null : Math.ceil(gwei) + 1);
+
   // Score each live, non-emigrated rival.
   const rows = [];
   for (const t of rivals) {
@@ -738,6 +752,12 @@ async function main() {
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
       payBlkMin, payBlkMed, audited: aud,
       beatBidEth, defenseUnexplained,
+      // The two levers, per rival. Same bar, priced both ways: a tip that needs no builder
+      // cooperation, or a flat bid that is cheaper in ETH on a small bundle but dead on a
+      // solo-built block.
+      beatTipGwei: priceTip(defenseGwei),
+      beatTipRecentGwei: priceTip(defenseRecentGwei),
+      beatTipBoundaryGwei: priceTip(boundaryDensity[t] ?? null),
       beatBidRecentEth, defenseRecentGwei: defenseRecentGwei === null ? null : +defenseRecentGwei.toFixed(1),
       // Defense measured ONLY on boundary-block payments — what it mounts in the block that
       // decides an audit, rather than its peak across quiet mid-epoch payments. null = it
@@ -811,10 +831,24 @@ async function main() {
     }
     console.log(
       `lead = bid for YOUR bundle to be the densest in a boundary block, over ${leadBar.blocks} observed race(s):\n` +
-        `  typical block (p50) ${leadBar.p50} gwei/gas -> ${leadBidEth.p50} ETH · most blocks (p90) ${leadBar.p90} -> ${leadBidEth.p90} ETH · strongest seen ${leadBar.max} -> ${leadBidEth.max} ETH`,
+        `  typical block (p50): tip ${priceTip(leadBar.p50)} gwei  OR  bid ${leadBidEth.p50} ETH at your ${OUR_TIP_GWEI} gwei tip
+` +
+      `  most blocks  (p90): tip ${priceTip(leadBar.p90)} gwei  OR  bid ${leadBidEth.p90} ETH
+` +
+      `  strongest seen    : tip ${priceTip(leadBar.max)} gwei  OR  bid ${leadBidEth.max} ETH`,
     );
     console.log(
-      `  this is the bar to CLEAR, not a guarantee: across the same races the densest bundle took index 0 about half the time, so treat p90 as buying margin against that noise`,
+      `  the tip column works on EVERY builder, including the ~1 boundary in 10 built by a solo
+` +
+      `  validator on vanilla geth/reth — those order by priority fee and ignore coinbase transfers
+` +
+      `  outright, so a bid buys nothing there. The bid column is cheaper in ETH on a small bundle
+` +
+      `  (it is flat, while the tip is charged per tx) but only counts with builders that take it.
+` +
+      `  Either way this is the bar to CLEAR, not a guarantee: across the same races the densest
+` +
+      `  bundle took index 0 about half the time, so treat p90 as buying margin against that noise.`,
     );
   }
 
@@ -831,11 +865,26 @@ async function main() {
   const beatNowCol = (r) =>
     (r.beatBidRecentEth === null ? "·" : r.beatBidRecentEth > 0 ? r.beatBidRecentEth.toFixed(4) : "-").padStart(7);
   const bidCol = (r) => (r.bidEth === null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "-").padStart(8);
+  /** A tip bar in gwei, or "·" when the rival was never observed defending in that window. */
+  const tipCol = (g) => (g === null || g === undefined ? "·" : String(g)).padStart(6);
+  /** Bid priced against boundary-block defence only — the block that actually decides an audit. */
+  const bndCol = (r) =>
+    (r.beatBoundaryEth === null || r.beatBoundaryEth === undefined
+      ? "·"
+      : r.beatBoundaryEth > 0 ? r.beatBoundaryEth.toFixed(4) : "-").padStart(6);
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"} ${skipCol(r)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
-    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${bidCol(r)} ${beatNowCol(r)} ${beatCol(r)} ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
-  const header = "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk      bid beat2ep beatMax aud  score";
+    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${r.maxTip.toFixed(1).padStart(5)} ${String(r.bestIdx ?? "-").padStart(4)} ${payBlkCol(r)} ${bidCol(r)}` +
+    ` | ${tipCol(r.beatTipRecentGwei)} ${tipCol(r.beatTipGwei)} ${tipCol(r.beatTipBoundaryGwei)}` +
+    ` | ${beatNowCol(r)} ${beatCol(r)} ${bndCol(r)} | ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
+  // The two right-hand groups are the point of the report: BEAT-BY-TIP is the priority fee
+  // that out-densities them with no bid at all (works on every builder, including the ~10% of
+  // boundaries built by a solo validator that ignores coinbase transfers); BEAT-BY-BID is the
+  // flat bid that gets there at YOUR configured tip instead.
+  const header =
+    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk      bid" +
+    " | tip2ep tipMax tipBnd | bid2ep bidMax bidBnd | aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
   // --auditable-next keeps only rows that will be auditable when the epoch rolls: 1+
@@ -932,7 +981,10 @@ async function main() {
   if (!auditableNext) {
     const best = [...rows].filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);
     console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
-    console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted · score 0 = uncatchable or under audit");
+    console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted");
+    console.log("tip2ep/tipMax/tipBnd = PRIORITY FEE (gwei) that out-densities them with no bid — recent 2 epochs / peak / boundary blocks only");
+    console.log("bid2ep/bidMax/bidBnd = same three bars priced as a FLAT BID at your configured tip instead · '-' = your tip already clears it · '·' = never observed defending in that window");
+    console.log("tipBnd/bidBnd are the ones that matter for a boundary race: measured only in blocks that decided an audit, not quiet mid-epoch payments");
     // The beat columns are meaningless without the bundle they were priced for, and this
     // is the default output — most runs never see the fuller legend under --auditable-next.
     console.log(`beat2ep/beatMax priced for ${PLAN_PAYMENTS} payment(s) + ${PLAN_AUDITS} audit(s) + payer = ${OUR_BUNDLE_GAS.toLocaleString()} gas @ ${OUR_TIP_GWEI} gwei tip · change with --payments N --audits M --tip G`);
