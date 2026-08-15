@@ -2,6 +2,7 @@ import { encodeFunctionData, type Address } from "viem";
 import {
   deathAndTaxesAbi,
   citizensAbi,
+  citizenVaultAbi,
   EPOCH_DURATION_SECONDS,
   type OwnedTokenStatus,
   type TargetTokenStatus,
@@ -283,6 +284,34 @@ export function encodeKill(tokenId: bigint): `0x${string}` {
     functionName: "kill",
     args: [tokenId],
   });
+}
+
+/** One game action inside a vault batch. `tolerate` decides whether its failure is
+ *  survivable (a speculative audit) or must abort the whole batch (a tax payment). */
+export interface VaultCall {
+  data: `0x${string}`;
+  value: bigint;
+  tolerate: boolean;
+}
+
+/**
+ * Encode `CitizenVault.run(calls, bidWei)` — the whole boundary as one call.
+ *
+ * The vault requires `msg.value == sum(values) + bidWei` exactly, so callers must send
+ * `vaultCallValue(calls, bidWei)` and not a penny else; a mismatch reverts the batch rather
+ * than quietly spending whatever balance happened to be sitting in the contract.
+ */
+export function encodeVaultRun(calls: VaultCall[], bidWei: bigint): `0x${string}` {
+  return encodeFunctionData({
+    abi: citizenVaultAbi,
+    functionName: "run",
+    args: [calls.map((c) => ({ data: c.data, value: c.value, tolerate: c.tolerate })), bidWei],
+  });
+}
+
+/** The exact `msg.value` a vault batch must carry. */
+export function vaultCallValue(calls: VaultCall[], bidWei: bigint): bigint {
+  return calls.reduce((sum, c) => sum + c.value, bidWei);
 }
 
 export function encodeUseBribe(tokenId: bigint): `0x${string}` {

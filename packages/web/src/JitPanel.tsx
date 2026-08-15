@@ -389,11 +389,38 @@ export function JitPanel({
                 />
               </label>
             </div>
-            {(config.coinbaseBidEth > 0 || config.coinbaseBidAuditOnlyEth > 0) && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
+            {/* Only meaningful without a vault: with one, the bid is paid inside the batch
+                call and the forwarder is never used, so this warning would be wrong. */}
+            {!config.vaultAddress
+              && (config.coinbaseBidEth > 0 || config.coinbaseBidAuditOnlyEth > 0)
+              && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
               <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
                 No CoinbasePayer address configured, so the bid won't fire. Set it in data/config.json.
               </p>
             )}
+
+            {/* Shown only when in use. Read-only for the same reason the payer above is,
+                and more so: this address holds citizens, so it is not something to be able
+                to repoint from a browser. Edited in data/config.json. */}
+            {config.vaultAddress ? (
+              <div className="row wrap" style={{ gap: 12, alignItems: "flex-end", marginTop: 8 }}>
+                <label className="field" style={{ flex: "2 1 260px" }}>
+                  Vault address (batched boundary)
+                  <input
+                    type="text"
+                    value={config.vaultAddress}
+                    readOnly
+                    title="CitizenVault holding your citizens. The whole boundary goes out as one transaction with each action allowed to fail on its own, and the coinbase bid is paid inside that same call. Editable only via data/config.json."
+                    style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, opacity: 0.7, cursor: "not-allowed" }}
+                  />
+                </label>
+                {!/^0x[a-fA-F0-9]{40}$/.test(config.vaultAddress) && (
+                  <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
+                    Vault address is malformed — batching is disabled until it is a valid 0x address.
+                  </p>
+                )}
+              </div>
+            ) : null}
 
             {/* No switch of its own: arming automatically IS what away mode means, so the
                 away button is the single place it is turned on. Still described here,

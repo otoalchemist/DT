@@ -16,7 +16,11 @@ import {
   encodeUseBribe,
   estimateTaxes,
   gameContract,
+  encodeVaultRun,
+  vaultCallValue,
+  type VaultCall,
 } from "./contract.js";
+import { reconcileVaultReceipt } from "./vault-receipt.js";
 import {
   fetchOwnedTokenIds,
   fetchCandidateTokenIds,
@@ -83,6 +87,23 @@ function walletForToken(tokenId: bigint | string): Wallet | null {
 }
 
 /**
+ * The configured CitizenVault, or null when batching is off.
+ *
+ * The SINGLE place that decides whether vault mode is on, so the answer can never differ
+ * between the ownership pass and the submit path — which would route a call through a
+ * vault that the token lookup did not know about, or the reverse.
+ *
+ * Validated here rather than trusted: a half-typed address in config.json must not reach
+ * the NFT index or become a transaction target. An invalid value disables batching and
+ * falls back to one-tx-per-action, which is the behaviour that always works — never a
+ * failed boundary.
+ */
+function vaultAddressOrNull(): Address | null {
+  const v = (runtime.strategy.vaultAddress ?? "").trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(v) ? (v as Address) : null;
+}
+
+/**
  * Owned citizens across EVERY unlocked wallet, and the wallet holding each.
  *
  * Replaces the single `fetchOwnedTokenIds(citizens, address)`: with several wallets the
@@ -93,11 +114,21 @@ function walletForToken(tokenId: bigint | string): Wallet | null {
 // closed without it — so a test that submits for an owned token has to prime it the same
 // way tick() does, rather than assuming a wallet.
 export async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint[]> {
+  // Where to look, and which wallet signs for what we find there. Normally that is one
+  // entry per unlocked wallet. With a vault configured there is one more: the citizens it
+  // holds are owned by the CONTRACT on-chain, and the wallet that acts for them is the
+  // vault's operator — our primary. Listed LAST so that if the NFT index is momentarily
+  // stale mid-transfer, the wallet copy wins and we never route a call through the vault
+  // for a citizen it does not actually hold yet.
+  const holders: { w: Wallet; address: Address }[] = runtime.wallets.map((w) => ({
+    w,
+    address: w.account.address as Address,
+  }));
+  const vault = vaultAddressOrNull();
+  if (vault && runtime.primary) holders.push({ w: runtime.primary, address: vault });
+
   const per = await Promise.all(
-    runtime.wallets.map(async (w) => ({
-      w,
-      ids: await fetchOwnedTokenIds(citizens, w.account.address as Address),
-    })),
+    holders.map(async ({ w, address }) => ({ w, ids: await fetchOwnedTokenIds(citizens, address) })),
   );
   const next = new Map<string, Wallet>();
   const ids: bigint[] = [];
@@ -120,16 +151,152 @@ export async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint
 // once the whole tick's txs are sent together as one atomic bundle.
 let batchEntries: { entryId: string; nonce: number }[] = [];
 
+/**
+ * Actions collected for a single CitizenVault.run() call, and the bid riding with them.
+ *
+ * Non-null only between beginVaultBatch() and flushVaultBatch(), and only when a vault is
+ * configured. While it is open, act() appends here instead of submitting — so N game
+ * actions become ONE transaction, and an action that reverts costs a few thousand gas of
+ * internal call rather than a whole ~81,000-gas transaction and a bundle slot.
+ *
+ * `entryId` is carried per call so the receipt decode can flip each activity entry to its
+ * real outcome; `index` is implicit in the array position, which is exactly what the
+ * vault's CallResult event reports back.
+ */
+interface CollectedVaultCall extends VaultCall {
+  entryId: string;
+  kind: "pay-taxes" | "use-bribe" | "audit" | "kill";
+  tokenId?: string;
+  targetTokenId?: string;
+}
+let vaultBatch: CollectedVaultCall[] | null = null;
+let vaultBidWei = 0n;
+
+/** Which kinds are owner-only on-chain and therefore MUST be sent by the citizen's holder.
+ *  With a vault that holder is the contract, so these are the calls that have to be routed
+ *  through it. `kill` names no owned token and is callable by anyone, so it stays direct —
+ *  routing it through the vault would only add gas. */
+function isOwnerOnlyKind(kind: string): boolean {
+  return kind === "pay-taxes" || kind === "use-bribe" || kind === "audit";
+}
+
+/** Open a vault collection window. No-op unless a vault is configured. */
+function beginVaultBatch(): void {
+  vaultBatch = vaultAddressOrNull() ? [] : null;
+  vaultBidWei = 0n;
+}
+
+// Gas for the vault wrapper itself: calldata dispatch, the loop, the value check, the
+// refund and the coinbase transfer. Sized generously and deliberately — unused gas is
+// refunded, while under-providing loses the boundary. Same asymmetry as
+// GAS_COINBASE_BID_TX.
+const VAULT_CALL_OVERHEAD_GAS = 60_000n;
+// Per collected action. The largest game action is an audit at ~130,409; the rest is the
+// internal CALL and event. Not eth_estimateGas'd: at a boundary the batch is invalid
+// against current state (it pays an epoch that has not begun), which is exactly why
+// PRE_BOUNDARY_GAS exists too.
+const VAULT_PER_CALL_GAS = 145_000n;
+
+/**
+ * Send everything collected since beginVaultBatch() as ONE CitizenVault.run() call.
+ *
+ * Must run BEFORE flushBatch(): this queues the transaction into the open bundle, and
+ * flushBatch is what actually ships that bundle.
+ *
+ * The outer transaction is deliberately NOT marked revert-tolerant. Per-call tolerance
+ * already lives inside the vault, so the only way the whole call reverts is an intolerant
+ * action failing — and in that case landing it would burn the gas to accomplish nothing.
+ * Letting the builder drop it instead is the all-or-nothing behaviour we want.
+ */
+async function flushVaultBatch(): Promise<void> {
+  const calls = vaultBatch;
+  const bidWei = vaultBidWei;
+  vaultBatch = null;
+  vaultBidWei = 0n;
+  if (!calls || (calls.length === 0 && bidWei === 0n)) return;
+
+  const vault = vaultAddressOrNull();
+  const signer = runtime.primary;
+  if (!vault || !signer) return;
+
+  // A payment in the batch makes it defensive: a batch that never lands can cost a
+  // citizen, so it keeps a mempool copy exactly as a standalone payment does. An
+  // audit-only batch stays private — a visible pending audit lets the target cure first.
+  const hasPayment = calls.some((c) => c.kind === "pay-taxes");
+  const intent: TxIntent = {
+    to: vault,
+    data: encodeVaultRun(calls, bidWei),
+    value: vaultCallValue(calls, bidWei),
+    gas: VAULT_CALL_OVERHEAD_GAS + BigInt(calls.length) * VAULT_PER_CALL_GAS,
+  };
+
+  try {
+    const result = await submitTx(intent, {
+      account: signer.account,
+      race: hasPayment,
+      offense: !hasPayment,
+      revertible: false,
+      // The batch pays for an epoch that has not started yet, so simulating it against
+      // current state would wrongly revert — the same reason the pre-boundary payment
+      // skips its sim. Per-call tolerance is what makes that safe here.
+      skipSim: true,
+    });
+    if (!result.ok) {
+      // The whole batch failed to go out — every collected action failed with it, so say
+      // so on each entry rather than leaving a row of "submitted" that never resolves.
+      for (const c of calls) {
+        activity.update(c.entryId, { status: "skipped", message: `batch not sent — ${result.error ?? "failed"}` });
+      }
+      return;
+    }
+    const entry = activity.add({
+      kind: "info",
+      status: "submitted",
+      txHash: result.txHash,
+      bundleHash: result.bundleHash,
+      targetBlock: result.targetBlock?.toString(),
+      valueWei: intent.value.toString(),
+      gasWei: result.gasWei.toString(),
+      message:
+        `Vault batch: ${calls.filter((c) => c.kind === "pay-taxes").length} payment(s), ` +
+        `${calls.filter((c) => c.kind === "audit").length} audit(s)` +
+        (bidWei > 0n ? `, ${formatEther(bidWei)} ETH bid inline` : "") +
+        ` in one tx`,
+    });
+    runtime.recordSpend(result.gasWei);
+    invalidateBalanceCache();
+    commitFor(signer.account.address, result.gasWei);
+    if (result.queued) batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+    runtime.emitStatus();
+    // Per-action outcomes come from the receipt: a call that reverted inside the batch
+    // emits no game event, so only the vault's own CallResult log can say which failed.
+    const hash = result.txHash ?? result.predictedTxHash;
+    if (hash) void reconcileVaultReceipt(hash, calls, entry.id);
+  } catch (err) {
+    for (const c of calls) {
+      activity.update(c.entryId, { status: "skipped", message: `batch error — ${(err as Error).message}` });
+    }
+    logger.error("vault batch error:", (err as Error).message);
+  }
+}
+
 /** Open a bundle batch for a tick so all its txs go out as one atomic multi-tx
  *  bundle (mainnet only; public/local send each tx immediately as before). */
 function beginBatch(): void {
   batchEntries = [];
+  // Every fire path already brackets itself with beginBatch/flushBatch, so hooking the
+  // vault collector here covers the boundary, JIT, defense, kill and manual paths at once
+  // — rather than five call sites that could each be forgotten.
+  beginVaultBatch();
   if (appConfig.mode === "mainnet") beginBundle();
 }
 
 /** Send the tick's queued txs as one bundle and reconcile each activity entry
  *  with its resulting hashes / status. No-op in public/local mode. */
 async function flushBatch(): Promise<void> {
+  // Vault first: this queues the ONE batched transaction into the bundle that the flush
+  // below actually ships, and appends its entry to batchEntries in time to be reconciled.
+  await flushVaultBatch();
   const entries = batchEntries;
   batchEntries = [];
   if (appConfig.mode !== "mainnet" || entries.length === 0) return;
@@ -817,8 +984,22 @@ function applyExclusions(ids: bigint[], context: string): bigint[] {
 async function maybeQueueCoinbaseBid(kind: BidKind): Promise<void> {
   const s = runtime.strategy;
   const amount = coinbaseBidFor(s, kind);
-  if (amount <= 0 || !s.coinbasePayerAddress) return;
+  if (amount <= 0) return;
   const bidWei = parseEther(String(amount));
+
+  // With a vault the bid rides INSIDE the batch call rather than in a CoinbasePayer
+  // transaction of its own. That is not just tidier: the forwarder tx costs ~30,550 gas
+  // that the bid is then spread across, so paying inline buys a higher value-per-gas for
+  // the same ETH. No payer address is needed on this path.
+  if (vaultBatch) {
+    vaultBidWei += bidWei;
+    runtime.recordSpend(bidWei);
+    if (runtime.primary) commitFor(runtime.primary.account.address, bidWei);
+    invalidateBalanceCache();
+    return;
+  }
+
+  if (!s.coinbasePayerAddress) return;
   const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei);
   if (!queued) return;
   // The bid is real ETH but it does NOT go through act(), so it was invisible to every
@@ -860,7 +1041,10 @@ export function coinbaseBidFor(s: StrategyConfig, kind: BidKind): number {
 }
 
 export function coinbaseBidActive(s: StrategyConfig, kind: BidKind = "payment"): boolean {
-  return coinbaseBidFor(s, kind) > 0 && !!s.coinbasePayerAddress;
+  // A vault pays the bid inline, so it needs no CoinbasePayer — reading only the payer
+  // here would report "no bid" for a vault user and cascade into the wrong bundle shape
+  // (audits stripped of their mempool mirror on the expectation of a bid that never fires).
+  return coinbaseBidFor(s, kind) > 0 && (!!s.coinbasePayerAddress || !!s.vaultAddress);
 }
 
 /**
@@ -1630,6 +1814,53 @@ async function act(
     });
     return null;
   }
+  // --- vault routing -------------------------------------------------------------
+  //
+  // With a vault configured its citizens are owned by the CONTRACT, so an owner-only call
+  // signed straight from a wallet is a guaranteed revert. Every such call is therefore
+  // wrapped, uniformly, whether or not a batch happens to be open — a path that only
+  // worked at the boundary would leave proactive pay, JIT and the manual buttons silently
+  // broken.
+  const vault = vaultAddressOrNull();
+  if (vault && isOwnerOnlyKind(kind)) {
+    const call: VaultCall = {
+      data: intent.data,
+      value: intent.value,
+      // Reuse the caller's own revert-tolerance decision rather than deciding by kind:
+      // it already encodes "may this fail without taking the others down" (an audit whose
+      // target a rival may cure first, or one of several payments where a single bad
+      // citizen must not drop its siblings). A lone must-land payment stays intolerant, so
+      // it still fails loudly instead of being swallowed inside the batch.
+      tolerate: ctx.revertible ?? false,
+    };
+    if (vaultBatch) {
+      // Collected: the entry is written now so the log shows intent immediately, exactly
+      // as it does today, and the receipt decode flips it to its real outcome later.
+      const entry = activity.add({
+        kind,
+        status: "submitted",
+        tokenId: ctx.tokenId,
+        targetTokenId: ctx.targetTokenId,
+        valueWei: intent.value.toString(),
+        message: `${ctx.message} (batched)`,
+      });
+      vaultBatch.push({ ...call, entryId: entry.id, kind, tokenId: ctx.tokenId, targetTokenId: ctx.targetTokenId });
+      runtime.recordSpend(intent.value);
+      commitFor(signer.account.address, intent.value);
+      invalidateBalanceCache();
+      runtime.emitStatus();
+      return { ok: true, simulated: false, queued: true, nonce: -1, valueWei: intent.value, gasWei: 0n };
+    }
+    // No batch open (defense, proactive pay, a manual button): send it on its own, still
+    // through the vault because that is who owns the citizen.
+    intent = {
+      to: vault,
+      data: encodeVaultRun([call], 0n),
+      value: vaultCallValue([call], 0n),
+      gas: intent.gas === undefined ? undefined : intent.gas + VAULT_CALL_OVERHEAD_GAS,
+    };
+  }
+
   try {
     const result = await submitTx(intent, {
       account: signer.account,

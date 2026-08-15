@@ -488,6 +488,22 @@ export interface StrategyConfig {
   /** Address of the deployed CoinbasePayer forwarder used for coinbaseBidEth. Its
    *  receive() forwards ETH to block.coinbase. Empty = coinbase bidding disabled. */
   coinbasePayerAddress: string;
+  /**
+   * ADVANCED, opt-in. Address of a deployed CitizenVault (contracts/CitizenVault.sol)
+   * holding your citizens, so a whole boundary goes out as ONE transaction with each
+   * action allowed to fail on its own.
+   *
+   * Empty = off, and the bot behaves exactly as it did before this existed: one
+   * transaction per action, signed by whichever wallet holds the citizen.
+   *
+   * When set, the vault is treated as an additional holder — its citizens are owned by
+   * the contract on-chain, and the bot's wallet acts as the vault's `operator`. The
+   * coinbase bid is then paid inside the same call, so coinbasePayerAddress is unused.
+   *
+   * Setting this does NOT move anything. Citizens are yours until you
+   * `safeTransferFrom` them in, and only the vault's cold-key owner can take them out.
+   */
+  vaultAddress: string;
 
   /** Hard cap (ETH) on the value of any single transaction (payments in
    *  particular). A tx whose value exceeds this is skipped, not sent — a
