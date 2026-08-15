@@ -1,4 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { AppConfig } from "./config.js";
 
@@ -180,5 +183,63 @@ describe("API browser security", () => {
     });
     expect(socket.readyState).toBe(1);
     socket.close();
+  });
+});
+
+describe("built dashboard", () => {
+  it("serves the Vite bundle at GET / with anti-framing headers", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dt-api-dash-"));
+    try {
+      fs.writeFileSync(path.join(root, "index.html"), "<!doctype html><title>dash</title>");
+      fs.mkdirSync(path.join(root, "assets"));
+      fs.writeFileSync(path.join(root, "assets", "app.js"), "console.log(1)");
+
+      const app = await buildServer({ dashboardRoot: root });
+      openApps.push(app);
+
+      const page = await app.inject({ method: "GET", url: "/", headers: { host: "localhost:8787" } });
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["content-type"]).toMatch(/text\/html/);
+      expect(page.headers["x-frame-options"]).toBe("DENY");
+      expect(page.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+      expect(page.body).toContain("<title>dash</title>");
+
+      const asset = await app.inject({
+        method: "GET",
+        url: "/assets/app.js",
+        headers: { host: "localhost:8787" },
+      });
+      expect(asset.statusCode).toBe(200);
+      expect(asset.headers["content-type"]).toMatch(/javascript/);
+      expect(asset.body).toBe("console.log(1)");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("explains how to open the dashboard when the bundle is missing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dt-api-dash-empty-"));
+    try {
+      const app = await buildServer({ dashboardRoot: root });
+      openApps.push(app);
+      const page = await app.inject({ method: "GET", url: "/", headers: { host: "localhost:8787" } });
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["x-frame-options"]).toBe("DENY");
+      expect(page.body).toContain("localhost:5173");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let the dashboard handler swallow API 404s", async () => {
+    const app = await makeApp();
+    const token = await getSession(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/does-not-exist",
+      headers: { ...localHeaders, "x-dat-bot-session": token },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ error: "Not Found", statusCode: 404 });
   });
 });

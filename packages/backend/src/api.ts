@@ -37,8 +37,9 @@ import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readDoNotTarget, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
+import { defaultDashboardRoot, registerDashboard } from "./dashboard.js";
 
-export async function buildServer(): Promise<FastifyInstance> {
+export async function buildServer(options: { dashboardRoot?: string } = {}): Promise<FastifyInstance> {
   if (!isLoopbackHostname(appConfig.host)) {
     throw new Error(
       `Refusing to bind unauthenticated wallet API to non-loopback HOST=${appConfig.host}. ` +
@@ -946,6 +947,10 @@ export async function buildServer(): Promise<FastifyInstance> {
       offActivity();
     });
   });
+
+  // After `npm run build`, serve the Vite dashboard from this same loopback port
+  // so `npm start` has a UI at GET /. Dev still uses the Vite server on :5173.
+  registerDashboard(app, options.dashboardRoot ?? defaultDashboardRoot());
 
   return app;
 }

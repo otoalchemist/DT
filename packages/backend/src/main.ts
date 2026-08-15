@@ -3,6 +3,7 @@ import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { runtime } from "./runtime.js";
 import { buildServer } from "./api.js";
+import { dashboardIndexExists } from "./dashboard.js";
 import { getChainId } from "./chain.js";
 import { prewarmTargets } from "./service.js";
 import { activity } from "./activity.js";
@@ -16,7 +17,13 @@ async function main(): Promise<void> {
 
   const app = await buildServer();
   await app.listen({ port: appConfig.port, host: appConfig.host });
-  logger.info(`API listening on http://${appConfig.host}:${appConfig.port}`);
+  const origin = `http://${appConfig.host}:${appConfig.port}`;
+  logger.info(`API listening on ${origin}`);
+  if (dashboardIndexExists()) {
+    logger.info(`Dashboard: ${origin}/`);
+  } else {
+    logger.info("Dashboard bundle not found — in development, open http://localhost:5173/");
+  }
   logger.info("LIVE FIRE — the bot submits real transactions when unlocked and enabled.");
 
   // Warm the rival-target caches in the background so the first dashboard load is fast

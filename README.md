@@ -117,13 +117,16 @@ Fund the wallet with a little ETH for taxes/audits/gas. Keep the dashboard's
 
 ```bash
 npm run build
-npm start          # backend only; serve packages/web/dist with any static host
+npm start          # API + built dashboard at http://localhost:8787/
 ```
 
-The bundled Vite development and preview servers deny framing. If you serve
-`packages/web/dist` from another static host, preserve at least
-`Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`;
-otherwise another site could iframe the local dashboard and attempt clickjacking.
+After a build, the backend serves `packages/web/dist` from the same loopback
+port as the API. Open **`http://localhost:8787/`**. You can still host that
+`dist` folder yourself if you want; if you do, preserve at least
+`Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`
+(the backend already sets both). Otherwise another site could iframe the local
+dashboard and attempt clickjacking. The bundled Vite development and preview
+servers deny framing too.
 
 ### Versioning & releases
 
