@@ -21,6 +21,7 @@ import {
   type VaultCall,
 } from "./contract.js";
 import { reconcileVaultReceipt } from "./vault-receipt.js";
+import { refreshVaultCheck, getVaultCheck } from "./vault-preflight.js";
 import {
   fetchOwnedTokenIds,
   fetchCandidateTokenIds,
@@ -87,6 +88,23 @@ function walletForToken(tokenId: bigint | string): Wallet | null {
 }
 
 /**
+ * Citizens the VAULT holds right now, refreshed with `ownedBy` every ownership pass.
+ *
+ * Migration is incremental by design — move one citizen, run an epoch, then the rest — so
+ * there is a real and deliberate period where some citizens are in the vault and some are
+ * still in a wallet. Routing must follow the token, not the config: wrapping a
+ * wallet-held citizen's payTaxes in a vault that does not own it reverts owner-only, which
+ * would break the payment for every citizen not yet migrated.
+ */
+let vaultHeld = new Set<string>();
+
+/** Whether this citizen is currently held by the vault, and so must be acted on through
+ *  it. Unknown/absent tokenId is false — `kill` names no owned token and goes direct. */
+function isVaultHeld(tokenId?: string): boolean {
+  return tokenId !== undefined && vaultHeld.has(tokenId);
+}
+
+/**
  * The configured CitizenVault, or null when batching is off.
  *
  * The SINGLE place that decides whether vault mode is on, so the answer can never differ
@@ -120,29 +138,42 @@ export async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint
   // vault's operator — our primary. Listed LAST so that if the NFT index is momentarily
   // stale mid-transfer, the wallet copy wins and we never route a call through the vault
   // for a citizen it does not actually hold yet.
-  const holders: { w: Wallet; address: Address }[] = runtime.wallets.map((w) => ({
+  const holders: { w: Wallet; address: Address; isVault: boolean }[] = runtime.wallets.map((w) => ({
     w,
     address: w.account.address as Address,
+    isVault: false,
   }));
   const vault = vaultAddressOrNull();
-  if (vault && runtime.primary) holders.push({ w: runtime.primary, address: vault });
+  if (vault && runtime.primary) {
+    holders.push({ w: runtime.primary, address: vault, isVault: true });
+    // Cached for 5 minutes, so this is free on all but the first pass. Awaited rather than
+    // fired-and-forgotten because the answer gates whether we may act at all, and finding
+    // out after building a boundary bundle is finding out too late.
+    await refreshVaultCheck(vault, {
+      operator: runtime.primary.account.address,
+      citizens: runtime.citizensAddress,
+    });
+  }
 
   const per = await Promise.all(
-    holders.map(async ({ w, address }) => ({ w, ids: await fetchOwnedTokenIds(citizens, address) })),
+    holders.map(async ({ w, address, isVault }) => ({ w, isVault, ids: await fetchOwnedTokenIds(citizens, address) })),
   );
   const next = new Map<string, Wallet>();
+  const nextVaultHeld = new Set<string>();
   const ids: bigint[] = [];
-  for (const { w, ids: list } of per) {
+  for (const { w, isVault, ids: list } of per) {
     for (const id of list) {
       const key = id.toString();
       // A token can only be in one wallet; if the index is momentarily stale during a
       // transfer, first-seen wins rather than the entry silently flipping mid-tick.
       if (next.has(key)) continue;
       next.set(key, w);
+      if (isVault) nextVaultHeld.add(key);
       ids.push(id);
     }
   }
   ownedBy = next;
+  vaultHeld = nextVaultHeld;
   return ids;
 }
 
@@ -1816,13 +1847,33 @@ async function act(
   }
   // --- vault routing -------------------------------------------------------------
   //
-  // With a vault configured its citizens are owned by the CONTRACT, so an owner-only call
-  // signed straight from a wallet is a guaranteed revert. Every such call is therefore
-  // wrapped, uniformly, whether or not a batch happens to be open — a path that only
-  // worked at the boundary would leave proactive pay, JIT and the manual buttons silently
-  // broken.
+  // A citizen the vault holds is owned by the CONTRACT, so an owner-only call signed
+  // straight from a wallet is a guaranteed revert. Such calls are wrapped uniformly,
+  // whether or not a batch happens to be open — a path that only worked at the boundary
+  // would leave proactive pay, JIT and the manual buttons silently broken.
+  //
+  // Gated on the TOKEN, not merely on the vault being configured. Migration is incremental
+  // (move one, run an epoch, then the rest), so a wallet-held citizen must keep going
+  // direct; wrapping it in a vault that does not own it reverts owner-only and would break
+  // payments for everything not yet moved.
   const vault = vaultAddressOrNull();
-  if (vault && isOwnerOnlyKind(kind)) {
+  if (vault && isOwnerOnlyKind(kind) && isVaultHeld(ctx.tokenId)) {
+    // Refuse on POSITIVE evidence the wiring is broken — an unread or unknown check still
+    // proceeds, because failing a boundary over a slow RPC would be its own harm. When it
+    // is genuinely misconfigured there is nothing to fall back TO (the citizen is in the
+    // vault, so signing from the wallet reverts identically), and the only difference
+    // between acting and not is whether we also burn the gas.
+    const check = getVaultCheck();
+    if (check && !check.ok) {
+      activity.add({
+        kind: "error",
+        status: "skipped",
+        tokenId: ctx.tokenId,
+        targetTokenId: ctx.targetTokenId,
+        message: `${ctx.message} — skipped: vault not usable (${check.problems[0] ?? "failed preflight"})`,
+      });
+      return null;
+    }
     const call: VaultCall = {
       data: intent.data,
       value: intent.value,
