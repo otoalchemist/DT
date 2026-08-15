@@ -3,7 +3,6 @@ import type {
   StrategyConfig,
   ActivityEntry,
   OwnedTokenStatus,
-  PostMortemResult,
 } from "@dat-bot/shared";
 
 let sessionTokenPromise: Promise<string> | null = null;
@@ -94,6 +93,4 @@ export const api = {
     req<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify({ alchemyApiKey }) }),
   saveMode: (mode: "mainnet" | "public") =>
     req<{ ok: boolean; mode: string }>("/api/settings", { method: "POST", body: JSON.stringify({ mode }) }),
-  postMortem: (ours: string[], rivals: string[]) =>
-    req<PostMortemResult>("/api/postmortem", { method: "POST", body: JSON.stringify({ ours, rivals }) }),
 };

@@ -6,7 +6,6 @@ A self-hosted **defensive** automation bot for the on-chain game **[Death & Taxe
 - **Defense (pre-audit by default):** keeping citizens current *before* they can be audited (proactive pay, prepay up to 7 epochs to lock the current rate, and the JIT boundary payment). Those skip any citizen already under audit. Any citizen you **uncheck** in the JIT panel is excluded from *every* automatic payment. Recovering an audited citizen is your call via **Pay to current** / **Clear audit (bribe)** on the token row, unless you opt into **Benji (Defense) Mode** (`autoDefendAudit`) to auto-pay *your* audited citizen.
 - **Reliable inclusion:** choose your submission path — **`mainnet`** (the default: private **bundles** fanned out to several block builders; bundles sit in the block's top region *regardless of tip*, which is what wins a boundary race — and payments still mirror to the public mempool so they can't fail to land) or **`public`** (mempool only, seated after every bundle). Optional latency edges let payments compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
 - **Live activity log:** every action is timestamped with its status; submitted transactions link to Etherscan and auto-update from **submitted → included / reverted** once the receipt lands.
-- **Race post-mortem:** after the fact, paste your tx hash and a rival's to see whether you lost on **timing** (later block) or **fee** (same block, out-priced) — in the dashboard or from the CLI.
 
 You run it on your own machine with your own key. It ships with a local web dashboard.
 
@@ -340,20 +339,6 @@ in the dashboard):
   batch-auditor hits several of your citizens at once. Each tx still mirrors to the
   public mempool individually as a fallback. No configuration; always on in
   `mainnet` mode.
-
-## Race post-mortem
-
-Compare your transaction against a rival's to diagnose *why* you lost a race —
-**timing** (you landed in a later block; more gas wouldn't have helped) vs **fee**
-(same block, out-priced). Available in the dashboard, or from the CLI:
-
-```bash
-# your tx first, then one or more rival txs
-npx tsx packages/backend/src/postmortem.ts <yourTx> <rivalTx> [<rivalTx> ...]
-```
-
-It reports each tx's block, index, and effective priority tip, then a per-pair
-verdict and a summary. Needs an RPC (`ALCHEMY_API_KEY` or `RPC_HTTP_URL`).
 
 ---
 

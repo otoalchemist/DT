@@ -9,7 +9,6 @@ import {
 import { api } from "./api.js";
 import { Config } from "./Config.js";
 import { JitPanel } from "./JitPanel.js";
-import { PostMortem } from "./PostMortem.js";
 import { Wallets } from "./Wallets.js";
 import { weiToEth, shortAddr, countdown, timeAgo, gameStateLabel } from "./util.js";
 
@@ -436,9 +435,6 @@ Mid-epoch work is still missed: an audit expires 24h after it was cast, not on a
           </div>
         </div>
       </div>
-
-      <div className="spacer" />
-      <PostMortem />
 
     </div>
   );

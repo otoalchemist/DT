@@ -33,7 +33,6 @@ import { invalidateTokenCaches } from "./index-tokens.js";
 import { resolveJitTarget } from "./logic.js";
 import { startEngine, stopEngine, quiesceEngine, hasActiveEngineWork, beginEngineMaintenance, isEngineMaintenanceActive, type EngineMaintenanceLease, scheduleJitBoundary, schedulePreBoundaryPay, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses } from "./service.js";
-import { runPostMortem } from "./postmortem.js";
 import { defaultDashboardRoot, registerDashboard } from "./dashboard.js";
 
 export async function buildServer(options: { dashboardRoot?: string } = {}): Promise<FastifyInstance> {
@@ -793,29 +792,6 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
         ? { ...entry, message: "Sensitive provider or credential detail was redacted" }
         : entry
     ));
-  });
-
-  // --- race post-mortem: compare our tx(s) vs rival tx(s) on-chain ---
-  app.post("/api/postmortem", async (req, reply) => {
-    const hash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "invalid tx hash");
-    const schema = z.object({
-      ours: z.array(hash).min(1).max(20),
-      rivals: z.array(hash).max(20).default([]),
-    });
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    if (!appConfig.httpUrl) {
-      return reply.code(400).send({ error: "No RPC configured — set the Alchemy key first." });
-    }
-    try {
-      const result = await runPostMortem(
-        parsed.data.ours as `0x${string}`[],
-        parsed.data.rivals as `0x${string}`[],
-      );
-      return result;
-    } catch (err) {
-      return internalFailure(reply, err, "Could not generate the transaction post-mortem", 502);
-    }
   });
 
   // --- websocket: push status + activity ---

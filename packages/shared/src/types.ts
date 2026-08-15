@@ -193,46 +193,6 @@ export interface StrategyConfig {
   maxPaymentEth: number;
 }
 
-/** One transaction resolved on-chain for a race post-mortem. */
-export interface PostMortemTx {
-  hash: string;
-  role: "ours" | "rival";
-  found: boolean;
-  action: string;
-  args: string;
-  from: string;
-  blockNumber: string | null;
-  txIndex: number | null;
-  blockTs: number | null;
-  baseFeeGwei: number | null;
-  /** Effective priority tip actually paid. */
-  tipGwei: number | null;
-  /** Total effective gas price paid. */
-  effectiveGwei: number | null;
-  /** True if the tx targeted the game contract. */
-  toGame: boolean;
-}
-
-/** Win/loss verdict for one of our txs vs one rival tx. */
-export interface PostMortemVerdict {
-  ourHash: string;
-  rivalHash: string;
-  ourLabel: string;
-  rivalLabel: string;
-  sameAction: boolean;
-  /** "won" | "lost-timing" | "lost-fee" | "unknown". */
-  outcome: "won" | "lost-timing" | "lost-fee" | "unknown";
-  detail: string;
-}
-
-export interface PostMortemResult {
-  txs: PostMortemTx[];
-  verdicts: PostMortemVerdict[];
-  summary: string;
-  gameAddress: string;
-  mode: string;
-}
-
 /** One unlocked hot wallet in the keystore. */
 export interface WalletStatus {
   address: string;
