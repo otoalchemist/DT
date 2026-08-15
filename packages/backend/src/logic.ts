@@ -11,21 +11,9 @@ export interface GasSettings {
 }
 
 /**
- * Resolve the gas settings for a transaction. Audit/kill (`offense`) use the
- * dedicated `offense*` fields when `separateOffenseGas` is on; everything else —
- * and offense when the split is off — uses the shared base settings. Keeping
- * this in one pure function guarantees the guardrail check (`canSpend`) and the
- * fee builder (`computeFees`) always agree on which numbers apply.
+ * Resolve the gas settings for a tax-payment transaction.
  */
-export function resolveGas(s: StrategyConfig, offense: boolean): GasSettings {
-  if (offense && s.separateOffenseGas) {
-    return {
-      maxBaseFeeGwei: s.offenseMaxBaseFeeGwei,
-      priorityFeeGwei: s.offensePriorityFeeGwei,
-      dynamicTipEnabled: s.offenseDynamicTipEnabled,
-      dynamicTipMaxGwei: s.offenseDynamicTipMaxGwei,
-    };
-  }
+export function resolveGas(s: StrategyConfig): GasSettings {
   return {
     maxBaseFeeGwei: s.maxBaseFeeGwei,
     priorityFeeGwei: s.priorityFeeGwei,
@@ -42,23 +30,6 @@ export function isAuditable(lastEpochPaid: bigint, currentEpoch: bigint): boolea
 /** A token can be killed once it is under audit and the deadline has passed. */
 export function isKillable(auditDueTimestamp: bigint, nowSec: bigint): boolean {
   return auditDueTimestamp !== 0n && nowSec > auditDueTimestamp;
-}
-
-/**
- * Whether an owned token can be used as an audit "from" token right now. The
- * contract requires the from-token to not itself be delinquent/auditable and to
- * still have audit capacity this epoch. On-chain evidence: a token one epoch
- * behind can still audit (so it need not be strictly current — up to 1 behind is
- * fine), and each token may audit `auditLimit` times per epoch (1 for a normal
- * token, higher for auditor-role tokens).
- */
-export function isEligibleAuditor(
-  lastEpochPaid: bigint,
-  currentEpoch: bigint,
-  auditsUsedThisEpoch: bigint,
-  auditLimit: bigint,
-): boolean {
-  return !isAuditable(lastEpochPaid, currentEpoch) && auditsUsedThisEpoch < auditLimit;
 }
 
 export interface RiskResult {
@@ -115,11 +86,10 @@ export function preBoundaryTaxWei(
  * The set of citizens the bot must never pay, normalized through BigInt so "0206",
  * "206" and "0xce" all compare equal to the canonical "206".
  *
- * The same normalization bug already bit the offense pin list (a pin that didn't
- * string-match its canonical form was silently skipped). Here the failure mode is
- * worse than a missed audit: an exclusion that fails to match would pay a citizen the
- * user explicitly abandoned. Unparseable entries are dropped rather than poisoning the
- * whole set — but the caller logs them so a typo can't hide.
+ * The same normalization is used everywhere a token-id list is compared, so
+ * "0206", "206" and "0xce" all match the canonical "206". Unparseable entries
+ * are dropped rather than poisoning the whole set — but the caller logs them so
+ * a typo can't hide.
  */
 export function excludedTokenSet(ids: string[]): { set: Set<string>; invalid: string[] } {
   const set = new Set<string>();
@@ -232,33 +202,6 @@ export function resolveJitTarget(
     };
   }
   return { ok: true, target };
-}
-
-/**
- * Deterministically order items by a salted hash of their key.
- *
- * Every bot enumerates rival candidates in the same order (the NFT API returns a
- * stable list), so without this every user sweeps the same tokens first — piling
- * onto identical targets and colliding on the same races, while tokens late in the
- * list are never reached when the auditor pool runs out. Salting per engine start
- * gives each run a stable but distinct order, spreading coverage across users.
- *
- * Stable for a given salt (so a run doesn't reshuffle mid-flight) and a pure
- * permutation — same elements, just reordered.
- */
-export function orderBySalt<T>(items: T[], keyOf: (item: T) => string, salt: number): T[] {
-  const hash = (key: string): number => {
-    let h = salt >>> 0;
-    for (let i = 0; i < key.length; i++) {
-      h = Math.imul(h ^ key.charCodeAt(i), 0x01000193) >>> 0; // FNV-1a style
-    }
-    return h >>> 0;
-  };
-  return [...items]
-    .map((item) => ({ item, h: hash(keyOf(item)) }))
-    // Tie-break on the key so equal hashes still order deterministically.
-    .sort((a, b) => a.h - b.h || keyOf(a.item).localeCompare(keyOf(b.item)))
-    .map((x) => x.item);
 }
 
 /** Would spending `total` drop the balance below the floor? */

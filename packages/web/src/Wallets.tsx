@@ -6,7 +6,7 @@ import { weiToEth, shortAddr } from "./util.js";
 /**
  * Hot wallets holding the bot's citizens.
  *
- * payTaxes / audit / useBribe are owner-only on-chain, so a citizen can only be acted on
+ * payTaxes / useBribe are owner-only on-chain, so a citizen can only be acted on
  * by the wallet that holds it — there is no delegation path. That is why every wallet's
  * key lives here rather than one wallet acting for the rest, and why each needs its own
  * gas: the min-balance floor is enforced per wallet.
@@ -44,7 +44,7 @@ export function Wallets({ status }: { status: BotStatus | null }) {
       });
       setNote(
         r.generated
-          ? `Generated ${r.label} (${shortAddr(r.address)}). Fund it before it can pay or audit.`
+          ? `Generated ${r.label} (${shortAddr(r.address)}). Fund it before it can pay.`
           : `Added ${r.label} (${shortAddr(r.address)}).`,
       );
       reset();
@@ -61,8 +61,8 @@ export function Wallets({ status }: { status: BotStatus | null }) {
     // becomes unmanageable, so make the consequence explicit rather than just "are you sure".
     const ok = window.confirm(
       `Remove ${walletLabel} (${address})?\n\n` +
-        `Its encrypted key is removed from the active keystore. The bot will stop paying and ` +
-        `auditing with every citizen this wallet holds, and you will need the private key ` +
+        `Its encrypted key is removed from the active keystore. The bot will stop paying ` +
+        `every citizen this wallet holds, and you will need the private key ` +
         `again to re-add it. Any ETH in the wallet is untouched but no longer reachable ` +
         `from the bot. An owner-only encrypted backup of the previous keystore is retained ` +
         `until the next keystore change.`,
@@ -113,7 +113,7 @@ export function Wallets({ status }: { status: BotStatus | null }) {
                 <td className="mono" style={{ fontSize: 11 }}>{shortAddr(w.address)}</td>
                 <td
                   style={{ color: w.balanceWei !== null && BigInt(w.balanceWei) === 0n ? "var(--red)" : undefined }}
-                  title="Each wallet pays its own gas, so the min-balance floor is checked per wallet — an empty one cannot pay or audit even if another is full."
+                  title="Each wallet pays its own gas, so the min-balance floor is checked per wallet — an empty one cannot pay even if another is full."
                 >
                   {weiToEth(w.balanceWei)} ETH
                 </td>
@@ -197,7 +197,7 @@ export function Wallets({ status }: { status: BotStatus | null }) {
       )}
 
       <p className="muted" style={{ fontSize: 11, margin: "10px 0 0 0", lineHeight: 1.5 }}>
-        A citizen can only be paid or audited by the wallet that holds it — that is enforced
+        A citizen can only be paid by the wallet that holds it — that is enforced
         on-chain, so every wallet needs its own key here and its own ETH for gas. All wallets
         share one passphrase, so one unlock opens them all, and their transactions go out in a
         single bundle with one coinbase bid rather than competing with each other.

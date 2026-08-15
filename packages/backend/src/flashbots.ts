@@ -130,7 +130,7 @@ function hostOf(url: string): string {
 // the fee calc, the gas estimate, and the target-block derivation.
 /**
  * "Normal" network gas, read at submit time — the node's own suggested priority fee
- * rather than any of the configured race/offense tips. Used by manual, user-initiated
+ * rather than any of the configured race tips. Used by manual, user-initiated
  * actions (pay-to-current / use-bribe from the dashboard), which aren't racing anyone
  * and shouldn't inherit boundary-race pricing. Falls back to 1 gwei if the node has
  * no suggestion.
@@ -150,12 +150,12 @@ async function normalFees(block: Block): Promise<{
   return { maxFeePerGas: baseFee * 2n + priority, maxPriorityFeePerGas: priority, baseFee };
 }
 
-function computeFees(offense: boolean, block: Block): {
+function computeFees(block: Block): {
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
   baseFee: bigint;
 } {
-  const gas = resolveGas(runtime.strategy, offense);
+  const gas = resolveGas(runtime.strategy);
   const baseFee = block.baseFeePerGas ?? 0n;
 
   // Priority tip: static by default, or scaled up by block fullness when the
@@ -472,7 +472,7 @@ export async function queueCoinbaseBid(
     }
 
     const latest = await getLatestBlockCached();
-    const { maxFeePerGas, maxPriorityFeePerGas, baseFee } = computeFees(false, latest);
+    const { maxFeePerGas, maxPriorityFeePerGas, baseFee } = computeFees(latest);
     const quote: SpendQuote = {
       account: account.address,
       valueWei: bidWei,
@@ -514,7 +514,6 @@ export async function submitTx(
   intent: TxIntent,
   opts: {
     race?: boolean;
-    offense?: boolean;
     /** Simulate at this future unix-second timestamp (pre-boundary races). */
     simTimestamp?: bigint;
     /** Skip simulation entirely. Only for a tx whose validity depends on ANOTHER tx
@@ -528,9 +527,9 @@ export async function submitTx(
      *  payment bundle in combined mode. */
     revertible?: boolean;
     /** Price with the node's current suggested fee instead of the configured
-     *  race/offense tips. For manual, user-initiated actions (see normalFees). */
+     *  race tips. For manual, user-initiated actions (see normalFees). */
     normalGas?: boolean;
-    /** Wallet that must sign. payTaxes/audit/kill/useBribe are owner-only on-chain, so
+    /** Wallet that must sign. payTaxes/useBribe are owner-only on-chain, so
      *  this has to be the wallet holding the citizen involved — not simply "the" wallet.
      *  Defaults to the primary for wallet-agnostic sends (e.g. the coinbase bid). */
     account?: PrivateKeyAccount;
@@ -553,7 +552,7 @@ export async function submitTx(
   ]);
   const { maxFeePerGas, maxPriorityFeePerGas } = opts.normalGas
     ? await normalFees(latest)
-    : computeFees(opts.offense ?? false, latest);
+    : computeFees(latest);
   const gasWei = gas * maxFeePerGas;
   // Reuse the block's own number instead of a separate getBlockNumber round-trip.
   // Only used for sim context + reporting here; the actual bundle target block is

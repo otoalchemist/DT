@@ -5,7 +5,7 @@ import { z } from "zod";
 import { generatePrivateKey } from "viem/accounts";
 import { appConfig, loadSettings, saveSettings, deriveUrlsFromKey } from "./config.js";
 import { publicClient, reinitClients, accountFromPrivateKey, getChainId, validateRpcConfiguration, getBalanceCached, invalidateBalanceCache, getLatestBlockCached } from "./chain.js";
-import { runtime, loadRivalSkippers, loadDefaultRivalTargets, strategyPatchSchema } from "./runtime.js";
+import { runtime, strategyPatchSchema } from "./runtime.js";
 import { nonces } from "./nonce.js";
 import { activity } from "./activity.js";
 import { logger } from "./logger.js";
@@ -30,12 +30,9 @@ import {
 } from "./api-security.js";
 import { getGameSnapshot } from "./contract.js";
 import { invalidateTokenCaches } from "./index-tokens.js";
-import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
-import { startEngine, stopEngine, quiesceEngine, hasActiveEngineWork, beginEngineMaintenance, isEngineMaintenanceActive, type EngineMaintenanceLease, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
-import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
-  readDoNotTarget, invalidateLiveCandidates, prewarmTargets } from "./service.js";
-import { getTargetScores, startTargetScores } from "./target-scores.js";
+import { startEngine, stopEngine, quiesceEngine, hasActiveEngineWork, beginEngineMaintenance, isEngineMaintenanceActive, type EngineMaintenanceLease, scheduleJitBoundary, schedulePreBoundaryPay, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
+import { readOwnedStatuses } from "./service.js";
 import { runPostMortem } from "./postmortem.js";
 import { defaultDashboardRoot, registerDashboard } from "./dashboard.js";
 
@@ -169,30 +166,12 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
   app.get("/api/status", async () => runtime.status());
   app.get("/api/config", async () => runtime.strategy);
 
-  // Curated rival target IDs shipped in git (data/rival-targets.json). Exposed so
-  // the Config UI can offer a "reset to default" that restores the shipped list
-  // after the user has edited their offense targets.
-  app.get("/api/default-rival-targets", async () => ({
-    tokenIds: loadDefaultRivalTargets(),
-  }));
-
-  // "Rival skippers" — the subset of default targets that pay on a ~2-epoch cadence
-  // (data/rival-skippers.json). Offered as a one-click focused target list.
-  app.get("/api/rival-skippers", async () => ({
-    tokenIds: loadRivalSkippers(),
-  }));
-
-  // --- on-demand rival scoring (dashboard "Analyze targets") ---
-  // The scan takes minutes, so POST starts it in the background and the UI polls GET.
-  app.get("/api/target-scores", async () => getTargetScores());
-  app.post("/api/target-scores", async () => startTargetScores());
-
   app.post("/api/config", async (req, reply) => withEngineMaintenance(reply, async () => {
     const parsed = strategyPatchSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
     const preview = { ...runtime.strategy, ...parsed.data };
     if (runtime.running || hasActiveEngineWork()) {
-      if (!preview.enabled && !preview.offenseEnabled) {
+      if (!preview.enabled) {
         // Disabling every strategy is the one running mutation allowed: quiesce first so
         // no captured tick signs after this response reports the bot disabled.
         await quiesceEngine();
@@ -203,20 +182,18 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
       }
     }
     const next = runtime.saveStrategy(parsed.data);
-    const nowActive = next.enabled || next.offenseEnabled;
+    const nowActive = next.enabled;
     // Saving strategy never auto-STARTS the engine — starting is explicit (the "Start
     // bot" button, or arming a JIT payment) so the user can finish configuring (coinbase
     // bid, gas, payment strategy) before going live. We still auto-STOP in the safe
     // direction: if every strategy flag is now off, a running engine has nothing to do.
     if (!nowActive && runtime.running) await quiesceEngine();
     // Away mode owns when the engine runs, so any config change re-evaluates it: turning
-    // it on arms the wake timer, turning it off cancels, and arming/disarming JIT or
-    // offense changes whether there is anything to wake FOR.
+    // it on arms the wake timer, turning it off cancels, and arming/disarming JIT
+    // changes whether there is anything to wake FOR.
     if (next.awayMode) scheduleAwayWake(); else clearAwayTimers();
     scheduleDefenseBoundary();
     schedulePreBoundaryPay();
-    schedulePreBoundaryAudit();
-    schedulePreBoundaryBundle();
     activity.add({
       kind: "info",
       status: "info",
@@ -619,14 +596,7 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
       resetJitState();
       runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
       scheduleJitBoundary();
-      // All three, because which one owns the boundary depends on combinedBundleActive:
-      // with a bid configured schedulePreBoundaryPay() returns immediately and the bundle
-      // scheduler is the one that matters. Arming only the pay path left the bundle to be
-      // picked up by the next refreshSnapshot — correct today, but a dependency on tick
-      // ordering that nothing states.
       schedulePreBoundaryPay();
-      schedulePreBoundaryAudit();
-      schedulePreBoundaryBundle();
       // Disarming changes what there is to wake for, exactly as arming does — re-evaluate
       // rather than leaving a wake armed for a JIT that no longer exists.
       if (runtime.strategy.awayMode) scheduleAwayWake();
@@ -675,11 +645,7 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
     if (runtime.strategy.awayMode) scheduleAwayWake();
     if (resumeEngine || !runtime.strategy.awayMode) startEngine(maintenanceLease);
     scheduleJitBoundary();
-    // Same as the disarm path above: arm every pre-boundary scheduler and let each one
-    // decide whether it owns this boundary, rather than assuming the pay path does.
     schedulePreBoundaryPay();
-    schedulePreBoundaryAudit();
-    schedulePreBoundaryBundle();
     return runtime.status();
   }));
 
@@ -746,18 +712,11 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
       reinitClients(urls.httpUrl, urls.wsUrl);
       // Everything read before this point came from either no key or the wrong one, so it
       // has to be thrown away. reinitClients only drops the block and balance caches; the
-      // ownership, live-candidate and emigration caches survive it, and makeIdCache is
-      // stale-while-revalidate — it serves the cached value immediately even when expired
-      // and refreshes behind you. So without this, the first reads after fixing the key
-      // still return the empty results cached while it was missing, and the UI only heals
-      // a poll or two later. That is what made "re-enter the same key" look like a fix.
+      // ownership caches survive it, and makeIdCache is stale-while-revalidate — it
+      // serves the cached value immediately even when expired and refreshes behind you.
+      // So without this, the first reads after fixing the key still return the empty
+      // results cached while it was missing, and the UI only heals a poll or two later.
       invalidateTokenCaches();
-      invalidateLiveCandidates();
-      invalidateEmigrationRoster();
-      // Warm them again. main.ts only prewarms when a key exists AT BOOT, which is never
-      // true on a fresh install — so the first dashboard load after setup paid the full
-      // ~15s cold collection enumeration against a blank screen.
-      void prewarmTargets();
       logger.info("Alchemy API key saved; RPC clients reinitialized and caches rebuilt.");
     }
 
@@ -787,45 +746,6 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
     }
   });
 
-  app.get("/api/targets", async (_req, reply) => {
-    try {
-      return await readTargets();
-    } catch (err) {
-      return internalFailure(reply, err, "Could not read target status");
-    }
-  });
-
-  // Citizens held by the Emigration contract — out of the main game, so they're
-  // filtered out of /api/targets and every offense sweep and listed only here.
-  app.get("/api/emigrated", async (_req, reply) => {
-    try {
-      return await readEmigrated();
-    } catch (err) {
-      return internalFailure(reply, err, "Could not read emigration status");
-    }
-  });
-
-  // Allied citizens (data/ally-tokens.json) — teammates' tokens, listed in their own
-  // panel and excluded from every rival/offense path.
-  app.get("/api/allies", async (_req, reply) => {
-    try {
-      return await readAllies();
-    } catch (err) {
-      return internalFailure(reply, err, "Could not read ally status");
-    }
-  });
-
-  // "Do not target" rivals (data/do-not-target.json) — big-boy operators we never audit.
-  // Still rivals, so they keep a live status read; they just get their own panel and are
-  // excluded from every offense path.
-  app.get("/api/do-not-target", async (_req, reply) => {
-    try {
-      return await readDoNotTarget();
-    } catch (err) {
-      return internalFailure(reply, err, "Could not read protected-target status");
-    }
-  });
-
   /**
    * Manual "Refresh data" — force a genuinely fresh read.
    *
@@ -840,8 +760,6 @@ export async function buildServer(options: { dashboardRoot?: string } = {}): Pro
   app.post("/api/refresh", async (_req, reply) => {
     try {
       invalidateTokenCaches();
-      invalidateLiveCandidates();
-      invalidateEmigrationRoster();
       // getGameSnapshot() with no TTL argument always reads the chain.
       const snap = await getGameSnapshot();
       runtime.currentEpoch = snap.currentEpoch;

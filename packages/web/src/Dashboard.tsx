@@ -1,21 +1,15 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   VERSION,
-  EMIGRATION_CONTRACT_ADDRESS,
-  ABBC_EMIGRATION_CONTRACT_ADDRESS,
   type BotStatus,
   type StrategyConfig,
   type ActivityEntry,
   type OwnedTokenStatus,
-  type TargetTokenStatus,
-  type EmigratedTokenStatus,
-  type DoNotTargetStatus,
 } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { Config } from "./Config.js";
 import { JitPanel } from "./JitPanel.js";
 import { PostMortem } from "./PostMortem.js";
-import { TargetScores } from "./TargetScores.js";
 import { Wallets } from "./Wallets.js";
 import { weiToEth, shortAddr, countdown, timeAgo, gameStateLabel } from "./util.js";
 
@@ -25,147 +19,6 @@ const riskBadge: Record<string, string> = {
   audited: "warn",
   "at-risk": "danger",
   dead: "off",
-};
-
-function targetSortKey(t: TargetTokenStatus): number {
-  if (t.killable) return 0;
-  if (t.auditDueTimestamp !== "0") return 1;
-  if (t.auditable) return 2;
-  if (t.delinquent) return 3;
-  return 4;
-}
-
-function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: string }) {
-  if (rows.length === 0) return <p className="muted" style={{ fontSize: 12 }}>{empty}</p>;
-  const sorted = [...rows].sort((a, b) => targetSortKey(a) - targetSortKey(b));
-  return (
-    <table>
-      <thead><tr><th>Token</th><th>Behind</th><th>State</th><th>Kill in</th></tr></thead>
-      <tbody>
-        {sorted.map((t) => (
-          <tr key={t.tokenId}>
-            <td className="mono">#{t.tokenId}</td>
-            <td>{t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
-            <td>
-              {t.killable
-                ? <span className="badge danger">killable</span>
-                : t.auditDueTimestamp !== "0"
-                  ? <span className="badge warn">under audit</span>
-                  : t.auditable
-                    ? <span className="badge warn">auditable</span>
-                    : t.delinquent
-                      ? <span className="badge">delinquent</span>
-                      : <span className="badge off">current</span>}
-            </td>
-            <td>{t.auditDueTimestamp === "0" ? "—" : t.killable ? "now" : countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-/**
- * Citizens that emigrated: sent to an Emigration contract, swapped for a membership NFT,
- * and held there permanently. They're out of the main game — we never pay, audit or kill
- * them — so this table deliberately carries no action affordance and mutes every badge.
- *
- * The roster is the full emigration history, so it includes emigrants that have ALREADY
- * been killed (rows go dim). Listing only the ones still held would shrink the count as
- * they die — the panel would have read 5 when 13 had emigrated. The live rows still show
- * a status because it's the only clue to when each remaining emigrant gets killed by
- * someone else and drops out of the supply that ends the game.
- *
- * Grouped by ROUTE (Governor, ABBC, …) rather than listed flat: there is now more than one
- * destination, they have separate capacities, and "which club did it join" is the thing you
- * actually want to read off the panel. Grouping also means a third route needs no UI work.
- */
-function EmigratedTable({ rows }: { rows: EmigratedTokenStatus[] }) {
-  if (rows.length === 0) {
-    return <p className="muted" style={{ fontSize: 12 }}>No citizens have emigrated yet.</p>;
-  }
-  // Preserve first-seen (chronological) route order, so the original Governor route stays
-  // on top and later ones append below it.
-  const byRoute = new Map<string, EmigratedTokenStatus[]>();
-  for (const r of rows) {
-    const list = byRoute.get(r.destinationLabel) ?? [];
-    list.push(r);
-    byRoute.set(r.destinationLabel, list);
-  }
-  const fate = (t: EmigratedTokenStatus) =>
-    !t.alive
-      ? "killed"
-      : t.killable
-        ? "awaiting kill"
-        : t.auditDueTimestamp !== "0"
-          ? `dies in ${countdown(Number(t.auditDueTimestamp) - Math.floor(Date.now() / 1000))}`
-          : "unaudited";
-  return (
-    <>
-      {[...byRoute.entries()].map(([label, list]) => {
-        const aliveCount = list.filter((t) => t.alive).length;
-        return (
-          <div key={label} style={{ marginBottom: 8 }}>
-            <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
-              {label} ({list.length}) · {aliveCount} held · {list.length - aliveCount} killed
-            </div>
-            <table>
-              <thead><tr><th>Token</th><th>Behind</th><th>Fate</th></tr></thead>
-              <tbody>
-                {list.map((t) => (
-                  <tr key={t.tokenId} style={t.alive ? undefined : { opacity: 0.55 }}>
-                    <td className="mono">#{t.tokenId}</td>
-                    <td>{t.alive && t.epochsBehind > 0 ? `${t.epochsBehind}` : "—"}</td>
-                    <td><span className="badge off">{fate(t)}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      })}
-    </>
-  );
-}
-
-/**
- * The "do not target" roster, grouped under the operator who runs each citizen. Same
- * status columns as the rivals table — these ARE rivals, and a big boy drifting delinquent
- * is worth seeing — but the operator tag is the point: it's what turns a list of bare ids
- * into "that's Graveyard's, leave it".
- */
-function DoNotTargetTable({ rows }: { rows: DoNotTargetStatus[] }) {
-  if (rows.length === 0) {
-    return <p className="muted" style={{ fontSize: 12 }}>None listed (see data/do-not-target.json).</p>;
-  }
-  const byOperator = new Map<string, DoNotTargetStatus[]>();
-  for (const r of rows) {
-    const list = byOperator.get(r.operator) ?? [];
-    list.push(r);
-    byOperator.set(r.operator, list);
-  }
-  return (
-    <>
-      {[...byOperator.entries()]
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([operator, list]) => (
-          <div key={operator} style={{ marginBottom: 8 }}>
-            <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
-              <span className="badge" style={{ fontSize: 9 }}>{operator}</span>{" "}
-              {list.length} citizen{list.length === 1 ? "" : "s"}
-            </div>
-            <TargetsTable rows={list} empty="" />
-          </div>
-        ))}
-    </>
-  );
-}
-
-const sectionLabel: React.CSSProperties = {
-  fontSize: 11,
-  textTransform: "uppercase",
-  letterSpacing: "0.05em",
-  marginBottom: 6,
 };
 
 export function Dashboard({
@@ -184,10 +37,6 @@ export function Dashboard({
   // fields against this to tell whether they hold unsaved edits.
   const [savedConfig, setSavedConfig] = useState<StrategyConfig | null>(null);
   const [tokens, setTokens] = useState<OwnedTokenStatus[]>([]);
-  const [targets, setTargets] = useState<TargetTokenStatus[]>([]);
-  const [emigrated, setEmigrated] = useState<EmigratedTokenStatus[]>([]);
-  const [allies, setAllies] = useState<TargetTokenStatus[]>([]);
-  const [doNotTarget, setDoNotTarget] = useState<DoNotTargetStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -221,44 +70,22 @@ export function Dashboard({
         const s = await api.refreshChain().catch(() => null);
         if (s) pushStatus(s);
       }
-      // A failed read must NOT blank the panel. These used to catch to [], which was then
-      // written to state — so one dropped request (a laptop suspending, a brief RPC
-      // hiccup) replaced the citizen and rival lists with "none". In away mode there is
-      // no 20s poll behind it to repair that, so it stayed empty until Refresh data was
-      // pressed, which reads as "the bot lost my citizens". Keep the last good rows and
-      // report the failure instead.
-      const keep = <T,>(p: Promise<T>): Promise<T | null> => p.then((v) => v, () => null);
-      const [t, g, e, a, dnt] = await Promise.all([
-        keep(api.tokens()),
-        keep(api.targets()),
-        keep(api.emigrated()),
-        keep(api.allies()),
-        keep(api.doNotTarget()),
-      ]);
-      if (t) setTokens(t);
-      if (g) setTargets(g);
-      if (e) setEmigrated(e);
-      if (a) setAllies(a);
-      if (dnt) setDoNotTarget(dnt);
-      const failed = [t, g, e, a, dnt].filter((v) => v === null).length;
-      setErr(
-        failed === 0
-          ? null
-          : `${failed} of 5 reads failed — showing the last good data. Press "Refresh data" to retry.`,
-      );
+      // A failed read must NOT blank the panel. Keep the last good rows and report
+      // the failure instead of replacing the citizen list with "none".
+      try {
+        setTokens(await api.tokens());
+        setErr(null);
+      } catch {
+        setErr("Could not read owned tokens — showing the last good data. Press \"Refresh data\" to retry.");
+      }
     } catch (e) {
       setErr((e as Error).message);
     }
   }, [pushStatus]);
 
-  // Poll on-chain views only while the tab is actually being looked at. Each cycle costs
-  // several RPC round-trips per endpoint, so a dashboard left open in a background tab
-  // was burning provider quota around the clock for a page nobody was reading.
-  //
-  // In away mode it stops polling entirely — that's the point of the mode. One read on
-  // mount so the page isn't blank, then nothing until "Refresh data" is pressed.
-  // Away mode IS the autonomous mode: it arms payments itself, since nobody is at the
-  // keyboard to do it. One switch, so there is no state where it wakes to do nothing.
+  // Poll on-chain views only while the tab is actually being looked at. In away mode it
+  // stops polling entirely — that's the point of the mode. One read on mount so the page
+  // isn't blank, then nothing until "Refresh data" is pressed.
   const awayMode = config?.awayMode ?? false;
   useEffect(() => {
     const tick = () => { if (!document.hidden) void refresh(); };
@@ -299,17 +126,13 @@ export function Dashboard({
   const selfRefreshing = running && !awayMode;
 
   // Away mode is an INSTANT-APPLY control, like Start bot — pressing it persists straight
-  // away rather than staging an edit for "Save strategy". It changes whether the engine
-  // runs at all, so a state that looked armed but wasn't saved would silently miss a
-  // boundary. The backend re-arms/cancels the wake timer on every config POST.
+  // away rather than staging an edit for "Save strategy".
   const [awayBusy, setAwayBusy] = useState(false);
   const [awayErr, setAwayErr] = useState<string | null>(null);
   const persistAway = async (patch: Partial<StrategyConfig>) => {
     setAwayBusy(true);
     setAwayErr(null);
     try {
-      // onConfigSaved keeps any edits still pending in the Strategy/Payment panels, so
-      // toggling away mode never clobbers (or silently commits) their unsaved work.
       onConfigSaved(await api.setConfig(patch));
     } catch (e) {
       setAwayErr((e as Error).message);
@@ -318,8 +141,6 @@ export function Dashboard({
     }
   };
 
-  // The lead-minutes box is typed into, so it can't persist per keystroke. Hold a draft
-  // while focused and commit on blur/Enter; `null` means "no draft, show the live value".
   const [leadDraft, setLeadDraft] = useState<string | null>(null);
   const leadMinutes = config?.awayLeadMinutes ?? 15;
   const commitLead = () => {
@@ -330,57 +151,11 @@ export function Dashboard({
     if (n !== leadMinutes) void persistAway({ awayLeadMinutes: n });
   };
 
-  // Only link to Etherscan on mainnet (chainId 1) — a local/anvil fork's hashes
-  // aren't there, so fall back to plain text in that case.
   const explorerBase = status?.chainId === 1 ? "https://etherscan.io" : null;
 
-  // Emigrants still held by a contract. The rest of the roster is already dead — kept
-  // on the list because emigrating is what put them there, and the count is the history.
-  const emigratedAlive = emigrated.filter((e) => e.alive).length;
-  // "Slots left" is a GOVERNOR-only idea: that contract has a fixed supply of 36. Counting
-  // it against the whole roster would let ABBC emigrations eat Governor slots that are
-  // still open. ABBC has no published cap, so it gets no slot count rather than a guess.
-  const governorSlotsLeft = 36 - emigrated.filter((e) => e.destinationLabel === "Governor").length;
-  // "At risk" = anything an opponent could act on: already under audit, killable, or
-  // auditable right now. Merely 1 behind is still in the grace epoch.
-  const alliesAtRisk = allies.filter((a) => a.killable || a.auditDueTimestamp !== "0" || a.auditable).length;
-
-  const pinnedSet = new Set(config?.offenseTargetTokenIds ?? []);
-  const myTargets = targets.filter((t) => pinnedSet.has(t.tokenId));
-  const otherTargets = targets.filter((t) => !pinnedSet.has(t.tokenId));
-  // How much offense the coming boundary actually offers.
-  //
-  // A citizen already under audit cannot be audited again, so it never counts however far
-  // behind it is. "Next boundary" is everything 1+ epoch behind: each rolls one deeper
-  // when the epoch turns, so that set includes the ones auditable right now — and it is
-  // what the bot can actually queue into the boundary bundle.
-  const auditableNextIn = (rows: TargetTokenStatus[]) =>
-    rows.filter((t) => t.auditDueTimestamp === "0" && t.epochsBehind >= 1).length;
-
-  // The whole board. readTargets drops UNPINNED roster members, so the big boys have to
-  // be added back — but a PINNED one is already in `targets` (readTargets checks the pin
-  // before the roster, so it lands under My rivals). Concatenating blindly counted those
-  // twice, so dedupe by tokenId.
-  const board = new Map<string, TargetTokenStatus>();
-  for (const t of [...targets, ...doNotTarget]) board.set(t.tokenId, t);
-  const totalAuditableNext = auditableNextIn([...board.values()]);
-
-  // What the bot will actually go after. With pins, that is exactly the My rivals
-  // table — pinned big boys are already in it, so no second list to merge. Blank means
-  // "audit every delinquent rival discovered", which excludes the roster: it stays out
-  // of auto-discovery, and a pin is the only override.
-  const myAuditableNext = pinnedSet.size > 0 ? auditableNextIn(myTargets) : auditableNextIn(targets);
-  // Slots are the scarce resource, not targets: an owned citizen audits at most
-  // `auditLimit` times per epoch, and auditor-role citizens carry more than one.
-  const auditCapacity = tokens.reduce((n, t) => n + (t.auditLimit ?? 1), 0);
-
-  // Manual per-token actions. `tokenBusy` keys off `${tokenId}:${action}` so only the
-  // pressed button shows a spinner, and both buttons on that row lock while it runs.
   const [tokenBusy, setTokenBusy] = useState<string | null>(null);
   const [tokenMsg, setTokenMsg] = useState<{ id: string; text: string; err: boolean } | null>(null);
   const runTokenAction = async (tokenId: string, action: "pay" | "bribe") => {
-    // Both actions submit a REAL transaction with real ETH the moment they're
-    // confirmed, so spell out the cost and the consequence before doing anything.
     const t = tokens.find((x) => x.tokenId === tokenId);
     const behind = t ? Number(BigInt(t.currentEpoch) - BigInt(t.lastEpochPaid)) : 0;
     const warning =
@@ -403,7 +178,7 @@ export function Dashboard({
     try {
       const res = action === "pay" ? await api.payToken(tokenId) : await api.bribeToken(tokenId);
       setTokenMsg({ id: tokenId, text: res.message, err: false });
-      await refresh(); // pull fresh on-chain status for the row
+      await refresh();
     } catch (e) {
       setTokenMsg({ id: tokenId, text: (e as Error).message, err: true });
     } finally {
@@ -427,381 +202,243 @@ export function Dashboard({
   };
 
   return (
-    <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+    <div>
 
-      {/* ── Main column ── */}
-      <div style={{ flex: "1 1 0", minWidth: 0 }}>
-
-        <div className="topbar">
-          <div className="brand" style={{ flex: "1 1 0", minWidth: 0 }}>
-            Death &amp; Taxes Bot <span className="version">v{VERSION}</span>
-            <small>
-              {connected ? "● live" : "○ reconnecting…"} · {shortAddr(status?.address)}
-              {status?.version && status.version !== VERSION && (
-                <span className="version-warn" title="The running backend is a different version than this dashboard — re-run the current build.">
-                  {" "}· ⚠ backend v{status.version}
-                </span>
-              )}
-            </small>
-          </div>
-          <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>
-            <span className={`badge status-lg ${running ? "on" : "off"}`}>{running ? "● RUNNING" : "PAUSED"}</span>
-            {awayMode && (
-              // The countdown itself lives on the Start button, so this badge just states
-              // the mode — two countdowns side by side would be noise.
-              <span
-                className="badge warn"
-                title={
-                  awayScheduled
-                    ? `Away mode: engine idle, no RPC polling. Starts itself ${config?.awayLeadMinutes ?? 15} min before the boundary, runs through it, then idles again 5 min after.`
-                    : awayIdleNoWork
-                      ? "Away mode on, but nothing is armed to wake for — arm a JIT payment or enable offense."
-                      : "Away mode: this is the boundary window, so the engine is running. It will idle again shortly after the boundary."
-                }
-              >
-                AWAY · AUTO{awayIdleNoWork ? " · nothing armed" : ""}
+      <div className="topbar">
+        <div className="brand" style={{ flex: "1 1 0", minWidth: 0 }}>
+          Death &amp; Taxes Bot <span className="version">v{VERSION}</span>
+          <small>
+            {connected ? "● live" : "○ reconnecting…"} · {shortAddr(status?.address)}
+            {status?.version && status.version !== VERSION && (
+              <span className="version-warn" title="The running backend is a different version than this dashboard — re-run the current build.">
+                {" "}· ⚠ backend v{status.version}
               </span>
             )}
-            <button
-              className="ghost"
-              onClick={() => void refresh(true)}
-              // Redundant only when both halves are already refreshed automatically: the dashboard
-              // polls every 20s whenever away mode is off, and the engine tick rewrites
-              // the header stats (epoch, balance, block) every block while running. With
-              // the engine stopped those stats go stale even though the lists keep
-              // polling, so the button stays live there.
-              disabled={selfRefreshing}
-              title={
-                selfRefreshing
-                  ? "Already refreshing: the dashboard polls every 20s and the running engine updates epoch/balance each block."
-                  : "Read on-chain data once, now — the header stats only update while the engine runs."
-              }
-            >
-              Refresh data
-            </button>
-            <button
-              className={`start-cta ${running ? "danger" : awayScheduled ? "" : "primary attention"}`}
-              onClick={toggleRun}
-              // With a wake scheduled the bot starts itself, so Start is not the user's
-              // job — showing it live would invite a press that fights the schedule.
-              // Pause stays live: stopping a running bot is always the user's call.
-              disabled={toggling || awayScheduled}
+          </small>
+        </div>
+        <div className="row" style={{ flex: "0 0 auto", gap: 12 }}>
+          <span className={`badge status-lg ${running ? "on" : "off"}`}>{running ? "● RUNNING" : "PAUSED"}</span>
+          {awayMode && (
+            <span
+              className="badge warn"
               title={
                 awayScheduled
-                  ? `Away mode is managing the bot. It starts itself ${config?.awayLeadMinutes ?? 15} min before the epoch boundary, runs through it, then idles again 5 min after.`
+                  ? `Away mode: engine idle, no RPC polling. Starts itself ${config?.awayLeadMinutes ?? 15} min before the boundary, runs through it, then idles again 5 min after.`
                   : awayIdleNoWork
-                    ? "Away mode is on but nothing is armed to wake for — arm a JIT payment or enable offense. You can still start manually."
-                    : undefined
+                    ? "Away mode on, but nothing is armed to wake for — arm a JIT payment or enable proactive pay."
+                    : "Away mode: this is the boundary window, so the engine is running. It will idle again shortly after the boundary."
               }
             >
-              {toggling
-                ? "…"
-                : running
-                  ? "Pause bot"
-                  : awayScheduled
-                    ? `Bot starting in ${countdown(awaySecsToWake)}`
-                    : "▶ Start bot"}
-            </button>
-            {toggleErr && <span className="err" style={{ fontSize: 12 }}>{toggleErr}</span>}
-          </div>
-          <div className="topbar-right" style={{ flex: "1 1 0" }}>
-            <button className="ghost" onClick={() => api.lock().then(() => location.reload())}>Lock</button>
-            <div className="row" style={{ gap: 6 }}>
-              <button
-                className={`away-cta${awayMode ? " on" : ""}`}
-                onClick={() => void persistAway({ awayMode: !awayMode })}
-                disabled={awayBusy || config === null}
-                title={
-                  awayMode
-                    ? `Away/Autonomous ON — the engine idles at zero RPC between epochs, starts itself ${leadMinutes} min before the boundary, runs through it, then stops 5 min after. The dashboard also stops its 20s polling; use Refresh data to read on demand.
-
-` +
-                      `Autonomous: it arms payments itself when a citizen falls behind, paying on the payment bid and dropping back to the audit-only bid on quiet epochs. Both bids are set under Coinbase bid — while this is on, they are spent without a keypress.` +
-                      `
-
-Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a boundary. Click to turn off.`
-                    : "Away/Autonomous OFF — the engine runs continuously (~22 provider requests/minute) and the dashboard polls every 20s. Click to idle between epochs and wake only for the boundary, which is also what makes unattended operation possible. Applies immediately; no save needed."
-                }
-              >
-                {awayBusy ? "…" : awayMode ? "◐ Away/Autonomous ON" : "Away/Autonomous off"}
-              </button>
-              <input
-                className="away-lead"
-                type="number"
-                min={1}
-                max={720}
-                step={1}
-                value={leadDraft ?? String(leadMinutes)}
-                disabled={awayBusy || config === null}
-                onChange={(e) => setLeadDraft(e.target.value)}
-                onBlur={commitLead}
-                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                title="Wake this many minutes before the epoch boundary. Saves when you press Enter or click away."
-              />
-              <span className="muted" style={{ fontSize: 11 }}>min lead</span>
-            </div>
-            {awayErr && <span className="err" style={{ fontSize: 12 }}>{awayErr}</span>}
-          </div>
-        </div>
-
-        <div className="panel">
-          <div className="row wrap" style={{ gap: 28 }}>
-            <div className="stat"><span className="label">Balance</span><span className="value">{weiToEth(status?.balanceWei ?? null)} ETH</span></div>
-            <div className="stat"><span className="label">Game</span><span className="value">{gameStateLabel(status?.gameState ?? null)}</span></div>
-            <div className="stat"><span className="label">Epoch</span><span className="value">{status?.currentEpoch ?? "—"}</span></div>
-            <div className="stat"><span className="label">Citizens left</span><span className="value">{status?.citizenSupply ?? "—"}</span></div>
-            <div className="stat"><span className="label">Spent this epoch</span><span className="value">{weiToEth(status?.spentThisEpochWei ?? "0")} ETH</span></div>
-            <div className="stat"><span className="label">Block</span><span className="value mono">{status?.lastBlock ?? "—"}</span></div>
-          </div>
-        </div>
-
-        <div className="spacer" />
-        <JitPanel status={status} tokens={tokens} config={config} savedConfig={savedConfig} onConfigChange={setConfig} onConfigSaved={onConfigSaved} />
-
-        <div className="spacer" />
-        <Wallets status={status} />
-
-        <div className="spacer" />
-        <div className="panel">
-          <h2>Your tokens</h2>
-          {tokens.length === 0 ? (
-            <p className="muted">
-              {status?.nftConfigured
-                ? "No owned Citizen tokens found for this wallet."
-                : "No owned Citizen tokens detected (needs the Alchemy NFT API for enumeration)."}
-            </p>
-          ) : (
-            <table>
-              <thead><tr><th>Token</th><th>Wallet</th><th>Paid</th><th>Status</th><th>Audit expires</th><th>Bribes</th><th>Pay est.</th><th>Actions</th></tr></thead>
-              <tbody>
-                {tokens.map((t) => {
-                  const current = BigInt(t.lastEpochPaid) >= BigInt(t.currentEpoch);
-                  const underAudit = t.auditDueTimestamp !== "0";
-                  const hasBribe = BigInt(t.bribeBalance) > 0n;
-                  const rowBusy = tokenBusy?.startsWith(`${t.tokenId}:`) ?? false;
-                  return (
-                  <tr key={t.tokenId}>
-                    <td className="mono">#{t.tokenId}</td>
-                    <td
-                      className="muted"
-                      style={{ fontSize: 11 }}
-                      title={
-                        t.walletAddress
-                          ? `Held by ${t.walletLabel} (${t.walletAddress}). Paying or auditing this citizen is owner-only on-chain, so it is signed by — and spends gas from — this wallet.`
-                          : undefined
-                      }
-                    >
-                      {t.walletLabel ?? "—"}
-                    </td>
-                    <td>{current
-                      ? <span className="badge on">current</span>
-                      : <span className="badge warn">behind</span>}
-                    </td>
-                    <td><span className={`badge ${riskBadge[t.risk] ?? "off"}`}>{t.risk}</span></td>
-                    <td>{t.auditDueTimestamp === "0" ? "—" : countdown(t.secondsUntilKillable)}</td>
-                    <td>{t.bribeBalance}</td>
-                    <td>{weiToEth(t.estimatedPayWei)} ETH</td>
-                    <td>
-                      <div className="row wrap" style={{ gap: 6 }}>
-                        <button
-                          style={{ fontSize: 11, padding: "3px 10px" }}
-                          disabled={rowBusy || current}
-                          onClick={() => runTokenAction(t.tokenId, "pay")}
-                          title={current
-                            ? "Already current — nothing to pay"
-                            : `Pay ${weiToEth(t.estimatedPayWei)} ETH to make #${t.tokenId} current${underAudit ? " and clear its audit" : ""}. Uses normal network gas.`}
-                        >
-                          {tokenBusy === `${t.tokenId}:pay` ? "…" : "Pay to current"}
-                        </button>
-                        {hasBribe && (
-                          <button
-                            style={{ fontSize: 11, padding: "3px 10px" }}
-                            disabled={rowBusy || !underAudit}
-                            onClick={() => runTokenAction(t.tokenId, "bribe")}
-                            title={underAudit
-                              ? `Spend 1 bribe to clear the audit on #${t.tokenId}. Does NOT pay tax — the token stays behind and can be audited again. Uses normal network gas.`
-                              : "Only usable while under audit"}
-                          >
-                            {tokenBusy === `${t.tokenId}:bribe` ? "…" : "Clear audit (bribe)"}
-                          </button>
-                        )}
-                      </div>
-                      {tokenMsg?.id === t.tokenId && (
-                        <div className={tokenMsg.err ? "err" : "hint"} style={{ fontSize: 11, marginTop: 4 }}>
-                          {tokenMsg.text}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+              AWAY · AUTO{awayIdleNoWork ? " · nothing armed" : ""}
+            </span>
           )}
-          {err && <p className="err">{err}</p>}
-        </div>
-
-        <div className="spacer" />
-        <div className="grid cols-2">
-          {config && <Config cfg={config} savedCfg={savedConfig} onChange={setConfig} onSaved={onConfigSaved} />}
-
-          <div className="panel fill">
-            <h2>Activity</h2>
-            <div className="log">
-              {activity.length === 0 && <p className="muted">No activity yet.</p>}
-              {[...activity].reverse().map((e) => {
-                const when = new Date(e.ts);
-                return (
-                <div className="log-row" key={e.id}>
-                  <span className="time" title={`${when.toLocaleString()} · ${timeAgo(e.ts)} ago`}>
-                    {when.toLocaleTimeString(undefined, { hour12: false })}
-                  </span>
-                  <span className={`pill ${e.status}`}>{e.status}</span>
-                  <span>
-                    {e.message}
-                    {e.txHash && (explorerBase
-                      ? <> · <a href={`${explorerBase}/tx/${e.txHash}`} target="_blank" rel="noreferrer">tx ↗</a></>
-                      : <> · <span className="mono">{e.txHash.slice(0, 10)}…</span></>)}
-                    {!e.txHash && e.bundleHash && (
-                      <> · <span className="muted">bundle {e.bundleHash.slice(0, 8)}…</span>
-                        {e.targetBlock && explorerBase && (
-                          <> · <a href={`${explorerBase}/block/${e.targetBlock}`} target="_blank" rel="noreferrer">blk {e.targetBlock} ↗</a></>
-                        )}
-                      </>
-                    )}
-                  </span>
-                </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-
-        <div className="spacer" />
-        <TargetScores
-          currentEpoch={status?.currentEpoch ?? null}
-          // Must mirror resolveGas(): the offense tip only applies when separateOffenseGas
-          // is on. With it off, audits ride the PAYMENT tip — reading offensePriorityFeeGwei
-          // unconditionally priced the bundle at a tip the bot wasn't going to bid, which
-          // overstated every beat figure (the gap is charged across the whole bundle gas).
-          tipGwei={
-            (config?.separateOffenseGas ? config?.offensePriorityFeeGwei : config?.priorityFeeGwei) ?? 20.1
-          }
-          ownedCitizens={tokens.length}
-          // Sum of auditLimit, not tokens.length: auditor-role citizens carry more than
-          // one slot, so a wallet's real capacity is usually above its citizen count.
-          // Falls back to 1 per citizen for rows read before auditLimit was fetched.
-          auditCapacity={auditCapacity}
-        />
-
-        <div className="spacer" />
-        <PostMortem />
-
-      </div>
-
-      {/* ── Right sidebar: Rival Targets + Emigrated ── */}
-      <div style={{ width: 380, flexShrink: 0, position: "sticky", top: 20 }}>
-        <div className="panel">
-          <h2>Rival targets</h2>
-          <div
-            style={{ display: "flex", gap: 14, alignItems: "baseline", margin: "0 0 10px 0", fontSize: 12, flexWrap: "wrap" }}
+          <button
+            className="ghost"
+            onClick={() => void refresh(true)}
+            disabled={selfRefreshing}
             title={
-              `My target audits: what the bot will actually go after at the coming boundary. A big boy counts only when you pin it — the roster is kept out of auto-discovery, and a pin is the override.` +
-              (pinnedSet.size === 0
-                ? ` Your target list is blank, which means "audit every delinquent rival discovered" — so this is every rival EXCEPT the big boys.`
-                : ``) +
-              `\n\nTotal: every delinquent rival on the board, pinned or not, big boys included.` +
-              `\n\nBoth count citizens 1+ epoch behind (they roll one deeper when the epoch turns) and exclude any already under audit, which cannot be audited again until it resolves.` +
-              `\n\nYou hold ${auditCapacity} audit slot(s) this epoch, so that is the most you can act on.`
+              selfRefreshing
+                ? "Already refreshing: the dashboard polls every 20s and the running engine updates epoch/balance each block."
+                : "Read on-chain data once, now — the header stats only update while the engine runs."
             }
           >
-            <span>
-              <b style={{ fontSize: 18, color: "var(--amber)" }}>{myAuditableNext}</b>{" "}
-              <span className="muted">my target audits next boundary</span>
-            </span>
-            {/* A blank target list means "audit every delinquent rival", not "audit
-                nobody" — pinnedTargetSet() returns null and every offense filter treats
-                null as unfiltered. A bare number here reads as a selection, so say
-                outright that there is no selection and this is the whole field. */}
-            {pinnedSet.size === 0 && (
-              <span
-                className="badge warn"
-                style={{ fontSize: 10, padding: "1px 6px" }}
-                title="Your target list is empty, which the engine reads as “audit every delinquent rival discovered” — not “audit none”. Big boys stay excluded (a pin is the only way to include one). Pin token IDs in Strategy to narrow it."
-              >
-                no pins · all rivals
-              </span>
-            )}
-            <span className="muted">{totalAuditableNext} total auditable</span>
-            <span className="muted">· {auditCapacity} slot{auditCapacity === 1 ? "" : "s"}</span>
-          </div>
-          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>My rivals ({myTargets.length})</div>
-          <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." />
-          <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}>
-            Pinned rivals always appear here, even while paid up. Everything below is
-            shown only while it's delinquent, under audit, or killable.
-          </p>
-          <div className="spacer" />
-          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
-          <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
-
-          <div className="spacer" />
-          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>
-            Do Not Target · big boys ({doNotTarget.length})
-          </div>
-          <DoNotTargetTable rows={doNotTarget} />
-          <p className="muted" style={{ fontSize: 11, margin: "6px 0 0 0", lineHeight: 1.5 }}>
-            From <code>data/do-not-target.json</code>, tagged with the operator who runs
-            them. These cure at the top of the boundary block, so an audit slot spent here
-            is normally wasted — they're kept out of auto-discovery and out of the target
-            analysis rankings. Unlike allies this is <b>advice, not a block</b>: pin one in
-            the Strategy targets box and the bot will still audit it.
-          </p>
+            Refresh data
+          </button>
+          <button
+            className={`start-cta ${running ? "danger" : awayScheduled ? "" : "primary attention"}`}
+            onClick={toggleRun}
+            disabled={toggling || awayScheduled}
+            title={
+              awayScheduled
+                ? `Away mode is managing the bot. It starts itself ${config?.awayLeadMinutes ?? 15} min before the epoch boundary, runs through it, then idles again 5 min after.`
+                : awayIdleNoWork
+                  ? "Away mode is on but nothing is armed to wake for — arm a JIT payment. You can still start manually."
+                  : undefined
+            }
+          >
+            {toggling
+              ? "…"
+              : running
+                ? "Pause bot"
+                : awayScheduled
+                  ? `Bot starting in ${countdown(awaySecsToWake)}`
+                  : "▶ Start bot"}
+          </button>
+          {toggleErr && <span className="err" style={{ fontSize: 12 }}>{toggleErr}</span>}
         </div>
+        <div className="topbar-right" style={{ flex: "1 1 0" }}>
+          <button className="ghost" onClick={() => api.lock().then(() => location.reload())}>Lock</button>
+          <div className="row" style={{ gap: 6 }}>
+            <button
+              className={`away-cta${awayMode ? " on" : ""}`}
+              onClick={() => void persistAway({ awayMode: !awayMode })}
+              disabled={awayBusy || config === null}
+              title={
+                awayMode
+                  ? `Away/Autonomous ON — the engine idles at zero RPC between epochs, starts itself ${leadMinutes} min before the boundary, runs through it, then stops 5 min after. The dashboard also stops its 20s polling; use Refresh data to read on demand.
 
-        <div className="spacer" />
+Autonomous: it arms JIT payments itself when a citizen falls behind. The coinbase bid under Just-in-time epoch payment is spent without a keypress while this is on.
 
-        <div className="panel">
-          <h2>Allied citizens ({allies.length})</h2>
-          <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>
-            {alliesAtRisk > 0
-              ? `${alliesAtRisk} at risk · ${allies.length - alliesAtRisk} safe`
-              : "all safe"}
+Mid-epoch work is still missed: an audit expires 24h after it was cast, not on a boundary. Click to turn off.`
+                  : "Away/Autonomous OFF — the engine runs continuously (~22 provider requests/minute) and the dashboard polls every 20s. Click to idle between epochs and wake only for the boundary. Applies immediately; no save needed."
+              }
+            >
+              {awayBusy ? "…" : awayMode ? "◐ Away/Autonomous ON" : "Away/Autonomous off"}
+            </button>
+            <input
+              className="away-lead"
+              type="number"
+              min={1}
+              max={720}
+              step={1}
+              value={leadDraft ?? String(leadMinutes)}
+              disabled={awayBusy || config === null}
+              onChange={(e) => setLeadDraft(e.target.value)}
+              onBlur={commitLead}
+              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+              title="Wake this many minutes before the epoch boundary. Saves when you press Enter or click away."
+            />
+            <span className="muted" style={{ fontSize: 11 }}>min lead</span>
           </div>
-          <TargetsTable rows={allies} empty="No allied citizens found (see data/ally-tokens.json)." />
-          <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.5 }}>
-            Teammates' citizens, from <code>data/ally-tokens.json</code>. They are <b>never</b>{" "}
-            audited or killed by the bot and are excluded from Rival targets — a delinquent
-            ally there would read as a kill candidate. Listed whatever their state, most at
-            risk first, so you can spot an ally in trouble.
-          </p>
-        </div>
-
-        <div className="spacer" />
-
-        <div className="panel">
-          <h2>Emigrated citizens ({emigrated.length})</h2>
-          <div className="muted" style={{ ...sectionLabel, marginBottom: 6 }}>
-            {emigratedAlive} still held · {emigrated.length - emigratedAlive} killed · {governorSlotsLeft} Governor slots left
-          </div>
-          <EmigratedTable rows={emigrated} />
-          <p className="muted" style={{ fontSize: 11, margin: "8px 0 0 0", lineHeight: 1.5 }}>
-            Traded away for a membership NFT — the{" "}
-            {explorerBase
-              ? <a href={`${explorerBase}/address/${EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">Governor</a>
-              : "Governor"}{" "}
-            route (36 total, first come) or{" "}
-            {explorerBase
-              ? <a href={`${explorerBase}/address/${ABBC_EMIGRATION_CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer">ABBC</a>
-              : "ABBC"}{" "}
-            (anti bot bot club). Either way they've left the main game: the bot never audits
-            or kills them, and they're excluded from Rival targets. Neither contract can pay
-            taxes or spend a bribe, so each one falls further behind until someone else kills
-            it — which still counts toward the{" "}
-            {status?.citizenSupply ?? "—"} → 69 endgame, so killed emigrants stay listed.
-          </p>
+          {awayErr && <span className="err" style={{ fontSize: 12 }}>{awayErr}</span>}
         </div>
       </div>
+
+      <div className="panel">
+        <div className="row wrap" style={{ gap: 28 }}>
+          <div className="stat"><span className="label">Balance</span><span className="value">{weiToEth(status?.balanceWei ?? null)} ETH</span></div>
+          <div className="stat"><span className="label">Game</span><span className="value">{gameStateLabel(status?.gameState ?? null)}</span></div>
+          <div className="stat"><span className="label">Epoch</span><span className="value">{status?.currentEpoch ?? "—"}</span></div>
+          <div className="stat"><span className="label">Citizens left</span><span className="value">{status?.citizenSupply ?? "—"}</span></div>
+          <div className="stat"><span className="label">Spent this epoch</span><span className="value">{weiToEth(status?.spentThisEpochWei ?? "0")} ETH</span></div>
+          <div className="stat"><span className="label">Block</span><span className="value mono">{status?.lastBlock ?? "—"}</span></div>
+        </div>
+      </div>
+
+      <div className="spacer" />
+      <JitPanel status={status} tokens={tokens} config={config} savedConfig={savedConfig} onConfigChange={setConfig} onConfigSaved={onConfigSaved} />
+
+      <div className="spacer" />
+      <Wallets status={status} />
+
+      <div className="spacer" />
+      <div className="panel">
+        <h2>Your tokens</h2>
+        {tokens.length === 0 ? (
+          <p className="muted">
+            {status?.nftConfigured
+              ? "No owned Citizen tokens found for this wallet."
+              : "No owned Citizen tokens detected (needs the Alchemy NFT API for enumeration)."}
+          </p>
+        ) : (
+          <table>
+            <thead><tr><th>Token</th><th>Wallet</th><th>Paid</th><th>Status</th><th>Audit expires</th><th>Bribes</th><th>Pay est.</th><th>Actions</th></tr></thead>
+            <tbody>
+              {tokens.map((t) => {
+                const current = BigInt(t.lastEpochPaid) >= BigInt(t.currentEpoch);
+                const underAudit = t.auditDueTimestamp !== "0";
+                const hasBribe = BigInt(t.bribeBalance) > 0n;
+                const rowBusy = tokenBusy?.startsWith(`${t.tokenId}:`) ?? false;
+                return (
+                <tr key={t.tokenId}>
+                  <td className="mono">#{t.tokenId}</td>
+                  <td
+                    className="muted"
+                    style={{ fontSize: 11 }}
+                    title={
+                      t.walletAddress
+                        ? `Held by ${t.walletLabel} (${t.walletAddress}). Paying this citizen is owner-only on-chain, so it is signed by — and spends gas from — this wallet.`
+                        : undefined
+                    }
+                  >
+                    {t.walletLabel ?? "—"}
+                  </td>
+                  <td>{current
+                    ? <span className="badge on">current</span>
+                    : <span className="badge warn">behind</span>}
+                  </td>
+                  <td><span className={`badge ${riskBadge[t.risk] ?? "off"}`}>{t.risk}</span></td>
+                  <td>{t.auditDueTimestamp === "0" ? "—" : countdown(t.secondsUntilKillable)}</td>
+                  <td>{t.bribeBalance}</td>
+                  <td>{weiToEth(t.estimatedPayWei)} ETH</td>
+                  <td>
+                    <div className="row wrap" style={{ gap: 6 }}>
+                      <button
+                        style={{ fontSize: 11, padding: "3px 10px" }}
+                        disabled={rowBusy || current}
+                        onClick={() => runTokenAction(t.tokenId, "pay")}
+                        title={current
+                          ? "Already current — nothing to pay"
+                          : `Pay ${weiToEth(t.estimatedPayWei)} ETH to make #${t.tokenId} current${underAudit ? " and clear its audit" : ""}. Uses normal network gas.`}
+                      >
+                        {tokenBusy === `${t.tokenId}:pay` ? "…" : "Pay to current"}
+                      </button>
+                      {hasBribe && (
+                        <button
+                          style={{ fontSize: 11, padding: "3px 10px" }}
+                          disabled={rowBusy || !underAudit}
+                          onClick={() => runTokenAction(t.tokenId, "bribe")}
+                          title={underAudit
+                            ? `Spend 1 bribe to clear the audit on #${t.tokenId}. Does NOT pay tax — the token stays behind and can be audited again. Uses normal network gas.`
+                            : "Only usable while under audit"}
+                        >
+                          {tokenBusy === `${t.tokenId}:bribe` ? "…" : "Clear audit (bribe)"}
+                        </button>
+                      )}
+                    </div>
+                    {tokenMsg?.id === t.tokenId && (
+                      <div className={tokenMsg.err ? "err" : "hint"} style={{ fontSize: 11, marginTop: 4 }}>
+                        {tokenMsg.text}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+        {err && <p className="err">{err}</p>}
+      </div>
+
+      <div className="spacer" />
+      <div className="grid cols-2">
+        {config && <Config cfg={config} savedCfg={savedConfig} onChange={setConfig} onSaved={onConfigSaved} />}
+
+        <div className="panel fill">
+          <h2>Activity</h2>
+          <div className="log">
+            {activity.length === 0 && <p className="muted">No activity yet.</p>}
+            {[...activity].reverse().map((e) => {
+              const when = new Date(e.ts);
+              return (
+              <div className="log-row" key={e.id}>
+                <span className="time" title={`${when.toLocaleString()} · ${timeAgo(e.ts)} ago`}>
+                  {when.toLocaleTimeString(undefined, { hour12: false })}
+                </span>
+                <span className={`pill ${e.status}`}>{e.status}</span>
+                <span>
+                  {e.message}
+                  {e.txHash && (explorerBase
+                    ? <> · <a href={`${explorerBase}/tx/${e.txHash}`} target="_blank" rel="noreferrer">tx ↗</a></>
+                    : <> · <span className="mono">{e.txHash.slice(0, 10)}…</span></>)}
+                  {!e.txHash && e.bundleHash && (
+                    <> · <span className="muted">bundle {e.bundleHash.slice(0, 8)}…</span>
+                      {e.targetBlock && explorerBase && (
+                        <> · <a href={`${explorerBase}/block/${e.targetBlock}`} target="_blank" rel="noreferrer">blk {e.targetBlock} ↗</a></>
+                      )}
+                    </>
+                  )}
+                </span>
+              </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="spacer" />
+      <PostMortem />
 
     </div>
   );

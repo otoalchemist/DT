@@ -2,7 +2,7 @@
   "name": "death-and-taxes-bot",
   "version": "1.3.0",
   "private": true,
-  "description": "Self-hosted automation bot for the DeathAndTaxes on-chain game (defense + game-strategy, Flashbots inclusion).",
+  "description": "Self-hosted defensive automation bot for the DeathAndTaxes on-chain game (just-in-time epoch payment, Flashbots inclusion).",
   "license": "MIT",
   "workspaces": [
     "packages/shared",
@@ -17,10 +17,7 @@
     "build": "npm run build:shared && npm run build -w @dat-bot/backend && npm run build -w @dat-bot/web",
     "start": "npm run build:shared && node packages/backend/dist/main.js",
     "test": "npm run test -w @dat-bot/backend",
-    "package": "node scripts/package.mjs",
-    "rival-skippers": "node scripts/rival-skippers.mjs",
-    "rival-builder-bids": "node scripts/rival-builder-bids.mjs",
-    "target-scores": "node scripts/target-scores.mjs"
+    "package": "node scripts/package.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

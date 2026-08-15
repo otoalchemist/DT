@@ -9,8 +9,7 @@ import { countdown, weiToEth } from "./util.js";
 const PAYMENT_FIELDS: (keyof StrategyConfig)[] = [
   "maxBaseFeeGwei", "priorityFeeGwei", "dynamicTipEnabled", "dynamicTipMaxGwei",
   "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
-  "maxAutoPayEpochs", "coinbaseBidEth", "coinbaseBidAuditOnlyEth",
-  "coinbasePayerAddress", "combinedBoundaryBundle",
+  "maxAutoPayEpochs", "coinbaseBidEth", "coinbasePayerAddress",
 ];
 
 export function JitPanel({
@@ -132,9 +131,7 @@ export function JitPanel({
         preBoundaryLeadMainnetMs: config.preBoundaryLeadMainnetMs,
         maxAutoPayEpochs: config.maxAutoPayEpochs,
         coinbaseBidEth: config.coinbaseBidEth,
-        coinbaseBidAuditOnlyEth: config.coinbaseBidAuditOnlyEth,
         coinbasePayerAddress: config.coinbasePayerAddress,
-        combinedBoundaryBundle: config.combinedBoundaryBundle,
       });
       onConfigSaved(next);
     } catch (e) {
@@ -171,11 +168,6 @@ export function JitPanel({
             delinquent, can be audited, and can eventually be <b>killed</b>: nothing automatic
             will rescue it (there is no auto-pay after an audit for <i>any</i> citizen). Pay it
             yourself from the token row when you choose to.
-          </p>
-          <p className="muted" style={{ fontSize: 11, margin: "0 0 6px 0", lineHeight: 1.5 }}>
-            This is a <b>payment</b> opt-out only — an unchecked citizen <b>still audits rivals</b>
-            up to its full audit capacity. It stops being a usable auditor on its own once it
-            falls 2+ epochs behind, since the game forbids an auditable token from auditing.
           </p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {tokens.map((t) => {
@@ -305,7 +297,7 @@ export function JitPanel({
             style={{
               marginTop: 12, paddingTop: 10,
               borderTop: "1px solid var(--border)",
-              ...(config.coinbaseBidEth > 0 || config.coinbaseBidAuditOnlyEth > 0
+              ...(config.coinbaseBidEth > 0
                 ? {
                     borderLeft: "3px solid var(--accent)",
                     background: "rgba(91,157,255,0.08)",
@@ -318,12 +310,7 @@ export function JitPanel({
               ⚠ COINBASE BID (advanced, mainnet)
               {config.coinbaseBidEth > 0 && (
                 <span className="badge" style={{ marginLeft: 8, background: "var(--accent)", color: "#fff", fontSize: 10 }}>
-                  PAYMENT · {config.coinbaseBidEth} ETH
-                </span>
-              )}
-              {config.coinbaseBidAuditOnlyEth > 0 && (
-                <span className="badge" style={{ marginLeft: 6, background: "var(--green)", color: "#04231a", fontSize: 10 }}>
-                  AUDIT-ONLY · {config.coinbaseBidAuditOnlyEth} ETH
+                  {config.coinbaseBidEth} ETH
                 </span>
               )}
             </div>
@@ -334,49 +321,15 @@ export function JitPanel({
               if the bundle wins the slot (it rides the bundle, allowed-to-revert), and never mirrors to the
               mempool. It forwards through an operator-configured, code-hash-allowlisted <code>CoinbasePayer</code> contract.
             </p>
-            {/* Two bids, because the two boundaries are not the same purchase. Shown
-                side by side with their own colours so the split is legible at a glance
-                rather than reading as one setting duplicated. */}
-            <div className="row wrap" style={{ gap: 12, alignItems: "stretch", marginBottom: 10 }}>
-              <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--accent)", paddingLeft: 10 }}>
-                <label className="field" style={{ marginBottom: 4 }}>
-                  {/* "(+ audits)" because the name otherwise reads as a payment-only bid,
-                      when in fact this is the one that covers a combined bundle. */}
-                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>Payment armed</span>{" "}
-                  <span style={{ opacity: 0.8 }}>(+ audits)</span> bid (ETH)
-                  <input
-                    type="number" min={0} step={0.001}
-                    value={config.coinbaseBidEth}
-                    onChange={(e) => gasField("coinbaseBidEth", Math.max(0, Number(e.target.value) || 0))}
-                    style={config.coinbaseBidEth > 0 ? { borderColor: "var(--accent)", fontWeight: 600 } : undefined}
-                  />
-                </label>
-                <p className="muted" style={{ fontSize: 10, margin: 0, lineHeight: 1.45 }}>
-                  Any boundary where a payment is armed — <b>your audits ride the same bundle
-                  on this bid</b>, not the one on the right. <b>Defensive: it must land</b>,
-                  missing it can cost a citizen. It is also the bigger bundle (each payment
-                  adds ~82,875 gas on top of the audits), so the same position costs more.
-                  Bid high here.
-                </p>
-              </div>
-              <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10 }}>
-                <label className="field" style={{ marginBottom: 4 }}>
-                  <span style={{ color: "var(--green)", fontWeight: 600 }}>Audit only</span> bid (ETH)
-                  <input
-                    type="number" min={0} step={0.001}
-                    value={config.coinbaseBidAuditOnlyEth}
-                    onChange={(e) => gasField("coinbaseBidAuditOnlyEth", Math.max(0, Number(e.target.value) || 0))}
-                    style={config.coinbaseBidAuditOnlyEth > 0 ? { borderColor: "var(--green)", fontWeight: 600 } : undefined}
-                  />
-                </label>
-                <p className="muted" style={{ fontSize: 10, margin: 0, lineHeight: 1.45 }}>
-                  Only when <em>nothing is owed</em> and the bundle is audits alone.{" "}
-                  <b>Speculative — losing costs the audit fee only</b>, and the bundle is far
-                  smaller, so a given position is cheaper. Most epochs are these.
-                  0 = don't bid on them.
-                </p>
-              </div>
-            </div>
+            <label className="field" style={{ marginBottom: 10 }}>
+              Payment bid (ETH)
+              <input
+                type="number" min={0} step={0.001}
+                value={config.coinbaseBidEth}
+                onChange={(e) => gasField("coinbaseBidEth", Math.max(0, Number(e.target.value) || 0))}
+                style={config.coinbaseBidEth > 0 ? { borderColor: "var(--accent)", fontWeight: 600 } : undefined}
+              />
+            </label>
             <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
               <label className="field" style={{ flex: "2 1 260px" }}>
                 CoinbasePayer address (fixed)
@@ -389,48 +342,29 @@ export function JitPanel({
                 />
               </label>
             </div>
-            {(config.coinbaseBidEth > 0 || config.coinbaseBidAuditOnlyEth > 0) && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
+            {config.coinbaseBidEth > 0 && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
               <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
                 No CoinbasePayer address configured, so the bid won't fire. Set it in data/config.json.
               </p>
             )}
 
-            {/* No switch of its own: arming automatically IS what away mode means, so the
-                away button is the single place it is turned on. Still described here,
-                because this is the panel that decides what it will spend when it does. */}
             <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
               <div style={{ fontSize: 12 }}>
                 <b>Away/Autonomous mode arms payments itself.</b>
               </div>
               <p className="muted" style={{ fontSize: 10, margin: "4px 0 0 0", lineHeight: 1.5 }}>
                 While away mode is on, the engine notices a citizen would be auditable at the
-                coming boundary, arms itself, and the bundle pays and audits together on the{" "}
+                coming boundary, arms itself, and pays on the{" "}
                 <span style={{ color: "var(--accent)" }}>payment bid</span>. JIT then disarms
-                itself as it always has, so quiet epochs fall back to offense on the{" "}
-                <span style={{ color: "var(--green)" }}>audit-only bid</span>.
+                itself as it always has.
                 <br />
-                <b>That spends ETH with no keypress</b>, so the bids above are the ceiling you
+                <b>That spends ETH with no keypress</b>, so the bid above is the ceiling you
                 are agreeing to each time you go away. It never arms for a citizen that is
                 under audit — recovering an audited citizen stays a manual decision — nor for
                 one you unchecked above. Running attended, arming stays a keypress.
               </p>
             </div>
           </div>
-
-          {/* COMBINED BOUNDARY BUNDLE (combinedBoundaryBundle) is intentionally not
-              rendered — it's ON by default and should stay on. It fuses the pre-boundary
-              payment and audit into one bundle (sequential nonces) so they land
-              consecutively top-of-block, share a single coinbase bid, and can't demote
-              each other. It is self-guarding: it only fuses when a coinbase bid is set,
-              and without one it's a no-op (separate bundles, so audits keep their mempool
-              fallback). Payment is mempool-mirrored either way and is never dropped.
-              Still editable in data/config.json. The status line below reports whether it
-              is actually fusing, since that depends on the bid above. */}
-          {config.combinedBoundaryBundle && config.coinbaseBidEth > 0 && (
-            <p className="hint" style={{ fontSize: 11, margin: "8px 0 0 0", color: "var(--accent)" }}>
-              Payment + audit will fuse into one atomic bundle, sharing this single {config.coinbaseBidEth} ETH bid.
-            </p>
-          )}
 
           <div className="save-bar" style={{ marginTop: 12 }}>
             <button

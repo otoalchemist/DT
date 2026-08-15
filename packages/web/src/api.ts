@@ -3,11 +3,7 @@ import type {
   StrategyConfig,
   ActivityEntry,
   OwnedTokenStatus,
-  TargetTokenStatus,
-  EmigratedTokenStatus,
   PostMortemResult,
-  TargetScoresState,
-  DoNotTargetStatus,
 } from "@dat-bot/shared";
 
 let sessionTokenPromise: Promise<string> | null = null;
@@ -58,8 +54,6 @@ export const api = {
   status: () => req<BotStatus>("/api/status"),
   keystore: () =>
     req<{ exists: boolean; address: string | null; wallets: { address: string; label: string }[] }>("/api/keystore"),
-  // Extra hot wallets. Citizens can only be acted on by the wallet that owns them, so
-  // each wallet needs its own key here. All share one passphrase.
   addWallet: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string; label?: string }) =>
     req<{ address: string; label: string; generated: boolean }>("/api/wallets", {
       method: "POST",
@@ -76,8 +70,6 @@ export const api = {
     req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase }) }),
   lock: () => req<{ ok: boolean }>("/api/lock", { method: "POST" }),
   getConfig: () => req<StrategyConfig>("/api/config"),
-  defaultRivalTargets: () => req<{ tokenIds: string[] }>("/api/default-rival-targets"),
-  rivalSkippers: () => req<{ tokenIds: string[] }>("/api/rival-skippers"),
   setConfig: (patch: Partial<StrategyConfig>) =>
     req<StrategyConfig>("/api/config", { method: "POST", body: JSON.stringify(patch) }),
   start: () => req<BotStatus>("/api/start", { method: "POST" }),
@@ -85,10 +77,6 @@ export const api = {
   jit: (body: { enable: boolean; targetEpoch?: number; tokenIds?: string[] }) =>
     req<BotStatus>("/api/jit", { method: "POST", body: JSON.stringify(body) }),
   tokens: () => req<OwnedTokenStatus[]>("/api/tokens"),
-  // On-demand rival scoring. POST starts a background scan; GET polls for the result.
-  targetScores: () => req<TargetScoresState>("/api/target-scores"),
-  runTargetScores: () => req<TargetScoresState>("/api/target-scores", { method: "POST" }),
-  // Manual per-token actions — normal network gas at press time, not the race tips.
   payToken: (tokenId: string) =>
     req<{ ok: boolean; message: string; txHash?: string; valueWei?: string }>("/api/token/pay", {
       method: "POST",
@@ -99,18 +87,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ tokenId }),
     }),
-  targets: () => req<TargetTokenStatus[]>("/api/targets"),
-  allies: () => req<TargetTokenStatus[]>("/api/allies"),
-  // Big-boy operators we never auto-target (data/do-not-target.json), each tagged with
-  // the operator who runs it. Still rivals — an explicit pin overrides the roster.
-  doNotTarget: () => req<DoNotTargetStatus[]>("/api/do-not-target"),
-  // Force-refresh chain state: re-reads snapshot/balance/block into runtime (which
-  // otherwise only updates inside an engine tick, so it never moves in away mode) and
-  // drops the ownership caches so follow-up GETs refetch instead of serving SWR-stale.
   refreshChain: () => req<BotStatus>("/api/refresh", { method: "POST" }),
-  // Full emigration history from the contract's event log — never in `targets`.
-  // Includes emigrants already killed (alive: false), so the count doesn't shrink.
-  emigrated: () => req<EmigratedTokenStatus[]>("/api/emigrated"),
   activity: (limit = 200) => req<ActivityEntry[]>(`/api/activity?limit=${limit}`),
   getSettings: () => req<{ alchemyKeySet: boolean; mode: "mainnet" | "public" }>("/api/settings"),
   saveAlchemyKey: (alchemyApiKey: string) =>

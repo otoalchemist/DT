@@ -1,20 +1,18 @@
 # Death & Taxes Bot
 
-A self-hosted automation bot for the on-chain game **[Death & Taxes](https://etherscan.io/address/0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F)** by Transient Labs. It watches the game for you and acts automatically:
+A self-hosted **defensive** automation bot for the on-chain game **[Death & Taxes](https://etherscan.io/address/0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F)** by Transient Labs. It pays taxes on **your** Citizens so they stay current — it does not audit or kill anyone else's tokens.
 
-- **Defense (pre-audit only):** the bot takes **zero automatic action once a citizen is audited** — it will not pay to clear the audit and will not spend a held bribe. Recovering an audited citizen is entirely your call, via the **Pay to current** / **Clear audit (bribe)** buttons on the token row. What stays automatic is keeping citizens current *before* they can be audited (proactive pay, prepay up to 7 epochs to lock the current rate, and the JIT boundary payment) — and those skip any citizen already under audit. Any citizen you **uncheck** in the JIT panel is excluded from *every* automatic payment. Consequence: an audited citizen you do not pay yourself becomes killable when its 24h audit expires.
-- **Just-in-time epoch payment (one-shot):** arm the bot for a single upcoming epoch and it pays exactly one epoch for each of your citizens *the moment that epoch begins on-chain* — before they can be audited — then auto-disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per citizen the instant epoch 133 starts. The exact amount is read on-chain at pay time, so it's always correct even for multiple citizens. Each JIT payment is exactly one epoch (one day) and advances the citizen a single epoch, so it fires even when a citizen is momentarily 2 epochs behind at the boundary, and never balloons into a multi-day charge — see the **per-payment epoch cap** below.
-- **Offense (optional):** audit delinquent rivals and `kill` expired-audit tokens to thin the field toward the winning 69. It audits **multiple rivals per epoch** — up to each eligible citizen's **`auditLimit`** (auditor-role tokens can audit several times per epoch; the bot reads each token's remaining capacity and uses all of it), instead of just one. This is a game strategy, not a profit engine — see below.
-- **Reliable inclusion:** choose your submission path — **`mainnet`** (the default: private **bundles** fanned out to several block builders; bundles sit in the block's top region *regardless of tip*, which is what wins a boundary race — and payments still mirror to the public mempool so they can't fail to land) or **`public`** (mempool only, seated after every bundle). Optional latency edges let payments/offense compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
+- **Just-in-time epoch payment (one-shot):** arm the bot for a single upcoming epoch and it pays exactly one epoch for each selected owned Citizen *the moment that epoch begins on-chain* — before they can be audited — then auto-disarms. E.g. arm for epoch 133 and it pays `133 × 0.00069 = 0.09177 ETH` per citizen the instant epoch 133 starts. The exact amount is read on-chain at pay time. Each JIT payment is exactly one epoch (one day) and never balloons into a multi-day charge — see the **per-payment epoch cap** below.
+- **Defense (pre-audit by default):** keeping citizens current *before* they can be audited (proactive pay, prepay up to 7 epochs to lock the current rate, and the JIT boundary payment). Those skip any citizen already under audit. Any citizen you **uncheck** in the JIT panel is excluded from *every* automatic payment. Recovering an audited citizen is your call via **Pay to current** / **Clear audit (bribe)** on the token row, unless you opt into **Benji (Defense) Mode** (`autoDefendAudit`) to auto-pay *your* audited citizen.
+- **Reliable inclusion:** choose your submission path — **`mainnet`** (the default: private **bundles** fanned out to several block builders; bundles sit in the block's top region *regardless of tip*, which is what wins a boundary race — and payments still mirror to the public mempool so they can't fail to land) or **`public`** (mempool only, seated after every bundle). Optional latency edges let payments compete in the *first eligible block* instead of the block after (see [Latency edges](#latency-edges)).
 - **Live activity log:** every action is timestamped with its status; submitted transactions link to Etherscan and auto-update from **submitted → included / reverted** once the receipt lands.
 - **Race post-mortem:** after the fact, paste your tx hash and a rival's to see whether you lost on **timing** (later block) or **fee** (same block, out-priced) — in the dashboard or from the CLI.
 
 You run it on your own machine with your own key. It ships with a local web dashboard.
 
 > ⚠️ **This is not a money-printer.** In Death & Taxes, `audit` and `kill` pay the
-> caller **nothing** — there is no arbitrage/MEV profit per transaction. The bot's
-> value is *keeping your tokens alive* and *helping you play toward being one of the
-> 69 survivors*. It spends ETH (taxes, audit fees, gas); it does not earn any.
+> caller **nothing**. This bot does not call them. Its value is *keeping your tokens
+> alive*. It spends ETH (taxes, gas, optional coinbase bids); it does not earn any.
 
 ---
 
@@ -24,40 +22,13 @@ You run it on your own machine with your own key. It ships with a local web dash
 | --- | --- |
 | Epoch | 24 hours. Tax rate for an epoch = `epoch × 0.00069 ETH`, so daily cost **rises over time**. |
 | Delinquent | A token that is ≥ 2 epochs behind on taxes. Delinquent tokens can be audited by anyone. |
-| Audit | Costs `0.00069 ETH`. Starts a **24h countdown** on a delinquent target. 1 audit per token per epoch. |
+| Audit | Costs `0.00069 ETH`. Starts a **24h countdown** on a delinquent target. |
 | Kill | Free, callable by **anyone** once a token's audit countdown expires. Turns the Citizen into a dead "Evader". |
 | Clear an audit | The target `payTaxes` (pays back-taxes) or `useBribe` (free, if it holds a bribe) before expiry. |
 | Life insurance | **Cosmetic only** — it changes the dead-Evader artwork. It does **not** prevent death. |
-| Emigration | `safeTransferFrom` a Citizen to an emigration contract and it mints you a membership NFT. Two routes exist: [Governor](https://etherscan.io/address/0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C) (36 available, first come) and [ABBC](https://etherscan.io/address/0xbFFFc99Fa75A0FEA45b765d11d8e52F8E1114F8c) — "anti bot bot club". One-way either way: the contract holds the Citizen forever and has no way to pay taxes or spend a bribe. |
 | Winning | The game ends when the Citizen supply drops to **69**; the survivors win. |
 
-**Emigrated citizens are out of the main game.** The bot treats them that way: they're
-excluded from every offense sweep (no audits, no kills) and from the **Rival targets**
-panel, and listed on their own under **Emigrated citizens** in the dashboard. Defense
-needs no special handling — an emigrated token is no longer owned by your wallet, so it
-drops out of the owned set by itself. They still count toward the supply that ends the
-game (they leave it only when somebody else kills them), so the endgame gate
-(`endgameOnlyWithin`) still reads the raw on-chain Citizen supply.
-
-**Both routes count as emigrated.** Every "has this citizen left the game" check consults
-the full destination set (`EMIGRATION_DESTINATIONS` in `packages/shared/src/constants.ts`),
-so adding a future route is one entry there rather than a hunt for hard-coded addresses.
-ABBC emits the identical `Emigrated(address, uint256)` event as the Governor contract, so
-one scanner covers both — each with its own cursor, since they were deployed ~86k blocks
-apart.
-
-> ⚠️ For ABBC the address that matters is the **vault** that receives the citizens
-> (`0xbFFFc99F…14F8c`), *not* the ABBC token contract (`0xFEc1DD88…58453`). The token
-> contract is a 45-byte proxy that only mints the membership NFT and never holds a
-> citizen — watching it finds zero emigrations.
-
-The **Emigrated citizens** panel is the full history, read from each contract's `Emigrated`
-event log rather than from who currently holds what. An emigrant that has already been
-killed is burned and disappears from every ownership index, so an ownership-based list
-would keep shrinking as they die — it read 5 when 13 had emigrated. Killed emigrants stay
-on the list, dimmed and marked `killed`. Rows are grouped by route with a per-route
-held/killed count; the header's "slots left" counts the **Governor** route only, since that
-is the contract with a fixed supply of 36.
+The bot only acts on **Citizens your unlocked wallets own**: pay taxes, spend a bribe, and (if you opt in) auto-clear an audit on your own token. It does not scan, audit, or kill rivals.
 
 ---
 
@@ -102,15 +73,15 @@ Open the dashboard at **`http://localhost:5173`** and:
 1. **Create a hot wallet** — generate a fresh burner or import a private key. It's
    encrypted at rest with a passphrase you choose. **Use a dedicated burner funded
    only with what you're willing to spend.** **This wallet must hold the Citizen
-   tokens you want defended** — the bot only pays taxes for and defends Citizens
-   owned by the wallet it unlocks. A freshly generated burner owns none until you
-   transfer Citizens into it, so to protect Citizens you already hold, import that
-   wallet's key.
+   tokens you want defended** — the bot only pays taxes for Citizens owned by the
+   wallet it unlocks. A freshly generated burner owns none until you transfer
+   Citizens into it, so to protect Citizens you already hold, import that wallet's
+   key.
 2. **Unlock** it with your passphrase.
-3. Configure your **strategy** (defense buffers, offense toggles, spend caps).
+3. Configure **JIT**, spend caps, and (optionally) Benji mode.
 4. Click **Start bot**. The bot is live-fire: once unlocked, started, and `enabled`, it submits real transactions.
 
-Fund the wallet with a little ETH for taxes/audits/gas. Keep the dashboard's
+Fund the wallet with a little ETH for taxes and gas. Keep the dashboard's
 **spend cap** and **min-balance floor** set to values you're comfortable with.
 
 ### Production run
@@ -188,30 +159,10 @@ npm run build
 For a ZIP install, download a trusted versioned release, extract it into a new
 directory, and review it before starting it. Copy `.env` and only the local state you
 intend to preserve (`data/settings.json`, `data/activity.json`, `data/config.json`,
-`data/flashbots-signer.key`, and `data/*.keystore.json`). Reconcile any locally
-edited curated-list files deliberately instead of copying the whole old `data/`
-directory over the new release. Keep a secure backup of the local files: they contain
-the encrypted keystore, runtime configuration, and other state. Using a fresh
-directory also avoids retaining code files removed by a later release.
-
-The four curated list files are part of each release and change only through a
-manual update. They are the bot's shared game intelligence and may change as the
-game is played:
-
-| File | What it is |
-| --- | --- |
-| `data/rival-targets.json` | The curated rival roster (the "reset to default" list). |
-| `data/rival-skippers.json` | Rivals that pay on a ~2-epoch cadence, so they're auditable at every boundary. Seeds the offense targets. |
-| `data/ally-tokens.json` | Teammates. **Never** audited or killed. |
-| `data/do-not-target.json` | Big-boy operators that cure at the top of the boundary block, so an audit slot spent there is wasted. |
-
-Review list changes carefully, especially `ally-tokens.json` and
-`do-not-target.json`, because they affect whom the offense engine may target. In a
-git checkout, local edits to tracked list files may need to be reconciled during a
-pull. In a ZIP install, choose deliberately whether to keep your locally edited
-copies or adopt those from the new release. Once you've customised the offense
-target box, you can re-adopt the shipped `rival-skippers.json` list with the
-one-click *skippers* template in the Config panel.
+`data/flashbots-signer.key`, and `data/*.keystore.json`). Keep a secure backup of the
+local files: they contain the encrypted keystore, runtime configuration, and other
+state. Using a fresh directory also avoids retaining code files removed by a later
+release.
 
 #### `DEFAULTS_VERSION` — pushing new defaults to existing users
 
@@ -223,11 +174,11 @@ Users keep their `data/` folder across updates (it holds the wallet keystore and
 API key), so their `data/config.json` survives — and saved values win per-field,
 meaning a changed default would otherwise *never* reach them. On load, a config
 stamped with an older `DEFAULTS_VERSION` has its recommended fields re-applied
-(gas tuning, behaviour flags, and the curated `data/rival-targets.json` list),
-while their own choices are preserved: run mode, coinbase bid + payer, spend
-guardrails, and JIT selection. The change is reported to the log and the activity
-feed. It's deliberately *not* tied to `VERSION` so a routine release doesn't reset
-anyone's tuning.
+(gas tuning and behaviour flags), while their own choices are preserved: run mode,
+coinbase bid + payer, spend guardrails, and JIT selection. Offense keys from older
+configs (`offenseEnabled`, rival pin lists, combined pay+audit bundle, etc.) are
+dropped. The change is reported to the log and the activity feed. It's deliberately
+*not* tied to `VERSION` so a routine release doesn't reset anyone's tuning.
 
 #### Release checklist
 
@@ -237,8 +188,7 @@ anyone's tuning.
 2. **Bump `DEFAULTS_VERSION`** in `packages/backend/src/runtime.ts` **if — and only
    if — you changed a recommended default** (gas tuning or a behaviour flag).
    Skipping this means existing users silently stay on the old settings; bumping it
-   needlessly resets their tuning. Curated list changes ship with a release and do
-   not require a defaults-version bump.
+   needlessly resets their tuning.
 3. Mirror any default changes into `data/config.example.json` (docs only, but keep
    it honest).
 4. `npm run build && npm test`, then commit.
@@ -257,7 +207,7 @@ anyone's tuning.
 | `BUILDER_URLS` | Comma-separated builders that receive your bundle in `mainnet` mode. Only the builder that **wins the slot** can include it, so the bot submits to **all** in parallel and succeeds if any accepts. Defaults to Flashbots, **BuilderNet**, beaverbuild and Titan (all verified live). Endpoints do change — verify against each builder's docs. |
 | `PORT` / `HOST` | Local API bind (default `127.0.0.1:8787`). Non-loopback hosts are refused because this API has no remote-user authentication or TLS. |
 | `COINBASE_PAYER_CODE_HASHES` | Comma-separated approved Coinbase payer runtime-code hashes. Coinbase bidding fails closed when this is empty or the configured payer does not match. |
-| `OWNED_TOKENS` / `TARGET_TOKENS` | Comma-separated tokenId overrides for local testing without the NFT API. |
+| `OWNED_TOKENS` | Comma-separated tokenId override for local testing without the NFT API. |
 
 Secrets live in `.env` and `data/` (the encrypted keystore + a Flashbots
 reputation key). Both are git-ignored. **Never commit them.** The backend tightens
@@ -278,14 +228,13 @@ cp data/config.example.json data/config.json
 
 ## Away mode — cut provider usage to near zero
 
-Every automatic action the bot takes fires **at an epoch boundary** (proactive pay, JIT,
-pre-boundary audit/kill). But a running engine reacts to *every block*, which costs
-roughly **22 provider requests per minute** around the clock — for work that happens
-once a day.
+Every automatic action the bot takes fires **at an epoch boundary** (proactive pay,
+JIT). But a running engine reacts to *every block*, which costs roughly **22
+provider requests per minute** around the clock — for work that happens once a day.
 
 **Away mode keeps the engine stopped and wakes it just before each boundary**, then
-stops it again once the boundary work has settled (5 minutes of grace). Toggle it in the
-dashboard's top bar; it applies instantly, like **Start bot**.
+stops it again once the boundary work has settled (5 minutes of grace). Toggle it in
+the dashboard's top bar; it applies instantly, like **Start bot**.
 
 Idling costs **zero requests**. Boundaries are `startTime + N × EPOCH_DURATION`, so the
 next one is arithmetic on the wall clock — there is nothing to poll. The dashboard also
@@ -295,14 +244,15 @@ stops its own 20s poll while away mode is on, so an open tab costs nothing eithe
 before the pre-boundary race arms, so leave headroom rather than trimming this to
 seconds.
 
-It only wakes when there is something to wake **for** — proactive pay on, a JIT arm, or
-offense enabled. With everything off, no wake is scheduled and the dashboard says so
-rather than counting down to a no-op.
+It only wakes when there is something to wake **for** — proactive pay on, or a JIT
+arm. With everything off, no wake is scheduled and the dashboard says so rather than
+counting down to a no-op.
 
-**The trade-off:** while the engine is stopped the bot is not watching. Nothing reacts to
-a mid-epoch event — an ally in trouble, a rival suddenly becoming killable — until the
-next wake. Away mode suits defending your own citizens on a schedule; leave it off if you
-want the bot opportunistically hunting between boundaries.
+**The trade-off:** while the engine is stopped the bot is not watching. Nothing reacts
+to a mid-epoch event — an audit landing on your citizen — until the next wake. Away
+mode suits defending your own citizens on a schedule; leave it off if you want the
+bot watching continuously (and enable Benji mode if you want it to auto-clear an
+audit without waiting for a boundary).
 
 ---
 
@@ -329,15 +279,6 @@ want the bot opportunistically hunting between boundaries.
   case). The cap only limits the multi-epoch paths — proactive-pay and defense —
   which otherwise pay `prepayEpochs`; raise it to let those auto-catch-up several
   epochs in one payment. Edited in the **Just-in-time epoch payment** panel.
-- **Separate offense gas (audit/kill):** audit/kill bid their own gas,
-  independent of payments — it's a race against rivals where a payment isn't, so
-  it carries a different tip and base-fee cap. **On by default**; turn off
-  **Separate gas for audit / kill** to make one set of gas settings apply to
-  everything. The shipped payment defaults are tuned to win the boundary bundle
-  race (a ~15 gwei tip clears the observed batch-audit bundles at ~3 gwei, with
-  dynamic tip scaling it up in contested blocks); offense carries its own tip and
-  a tighter base-fee cap. Payment gas is edited under **Just-in-time epoch
-  payment → Payment gas**; offense gas under **Offense**.
 - **Simulate-before-send:** every transaction is checked before final authorization and
   signing (normally with `eth_call` against the identity-checked HTTP RPC), so reverting
   transactions aren't paid for and nonces aren't burned on them. No usable signature is
@@ -359,30 +300,23 @@ want the bot opportunistically hunting between boundaries.
 ## Latency edges
 
 Rivals often win by landing in an *earlier block*, not by paying more. These
-optional, off-by-default edges close that gap (configure them in the dashboard):
+optional, off-by-default edges close that gap for **your payments** (configure them
+in the dashboard):
 
-- **Race the public mempool** (`mainnet` mode only) — also broadcasts a
-  time-critical **offense** tx to the public mempool alongside the bundle, so *any*
-  builder can include it next block. The tx is identical (same nonce), so only one
-  can ever land. Trades bundle privacy for lower inclusion latency. It's opt-in for
-  offense because a *visible pending audit* lets the target escape by paying first.
-  **Payments don't need this toggle** — in `mainnet` mode they always mirror to the
-  mempool (see below), and both paths fire concurrently so neither waits on the other.
 - **Dynamic priority tip** — scales the tip up as the latest block fills past 50%,
   up to a configurable ceiling, to stay competitive in contested blocks. When off,
-  the static priority fee is always used. It applies to **tax payments** too (set
-  under *Just-in-time epoch payment → Payment gas*) — useful when a boundary-timed
-  payment has to out-order a rival's batch-audit in the first block of an epoch.
-- **Race into the boundary block** (advanced, opt-in, `payTaxes` only) — the
-  ordinary JIT pay fires *just after* the boundary, so it lands one block late. This
-  mode instead *pre-submits* the armed JIT payment shortly **before** the boundary
-  with a value computed off-chain for the upcoming epoch, so it can land in the
-  **first block of the epoch** ahead of a batch-auditor (matching the fastest
-  rivals). The value is validated by **simulating at the boundary timestamp**
-  (`eth_call` block overrides, or `eth_callBundle`'s `timestamp` on mainnet), so a
-  wrong value is caught before spending gas; the normal post-boundary JIT pay still
-  runs as a fallback. Off by default; enable it under *Just-in-time epoch payment →
-  Payment gas*.
+  the static priority fee is always used. Set under *Just-in-time epoch payment →
+  Payment gas* — useful when a boundary-timed payment has to out-order a rival's
+  batch-audit in the first block of an epoch.
+- **Race into the boundary block** (advanced, `payTaxes` only) — the ordinary JIT
+  pay fires *just after* the boundary, so it lands one block late. This mode instead
+  *pre-submits* the armed JIT payment shortly **before** the boundary with a value
+  computed off-chain for the upcoming epoch, so it can land in the **first block of
+  the epoch** ahead of a batch-auditor. The value is validated by **simulating at
+  the boundary timestamp** (`eth_call` block overrides, or `eth_callBundle`'s
+  `timestamp` on mainnet), so a wrong value is caught before spending gas; the
+  normal post-boundary JIT pay still runs as a fallback. On by default; still
+  editable in `data/config.json`.
 - **Coinbase bid (advanced, opt-in, `mainnet` only)** — a **flat ETH payment straight
   to the block builder** added to the pre-boundary payment bundle, to bid it to the
   **top of the boundary block regardless of tip**. This is the lever the strongest
@@ -397,43 +331,15 @@ optional, off-by-default edges close that gap (configure them in the dashboard):
   deployed runtime code hash to `COINBASE_PAYER_CODE_HASHES`. The bot checks both code
   presence and the allowlisted hash before signing a bid. No shared payer is trusted by
   default. **Off by default.**
-- **Combine payment + audit into one atomic bundle (`mainnet` only)** — when a
-  pre-boundary payment and an audit are both due at the same epoch boundary, fuse
-  them into a **single** bundle (sequential nonces) instead of two, so they land
-  consecutively top-of-block, share **one** coinbase bid instead of two, and can't
-  demote each other. **Self-guarding and on by default:** it only actually fuses when
-  a coinbase bid is set (`coinbaseBidEth > 0`); without a bid it's a no-op and the bot
-  sends separate bundles so the audit keeps its public-mempool fallback. Payment is
-  always mempool-mirrored either way and is never dropped. So a later coinbase bid
-  "just works" without a second toggle — but nothing changes until you set one.
-- **Atomic multi-tx bundles (`mainnet` mode, automatic)** — every Citizen you hold
-  is owned by the same wallet, so paying/auditing several in one cycle produces
-  multiple txs on a single nonce sequence. Sent as independent one-tx bundles, only
-  the first (nonce == chain nonce) is a self-valid bundle; the rest carry a nonce
-  gap and won't be placed top-of-block by builders. The bot instead collects a
-  cycle's txs and submits them as **one atomic bundle** (txs in nonce order), so
-  **all** of them win top-of-block together — what you need to out-order a
-  batch-auditor hitting several of your citizens at once. Each tx still mirrors to
-  the public mempool individually as a fallback. No configuration; always on in
+- **Atomic multi-tx bundles (`mainnet` mode, automatic)** — paying several Citizens
+  in one cycle produces multiple txs on a single nonce sequence. Sent as independent
+  one-tx bundles, only the first (nonce == chain nonce) is a self-valid bundle; the
+  rest carry a nonce gap and won't be placed top-of-block by builders. The bot instead
+  collects a cycle's txs and submits them as **one atomic bundle** (txs in nonce
+  order), so **all** of them win top-of-block together — what you need when a
+  batch-auditor hits several of your citizens at once. Each tx still mirrors to the
+  public mempool individually as a fallback. No configuration; always on in
   `mainnet` mode.
-- **Race audits/kills into the first block** (advanced, opt-in) — the offense
-  equivalents. *Race audits* pre-submits audits just before the epoch boundary so
-  they land the instant rivals become delinquent (like a batch-auditor); *race
-  kills* pre-submits a `kill` just before a target's audit-expiry so it lands in
-  the first eligible block. Both are validated by simulating at the boundary/expiry
-  instant, reuse the shared pre-submit lead, and fall back to the normal
-  post-deadline offense. Off by default; enable under *Offense*. Note: boundary
-  block position is driven by **builder orderflow**, not tip — a defender who
-  pre-pays will beat your audit regardless of gas, so this is lower-value than the
-  payment race.
-- **Salted rival sweep order** — every bot sees the same candidate list in the
-  same order (same indexer, same on-chain enumeration), so without this every
-  instance would sweep the same tokens first, piling onto identical targets while
-  starving whichever ones are late in the list once the auditor-token pool runs
-  out. Each engine start picks a random salt and uses it to reorder the sweep
-  (offense, pre-boundary audit, pre-boundary kill) for that run — stable for the
-  run's lifetime, but different across restarts and across users. Always on, not
-  configurable.
 
 ## Race post-mortem
 
@@ -464,8 +370,8 @@ npm test                    # unit tests: keystore round-trip, epoch/delinquency
 RPC_HTTP_URL=<your-rpc> npx tsx packages/backend/src/probe.ts
 ```
 
-**Mainnet-fork end-to-end** (exercises real `payTaxes` / `audit` / `kill` signing
-and broadcast) — requires [Foundry](https://book.getfoundry.sh/):
+**Mainnet-fork end-to-end** (exercises real `payTaxes` signing and broadcast) —
+requires [Foundry](https://book.getfoundry.sh/):
 
 ```bash
 # 1. Fork mainnet locally
@@ -474,17 +380,17 @@ anvil --fork-url <your-mainnet-rpc>
 # 2. Point the bot at the fork; hardcode a token you'll test against
 #    (impersonate/fund it with cast). No NFT API needed in local mode.
 MODE=local RPC_HTTP_URL=http://127.0.0.1:8545 \
-  OWNED_TOKENS=<tokenId> TARGET_TOKENS=<delinquentTokenId> \
+  OWNED_TOKENS=<tokenId> \
   npm run dev
 
 # 3. In the dashboard, click Start. Use `cast rpc evm_increaseTime`
-#    to warp past an audit deadline and watch the kill path fire.
+#    to warp the clock and watch the JIT / proactive-pay path fire.
 ```
 
 In `local` and `public` modes the submitter broadcasts the signed transaction directly
 (Anvil has no Flashbots relay). In `mainnet` mode it submits private bundles to the
-configured builders; tax payments, and explicitly opted-in offense races, also use an
-identical public-mempool mirror so either copy can land but only one can execute.
+configured builders; tax payments also use an identical public-mempool mirror so
+either copy can land but only one can execute.
 
 ---
 

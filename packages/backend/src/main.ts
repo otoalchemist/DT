@@ -5,7 +5,6 @@ import { runtime } from "./runtime.js";
 import { buildServer } from "./api.js";
 import { dashboardIndexExists } from "./dashboard.js";
 import { getChainId } from "./chain.js";
-import { prewarmTargets } from "./service.js";
 import { activity } from "./activity.js";
 import { beginEngineMaintenance, quiesceEngine } from "./strategy.js";
 
@@ -26,22 +25,13 @@ async function main(): Promise<void> {
   }
   logger.info("LIVE FIRE — the bot submits real transactions when unlocked and enabled.");
 
-  // Warm the rival-target caches in the background so the first dashboard load is fast
-  // (the cold full-collection enumeration is ~15s). Best-effort; needs the NFT API.
-  //
-  // On a fresh install there is no key yet, so this is skipped — POST /api/settings warms
-  // them when the key arrives instead. Without that, the first dashboard load after setup
-  // paid the whole cold enumeration against a blank screen, which reads as "blockchain
-  // data isn't loading".
-  if (appConfig.nftUrl) {
-    void prewarmTargets();
-  } else {
+  if (!appConfig.nftUrl) {
     // Say so loudly: with no key the RPC client falls back to viem's default PUBLIC
     // mainnet endpoint, so the bot appears connected while ownership enumeration (which
     // needs the Alchemy NFT API) silently returns nothing.
     logger.warn(
       "No Alchemy API key configured — using the default public RPC and NO NFT API. " +
-        "Token/target lists stay empty until a key is saved in the UI.",
+        "Token lists stay empty until a key is saved in the UI.",
     );
   }
 

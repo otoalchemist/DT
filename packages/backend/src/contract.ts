@@ -4,11 +4,10 @@ import {
   citizensAbi,
   EPOCH_DURATION_SECONDS,
   type OwnedTokenStatus,
-  type TargetTokenStatus,
 } from "@dat-bot/shared";
 import { publicClient } from "./chain.js";
 import { appConfig } from "./config.js";
-import { classifyRisk, isAuditable, isKillable } from "./logic.js";
+import { classifyRisk } from "./logic.js";
 
 const game = { address: appConfig.gameAddress, abi: deathAndTaxesAbi } as const;
 
@@ -33,7 +32,7 @@ export async function resolveCitizensAddress(): Promise<Address> {
 }
 
 // Short-lived snapshot cache. The snapshot is a 4-call multicall and was being read
-// independently by the engine tick, /api/tokens AND /api/targets — so a dashboard poll
+// independently by the engine tick and /api/tokens — so a dashboard poll
 // landing near a tick fired three identical multicalls within a second.
 //
 // The cache is OPT-IN via `maxAgeMs`: the engine calls getGameSnapshot() with no
@@ -114,86 +113,6 @@ export async function getOwnedTokenStatus(
   };
 }
 
-/** Lightweight status for a rival token (audit/kill candidate). */
-export async function getTargetStatus(
-  tokenId: bigint,
-  owner: Address,
-  currentEpoch: bigint,
-  nowSec: bigint,
-): Promise<TargetTokenStatus> {
-  const [lastEpochPaid, auditDue] = await publicClient.multicall({
-    allowFailure: false,
-    contracts: [
-      { ...game, functionName: "lastEpochPaid", args: [tokenId] },
-      { ...game, functionName: "auditDueTimestamp", args: [tokenId] },
-    ],
-  });
-  const due = auditDue as bigint;
-  const lep = lastEpochPaid as bigint;
-  const auditable = due === 0n && isAuditable(lep, currentEpoch);
-  const killable = isKillable(due, nowSec);
-  const delinquent = lep < currentEpoch;
-  const epochsBehind = delinquent ? Number(currentEpoch - lep) : 0;
-  return {
-    tokenId: tokenId.toString(),
-    owner,
-    lastEpochPaid: lep.toString(),
-    delinquent,
-    epochsBehind,
-    auditable,
-    auditDueTimestamp: due.toString(),
-    killable,
-  };
-}
-
-/**
- * Fetch lastEpochPaid + auditDueTimestamp for a batch of tokens in ONE multicall,
- * then classify each result in memory. Much faster than calling getTargetStatus()
- * in a serial loop when there are hundreds of candidates.
- */
-export async function batchGetTargetStatuses(
-  tokens: { id: bigint; owner: Address }[],
-  currentEpoch: bigint,
-  nowSec: bigint,
-): Promise<TargetTokenStatus[]> {
-  if (tokens.length === 0) return [];
-
-  // Build a flat contract call list: [lep(0), adt(0), lep(1), adt(1), ...]
-  const contracts = tokens.flatMap(({ id }) => [
-    { ...game, functionName: "lastEpochPaid" as const, args: [id] as const },
-    { ...game, functionName: "auditDueTimestamp" as const, args: [id] as const },
-  ]);
-
-  const results = await publicClient.multicall({ allowFailure: true, contracts });
-
-  const out: TargetTokenStatus[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const lepResult = results[i * 2];
-    const adtResult = results[i * 2 + 1];
-    if (!lepResult || !adtResult) continue;
-    if (lepResult.status === "failure" || adtResult.status === "failure") continue;
-
-    const lep = lepResult.result as bigint;
-    const due = adtResult.result as bigint;
-    const { id, owner } = tokens[i]!;
-    const auditable = due === 0n && isAuditable(lep, currentEpoch);
-    const killable = isKillable(due, nowSec);
-    const delinquent = lep < currentEpoch;
-    const epochsBehind = delinquent ? Number(currentEpoch - lep) : 0;
-    out.push({
-      tokenId: id.toString(),
-      owner,
-      lastEpochPaid: lep.toString(),
-      delinquent,
-      epochsBehind,
-      auditable,
-      auditDueTimestamp: due.toString(),
-      killable,
-    });
-  }
-  return out;
-}
-
 /**
  * Full status for many owned tokens in ONE multicall, instead of a serial
  * getOwnedTokenStatus per token (N RPC round-trips). Used by the defense/proactive/
@@ -207,16 +126,13 @@ export async function batchGetOwnedStatuses(
   prepayEpochs = 1,
 ): Promise<OwnedTokenStatus[]> {
   if (tokenIds.length === 0) return [];
-  // auditLimit rides along in the same multicall — no extra round-trip — so the dashboard
-  // can total the audit capacity a wallet actually holds instead of assuming one each.
-  const PER = 6; // lastEpochPaid, auditDueTimestamp, bribeBalance, hasLifeInsurance, estimateTaxesToPay, auditLimit
+  const PER = 5; // lastEpochPaid, auditDueTimestamp, bribeBalance, hasLifeInsurance, estimateTaxesToPay
   const contracts = tokenIds.flatMap((tokenId) => [
     { ...game, functionName: "lastEpochPaid" as const, args: [tokenId] as const },
     { ...game, functionName: "auditDueTimestamp" as const, args: [tokenId] as const },
     { ...game, functionName: "bribeBalance" as const, args: [tokenId] as const },
     { ...game, functionName: "hasLifeInsurance" as const, args: [tokenId] as const },
     { ...game, functionName: "estimateTaxesToPay" as const, args: [tokenId, prepayEpochs] as const },
-    { ...game, functionName: "auditLimit" as const, args: [tokenId] as const },
   ]);
 
   const results = await publicClient.multicall({ allowFailure: true, contracts });
@@ -225,9 +141,9 @@ export async function batchGetOwnedStatuses(
   for (let i = 0; i < tokenIds.length; i++) {
     const slice = results.slice(i * PER, i * PER + PER);
     if (slice.some((r) => !r || r.status === "failure")) continue;
-    const [lastEpochPaid, auditDue, bribeBalance, hasLifeInsurance, estimate, auditLimit] = slice.map(
+    const [lastEpochPaid, auditDue, bribeBalance, hasLifeInsurance, estimate] = slice.map(
       (r) => r!.result,
-    ) as [bigint, bigint, bigint, boolean, bigint, bigint];
+    ) as [bigint, bigint, boolean, boolean, bigint];
     const { risk, secondsUntilKillable } = classifyRisk(lastEpochPaid, currentEpoch, auditDue, nowSec);
     out.push({
       tokenId: tokenIds[i]!.toString(),
@@ -239,7 +155,6 @@ export async function batchGetOwnedStatuses(
       hasLifeInsurance,
       risk,
       estimatedPayWei: estimate.toString(),
-      auditLimit: Number(auditLimit),
     });
   }
   return out;
@@ -263,25 +178,6 @@ export function encodePayTaxes(tokenId: bigint, numEpochs: number): `0x${string}
     abi: deathAndTaxesAbi,
     functionName: "payTaxes",
     args: [tokenId, numEpochs],
-  });
-}
-
-export function encodeAudit(
-  fromTokenId: bigint,
-  targetTokenId: bigint,
-): `0x${string}` {
-  return encodeFunctionData({
-    abi: deathAndTaxesAbi,
-    functionName: "audit",
-    args: [fromTokenId, targetTokenId],
-  });
-}
-
-export function encodeKill(tokenId: bigint): `0x${string}` {
-  return encodeFunctionData({
-    abi: deathAndTaxesAbi,
-    functionName: "kill",
-    args: [tokenId],
   });
 }
 

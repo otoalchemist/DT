@@ -18,7 +18,7 @@ export const GAME_CONTRACT_ADDRESS = "0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F
  * A citizen `safeTransferFrom`-ed here is swapped for a Governor NFT and held by the
  * contract forever — it has no `payTaxes`/`useBribe` code path and no generic executor,
  * so an emigrated citizen can never defend itself and never acts again. It has left the
- * main game: we don't pay for it (it isn't ours anymore), and we don't audit or kill it.
+ * main game: we don't pay for it (it isn't ours anymore).
  * `supply` is 36, which is exactly `citizenSupply - WINNERS` at deployment.
  */
 export const EMIGRATION_CONTRACT_ADDRESS = "0xE56d011262d4738dC8307fb8a4Ae48B2bFc20E7C" as const;
@@ -58,8 +58,7 @@ export const ABBC_EMIGRATION_DEPLOY_BLOCK = 25_727_232n;
  *
  * Emigration is no longer one destination, so anything that means "has this citizen left
  * the game" has to consult the whole set rather than a single address — a hard-coded
- * comparison silently treats ABBC emigrants as ordinary rivals, which means paying taxes
- * for a citizen we no longer own and spending audit slots on one nobody defends.
+ * comparison silently treats ABBC emigrants as still in the game.
  *
  * `label` is what the dashboard calls each route; `deployBlock` bounds its log scan.
  */
@@ -127,11 +126,7 @@ export type GameStateValue = (typeof GameState)[keyof typeof GameState];
 /**
  * Measured gas per game action, from real on-chain transactions over a 10-epoch window.
  * Used to price what a coinbase bid must cover: a bid buys position for the WHOLE bundle,
- * so the cost of out-ranking a rival scales linearly with how much gas you are carrying.
- *
- * Keep in sync with scripts/target-scores.mjs, which duplicates these — that script is
- * deliberately dependency-free (it runs standalone against an RPC) so it cannot import
- * from this package.
+ * so the cost of out-ranking a rival payment scales linearly with how much gas you are carrying.
  */
 export const GAS_PER_PAYMENT = 82_875;
 export const GAS_PER_AUDIT = 130_409;

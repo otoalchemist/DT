@@ -29,10 +29,8 @@ afterEach(() => {
 describe("strategy configuration security", () => {
   it("keeps spending and third-party payer behavior opt-in", () => {
     expect(DEFAULT_STRATEGY.enabled).toBe(false);
-    expect(DEFAULT_STRATEGY.offenseEnabled).toBe(false);
     expect(DEFAULT_STRATEGY.autoDefendAudit).toBe(false);
     expect(DEFAULT_STRATEGY.coinbaseBidEth).toBe(0);
-    expect(DEFAULT_STRATEGY.coinbaseBidAuditOnlyEth).toBe(0);
     expect(DEFAULT_STRATEGY.coinbasePayerAddress).toBe("");
   });
 
@@ -44,7 +42,7 @@ describe("strategy configuration security", () => {
   it.each(["01", "-1", "1.5", (1n << 256n).toString()])(
     "rejects unsafe token id %s",
     (id) => {
-      expect(() => strategyPatchSchema.parse({ offenseTargetTokenIds: [id] })).toThrow();
+      expect(() => strategyPatchSchema.parse({ jitTokenIds: [id] })).toThrow();
     },
   );
 
@@ -86,18 +84,16 @@ describe("strategy configuration security", () => {
     delete config.autoDefendAudit;
     delete config.awayMode;
     delete config.awayLeadMinutes;
-    delete config.coinbaseBidAuditOnlyEth;
     writeConfig(config);
 
     expect(() => runtime.loadStrategy()).not.toThrow();
     expect(runtime.strategy.autoDefendAudit).toBe(false);
     expect(runtime.strategy.awayMode).toBe(false);
     expect(runtime.strategy.awayLeadMinutes).toBe(15);
-    expect(runtime.strategy.coinbaseBidAuditOnlyEth).toBe(0.005);
     const persisted = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
     expect(persisted.defaultsVersion).toBe(DEFAULTS_VERSION);
     expect(persisted.autoDefendAudit).toBe(false);
-    expect(persisted.coinbaseBidAuditOnlyEth).toBe(0.005);
+    expect(persisted.coinbaseBidEth).toBe(0.005);
   });
 
   it("migrates the exact field shape shipped by the tracked v4 config example", () => {
@@ -143,10 +139,14 @@ describe("strategy configuration security", () => {
       autoDefendAudit: false,
       awayMode: false,
       awayLeadMinutes: 15,
-      coinbaseBidAuditOnlyEth: 0,
+      enabled: false,
+      coinbaseBidEth: 0,
     });
     const persisted = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
     expect(persisted.defaultsVersion).toBe(DEFAULTS_VERSION);
+    expect(persisted.offenseEnabled).toBeUndefined();
+    expect(persisted.offenseTargetTokenIds).toBeUndefined();
+    expect(persisted.autoAudit).toBeUndefined();
     expect(Object.keys(persisted).sort()).toEqual(
       [...Object.keys(DEFAULT_STRATEGY), "defaultsVersion"].sort(),
     );
@@ -170,8 +170,8 @@ describe("strategy configuration security", () => {
     const { defaultsVersion: _meta, ...config } = raw;
     const parsed = strategyConfigSchema.parse(config);
     expect(Object.keys(config).sort()).toEqual(Object.keys(DEFAULT_STRATEGY).sort());
-    expect(parsed.offenseEnabled).toBe(false);
-    expect(parsed.offenseTargetTokenIds).toEqual([]);
     expect(parsed.coinbasePayerAddress).toBe("");
+    expect(parsed).not.toHaveProperty("offenseEnabled");
+    expect(parsed).not.toHaveProperty("offenseTargetTokenIds");
   });
 });
