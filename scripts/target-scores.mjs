@@ -988,11 +988,34 @@ async function main() {
       console.log(`  #${r.token.padEnd(5)} ${r.skipClean}/${r.skipCaught} of ${r.crossings} skips · score ${r.score.toFixed(2)}`);
     }
     if (promote) {
-      const merged = [...new Set([...skipperSet, ...newlyObserved.map((r) => r.token)])]
-        .filter((t) => !bigBoyOwnerOf.has(t) && !allySet.has(t))
+      const candidates = [...new Set([...skipperSet, ...newlyObserved.map((r) => r.token)])];
+      /**
+       * Prune on the way through, and SAY what was pruned.
+       *
+       * The merge carries the existing file forward, so entries that have since left the
+       * game survived every promote — the list was holding #1000, #1417 and #6028 (all
+       * emigrated, two of them burned) as live audit targets. Same predicate the scan uses
+       * for a rival row: no owner = burned, emigration contract = out of the game. Neither
+       * can be audited, so both are dead weight crowding the paste list.
+       *
+       * Printed rather than dropped quietly: this rewrites a file the user curates by hand,
+       * and silently deleting ids from it would be indistinguishable from losing them.
+       */
+      const pruned = [];
+      const merged = candidates
+        .filter((t) => {
+          if (bigBoyOwnerOf.has(t) || allySet.has(t)) return false;
+          const owner = ownerOf.get(t) ?? null;
+          if (!owner) { pruned.push(`#${t} (burned/not in the collection)`); return false; }
+          if (isEmigratedOwner(owner)) { pruned.push(`#${t} (emigrated)`); return false; }
+          return true;
+        })
         .sort((a, b) => Number(a) - Number(b));
       fs.writeFileSync(path.join(dataDir, "rival-skippers.json"), JSON.stringify(merged, null, 2) + "\n");
       console.log(`  -> promoted ${newlyObserved.length}; data/rival-skippers.json now holds ${merged.length}`);
+      if (pruned.length > 0) {
+        console.log(`  -> dropped ${pruned.length} that can no longer be audited: ${pruned.join(", ")}`);
+      }
     } else {
       console.log(`  (re-run with --promote to add them to data/rival-skippers.json)`);
     }
