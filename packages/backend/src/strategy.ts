@@ -430,12 +430,9 @@ export function scheduleAwayWake(): void {
     // One-off read to learn the epoch grid, then schedule offline from here on.
     void getGameSnapshot()
       .then((snap) => {
-        runtime.startTime = snap.startTime;
-        runtime.currentEpoch = snap.currentEpoch;
-        // Third path that learns the epoch, so it clears a dead arm too. Without this,
-        // awayHasWork() above keeps seeing the stale arm and away mode wakes the engine
-        // every boundary for work that cannot happen.
-        expireStaleJitArm(snap.currentEpoch);
+        // Clears a dead arm as a side effect: without that, awayHasWork() above keeps
+        // seeing it and away mode wakes the engine every boundary for impossible work.
+        runtime.applyChainSnapshot(snap);
         scheduleAwayWake();
       })
       .catch((err) => logger.warn(`away mode: could not read startTime: ${(err as Error).message}`));
@@ -1577,24 +1574,12 @@ async function refreshSnapshot(): Promise<void> {
     ),
     getLatestBlockCached(),
   ]);
-  runtime.gameState = snap.state;
-  runtime.currentEpoch = snap.currentEpoch;
-  runtime.citizenSupply = snap.citizenSupply;
-  runtime.citizensAddress = snap.citizensAddress;
-  runtime.startTime = snap.startTime;
+  runtime.applyChainSnapshot(snap);
   for (const b of balances) runtime.setBalance(b.address, b.wei);
   runtime.lastBlock = latest.number;
-  /**
-   * Drop a dead arm the moment the epoch is KNOWN, and before any scheduler sees it.
-   *
-   * This is the choke point on purpose. A persisted arm is loaded from data/config.json at
-   * boot, so between process start and the first chain read the bot is armed for an epoch
-   * it cannot yet date — and the four schedulers below run on every snapshot. Putting the
-   * check only in tick() left the ordering to luck; putting it here means every path that
-   * learns the epoch clears the arm first, which is what makes starting or unlocking with a
-   * days-old arm safe rather than merely usually-safe.
-   */
-  expireStaleJitArm(snap.currentEpoch);
+  // applyChainSnapshot retires a dead arm as part of applying the epoch, so it must run
+  // BEFORE the schedulers below — each of them reads the arm.
+  runtime.applyChainSnapshot(snap);
   runtime.emitStatus();
   scheduleJitBoundary();
   schedulePreBoundaryPay();
@@ -2596,3 +2581,18 @@ async function tick(fireProactivePay = false): Promise<void> {
     ticking = false;
   }
 }
+
+/**
+ * Wire the stale-arm check into runtime.applyChainSnapshot, so EVERY path that learns the
+ * epoch retires a dead JIT arm — the engine tick, the unlock handler, the away-mode read and
+ * POST /api/refresh alike. Registered here rather than imported by runtime.ts because that
+ * would be an import cycle (this module already imports runtime), and because the expiry
+ * needs this module's JIT bookkeeping via resetJitState.
+ *
+ * Module side effect on purpose: any future caller of applyChainSnapshot inherits the guard
+ * without knowing it exists, which is the property that the previous per-call-site version
+ * failed to provide.
+ */
+runtime.registerStaleArmCheck((currentEpoch) => {
+  expireStaleJitArm(currentEpoch);
+});

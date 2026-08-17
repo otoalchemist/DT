@@ -23,7 +23,7 @@ import { getGameSnapshot } from "./contract.js";
 import { invalidateTokenCaches } from "./index-tokens.js";
 import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
-import { startEngine, stopEngine, expireStaleJitArm, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
@@ -37,9 +37,20 @@ const strategyPatch = z
     proactivePay: z.boolean(),
     prepayEpochs: z.number().int().min(1).max(7),
     maxAutoPayEpochs: z.number().int().min(1),
-    jitEnabled: z.boolean(),
-    jitTargetEpoch: z.number().int().min(1).nullable(),
-    jitTokenIds: z.array(z.string()),
+    /**
+     * jitEnabled / jitTargetEpoch / jitTokenIds are DELIBERATELY absent.
+     *
+     * They are not settings — they are a live session, owned by POST /api/jit-arm and the
+     * disarm route, which validate the target against the current epoch. The Config panel
+     * saves by posting its WHOLE form object, so while these were accepted a dashboard whose
+     * state was loaded before a disarm would resurrect the dead arm on the next unrelated
+     * Save. That is exactly what happened in the field: an arm for epoch 166 was correctly
+     * retired, then written straight back three minutes later by a config save, and the
+     * panel showed it armed again against a chain on epoch 168.
+     *
+     * zod strips unknown keys, so a client may keep sending them harmlessly — they are
+     * simply ignored rather than 400-ing a save that is otherwise valid.
+     */
     excludedTokenIds: z.array(z.string()),
     preBoundaryPay: z.boolean(),
     preBoundaryLeadMs: z.number().int().min(250).max(8000),
@@ -336,16 +347,10 @@ export async function buildServer(): Promise<FastifyInstance> {
       // Populate chain state immediately so the UI can show epoch/countdown even
       // when the engine is paused.
       getGameSnapshot().then((snap) => {
-        runtime.currentEpoch = snap.currentEpoch;
-        runtime.startTime = snap.startTime;
-        runtime.gameState = snap.state;
-        runtime.citizenSupply = snap.citizenSupply;
-        runtime.citizensAddress = snap.citizensAddress;
-        // Unlocking is the moment a persisted arm becomes actionable — the engine may be
-        // started at any keypress from here, and away mode is armed just below. An arm for
-        // an epoch that has already passed is retired first, so neither can act on it and
-        // the panel stops showing a dead target epoch as live.
-        expireStaleJitArm(snap.currentEpoch);
+        // Applies the epoch AND retires a stale arm — unlocking is the moment a persisted
+        // arm becomes actionable, since the engine may be started at any keypress from here
+        // and away mode is armed just below.
+        runtime.applyChainSnapshot(snap);
         runtime.emitStatus();
         // Away mode can only arm once the wallet is unlocked and the epoch grid is
         // known — both are true right here.
@@ -462,11 +467,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     // read fails.
     try {
       const snap = await getGameSnapshot();
-      runtime.currentEpoch = snap.currentEpoch;
-      runtime.startTime = snap.startTime;
-      runtime.gameState = snap.state;
-      runtime.citizenSupply = snap.citizenSupply;
-      runtime.citizensAddress = snap.citizensAddress;
+      runtime.applyChainSnapshot(snap);
       runtime.emitStatus();
     } catch (err) {
       return reply.code(502).send({ error: `Could not read the current epoch from chain — try again: ${(err as Error).message}` });
@@ -621,11 +622,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       invalidateEmigrationRoster();
       // getGameSnapshot() with no TTL argument always reads the chain.
       const snap = await getGameSnapshot();
-      runtime.currentEpoch = snap.currentEpoch;
-      runtime.startTime = snap.startTime;
-      runtime.gameState = snap.state;
-      runtime.citizenSupply = snap.citizenSupply;
-      runtime.citizensAddress = snap.citizensAddress;
+      runtime.applyChainSnapshot(snap);
       if (runtime.unlocked) {
         invalidateBalanceCache(); // the 30s cache would otherwise answer this
         await Promise.all(

@@ -372,6 +372,43 @@ describe("starting or unlocking with a days-old arm", () => {
     expect(runtime.strategy.jitTargetEpoch).toBeNull();
   });
 
+  /**
+   * The regression that mattered. The check used to live at individual call sites — the engine
+   * tick, the unlock handler, the away-mode read — and POST /api/refresh was missed. In away
+   * mode the engine is PAUSED, so /api/refresh is the path that normally learns the epoch:
+   * a live bot sat with a four-day-old arm on display having read the current epoch minutes
+   * before. Every path now applies chain state through this one method, so covering it covers
+   * all of them, including any added later.
+   */
+  it("applyChainSnapshot retires a dead arm — the choke point every path goes through", () => {
+    runtime.currentEpoch = null;
+    runtime.startTime = null;
+    armFor(STALE_TARGET);
+    runtime.applyChainSnapshot({
+      state: 1,
+      currentEpoch: LIVE_EPOCH,
+      startTime: START_TIME,
+      citizenSupply: 100n,
+      citizensAddress: "0x000000000000000000000000000000000000cc",
+    });
+    expect(runtime.currentEpoch).toBe(LIVE_EPOCH); // state applied...
+    expect(runtime.strategy.jitEnabled).toBe(false); // ...and the dead arm went with it
+    expect(runtime.strategy.jitTargetEpoch).toBeNull();
+  });
+
+  it("applyChainSnapshot leaves a live arm alone", () => {
+    armFor(Number(LIVE_EPOCH + 1n));
+    runtime.applyChainSnapshot({
+      state: 1,
+      currentEpoch: LIVE_EPOCH,
+      startTime: START_TIME,
+      citizenSupply: 100n,
+      citizensAddress: "0x000000000000000000000000000000000000cc",
+    });
+    expect(runtime.strategy.jitEnabled).toBe(true);
+    expect(runtime.strategy.jitTargetEpoch).toBe(Number(LIVE_EPOCH + 1n));
+  });
+
   it("refuses to guess when neither the epoch nor the grid is known", () => {
     // Nothing may be expired on a guess: wrongly dropping a live arm skips a payment the
     // user asked for. With no clock grid and no epoch, the arm stands until a chain read.
