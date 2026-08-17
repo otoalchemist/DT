@@ -98,7 +98,16 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dataDir = path.join(root, "data");
 
 const GAME = "0xa448c7f618087dda1a3b128cad8a424fbae4b71f";
-const EMIGRATION = "0xe56d011262d4738dc8307fb8a4ae48b2bfc20e7c"; // citizens here have left the game
+// Citizens held by ANY of these have left the main game. There are two routes now, and
+// scoring only the first meant ABBC emigrants were still ranked as live targets — #1000
+// came out 3rd-best on a scan while it was already out of the game, where an audit can only
+// revert. Keep in sync with EMIGRATION_DESTINATIONS in shared/constants.ts (duplicated
+// because this script runs standalone and cannot import the package).
+const EMIGRATION_CONTRACTS = [
+  "0xe56d011262d4738dc8307fb8a4ae48b2bfc20e7c", // Governor
+  "0xbfffc99fa75a0fea45b765d11d8e52f8e1114f8c", // ABBC
+];
+const isEmigratedOwner = (owner) => owner != null && EMIGRATION_CONTRACTS.includes(owner.toLowerCase());
 const EPOCH_DURATION = 86400n;
 // Our own bundle shape, for pricing what it costs to out-rank a rival's defense.
 // Gas MEASURED from real on-chain txs: payTaxes ~82,875, audit ~130,409, CoinbasePayer
@@ -243,7 +252,7 @@ async function main() {
   // blind to any delinquent rival outside it (and, since most of the curated list is on the
   // skippers roster, made "non-skippers" look far smaller than it is). --curated restores
   // the old narrow behaviour.
-  const universe = [...ownerOf.keys()].filter((t) => ownerOf.get(t) !== EMIGRATION.toLowerCase() && !allySet.has(t));
+  const universe = [...ownerOf.keys()].filter((t) => !isEmigratedOwner(ownerOf.get(t)) && !allySet.has(t));
   const rivals = (curatedOnly ? universe.filter((t) => curatedSet.has(t)) : universe).sort((a, b) => Number(a) - Number(b));
   if (!asJson) {
     const extra = rivals.filter((t) => !curatedSet.has(t)).length;
@@ -669,7 +678,7 @@ async function main() {
   const rows = [];
   for (const t of rivals) {
     const owner = ownerOf.get(t) ?? null;
-    if (!owner || owner === EMIGRATION) continue; // dead/burned or emigrated: not a target
+    if (!owner || isEmigratedOwner(owner)) continue; // dead/burned or emigrated: not a target
     const s = st[t]; const lep = s.lep ?? 0n;
     const behind = ce > lep ? Number(ce - lep) : 0;
     const due = s.due ?? 0n;

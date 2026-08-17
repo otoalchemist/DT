@@ -2283,9 +2283,16 @@ describe("multi-citizen: today's paths under a real roster", () => {
     expect(new Set(pays.map((p) => p.signer))).toEqual(new Set([A, B]));
   });
 
-  it("auto-arm: one citizen falling behind arms the whole roster, and JIT pays only those behind", async () => {
-    // jitTokenIds stays empty (= all owned) on purpose, so a roster that drifts apart over
-    // several epochs is caught by one arm. jitPass is what filters to the ones that owe.
+  it("auto-arm: arms only the citizens that are behind, and JIT pays exactly those", async () => {
+    // jitTokenIds names the delinquent citizens rather than staying empty (= all owned).
+    // A current citizen does not need the boundary it would be armed for: auditability is
+    // lastEpochPaid + 2 <= currentEpoch, so a citizen paid through the current epoch is
+    // only 1 behind after the boundary — inside its grace epoch. And it cannot become
+    // delinquent before that boundary, since only a boundary moves it.
+    //
+    // The multi-epoch drift the empty list used to cover is now handled properly instead:
+    // expireStaleJitArm drops an arm whose epoch has passed, which unblocks the auto-arm
+    // (it bails on "already armed") so away mode re-arms each epoch off a FRESH read.
     runtime.strategy = {
       ...DEFAULT_STRATEGY, awayMode: true, jitEnabled: false, jitTargetEpoch: null,
       minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, priorityFeeGwei: 0,
@@ -2295,7 +2302,8 @@ describe("multi-citizen: today's paths under a real roster", () => {
 
     await maybeAutoArmPayment([10n, 20n, 30n], EPOCH, 0n);
     expect(runtime.strategy.jitTargetEpoch).toBe(Number(EPOCH + 1n));
-    expect(runtime.strategy.jitTokenIds).toEqual([]); // every owned citizen, not a snapshot
+    expect(runtime.strategy.jitTokenIds).toEqual(["10", "20"]); // the delinquent two only
+    expect(runtime.strategy.jitTokenIds).not.toContain("30");
 
     // Now run the boundary the arm was for: only the two that owe should be paid.
     resetJitState();

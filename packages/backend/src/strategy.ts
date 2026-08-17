@@ -22,6 +22,7 @@ import {
   fetchCandidateTokenIds,
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
+import { emigratedTokenIdSet } from "./emigration.js";
 import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, setRaceBoundary, type TxIntent, type SubmitResult } from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, excludedTokenSet, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
@@ -93,26 +94,68 @@ function walletForToken(tokenId: bigint | string): Wallet | null {
 // closed without it — so a test that submits for an owned token has to prime it the same
 // way tick() does, rather than assuming a wallet.
 export async function fetchOwnedAcrossWallets(citizens: Address): Promise<bigint[]> {
-  const per = await Promise.all(
-    runtime.wallets.map(async (w) => ({
-      w,
-      ids: await fetchOwnedTokenIds(citizens, w.account.address as Address),
-    })),
-  );
+  const [per, emigrated] = await Promise.all([
+    Promise.all(
+      runtime.wallets.map(async (w) => ({
+        w,
+        ids: await fetchOwnedTokenIds(citizens, w.account.address as Address),
+      })),
+    ),
+    // Cheap: cached and stale-while-revalidate, so this is a Map read on almost every tick.
+    emigratedTokenIdSet(),
+  ]);
   const next = new Map<string, Wallet>();
   const ids: bigint[] = [];
+  const dropped: string[] = [];
   for (const { w, ids: list } of per) {
     for (const id of list) {
       const key = id.toString();
       // A token can only be in one wallet; if the index is momentarily stale during a
       // transfer, first-seen wins rather than the entry silently flipping mid-tick.
       if (next.has(key)) continue;
+      /**
+       * An emigrated citizen leaves the owned set entirely: it is out of the main game, so
+       * it owes no tax and can serve as no auditor. Keeping it meant the payment paths saw
+       * a citizen that could never be current (payTaxes on a burned token reverts) and the
+       * auditor pool offered a "from" token the game would reject.
+       *
+       * It can still show up here at all because ownership comes from the NFT owner INDEX,
+       * which lags the chain — emigrating transfers the citizen away, but the index serves
+       * the old answer for a while. The event roster is authoritative and immediate.
+       */
+      if (emigrated.has(key)) {
+        dropped.push(key);
+        continue;
+      }
       next.set(key, w);
       ids.push(id);
     }
   }
+  // Once per changed set, not once per tick: this fires on every sweep and would otherwise
+  // bury the log. Worth saying at all because "my citizen vanished from the bot" needs an
+  // explanation that names the reason.
+  const fingerprint = dropped.join(",");
+  if (dropped.length > 0 && fingerprint !== reportedEmigrantDrop) {
+    activity.add({
+      kind: "info",
+      status: "info",
+      message:
+        `Excluded ${dropped.length} emigrated citizen(s) from the owned list: #${dropped.join(", #")}. ` +
+        `They have left the main game (Governor/ABBC), so they owe no tax and cannot audit.`,
+    });
+  }
+  reportedEmigrantDrop = fingerprint;
   ownedBy = next;
   return ids;
+}
+
+/** Fingerprint of the last emigrant set reported, so the notice is per-change not per-tick. */
+let reportedEmigrantDrop = "";
+
+/** Forget which emigrant set was last reported, so the next sweep announces it again.
+ *  For tests — this is module state that otherwise leaks across cases in file order. */
+export function resetOwnedEmigrantNotice(): void {
+  reportedEmigrantDrop = "";
 }
 
 // Activity entries whose tx was queued into the current bundle batch (mainnet).
@@ -590,6 +633,12 @@ export function scheduleJitBoundary(): void {
   const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaSec = Number(boundary - nowSec);
+  // A target epoch that has fully elapsed is STALE, not imminent. Without this the
+  // deltaSec <= 0 branch below fired a tick instantly — and that tick's jitPass paid,
+  // mid-epoch, for a boundary days gone (see expireStaleJitArm). tick() expires the arm
+  // itself, but this scheduler is reachable before/independently of a tick — every arm
+  // path calls it directly — so it has to refuse on its own rather than trusting that.
+  if (runtime.currentEpoch !== null && BigInt(s.jitTargetEpoch) < runtime.currentEpoch) return;
   if (deltaSec <= 0) {
     void tick();
     return;
@@ -617,6 +666,9 @@ export function schedulePreBoundaryPay(): void {
   const boundary = runtime.startTime + BigInt(s.jitTargetEpoch - 1) * EPOCH_DURATION_SECONDS;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
+  // Stale arm: say nothing and arm nothing. Reporting "race missed" for an epoch that
+  // ended days ago would be a fresh warning every reschedule about a race never entered.
+  if (runtime.currentEpoch !== null && BigInt(s.jitTargetEpoch) < runtime.currentEpoch) return;
   if (deltaMs <= 0) {
     // The +500ms JIT tick still pays, just a block later instead of racing into the
     // boundary block — worth saying so rather than leaving the log empty.
@@ -1274,8 +1326,18 @@ export async function firePreBoundaryBundle(): Promise<void> {
    * That is the epoch-162 miss (tx 0x2090097f…494c): the payment left via the ordinary
    * post-boundary JIT tick instead, landing at index 0 of the block AFTER the boundary
    * block, with no pre-boundary entry in the activity log to explain it.
+   *
+   * BOUNDED to `armedEpoch >= currentEpoch`, because "trust the arm over live state" only
+   * needs to absorb ONE epoch of drift — the delay above advances currentEpoch to the
+   * armed epoch, never past it. An arm older than that is stale (expireStaleJitArm), and
+   * honouring it here meant paying for a dead epoch against a boundary timestamp days in
+   * the past. Falling back to null makes the payment gate below skip, which is right: a
+   * stale arm is not an instruction to pay now.
    */
-  const armedEpoch = s.jitEnabled && s.jitTargetEpoch !== null ? BigInt(s.jitTargetEpoch) : null;
+  const armedEpoch =
+    s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) >= (runtime.currentEpoch ?? 0n)
+      ? BigInt(s.jitTargetEpoch)
+      : null;
   const targetEpoch = armedEpoch ?? (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
@@ -1910,7 +1972,28 @@ export async function maybeAutoArmPayment(
   if (behind.length === 0) return;
 
   const target = Number(currentEpoch + 1n);
-  runtime.saveStrategy({ enabled: true, jitEnabled: true, jitTargetEpoch: target, jitTokenIds: [] });
+  /**
+   * Arm EXACTLY the citizens that are behind — not `[]`, which every consumer reads as
+   * "every owned citizen" (see the `jitTokenIds.length > 0 ? ... : ownedIds` fallbacks).
+   *
+   * A current citizen does not need this boundary. Auditability is `lastEpochPaid + 2 <=
+   * currentEpoch`, so at the boundary into epoch E+1 a citizen paid through E is only 1
+   * behind — inside its grace epoch and not auditable. The ones actually at risk are
+   * exactly those with `lastEpochPaid < currentEpoch`, which is `behind` here: they cross
+   * to 2 behind and become auditable the moment the boundary lands.
+   *
+   * Both fire paths do re-check `lastEpochPaid` on-chain and skip a citizen that is already
+   * current, so this is not what stops a wrongful payment — that guard is in
+   * queuePreBoundaryPayments and jitPass. What arming the narrow set fixes is everything
+   * around it: the panel no longer reports current citizens as armed to pay, the boundary
+   * multicall stops carrying tokens whose answer cannot matter, and the one-shot disarm
+   * settles on the set that actually owed rather than waiting on tokens that never did.
+   *
+   * Audit capacity is untouched: findPreBoundaryAuditors draws its auditor pool from owned
+   * tokens, never from jitTokenIds, so an unarmed citizen still audits.
+   */
+  const armedIds = behind.map((b) => b.tokenId);
+  runtime.saveStrategy({ enabled: true, jitEnabled: true, jitTargetEpoch: target, jitTokenIds: armedIds });
   resetJitState();
   activity.add({
     kind: "info",
@@ -1985,6 +2068,55 @@ async function proactivePayPass(
       { tokenId: st.tokenId, message: `Proactive pay #${st.tokenId} (${epochs} epoch) = ${formatEther(value)} ETH` },
     );
   }
+}
+
+/**
+ * Retire a JIT arm whose target epoch is already OVER, before anything acts on it.
+ *
+ * An arm names exactly one epoch, and the only paths that clear it are a completed
+ * jitPass and a manual disarm. So any arm that fails to pay — a `canSpend` deferral
+ * (base fee over cap, balance short) leaves the token unmarked on purpose, and an arm
+ * held while the engine is stopped never runs at all — survives into later epochs. From
+ * that point every consumer of `jitTargetEpoch` computes a boundary that is in the PAST,
+ * and each one reads that as "the boundary is here, go":
+ *
+ *   - scheduleJitBoundary saw deltaSec <= 0 and fired `tick()` IMMEDIATELY — so a stale
+ *     arm paid mid-epoch, nowhere near a boundary. This is the "bot armed itself and
+ *     triggered the payment early" report: the payment was real, the boundary was not.
+ *   - firePreBoundaryBundle derived targetEpoch from the arm and simulated against a
+ *     boundary timestamp days old.
+ *   - the dashboard showed the stale epoch as the live target (166 while the chain was
+ *     on 168), which is how this became visible at all.
+ *   - maybeAutoArmPayment bails out on `already armed`, so in away mode a stale arm also
+ *     BLOCKED re-arming for the real next boundary while citizens kept drifting.
+ *
+ * Expiring it is what makes away mode self-heal: the auto-arm immediately below this call
+ * in tick() then arms for currentEpoch + 1 on the same pass. Deliberately loud — a
+ * payment the user armed for did not happen, and going quiet here is what let a 65-hour-
+ * stale arm sit on a dashboard looking active.
+ *
+ * `>= currentEpoch` is the keep condition, not `> currentEpoch`: an arm for the epoch we
+ * are IN is still live and correct (jitPass pays the moment the chain reaches the target,
+ * and a fire delayed past its own boundary lands here legitimately). Only an epoch that
+ * has fully elapsed is stale.
+ */
+export function expireStaleJitArm(currentEpoch: bigint): boolean {
+  const s = runtime.strategy;
+  if (!s.jitEnabled || s.jitTargetEpoch === null) return false;
+  if (BigInt(s.jitTargetEpoch) >= currentEpoch) return false;
+  const stale = s.jitTargetEpoch;
+  runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
+  resetJitState();
+  activity.add({
+    kind: "info",
+    status: "skipped",
+    message:
+      `Disarmed a stale JIT arm: it was armed for epoch ${stale}, but the chain is now on ` +
+      `epoch ${currentEpoch}, so that boundary has passed and nothing it names can still be ` +
+      `raced. No payment was sent for it. Re-arm if those citizens still owe — away mode ` +
+      `re-arms for the next boundary on its own.`,
+  });
+  return true;
 }
 
 /**
@@ -2382,6 +2514,10 @@ async function tick(fireProactivePay = false): Promise<void> {
     const currentEpoch = runtime.currentEpoch ?? 0n;
 
     const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
+    // Before anything reads the arm: drop it if its epoch is already over. Ordered ahead
+    // of the auto-arm on purpose — that bails on "already armed", so expiring first is
+    // what lets away mode re-arm for the real next boundary on this same pass.
+    expireStaleJitArm(currentEpoch);
     await maybeAutoArmPayment(ownedIds, currentEpoch, nowSec);
 
     if (runtime.strategy.enabled) {

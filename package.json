@@ -1,6 +1,6 @@
 {
   "name": "death-and-taxes-bot",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "description": "Self-hosted automation bot for the DeathAndTaxes on-chain game (defense + game-strategy, Flashbots inclusion).",
   "license": "MIT",
