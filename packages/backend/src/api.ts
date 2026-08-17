@@ -23,7 +23,7 @@ import { getGameSnapshot } from "./contract.js";
 import { invalidateTokenCaches } from "./index-tokens.js";
 import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
-import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
+import { startEngine, stopEngine, expireStaleJitArm, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
@@ -341,6 +341,11 @@ export async function buildServer(): Promise<FastifyInstance> {
         runtime.gameState = snap.state;
         runtime.citizenSupply = snap.citizenSupply;
         runtime.citizensAddress = snap.citizensAddress;
+        // Unlocking is the moment a persisted arm becomes actionable — the engine may be
+        // started at any keypress from here, and away mode is armed just below. An arm for
+        // an epoch that has already passed is retired first, so neither can act on it and
+        // the panel stops showing a dead target epoch as live.
+        expireStaleJitArm(snap.currentEpoch);
         runtime.emitStatus();
         // Away mode can only arm once the wallet is unlocked and the epoch grid is
         // known — both are true right here.

@@ -121,7 +121,7 @@ const { activity } = await import("./activity.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const {
   expireStaleJitArm, scheduleJitBoundary, schedulePreBoundaryPay, firePreBoundaryBundle,
-  maybeAutoArmPayment, stopEngine, resetJitState,
+  maybeAutoArmPayment, startEngine, stopEngine, resetJitState,
 } = await import("./strategy.js");
 
 const ADDR = "0x0000000000000000000000000000000000000001";
@@ -207,7 +207,7 @@ describe("a JIT arm whose epoch has already passed", () => {
       // Loud on purpose: a payment the user armed for did not happen. Silence here is what
       // let a 65h-stale arm sit on the dashboard looking live.
       const msg = vi.mocked(activity.add).mock.calls.map((c) => (c[0] as { message: string }).message).join("\n");
-      expect(msg).toMatch(/stale JIT arm/i);
+      expect(msg).toMatch(/stale JIT payment arm/i);
       expect(msg).toContain(String(STALE_TARGET));
       expect(msg).toContain(String(LIVE_EPOCH));
       expect(msg).toMatch(/No payment was sent/i);
@@ -327,6 +327,103 @@ describe("a JIT arm whose epoch has already passed", () => {
   });
 });
 
+/**
+ * The start/unlock path, which is where a stale arm is genuinely dangerous: the arm is
+ * loaded from data/config.json before any chain read, so for a moment the bot knows what it
+ * is armed for but not what epoch it is. A guard written only as
+ * `target < runtime.currentEpoch` passes silently there.
+ *
+ * Modelled on the real incident: config.json held jitEnabled/jitTargetEpoch 166 for four
+ * days after the bot stopped running, because an arm is only cleared by a completed payment
+ * or a manual disarm.
+ */
+describe("starting or unlocking with a days-old arm", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    freezeMidEpoch();
+    useWalletLike();
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x000000000000000000000000000000000000cc";
+    runtime.citizenSupply = 100n;
+    resetJitState();
+  });
+
+  afterEach(() => {
+    stopEngine();
+    runtime.running = false;
+    vi.useRealTimers();
+  });
+
+  function useWalletLike(): void {
+    runtime.setWallets([
+      { account: { address: ADDR } as unknown as PrivateKeyAccount, label: "test", balanceWei: 100_000_000_000_000_000_000n },
+    ]);
+  }
+
+  it("expires the arm from the CLOCK, before the epoch number is known", () => {
+    // Exactly the boot state: the arm is loaded, startTime is known from a snapshot, but
+    // currentEpoch has not been assigned. The old `< currentEpoch` test could not fire.
+    runtime.currentEpoch = null;
+    runtime.startTime = START_TIME;
+    armFor(STALE_TARGET);
+    expect(expireStaleJitArm()).toBe(true);
+    expect(runtime.strategy.jitEnabled).toBe(false);
+    expect(runtime.strategy.jitTargetEpoch).toBeNull();
+  });
+
+  it("refuses to guess when neither the epoch nor the grid is known", () => {
+    // Nothing may be expired on a guess: wrongly dropping a live arm skips a payment the
+    // user asked for. With no clock grid and no epoch, the arm stands until a chain read.
+    runtime.currentEpoch = null;
+    runtime.startTime = null;
+    armFor(STALE_TARGET);
+    expect(expireStaleJitArm()).toBe(false);
+    expect(runtime.strategy.jitEnabled).toBe(true);
+  });
+
+  it("keeps a live arm when only the clock is known", () => {
+    runtime.currentEpoch = null;
+    runtime.startTime = START_TIME;
+    armFor(Number(LIVE_EPOCH + 1n)); // the next boundary — still ahead
+    expect(expireStaleJitArm()).toBe(false);
+    expect(runtime.strategy.jitEnabled).toBe(true);
+  });
+
+  it("starting the engine with a stale arm pays nothing and clears it", async () => {
+    // The end-to-end property the user asked for. startEngine ends in a tick, whose
+    // refreshSnapshot learns the epoch and expires the arm before any scheduler or
+    // payment path can act on it.
+    runtime.currentEpoch = null;
+    runtime.startTime = null;
+    // enabled:true matters: tick only reaches jitPass when the strategy is enabled, so
+    // without it this would pass for the wrong reason (no payment attempted at all).
+    armFor(STALE_TARGET, { enabled: true });
+    startEngine();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(encodePayTaxes).not.toHaveBeenCalled();
+    expect(submitTx).not.toHaveBeenCalled();
+    expect(runtime.strategy.jitEnabled).toBe(false);
+    expect(runtime.strategy.jitTargetEpoch).toBeNull();
+    const msg = vi.mocked(activity.add).mock.calls.map((c) => (c[0] as { message?: string }).message ?? "").join("\n");
+    expect(msg).toMatch(/stale JIT payment arm/i);
+  });
+
+  it("starting with a LIVE arm still pays — the guard must not disarm real work", async () => {
+    // The counterweight. If this ever fails, the fix has become "never pay at a boundary".
+    runtime.currentEpoch = null;
+    runtime.startTime = null;
+    armFor(Number(LIVE_EPOCH), { enabled: true, preBoundaryPay: false }); // armed for the epoch we are in
+    startEngine();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(encodePayTaxes).toHaveBeenCalled();
+    // It ends up disarmed either way, so assert the REASON: the one-shot completion, not
+    // the stale-arm path. Only the message distinguishes "paid, done" from "given up on".
+    const msg = vi.mocked(activity.add).mock.calls.map((c) => (c[0] as { message?: string }).message ?? "").join("\n");
+    expect(msg).toMatch(/JIT payment complete/i);
+    expect(msg).not.toMatch(/stale JIT payment arm/i);
+  });
+});
 /**
  * The auto-arm knew which citizens were behind, then armed `jitTokenIds: []` — and every
  * consumer reads empty as "every owned citizen". Both fire paths re-check lastEpochPaid and

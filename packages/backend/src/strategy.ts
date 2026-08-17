@@ -355,6 +355,33 @@ function nextBoundarySec(startTime: bigint, nowSec: bigint): bigint {
 }
 
 /**
+ * Is the epoch a JIT arm names already OVER? Answered from the CLOCK when it can be,
+ * because that works when `runtime.currentEpoch` is still null.
+ *
+ * That null case is the dangerous one, and it is exactly the start/unlock path: the
+ * strategy — including a persisted arm — is loaded from data/config.json before any chain
+ * read, so for the first moments of a run the bot knows what it is armed for but not what
+ * epoch it is. A guard written only as `target < runtime.currentEpoch` silently passes
+ * there, which is how a four-day-old arm could still reach a scheduler.
+ *
+ * Epoch N runs from startTime + (N-1)*EPOCH to startTime + N*EPOCH, so the armed epoch is
+ * over once now >= startTime + N*EPOCH.
+ *
+ * `currentEpoch` is checked FIRST when it is known, because it comes from the chain and the
+ * clock does not: a wrong local clock, or a startTime that has not been read yet, must never
+ * be able to retire a live arm. The clock is strictly the fallback for the boot window.
+ * Answers `false` when neither is available — nothing may be expired on a guess, since
+ * wrongly dropping a live arm skips a payment the user asked for.
+ */
+function armedEpochIsOver(targetEpoch: number, nowSec = BigInt(Math.floor(Date.now() / 1000))): boolean {
+  if (runtime.currentEpoch !== null) return BigInt(targetEpoch) < runtime.currentEpoch;
+  if (runtime.startTime !== null) {
+    return nowSec >= runtime.startTime + BigInt(targetEpoch) * EPOCH_DURATION_SECONDS;
+  }
+  return false;
+}
+
+/**
  * Whether there is anything worth waking up for.
  *
  * This must mirror what a RUNNING engine would actually do at a boundary (see tick()),
@@ -405,6 +432,10 @@ export function scheduleAwayWake(): void {
       .then((snap) => {
         runtime.startTime = snap.startTime;
         runtime.currentEpoch = snap.currentEpoch;
+        // Third path that learns the epoch, so it clears a dead arm too. Without this,
+        // awayHasWork() above keeps seeing the stale arm and away mode wakes the engine
+        // every boundary for work that cannot happen.
+        expireStaleJitArm(snap.currentEpoch);
         scheduleAwayWake();
       })
       .catch((err) => logger.warn(`away mode: could not read startTime: ${(err as Error).message}`));
@@ -638,7 +669,7 @@ export function scheduleJitBoundary(): void {
   // mid-epoch, for a boundary days gone (see expireStaleJitArm). tick() expires the arm
   // itself, but this scheduler is reachable before/independently of a tick — every arm
   // path calls it directly — so it has to refuse on its own rather than trusting that.
-  if (runtime.currentEpoch !== null && BigInt(s.jitTargetEpoch) < runtime.currentEpoch) return;
+  if (armedEpochIsOver(s.jitTargetEpoch, nowSec)) return;
   if (deltaSec <= 0) {
     void tick();
     return;
@@ -668,7 +699,7 @@ export function schedulePreBoundaryPay(): void {
   const deltaMs = Number(boundary - nowSec) * 1000 - effectiveLeadMs();
   // Stale arm: say nothing and arm nothing. Reporting "race missed" for an epoch that
   // ended days ago would be a fresh warning every reschedule about a race never entered.
-  if (runtime.currentEpoch !== null && BigInt(s.jitTargetEpoch) < runtime.currentEpoch) return;
+  if (armedEpochIsOver(s.jitTargetEpoch, nowSec)) return;
   if (deltaMs <= 0) {
     // The +500ms JIT tick still pays, just a block later instead of racing into the
     // boundary block — worth saying so rather than leaving the log empty.
@@ -810,6 +841,10 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
 export async function firePreBoundaryPay(): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryPay || !s.jitEnabled || s.jitTargetEpoch === null) return;
+  // Its scheduler already refuses a dead epoch, so this is belt-and-braces — but the timer
+  // could have been armed before the arm went stale, and this function computes a payment
+  // value from the armed epoch. Cheaper to make the property local than to rely on callers.
+  if (armedEpochIsOver(s.jitTargetEpoch)) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
   // Same tick-contention report as the combined fire — see warnRaceLostToTick.
@@ -1334,12 +1369,15 @@ export async function firePreBoundaryBundle(): Promise<void> {
    * the past. Falling back to null makes the payment gate below skip, which is right: a
    * stale arm is not an instruction to pay now.
    */
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const armedEpoch =
-    s.jitEnabled && s.jitTargetEpoch !== null && BigInt(s.jitTargetEpoch) >= (runtime.currentEpoch ?? 0n)
+    s.jitEnabled &&
+    s.jitTargetEpoch !== null &&
+    BigInt(s.jitTargetEpoch) >= (runtime.currentEpoch ?? 0n) &&
+    !armedEpochIsOver(s.jitTargetEpoch, nowSec)
       ? BigInt(s.jitTargetEpoch)
       : null;
   const targetEpoch = armedEpoch ?? (runtime.currentEpoch ?? 0n) + 1n;
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const boundaryTs = (runtime.startTime ?? 0n) + (targetEpoch - 1n) * EPOCH_DURATION_SECONDS;
   // Telemetry only: lets the flush record how early this race was sent (race-timing.ts).
   setRaceBoundary(boundaryTs);
@@ -1546,6 +1584,17 @@ async function refreshSnapshot(): Promise<void> {
   runtime.startTime = snap.startTime;
   for (const b of balances) runtime.setBalance(b.address, b.wei);
   runtime.lastBlock = latest.number;
+  /**
+   * Drop a dead arm the moment the epoch is KNOWN, and before any scheduler sees it.
+   *
+   * This is the choke point on purpose. A persisted arm is loaded from data/config.json at
+   * boot, so between process start and the first chain read the bot is armed for an epoch
+   * it cannot yet date — and the four schedulers below run on every snapshot. Putting the
+   * check only in tick() left the ordering to luck; putting it here means every path that
+   * learns the epoch clears the arm first, which is what makes starting or unlocking with a
+   * days-old arm safe rather than merely usually-safe.
+   */
+  expireStaleJitArm(snap.currentEpoch);
   runtime.emitStatus();
   scheduleJitBoundary();
   schedulePreBoundaryPay();
@@ -2100,21 +2149,26 @@ async function proactivePayPass(
  * and a fire delayed past its own boundary lands here legitimately). Only an epoch that
  * has fully elapsed is stale.
  */
-export function expireStaleJitArm(currentEpoch: bigint): boolean {
+export function expireStaleJitArm(currentEpoch: bigint | null = runtime.currentEpoch): boolean {
   const s = runtime.strategy;
   if (!s.jitEnabled || s.jitTargetEpoch === null) return false;
-  if (BigInt(s.jitTargetEpoch) >= currentEpoch) return false;
+  // Chain epoch when we have one, clock only as the boot-window fallback (armedEpochIsOver).
+  const known = currentEpoch ?? runtime.currentEpoch;
+  const over = known !== null ? BigInt(s.jitTargetEpoch) < known : armedEpochIsOver(s.jitTargetEpoch);
+  if (!over) return false;
   const stale = s.jitTargetEpoch;
+  const nowEpoch = currentEpoch ?? runtime.currentEpoch;
   runtime.saveStrategy({ jitEnabled: false, jitTargetEpoch: null });
   resetJitState();
   activity.add({
     kind: "info",
     status: "skipped",
     message:
-      `Disarmed a stale JIT arm: it was armed for epoch ${stale}, but the chain is now on ` +
-      `epoch ${currentEpoch}, so that boundary has passed and nothing it names can still be ` +
-      `raced. No payment was sent for it. Re-arm if those citizens still owe — away mode ` +
-      `re-arms for the next boundary on its own.`,
+      `Disarmed a stale JIT payment arm: it was armed for epoch ${stale}` +
+      (nowEpoch !== null ? `, but the chain is now on epoch ${nowEpoch}` : "") +
+      `, so that boundary has passed and nothing it names can still be raced. No payment ` +
+      `was sent for it. Re-arm if those citizens still owe — away mode re-arms for the ` +
+      `next boundary on its own.`,
   });
   return true;
 }
@@ -2514,10 +2568,10 @@ async function tick(fireProactivePay = false): Promise<void> {
     const currentEpoch = runtime.currentEpoch ?? 0n;
 
     const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
-    // Before anything reads the arm: drop it if its epoch is already over. Ordered ahead
-    // of the auto-arm on purpose — that bails on "already armed", so expiring first is
-    // what lets away mode re-arm for the real next boundary on this same pass.
-    expireStaleJitArm(currentEpoch);
+    // A stale arm is already gone by here: refreshSnapshot above expires it as soon as the
+    // epoch is known. That ordering matters — maybeAutoArmPayment bails on "already armed",
+    // so the dead arm has to clear BEFORE it runs or away mode never re-arms for the real
+    // next boundary.
     await maybeAutoArmPayment(ownedIds, currentEpoch, nowSec);
 
     if (runtime.strategy.enabled) {
