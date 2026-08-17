@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { bidToBeat, bundleGas, type TargetScoreRow, type TargetScoresState } from "@dat-bot/shared";
+import { bidToBeat, bundleGas, tipCostEth, tipOnlyBundleGas, type TargetScoreRow, type TargetScoresState } from "@dat-bot/shared";
 import { api } from "./api.js";
 
 /**
@@ -51,6 +51,10 @@ function TipLine({ density, plan }: { density: number | null | undefined; plan: 
   const tip = tipFor(density);
   if (tip === null) return null;
   const enough = plan.tipGwei >= tip;
+  // The bid above is in ETH and the tip is in gwei/gas, so they cannot be compared as
+  // printed. Quote the tip in ETH too. Converting shows the tip is the CHEAPER lever at
+  // equal density — the bid route also sends and tips the CoinbasePayer tx.
+  const costEth = tipCostEth(tip, plan.payments, plan.audits);
   return (
     <>
       <br />
@@ -58,11 +62,11 @@ function TipLine({ density, plan }: { density: number | null | undefined; plan: 
         style={{ fontSize: 10, color: enough ? "var(--green)" : "var(--muted, #888)" }}
         title={
           enough
-            ? `Your ${plan.tipGwei} gwei tip already exceeds the ${tip} gwei this bar needs, so no bid is required on any builder — including the ~1 boundary in 10 built by a solo validator that ignores coinbase bids entirely.`
-            : `Or skip the bid: a ${tip} gwei priority fee clears this bar on its own. Unlike a bid it does not scale with bundle size, and it is the ONLY lever on the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which ignores coinbase transfers.`
+            ? `Your ${plan.tipGwei} gwei tip already exceeds the ${tip} gwei this bar needs, so no bid is required on any builder — including the ~1 boundary in 10 built by a solo validator that ignores coinbase bids entirely. At ${tip} gwei over ${tipOnlyBundleGas(plan.payments, plan.audits).toLocaleString()} gas that is ~${costEth.toFixed(4)} ETH of priority fee (the bid tx is not sent on this route, so its gas is excluded).`
+            : `Or skip the bid: a ${tip} gwei priority fee clears this bar on its own, costing ~${costEth.toFixed(4)} ETH over ${tipOnlyBundleGas(plan.payments, plan.audits).toLocaleString()} gas. Compare that against the bid above PLUS the tip you would still be paying on the bid route — including its CoinbasePayer transaction — which makes the tip the cheaper lever at equal density, not the dearer one. It is also the ONLY lever on the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which ignores coinbase transfers.`
         }
       >
-        {tip}gw tip
+        {tip}gw ≈ {costEth.toFixed(4)}Ξ
       </span>
     </>
   );
@@ -107,9 +111,9 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments) — the 'are they bidding right now' signal, deliberately narrower than the window BeatBid is priced against. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
-            <th style={cell} title="What it takes to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to Beat/max: equal means a steady defender and the figure is reliable; a gap means it escalates. — = nothing needed. · = no payment in the last 2 epochs. Each cell shows BOTH ways past this rival: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid at all. Green means your current tip already clears it. The tip route works on every builder — including the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which sorts by priority fee and ignores coinbase transfers outright, where a bid buys nothing. The bid route is flat, so it is cheaper in ETH on a small bundle while the tip is charged per transaction.">Beat 2ep<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
-            <th style={cell} title="What it takes to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder sorts on. Peak, not recent: what you must clear is the strongest defense it has actually mounted. A ceiling, not a forecast — off-chain builder deals stay invisible. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids; bid is flat so it is cheaper on a small bundle.">Beat max<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
-            <th style={cell} title="THE COLUMN FOR A BOUNDARY RACE: what it takes to out-rank this rival in a boundary block specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without spending anything. · = re-run the scan to populate this. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids; bid is flat so it is cheaper on a small bundle.">Beat boundary<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
+            <th style={cell} title="What it takes to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to Beat/max: equal means a steady defender and the figure is reliable; a gap means it escalates. — = nothing needed. · = no payment in the last 2 epochs. Each cell shows BOTH ways past this rival: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid at all. Green means your current tip already clears it. The tip route works on every builder — including the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which sorts by priority fee and ignores coinbase transfers outright, where a bid buys nothing. And at equal density the tip is the CHEAPER lever, not the dearer one: the bid route must also send and tip the CoinbasePayer transaction (~30,550 gas), which costs it ~0.011-0.014 ETH more at any bundle size. The bid figure looks smaller only because it is quoted on top of a tip you are still paying. What the bid actually buys is scope: it is a per-boundary lever, while the configured tip re-prices every transaction the bot sends.">Beat 2ep<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
+            <th style={cell} title="What it takes to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder sorts on. Peak, not recent: what you must clear is the strongest defense it has actually mounted. A ceiling, not a forecast — off-chain builder deals stay invisible. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids, and at equal density it is the cheaper lever — the bid route also sends and tips the CoinbasePayer tx (~30,550 gas), so it costs ~0.011-0.014 ETH more. The bid figure only looks smaller because it sits on top of a tip you already pay; what it really buys is scope, being per-boundary rather than a global tip change.">Beat max<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
+            <th style={cell} title="THE COLUMN FOR A BOUNDARY RACE: what it takes to out-rank this rival in a boundary block specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without spending anything. · = re-run the scan to populate this. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids, and at equal density it is the cheaper lever — the bid route also sends and tips the CoinbasePayer tx (~30,550 gas), so it costs ~0.011-0.014 ETH more. The bid figure only looks smaller because it sits on top of a tip you already pay; what it really buys is scope, being per-boundary rather than a global tip change.">Beat boundary<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
             <th style={cell} title="Bribes held — each is one free audit escape">Br</th>
             <th style={cell} title="Times anyone successfully audited it in the window">Aud</th>
             <th style={cell} title="Weak-link score, higher is a better target. 0 = under audit, or not a weak link">Score</th>
@@ -423,7 +427,8 @@ export function TargetScores({
               style={{ fontSize: 11, lineHeight: 1.5 }}
               title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus 30,550 for the CoinbasePayer transaction that carries the bid. That last figure is gas USED, not the 60,000 limit the payer tx is signed with — builders simulate and order on what a bundle actually burns, so pricing against the limit overstated every bundle by ~30,000 gas."
             >
-              bundle {planGas.toLocaleString()} gas @ {tip} gwei tip
+              bundle {planGas.toLocaleString()} gas @ {tip} gwei tip ≈{" "}
+              {tipCostEth(tip, payments, audits).toFixed(4)} ETH in tips
               {paymentsEdit === null && auditsEdit === null && tipEdit === null ? (
                 <> · from your wallet: {ownedCitizens} citizen{ownedCitizens === 1 ? "" : "s"},{" "}
                   {auditCapacity} audit slot{auditCapacity === 1 ? "" : "s"}</>
@@ -466,7 +471,7 @@ export function TargetScores({
                   return (
                     <span
                       key={k}
-                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it: a ${tipFor(bar)} gwei priority fee on its own, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid for ${payments} payment(s) + ${audits} audit(s). The tip route works on every builder; the bid route is flat (so cheaper on a small bundle) but buys nothing on a solo-built block.`}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid — but that route also tips the CoinbasePayer tx, so its true total is ~${(bid + tipCostEth(tip, payments, audits) + (tip * 30550) / 1e9).toFixed(4)} ETH. The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator. A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
                     >
                       {label}{" "}
                       <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>
@@ -474,7 +479,13 @@ export function TargetScores({
                       </strong>
                       {bid > 0 ? (
                         <span className="muted" style={{ fontSize: 10 }}>
-                          {" "}or {tipFor(bar)}gw tip
+                          {" "}
+                          {/* Totals, not the bare bid: the bid route keeps paying its tip
+                              (payer tx included), so the raw bid understates it. */}
+                          (+{tipCostEth(tip, payments, audits).toFixed(4)} tip ={" "}
+                          {(bid + (tip * bundleGas(payments, audits)) / 1e9).toFixed(4)}Ξ) or{" "}
+                          {tipFor(bar)}gw tip alone ={" "}
+                          {tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)}Ξ
                         </span>
                       ) : null}
                     </span>
@@ -548,8 +559,14 @@ export function TargetScores({
             <b> priority fee</b> that clears the same bar with no bid at all (green = your
             current tip already clears it). The tip works on <i>every</i> builder — including
             the ~1 boundary in 10 built by a solo validator, which sorts on priority fee and
-            ignores coinbase transfers outright, so a bid buys nothing there. The bid is flat,
-            so it is cheaper in ETH on a small bundle while the tip is charged per transaction.
+            ignores coinbase transfers outright, so a bid buys nothing there. The tip is also the
+            <b> cheaper</b> lever at equal density, which is the opposite of what this panel
+            used to say: the bid route must additionally send and tip the CoinbasePayer
+            transaction (~30,550 gas), leaving it ~0.011–0.014 ETH dearer at any bundle size.
+            The bid figure only looks smaller because it is quoted on top of a tip you still
+            pay. A bid buys <i>scope</i>, not a discount — it applies to one boundary, while
+            the configured tip re-prices every transaction the bot sends. Each tip figure now
+            carries its ETH cost so the two are directly comparable.
             <b> Beat boundary is the one to read for a boundary race</b>: it measures defense
             only in blocks that actually decided an audit. In a Beat cell, <b>!</b> and
             <b> ?</b> both mean no price can be quoted, but for opposite reasons: <b>!</b> = a
