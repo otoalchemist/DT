@@ -265,12 +265,17 @@ let bundleQueue: QueuedTx[] | null = null;
 
 /**
  * The boundary this batch is racing into, in unix seconds. Set by the pre-boundary fires,
- * which are the only callers that know it; null for an ordinary tick's batch. Used solely
- * to compute the lead time in race telemetry.
+ * which are the only callers that know it; null for an ordinary tick's batch.
+ *
+ * No longer telemetry-only: it also becomes the bundle's `minTimestamp`, which is what stops
+ * a builder executing a pre-boundary race in a block before the boundary (see flushBundle).
+ * So a WRONG value here now costs inclusion rather than just a mis-reported lead — hence
+ * beginBundle clearing it, and only the fires setting it.
  */
 let raceBoundaryTs: bigint | null = null;
 
-/** Tell the open batch which boundary it is racing into (telemetry only). */
+/** Tell the open batch which boundary it is racing into: bounds the bundle (minTimestamp)
+ *  and measures the lead in race telemetry. */
 export function setRaceBoundary(ts: bigint | null): void {
   raceBoundaryTs = ts;
 }
@@ -325,7 +330,17 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   // bundle, and the coinbase bid), so a defended target or misconfigured payer can
   // never drop a mandatory payment. A tx hash is keccak(signed tx).
   const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
-  const targetBlock = (await publicClient.getBlockNumber()) + 1n;
+  /**
+   * Fresh head, deliberately uncached.
+   *
+   * viem caches `getBlockNumber` for `cacheTime`, which defaults to `pollingInterval`
+   * (4,000 ms) — and this fires ~3-5 s before a boundary, so a cached head can be a whole
+   * block stale. That is not hypothetical: at the epoch-169 boundary the head read 25778246
+   * when 25778247 already existed, so the bundle was aimed at [25778247, 25778248] where
+   * 25778247 was ALREADY MINED. One of the two target blocks was spent on a block that could
+   * never include us, halving the fan-out that exists to survive a missed slot.
+   */
+  const targetBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 1n;
 
   // Stamped here, immediately before the fan-out, so it measures OUR send time and not
   // how long the builders took to acknowledge (telemetry only — see race-timing.ts).
@@ -338,6 +353,28 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     [targetBlock, targetBlock + 1n].map(async (blk) => {
       const params: Record<string, unknown> = { txs: signedList, blockNumber: toHex(blk) };
       if (revertingTxHashes.length > 0) params.revertingTxHashes = revertingTxHashes;
+      /**
+       * Never let this bundle execute BEFORE the boundary it is racing into.
+       *
+       * A bundle is constrained by block NUMBER, but everything it does is gated on block
+       * TIMESTAMP: the epoch only advances when a block's timestamp crosses the boundary, and
+       * a pre-boundary audit is invalid until then. We simulate against that timestamp
+       * (`simTimestamp`) and pass — then the transaction can still be mined a block early and
+       * revert. Which is exactly what happened at the epoch-169 boundary: slot 23:59:23 was
+       * published ~8 s late, after our 23:59:31.578 submission, so `targetBlock` pointed at a
+       * PRE-boundary block. A builder took the audit there, the epoch was still 168, and it
+       * reverted — burning the gas and the nonce, which killed the copy aimed at the real
+       * boundary block. The audit was correct; it just ran one epoch early.
+       *
+       * `minTimestamp` is the matching unit, so the pre-boundary block simply becomes
+       * ineligible and the fan-out spends both shots on blocks that can actually work.
+       * Boundaries are slot-aligned (86,400 / 12 = 7,200 exactly), so the boundary block's
+       * timestamp equals `raceBoundaryTs` and an inclusive minimum admits it.
+       *
+       * Only set for a race — `beginBundle` clears `raceBoundaryTs`, so an ordinary tick's
+       * batch carries no constraint and behaves exactly as before.
+       */
+      if (raceBoundaryTs !== null) params.minTimestamp = Number(raceBoundaryTs);
       const r = await flashbotsRpcWithTimeout("eth_sendBundle", [params], url, SEND_BUNDLE_TIMEOUT_MS);
       return { url, bundleHash: r?.bundleHash as string | undefined };
     }),
@@ -609,9 +646,14 @@ export async function submitTx(
   const acceptedBy = new Set<string>();
   const attempts = appConfig.builderUrls.flatMap((url) =>
     [targetBlock, targetBlock + 1n].map(async (blk) => {
+      const params: Record<string, unknown> = { txs: [signed], blockNumber: toHex(blk) };
+      // Same boundary guard as the batched path: a pre-boundary block must not be able to
+      // execute this. Keyed off simTimestamp, which IS the boundary timestamp when a
+      // pre-boundary fire queued this tx, so no module state is involved here.
+      if (opts.simTimestamp !== undefined) params.minTimestamp = Number(opts.simTimestamp);
       const r = await flashbotsRpcWithTimeout(
         "eth_sendBundle",
-        [{ txs: [signed], blockNumber: toHex(blk) }],
+        [params],
         url,
         SEND_BUNDLE_TIMEOUT_MS,
       );

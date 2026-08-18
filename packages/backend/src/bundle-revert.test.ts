@@ -81,10 +81,11 @@ vi.mock("./nonce.js", () => ({
   },
 }));
 
-const { submitTx, beginBundle, flushBundle } = await import("./flashbots.js");
+const { submitTx, beginBundle, flushBundle, setRaceBoundary } = await import("./flashbots.js");
+const { publicClient } = await import("./chain.js");
 
 /** Every eth_sendBundle body POSTed during a flush. */
-function sentBundles(): { txs: `0x${string}`[]; revertingTxHashes?: `0x${string}`[]; blockNumber: string }[] {
+function sentBundles(): { txs: `0x${string}`[]; revertingTxHashes?: `0x${string}`[]; blockNumber: string; minTimestamp?: number }[] {
   return vi.mocked(globalThis.fetch).mock.calls
     .map(([, init]) => { try { return JSON.parse(String((init as RequestInit).body)); } catch { return null; } })
     .filter((b) => b && b.method === "eth_sendBundle")
@@ -231,5 +232,77 @@ describe("bundle integrity is preserved by the change", () => {
     const { keccak256 } = await import("viem");
     const present = new Set(b.txs.map((t) => keccak256(t)));
     for (const h of b.revertingTxHashes ?? []) expect(present.has(h)).toBe(true);
+  });
+});
+
+/**
+ * `minTimestamp`: a pre-boundary race must not be executable before the boundary.
+ *
+ * A bundle is constrained by block NUMBER, but epoch advance — and therefore whether an
+ * audit is valid at all — is a function of block TIMESTAMP. At the epoch-169 boundary that
+ * gap cost a real audit: slot 23:59:23 was published ~8s LATE, after the 23:59:31.578
+ * submission, so `targetBlock` named a PRE-boundary block. Quasar included the audit there
+ * at index 5, the epoch was still 168, and it reverted — 0.024 ETH of gas plus the nonce,
+ * which killed the copy aimed at the real boundary block one slot later.
+ *
+ * Asserted on the POSTed JSON because that is the contract with the builders.
+ */
+describe("minTimestamp: a race can never execute before its boundary", () => {
+  const BOUNDARY = 1787011175n; // the epoch-169 boundary, 2026-08-17T23:59:35Z
+
+  it("stamps the boundary on the bundle", async () => {
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+    for (const b of sentBundles()) expect(b.minTimestamp).toBe(Number(BOUNDARY));
+  });
+
+  it("stamps BOTH target blocks, since the fan-out is what spans the boundary", async () => {
+    // The pre-boundary block is only excluded if the constraint rides every copy — the
+    // whole failure was one of the two target blocks being on the wrong side of it.
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+    const blocks = new Set(sentBundles().map((b) => b.blockNumber));
+    expect(blocks.size).toBe(2); // targetBlock and targetBlock + 1
+    expect(sentBundles().every((b) => b.minTimestamp === Number(BOUNDARY))).toBe(true);
+  });
+
+  it("leaves an ordinary tick's batch unconstrained", async () => {
+    // Only a race knows a boundary. Constraining a routine bundle would delay work that
+    // has no timing requirement at all.
+    beginBundle();
+    await queue({ race: true });
+    await flushBundle();
+    for (const b of sentBundles()) expect(b.minTimestamp).toBeUndefined();
+  });
+
+  it("does not leak a stale boundary into the next batch", async () => {
+    // beginBundle clears it. Now that the value bounds INCLUSION and not just telemetry, a
+    // leaked one would silently hold a later bundle out of every block it could have won.
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+
+    beginBundle(); // next tick, no race
+    await queue({ race: true });
+    await flushBundle();
+    const second = sentBundles().slice(BUILDERS.length * 2);
+    expect(second.length).toBeGreaterThan(0);
+    for (const b of second) expect(b.minTimestamp).toBeUndefined();
+  });
+
+  it("reads the head UNCACHED when choosing the target block", async () => {
+    // viem caches getBlockNumber for `cacheTime` (default = pollingInterval, 4s). This
+    // fires ~3-5s before a boundary, so a cached head can be a block stale — which is how
+    // the primary target came to name a block that was already mined.
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+    expect(publicClient.getBlockNumber).toHaveBeenCalledWith({ cacheTime: 0 });
   });
 });
