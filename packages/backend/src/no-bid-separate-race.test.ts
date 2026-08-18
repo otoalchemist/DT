@@ -49,12 +49,20 @@ const AUDIT_TIP_GWEI = 150;
 
 const sendRawTransaction = vi.fn(async () => "0xmirror");
 const getTransactionCount = vi.fn(async () => chainNonce);
+/**
+ * The timestamp-override simulation each pre-boundary tx runs (simulateAtTimestamp). Mocked
+ * as SUCCEEDING so the real sim path is exercised — leaving it off made every tx fall back to
+ * "sending unsimulated", which both skipped the code under test and hid 10 round-trips from
+ * the timing budget below.
+ */
+const request = vi.fn(async () => "0x");
 vi.mock("./chain.js", () => ({
   publicClient: {
     getBlock: vi.fn(async () => ({ baseFeePerGas: 1_000_000_000n })),
     getBalance: vi.fn(async () => 100_000_000_000_000_000_000n),
     getBlockNumber: vi.fn(async () => 100n),
     getTransactionCount,
+    request,
     sendRawTransaction,
     estimateGas: vi.fn(async () => 100_000n),
     waitForTransactionReceipt: vi.fn(async () => ({ status: "success", blockNumber: 101n, transactionIndex: 0 })),
@@ -135,6 +143,8 @@ const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { awaitPendingMirrors } = await import("./flashbots.js");
 const { firePreBoundaryPay, firePreBoundaryAudit, combinedBundleActive } = await import("./strategy.js");
 const { fetchOwnedTokenIds } = await import("./index-tokens.js");
+const { batchGetTargetStatuses } = await import("./contract.js");
+const { publicClient } = await import("./chain.js");
 
 const PAY = "11111111", AUDIT = "22222222";
 
@@ -178,6 +188,9 @@ async function runBothFires(): Promise<void> {
 }
 
 beforeEach(() => {
+  // Clear call history first (implementations survive), so per-test counts are per-test.
+  // Without this the round-trip measurement below silently accumulated the whole file.
+  vi.clearAllMocks();
   chainNonce += 50; // past any ceiling the previous case reserved
   ownedLep = TARGET_EPOCH - 1n; // default: a payment is owed
   vi.mocked(fetchOwnedTokenIds).mockResolvedValue(OWNED);
@@ -420,5 +433,124 @@ describe("single-citizen holder, no bid", () => {
     const payBundle = bundles().find((b) => kindsOf(b).includes(PAY))!;
     expect(payBundle.txs).toHaveLength(1);
     expect(payBundle.revertingTxHashes ?? []).toHaveLength(0);
+  });
+});
+
+/**
+ * Will it hold up in the 5s lead, with both schedulers live?
+ *
+ * The two fires contend for the same `ticking` lock — whichever timer fires first takes it and
+ * the other retries every 150ms — so "both bundles were produced" is not enough. What matters
+ * is that the second fire still gets in, and that the number of SERIAL round-trips fits the
+ * lead: every payment and every audit is queued in a sequential loop, each with its own
+ * timestamp-override simulation.
+ */
+describe("both fires inside the lead, with the real scheduler contention", () => {
+  /** Count RPC-ish round-trips a fire makes, to price it against the lead. */
+  function rpcCalls(): number {
+    return (
+      vi.mocked(publicClient.multicall).mock.calls.length +
+      vi.mocked(publicClient.getBlock).mock.calls.length +
+      vi.mocked(publicClient.getBlockNumber).mock.calls.length +
+      vi.mocked(getTransactionCount).mock.calls.length +
+      vi.mocked(request).mock.calls.length
+    );
+  }
+
+  it("the audit fire still runs when the payment fire holds the tick lock", async () => {
+    // Fire them CONCURRENTLY, which is what the two timers do at the same boundary. The
+    // loser must not silently give up — it retries behind `ticking`.
+    const both = Promise.all([firePreBoundaryPay(), firePreBoundaryAudit()]);
+    await vi.waitFor(async () => {
+      await both.catch(() => {});
+      const kinds = bundles().map(kindsOf).flat();
+      expect(kinds).toContain(PAY);
+      expect(kinds).toContain(AUDIT);
+    }, { timeout: 5_000, interval: 25 });
+    // ...and the two sets still occupy separate bundles with no shared nonce.
+    const nonces = wireTxs().map((s) => s.nonce);
+    expect(new Set(nonces).size).toBe(nonces.length);
+  });
+
+  it("costs few enough serial round-trips to fit a 5s lead", async () => {
+    await runBothFires();
+    const calls = rpcCalls();
+    // Measured for 5 payments + 5 audits, no bid (one builder in this harness):
+    //   2 nonce syncs · 2 state multicalls · 10 timestamp-override sims (one per tx, SERIAL)
+    //   2 uncached head reads · 4 eth_sendBundle posts · 10 mirrors (detached, off this path)
+    // ~16 serial round-trips, so ~1.0s at a pessimistic 60ms each against a 5,000ms lead.
+    // 10 game actions, each simulated and signed. At a pessimistic 60ms per round-trip this
+    // is the wall-clock budget the 5,000ms lead has to absorb; assert it stays well inside.
+    const worstCaseMs = calls * 60;
+    expect(worstCaseMs).toBeLessThan(4_000);
+    // Recorded so a regression that adds a per-citizen round-trip is visible as a number,
+    // not as a mysteriously missed boundary in production.
+    expect(calls).toBeLessThanOrEqual(40);
+  });
+
+  it("produces exactly two bundles per builder per target block — no duplicate submissions", async () => {
+    // A retry loop that re-queued would double-submit the same nonces to the same builder.
+    await runBothFires();
+    const perBlock = new Map<string, number>();
+    for (const b of bundles()) perBlock.set(b.blockNumber, (perBlock.get(b.blockNumber) ?? 0) + 1);
+    // 1 builder x 2 target blocks x 2 fires = 4 posts, 2 per block.
+    expect([...perBlock.values()].every((n) => n === 2)).toBe(true);
+    expect(bundles()).toHaveLength(4);
+  });
+});
+
+describe("a large holder: 10 payments + 10 audits, no bid", () => {
+  const BIG = [10n, 20n, 30n, 40n, 50n, 60n, 70n, 80n, 90n, 100n];
+  const BIG_RIVALS = ["501", "502", "503", "504", "505", "506", "507", "508", "509", "510"];
+
+  beforeEach(() => {
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue(BIG);
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+      BIG_RIVALS.map((tokenId) => ({
+        tokenId, owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      })) as never,
+    );
+    runtime.strategy = { ...runtime.strategy, offenseTargetTokenIds: BIG_RIVALS };
+  });
+
+  it("queues all 20 actions, each at its own tip, on 20 distinct sequential nonces", async () => {
+    await runBothFires();
+    const pays = wireTxs().filter((s) => s.sel === PAY);
+    const audits = wireTxs().filter((s) => s.sel === AUDIT);
+    expect(pays).toHaveLength(10);
+    expect(audits).toHaveLength(10);
+    expect(pays.every((s) => s.tipGwei === PAY_TIP_GWEI)).toBe(true);
+    expect(audits.every((s) => s.tipGwei === AUDIT_TIP_GWEI)).toBe(true);
+    const nonces = wireTxs().map((s) => s.nonce);
+    expect(nonces).toEqual([...Array(20).keys()].map((i) => chainNonce + i));
+    // Payments still entirely ahead of audits, so the nonce chain unblocks in the right order.
+    expect(Math.max(...pays.map((p) => p.nonce))).toBeLessThan(Math.min(...audits.map((a) => a.nonce)));
+  });
+
+  it("still fits the lead at double the roster", async () => {
+    // The per-citizen cost is one timestamp-override simulation each, run serially. This is
+    // the number that would eat a 5s lead if it ever grew per-citizen round-trips.
+    await runBothFires();
+    const serial =
+      vi.mocked(publicClient.multicall).mock.calls.length +
+      vi.mocked(publicClient.getBlockNumber).mock.calls.length +
+      vi.mocked(getTransactionCount).mock.calls.length +
+      vi.mocked(request).mock.calls.length;
+    expect(serial * 60).toBeLessThan(4_000); // pessimistic 60ms per round-trip
+  });
+
+  it("mirrors all 20, so a solo-built boundary block is still reachable", async () => {
+    await runBothFires();
+    await awaitPendingMirrors();
+    expect(sendRawTransaction).toHaveBeenCalledTimes(20);
+  });
+
+  it("keeps all 10 payments revert-tolerant so one bad payment cannot drop the other nine", async () => {
+    await runBothFires();
+    const payBundle = bundles().find((b) => kindsOf(b).includes(PAY))!;
+    expect(payBundle.txs).toHaveLength(10);
+    expect(payBundle.revertingTxHashes ?? []).toHaveLength(10);
   });
 });
