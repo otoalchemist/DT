@@ -420,7 +420,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
   });
 
   it("queues exactly one audit of #1612 from our owned auditor token", async () => {
-    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     expect(queued).toBe(true);
     // The audit tx was actually submitted (encodeAudit calldata), value == AUDIT_COST_WEI.
     const auditCalls = vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT");
@@ -434,7 +434,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
     // because the contract forbids an auditable token from auditing — but that's the
     // game's rule, not an exclusion effect.)
     runtime.strategy = { ...runtime.strategy, excludedTokenIds: ["1"] };
-    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     expect(queued).toBe(true);
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(1);
     // ...and it audited FROM the excluded token #1.
@@ -454,7 +454,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
         killable: false,
       },
     ]);
-    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     expect(queued).toBe(false);
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
   });
@@ -505,7 +505,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
         })),
       );
 
-      const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+      const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
       expect(queued).toBe(false);
       // Nothing submitted (the point of the cap) ...
       expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
@@ -535,7 +535,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
           killable: false,
         })),
       );
-      await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+      await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
       // Both candidates were considered — the loop continued rather than breaking out.
       expect(vi.mocked(getLatestBlockCached).mock.calls.length).toBe(2);
     });
@@ -675,7 +675,7 @@ describe("combined boundary bundle with multiple citizens", () => {
     const opts = (data: string) =>
       vi.mocked(submitTx).mock.calls
         .filter(([i]) => (i as { data: string }).data === data)
-        .map(([, o]) => o as { revertible?: boolean; race?: boolean });
+        .map(([, o]) => o as { revertible?: boolean; race?: boolean; bundleOnly?: boolean });
 
     const pays = opts("0xPAYTAXES");
     const audits = opts("0xAUDIT");
@@ -1538,7 +1538,7 @@ describe("multi-wallet: actions are signed by the wallet that owns the citizen",
     vi.mocked(fetchOwnedTokenIds).mockImplementation(async (_c: unknown, addr: string) =>
       addr.toLowerCase() === B.toLowerCase() ? [20n] : [],
     );
-    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     const audits = signersByData().filter((c) => c.data === "0xAUDIT");
     expect(audits.length).toBeGreaterThan(0);
     for (const a of audits) expect(a.signer).toBe(B);
@@ -1649,7 +1649,7 @@ describe("multi-wallet: manual actions resolve the owning wallet before signing"
 // bundle, the builder dropped it, the bundle-only coinbase bid died with it, and the
 // audits trickled out through the mempool naked — landing at tx index 40 instead of 0 and
 // every one reverting with AuditAlreadyActive.
-describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bid", () => {
+describe("pre-boundary audit-only fire: revert-tolerant either way, never bundle-only", () => {
   const ADDR = "0x1111111111111111111111111111111111111111" as const;
   const PAYER = "0x00000000000000000000000000000000000000b1";
   const CURRENT = 200n;
@@ -1732,22 +1732,38 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
     for (const o of opts) expect(o.revertible).toBe(true);
   });
 
-  it("WITHOUT a bid: audits stay all-or-nothing and keep the mempool mirror", async () => {
-    // No bid means the bundle is unlikely to win top-of-block at all, so the mirror is
-    // the only copy that will realistically land — losing it would be strictly worse.
+  it("WITHOUT a bid: audits are revert-tolerant TOO, and still keep the mempool mirror", async () => {
+    // This used to be all-or-nothing, which meant the config most people run lost every
+    // audit from its bundle to one stale target. Nothing shares this bundle — the payments
+    // are in their own — so tolerating a revert costs nothing, and the mirror is kept
+    // because it is the only copy that can land in a solo-built boundary block.
     runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: PAYER };
     await firePreBoundaryAudit();
     const opts = auditOpts();
     expect(opts.length).toBeGreaterThan(0);
-    for (const o of opts) expect(o.revertible).toBe(false);
+    for (const o of opts) {
+      expect(o.revertible).toBe(true);
+      // act() consumes bundleOnly to derive `race`, so race:true IS the mirror surviving.
+      expect(o.race).toBe(true);
+    }
   });
 
-  it("a bid amount with no payer configured does NOT switch to bundle-only", async () => {
-    // maybeQueueCoinbaseBid is a no-op without a payer, so treating this as "bidding"
-    // would drop the mempool mirror while buying no position whatsoever.
-    runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: "" };
-    await firePreBoundaryAudit();
-    for (const o of auditOpts()) expect(o.revertible).toBe(false);
+  it("never goes bundle-only on the standalone path, whatever the bid settings say", async () => {
+    // The standalone fire has no payment sharing its bundle, so there is nothing for
+    // bundle-only to protect — and dropping the mirror would forfeit the solo-builder case.
+    // Checked with a bid amount but no payer (where maybeQueueCoinbaseBid is a no-op) and
+    // with a fully configured bid.
+    for (const bid of [
+      { coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: "" },
+      { coinbaseBidAuditOnlyEth: 0.022, coinbasePayerAddress: PAYER },
+    ]) {
+      vi.mocked(submitTx).mockClear();
+      runtime.strategy = { ...base, ...bid };
+      await firePreBoundaryAudit();
+      const opts = auditOpts();
+      expect(opts.length).toBeGreaterThan(0);
+      for (const o of opts) expect(o.race).toBe(true); // mirror kept in both bid shapes
+    }
   });
 });
 

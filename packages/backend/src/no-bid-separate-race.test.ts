@@ -317,17 +317,17 @@ describe("no-bid boundary race: payments and audits as two separate bundles", ()
     expect(kindsOf(payBundle).every((k) => k === PAY)).toBe(true); // no audit can poison it
   });
 
-  it("leaves the audit bundle ALL-OR-NOTHING without a bid — the real cost of this setup", async () => {
-    // Documenting a genuine weakness, not asserting it is desirable: `revertible` is only set
-    // for audits when a bid is active, and `revertible` is also what makes a tx bundle-only.
-    // So with no bid the 5 audits are mandatory — one stale target drops all five from the
-    // bundle, and they fall back to their mempool mirrors.
+  it("makes all 5 audits revert-tolerant AND mirrored, so one stale target costs only itself", async () => {
+    // The weakness this file used to document. Without a bid the audits were mandatory, so a
+    // single target cured before execution dropped all five from the bundle. Nothing shares
+    // this bundle — the payments have their own — so revert-tolerance is free here, and the
+    // mirror is kept because it is the only copy that can land in a solo-built boundary block.
     await runBothFires();
     const auditBundle = bundles().find((b) => kindsOf(b).includes(AUDIT))!;
     expect(auditBundle.txs).toHaveLength(5);
-    expect(auditBundle.revertingTxHashes ?? []).toHaveLength(0);
+    expect(auditBundle.revertingTxHashes ?? []).toHaveLength(5);
     await awaitPendingMirrors();
-    expect(sendRawTransaction).toHaveBeenCalledTimes(10); // ...but every one is mirrored
+    expect(sendRawTransaction).toHaveBeenCalledTimes(10); // payments + audits, all mirrored
   });
 
   it("keeps each bundle in ascending nonce order", async () => {

@@ -1146,13 +1146,29 @@ export function schedulePreBoundaryAudit(): void {
  * and synced the nonce). Targets rivals auditable in the first block of `targetEpoch`,
  * one per eligible auditor token.
  *
- * `opts.revertible` marks each audit allowed-to-revert AND bundle-only (never mirrored —
- * see act()). Set it when a coinbase bid will fire: the bid buys the bundle its position,
- * and revert-tolerance stops one stale target (already audited, auditor out of capacity)
- * from invalidating the whole bundle and taking the bid down with it. Leave it off when
- * no bid fires — the bundle is then unlikely to win top-of-block, so the mempool mirror
- * is the only copy likely to land at all. In combined mode it is also what stops a
- * defended target from dropping the payment. Returns whether any queued.
+ * `opts.revertible` marks each audit allowed-to-revert, so one stale target (already audited,
+ * auditor out of capacity) cannot invalidate the whole bundle and take its siblings with it.
+ *
+ * `opts.bundleOnly` separately decides whether each audit is withheld from the public mempool,
+ * and the two are NOT the same question — conflating them is what made the useful combination
+ * unrepresentable. It matters which caller is asking:
+ *
+ *   COMBINED bundle (payments + audits share one bundle) -> bundleOnly MUST be true. Payments
+ *     and audits there hold sequential nonces of the same wallet, so if a mirrored audit
+ *     landed it would consume its nonce and make the bundle containing that nonce invalid —
+ *     the builder drops it and the PAYMENTS go down with the audit. That is the "mirroring an
+ *     audit demotes the payment" hazard, and it is specific to sharing a bundle.
+ *   STANDALONE audit bundle (no bid, payments in their OWN bundle) -> bundleOnly false is
+ *     safe and strictly better. A mirror landing can only invalidate the audit bundle, and by
+ *     then the audit has landed; nothing else rides with it. That buys revert-tolerance AND
+ *     keeps the only copy that can land in the ~1 boundary in 10 built by a solo validator,
+ *     which accepts no bundles at all.
+ *
+ * The cost of mirroring an audit is strategic, not mechanical: a visible pending audit lets
+ * the target cure first. That is the same exposure payments already carry, and it stays gated
+ * behind `racePublicMempool` (see act()).
+ *
+ * Returns whether any queued.
  */
 // Exported for tests: this is the audit-queue unit that a boundary miss like
 // token 1612 flows through, so an integration test drives it directly.
@@ -1160,7 +1176,7 @@ export async function queuePreBoundaryAudits(
   targetEpoch: bigint,
   nowSec: bigint,
   boundaryTs: bigint,
-  opts: { revertible: boolean; paidInBundle?: Set<string> },
+  opts: { revertible: boolean; bundleOnly: boolean; paidInBundle?: Set<string> },
 ): Promise<boolean> {
   const s = runtime.strategy;
   const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
@@ -1233,15 +1249,16 @@ export async function queuePreBoundaryAudits(
         targetTokenId: t.tokenId,
         message:
           `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch}` +
-          (viaBundlePayment ? " (auditor paid in this bundle, unsimulated)" : opts.revertible ? " (in payment bundle)" : " (boundary race)"),
+          (viaBundlePayment ? " (auditor paid in this bundle, unsimulated)" : opts.bundleOnly ? " (in payment bundle)" : " (boundary race)"),
         race: true,
         simTimestamp: boundaryTs,
         skipSim: viaBundlePayment,
         revertible: opts.revertible,
-        // Preserves the previous behaviour now that the mirror is no longer derived from
-        // `revertible`: a revert-tolerant audit stays bundle-only, because mirroring it adds
-        // a second mempool nonce that can demote the payment sharing its bundle.
-        bundleOnly: opts.revertible,
+        // The caller decides, because only the caller knows whether a payment shares this
+        // bundle — see the note on this function. Deriving it from `revertible` forced
+        // revert-tolerance and the mempool mirror to be the same choice, which cost the
+        // no-bid path one of them for no reason.
+        bundleOnly: opts.bundleOnly,
       },
     );
     if (res?.ok) { idx++; queued++; }
@@ -1299,7 +1316,23 @@ export async function firePreBoundaryAudit(): Promise<void> {
     // 40+ instead of 0, and every one reverted with AuditAlreadyActive because faster
     // bundles had already taken the targets.
     const bidding = coinbaseBidActive(s, "audit");
-    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, { revertible: bidding });
+    /**
+     * Standalone audit bundle: revert-tolerant EITHER WAY, and never bundle-only.
+     *
+     * Revert-tolerance used to be tied to bidding, which left the no-bid config — the one
+     * most people run — with an all-or-nothing bundle: one stale target dropped every audit
+     * from it and they all fell back to their mirrors, losing the placement the tip paid for.
+     * There is no payment in THIS bundle to protect, so tolerating a revert costs nothing.
+     *
+     * bundleOnly stays false because the payments are in their own separate bundle here, so a
+     * mirror that lands can only invalidate this one — by which point the audit has landed.
+     * That keeps the mempool copy, which is the only thing that can land in the ~1 boundary
+     * in 10 built by a solo validator.
+     */
+    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
+      revertible: true,
+      bundleOnly: false,
+    });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
     if (queuedAudit) await maybeQueueCoinbaseBid("audit");
   } catch (err) {
@@ -1406,6 +1439,10 @@ export async function firePreBoundaryBundle(): Promise<void> {
     ) {
       auditQueued = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
         revertible: paidInBundle.size > 0 || coinbaseBidActive(s, "audit"),
+        // MUST stay true here: payments share this bundle on sequential nonces, so a mirrored
+        // audit that lands would consume its nonce, invalidate the bundle, and take the
+        // payments with it. Unchanged from before — only the standalone path moved.
+        bundleOnly: true,
         // Tokens paid above are current by the time the audit executes, so they can
         // serve as audit "from" tokens even though the chain still reads them behind.
         paidInBundle,
