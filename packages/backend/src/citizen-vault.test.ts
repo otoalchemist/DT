@@ -70,6 +70,7 @@ const STRANGER = new Address(hexToBytes("0x" + "33".repeat(20)));
 const COINBASE = new Address(hexToBytes("0x" + "44".repeat(20)));
 
 let vaultAbi: Abi;
+let vaultBytecode: string;
 let evm: EVM;
 let vault: Address;
 let nft: Address;
@@ -152,6 +153,7 @@ beforeAll(async () => {
 
   const art = out.contracts["CitizenVault.sol"].CitizenVault;
   vaultAbi = art.abi as Abi;
+  vaultBytecode = art.evm.bytecode.object;
 
   evm = await EVM.create();
   for (const a of [OWNER, OPERATOR, STRANGER]) {
@@ -283,5 +285,23 @@ describe("CitizenVault: getting things back out", () => {
     // owner call something, a vault-held citizen cannot claim it; withdraw first.
     const r = await run(OPERATOR, [{ data: toFunctionSelector("function claim()"), value: 0n, tolerate: false }]);
     expect(r.reverted).toBe(true);
+  });
+});
+
+describe("CitizenVault: deployment guards", () => {
+  it("refuses to deploy against a game address with no code", async () => {
+    // The failure this prevents is silent and permanent. A low-level call to an address
+    // with no code SUCCEEDS and returns true, so a mistyped game address would make every
+    // payTaxes report ok while sending the tax to a dead address: the activity log reads
+    // "included", the citizen goes unpaid, and it is killed on schedule with nothing
+    // anywhere explaining why. Measured before the guard existed: 0.5 ETH gone, run()
+    // returned success. Deploy time is the only cheap place to catch it.
+    const notAContract = "0x00000000000000000000000000000000deadbeef";
+    const ctorArgs = encodeFunctionData({
+      abi: gameFn("c", ["address", "address", "address"], "nonpayable"),
+      functionName: "c",
+      args: [notAContract, notAContract, bytesToHex(OPERATOR.bytes)],
+    }).slice(10);
+    await expect(deploy(vaultBytecode + ctorArgs)).rejects.toThrow();
   });
 });

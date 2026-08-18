@@ -4,6 +4,7 @@ import type { PrivateKeyAccount } from "viem/accounts";
 import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { vaultStatusForUi } from "./vault-preflight.js";
 import { activity } from "./activity.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
 import { versionState } from "./version-check.js";
@@ -573,6 +574,7 @@ class Runtime {
       citizensAddress: this.citizensAddress,
       lastBlock: this.lastBlock?.toString() ?? null,
       awayNextWakeSec: this.awayNextWakeSec,
+      vault: vaultStatusForUi(),
       spentThisEpochWei: this.spentThisEpochWei().toString(),
       startTime: this.startTime?.toString() ?? null,
       jitEnabled: this.strategy.jitEnabled,

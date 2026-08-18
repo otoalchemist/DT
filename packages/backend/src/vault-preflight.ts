@@ -156,3 +156,28 @@ export async function refreshVaultCheck(
 
   return inFlight;
 }
+
+/**
+ * The check as the dashboard needs it, or null when no vault is configured.
+ *
+ * Deliberately omits `game`/`citizens`/`checkedAt`: the panel's job is to answer "can this
+ * act, and if not what do I fix", and the specific mismatched address is already spelled out
+ * in `problems`. Returning null rather than an "unknown" shape keeps the common case — no
+ * vault at all — from rendering anything.
+ */
+export function vaultStatusForUi(): {
+  address: string;
+  ok: boolean;
+  owner: string | null;
+  operator: string | null;
+  problems: string[];
+} | null {
+  if (!cached) return null;
+  return {
+    address: cached.address,
+    ok: cached.ok,
+    owner: cached.owner,
+    operator: cached.operator,
+    problems: cached.problems,
+  };
+}

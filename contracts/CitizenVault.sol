@@ -94,6 +94,7 @@ contract CitizenVault {
     error SelectorNotAllowed(uint256 index, bytes4 selector);
     error CallFailed(uint256 index);
     error RefundFailed();
+    error NotAContract(address what);
 
     // Computed from the signatures rather than pasted as hex, so they are checkable by
     // reading. Verified against mainnet calldata: payTaxes 0x58670017, audit 0x5daba7c0.
@@ -105,6 +106,15 @@ contract CitizenVault {
     bytes4 private constant SEL_KILL = bytes4(keccak256("kill(uint256)"));
 
     constructor(address _game, address _citizens, address _operator) {
+        // Both MUST be contracts, checked here because getting it wrong is silent and
+        // permanent otherwise. A low-level call to an address with no code SUCCEEDS and
+        // returns true, so a mistyped _game would make every payTaxes report ok while
+        // sending the tax straight to a dead address — the activity log would read
+        // "included", the citizen would go unpaid, and it would be killed on schedule with
+        // nothing anywhere saying why. Verified in the EVM: 0.5 ETH sent, run() returned
+        // success. Failing at deploy is the only place this is cheap to catch.
+        if (_game.code.length == 0) revert NotAContract(_game);
+        if (_citizens.code.length == 0) revert NotAContract(_citizens);
         owner = msg.sender;
         game = _game;
         citizens = _citizens;

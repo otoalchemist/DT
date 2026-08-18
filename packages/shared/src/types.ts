@@ -241,6 +241,17 @@ export interface LeadBar {
   max: number;
 }
 
+/** Whether the configured vault is wired to this bot, and what is wrong if not. */
+export interface VaultStatus {
+  address: string;
+  /** False = the bot will refuse to act on vault-held citizens until it is fixed. */
+  ok: boolean;
+  owner: string | null;
+  operator: string | null;
+  /** Reasons it is unusable, most important first. Empty when ok. */
+  problems: string[];
+}
+
 /** State of the on-demand rival scan behind the dashboard's "Analyze targets" button. */
 export interface TargetScoresState {
   running: boolean;
@@ -591,6 +602,15 @@ export interface BotStatus {
   /** Away mode: unix seconds of the next scheduled wake-up, or null when away mode is
    *  off / nothing is armed to wake for. Lets the dashboard count down without polling. */
   awayNextWakeSec: number | null;
+  /**
+   * Result of the CitizenVault wiring check, or null when no vault is configured.
+   *
+   * Surfaced because the failure it catches is otherwise invisible: a vault whose operator
+   * was never pointed at this bot reverts every batch while looking healthy from outside —
+   * it builds, submits, the transaction lands, it reverted. Without this the operator's
+   * first signal is a citizen dying.
+   */
+  vault: VaultStatus | null;
   spentThisEpochWei: string;
   /** Game start time (unix seconds) — lets the UI compute epoch boundaries. */
   startTime: string | null;

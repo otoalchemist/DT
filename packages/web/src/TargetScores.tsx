@@ -15,7 +15,7 @@ import { api } from "./api.js";
 const dimmed = (r: TargetScoreRow): boolean => r.uncatchable ?? false;
 
 /** The bundle the user plans to send, and the tip they'll send it with. */
-interface Plan { payments: number; audits: number; tipGwei: number }
+interface Plan { payments: number; audits: number; tipGwei: number; batched: boolean }
 
 /**
  * Price a beat-bid for THIS plan from the rival's raw defense density.
@@ -28,7 +28,7 @@ interface Plan { payments: number; audits: number; tipGwei: number }
  */
 function beatFor(densityGwei: number | null | undefined, plan: Plan): number | null {
   if (densityGwei === null || densityGwei === undefined) return null;
-  return bidToBeat(densityGwei, plan.tipGwei, plan.payments, plan.audits);
+  return bidToBeat(densityGwei, plan.tipGwei, plan.payments, plan.audits, plan.batched);
 }
 
 /**
@@ -267,11 +267,17 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
 export function TargetScores({
   currentEpoch,
   tipGwei,
+  batched,
   ownedCitizens,
   auditCapacity,
 }: {
   currentEpoch: string | null;
   tipGwei: number;
+  /** A vault sends the whole boundary as ONE tx with the bid inline, so there is no
+   *  CoinbasePayer transaction to price — which is the term the tip-vs-bid comparison
+   *  turns on. Without this every figure here is quoted for a bundle shape the operator
+   *  is not sending. */
+  batched: boolean;
   /** Citizens this wallet set holds — the natural payment count for a boundary. */
   ownedCitizens: number;
   /** Sum of auditLimit across them — how many audits a boundary can actually carry. */
@@ -324,8 +330,8 @@ export function TargetScores({
     catch (e) { setErr((e as Error).message); }
   };
 
-  const plan = { payments, audits, tipGwei: tip };
-  const planGas = bundleGas(payments, audits);
+  const plan = { payments, audits, tipGwei: tip, batched };
+  const planGas = bundleGas(payments, audits, batched);
   const running = state?.running ?? false;
   const rows = state?.rows ?? null;
   const pool = rows

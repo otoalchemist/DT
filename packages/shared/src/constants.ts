@@ -154,6 +154,17 @@ export const GAS_PER_AUDIT = 130_409;
 export const GAS_COINBASE_BID_TX = 30_550;
 
 /**
+ * Fixed overhead of a CitizenVault.run() call: calldata dispatch, the value check, the
+ * loop, the per-call CallResult logs, the refund and the inline coinbase transfer.
+ *
+ * Batching replaces N transactions with one, so the per-transaction 21,000 intrinsic gas is
+ * paid once instead of N times — but the wrapper itself is not free, and pricing a bid
+ * against a bundle that ignores it under-provides on the one number where under-providing
+ * loses the boundary. Sized from the measured VAULT_CALL_OVERHEAD_GAS the bot signs with.
+ */
+export const GAS_VAULT_OVERHEAD = 60_000;
+
+/**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.
  *
  * Builders order by value per gas, so the bar is the rival's DENSITY — (their bid + their
@@ -165,15 +176,28 @@ export function bidToBeat(
   ourTipGwei: number,
   payments: number,
   audits: number,
+  batched = false,
 ): number {
-  const gas = payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
   if (defenseGwei <= ourTipGwei) return 0;
-  return ((defenseGwei - ourTipGwei) * gas) / 1e9;
+  return ((defenseGwei - ourTipGwei) * bundleGas(payments, audits, batched)) / 1e9;
 }
 
-/** Total gas of a bundle carrying `payments` payments, `audits` audits and the bid tx. */
-export function bundleGas(payments: number, audits: number): number {
-  return payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
+/**
+ * Total gas of the bundle a bid is spread across.
+ *
+ * `batched` selects the SHAPE, which differs in a way that matters to every figure priced
+ * off it. Without a vault the bundle is N transactions plus a separate CoinbasePayer tx
+ * carrying the bid. With one it is a SINGLE transaction: the payer tx does not exist, so
+ * its ~30,550 gas is not paid, and the vault's own wrapper overhead is paid instead.
+ *
+ * Getting this wrong is not cosmetic. It is the term the whole tip-versus-bid comparison
+ * turns on: the documented ~0.0133 ETH advantage of the tip route IS the payer tx priced at
+ * defense density, so a batched operator reading the unbatched number is being told the
+ * wrong lever is cheaper.
+ */
+export function bundleGas(payments: number, audits: number, batched = false): number {
+  const work = payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
+  return work + (batched ? GAS_VAULT_OVERHEAD : GAS_COINBASE_BID_TX);
 }
 
 /**
