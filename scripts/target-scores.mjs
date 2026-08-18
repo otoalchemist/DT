@@ -98,7 +98,16 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dataDir = path.join(root, "data");
 
 const GAME = "0xa448c7f618087dda1a3b128cad8a424fbae4b71f";
-const EMIGRATION = "0xe56d011262d4738dc8307fb8a4ae48b2bfc20e7c"; // citizens here have left the game
+// Citizens held by ANY of these have left the main game. There are two routes now, and
+// scoring only the first meant ABBC emigrants were still ranked as live targets — #1000
+// came out 3rd-best on a scan while it was already out of the game, where an audit can only
+// revert. Keep in sync with EMIGRATION_DESTINATIONS in shared/constants.ts (duplicated
+// because this script runs standalone and cannot import the package).
+const EMIGRATION_CONTRACTS = [
+  "0xe56d011262d4738dc8307fb8a4ae48b2bfc20e7c", // Governor
+  "0xbfffc99fa75a0fea45b765d11d8e52f8e1114f8c", // ABBC
+];
+const isEmigratedOwner = (owner) => owner != null && EMIGRATION_CONTRACTS.includes(owner.toLowerCase());
 const EPOCH_DURATION = 86400n;
 // Our own bundle shape, for pricing what it costs to out-rank a rival's defense.
 // Gas MEASURED from real on-chain txs: payTaxes ~82,875, audit ~130,409, CoinbasePayer
@@ -153,6 +162,13 @@ function numArg(name, dflt, { min = 0 } = {}) {
 const PLAN_PAYMENTS = numArg("--payments", 1);
 const PLAN_AUDITS = numArg("--audits", 1);
 const OUR_BUNDLE_GAS = PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT + GAS_BID_TX;
+// Same bundle WITHOUT the bid tx: the tip route never sends one, so charging a tip for its
+// ~30,550 gas would overstate the tip lever by exactly that. Keep in sync with
+// tipOnlyBundleGas / tipCostEth in shared/constants.ts.
+const OUR_TIP_GAS = PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT;
+/** What a `gwei` priority fee costs in ETH for the planned bundle. Marginal cost of the tip
+ *  only — base fee is paid either way, so this is what compares against a bid figure. */
+const tipEth = (gwei) => (gwei === null ? null : (gwei * OUR_TIP_GAS) / 1e9);
 // The tip we would actually bid on an audit. Mirrors resolveGas(): the offense tip only
 // applies when separateOffenseGas is on, otherwise audits ride the payment tip. Read from
 // the live config rather than hardcoded, because pricing against a tip the bot won't bid
@@ -243,7 +259,7 @@ async function main() {
   // blind to any delinquent rival outside it (and, since most of the curated list is on the
   // skippers roster, made "non-skippers" look far smaller than it is). --curated restores
   // the old narrow behaviour.
-  const universe = [...ownerOf.keys()].filter((t) => ownerOf.get(t) !== EMIGRATION.toLowerCase() && !allySet.has(t));
+  const universe = [...ownerOf.keys()].filter((t) => !isEmigratedOwner(ownerOf.get(t)) && !allySet.has(t));
   const rivals = (curatedOnly ? universe.filter((t) => curatedSet.has(t)) : universe).sort((a, b) => Number(a) - Number(b));
   if (!asJson) {
     const extra = rivals.filter((t) => !curatedSet.has(t)).length;
@@ -669,7 +685,7 @@ async function main() {
   const rows = [];
   for (const t of rivals) {
     const owner = ownerOf.get(t) ?? null;
-    if (!owner || owner === EMIGRATION) continue; // dead/burned or emigrated: not a target
+    if (!owner || isEmigratedOwner(owner)) continue; // dead/burned or emigrated: not a target
     const s = st[t]; const lep = s.lep ?? 0n;
     const behind = ce > lep ? Number(ce - lep) : 0;
     const due = s.due ?? 0n;
@@ -779,7 +795,7 @@ async function main() {
       payBlkMin, payBlkMed, audited: aud,
       beatBidEth, defenseUnexplained, unexplainedReason,
       // The two levers, per rival. Same bar, priced both ways: a tip that needs no builder
-      // cooperation, or a flat bid that is cheaper in ETH on a small bundle but dead on a
+      // cooperation, or a flat bid that costs MORE at equal density (it also tips the payer tx) and is dead on a
       // solo-built block.
       beatTipGwei: priceTip(defenseGwei),
       beatTipRecentGwei: priceTip(defenseRecentGwei),
@@ -855,22 +871,36 @@ async function main() {
       console.log(`lead = (no boundary races with 2+ participants in this window — widen --epochs)`);
       return;
     }
+    /**
+     * Total ETH for the BID route: the bid itself plus the tip still charged across the whole
+     * bundle, payer transaction included.
+     *
+     * Printing the bare bid next to a tip cost invites the wrong conclusion — 0.0772 looks
+     * cheaper than 0.0956 — because the bid figure is an increment on top of a tip that is
+     * still being paid. Totalled honestly, the tip route wins at equal density.
+     */
+    const bidRouteTotal = (bidEth) => bidEth + (OUR_TIP_GWEI * OUR_BUNDLE_GAS) / 1e9;
+    const leadLine = (label, bar, bidEth) =>
+      `  ${label}: tip ${priceTip(bar)} gwei = ${tipEth(priceTip(bar)).toFixed(4)} ETH  OR  ` +
+      `bid ${bidEth.toFixed(4)} + ${((OUR_TIP_GWEI * OUR_BUNDLE_GAS) / 1e9).toFixed(4)} tip = ${bidRouteTotal(bidEth).toFixed(4)} ETH`;
     console.log(
-      `lead = bid for YOUR bundle to be the densest in a boundary block, over ${leadBar.blocks} observed race(s):\n` +
-        `  typical block (p50): tip ${priceTip(leadBar.p50)} gwei  OR  bid ${leadBidEth.p50} ETH at your ${OUR_TIP_GWEI} gwei tip
+      `lead = what it takes for YOUR bundle to be the densest in a boundary block, over ${leadBar.blocks} observed race(s):\n` +
+        leadLine("typical block (p50)", leadBar.p50, leadBidEth.p50) + `
 ` +
-      `  most blocks  (p90): tip ${priceTip(leadBar.p90)} gwei  OR  bid ${leadBidEth.p90} ETH
+      leadLine("most blocks  (p90)", leadBar.p90, leadBidEth.p90) + `
 ` +
-      `  strongest seen    : tip ${priceTip(leadBar.max)} gwei  OR  bid ${leadBidEth.max} ETH`,
+      leadLine("strongest seen    ", leadBar.max, leadBidEth.max),
     );
     console.log(
       `  the tip column works on EVERY builder, including the ~1 boundary in 10 built by a solo
 ` +
       `  validator on vanilla geth/reth — those order by priority fee and ignore coinbase transfers
 ` +
-      `  outright, so a bid buys nothing there. The bid column is cheaper in ETH on a small bundle
+      `  outright, so a bid buys nothing there. The tip column is also CHEAPER at equal density: the
 ` +
-      `  (it is flat, while the tip is charged per tx) but only counts with builders that take it.
+      `  bid route also sends and tips the CoinbasePayer tx, so it runs ~0.011-0.014 ETH dearer at
+  any bundle size. The bid only looks smaller because it is quoted on top of a tip you still
+  pay; what it buys is scope (one boundary) rather than a discount.
 ` +
       `  Either way this is the bar to CLEAR, not a guarantee: across the same races the densest
 ` +
@@ -979,11 +1009,34 @@ async function main() {
       console.log(`  #${r.token.padEnd(5)} ${r.skipClean}/${r.skipCaught} of ${r.crossings} skips · score ${r.score.toFixed(2)}`);
     }
     if (promote) {
-      const merged = [...new Set([...skipperSet, ...newlyObserved.map((r) => r.token)])]
-        .filter((t) => !bigBoyOwnerOf.has(t) && !allySet.has(t))
+      const candidates = [...new Set([...skipperSet, ...newlyObserved.map((r) => r.token)])];
+      /**
+       * Prune on the way through, and SAY what was pruned.
+       *
+       * The merge carries the existing file forward, so entries that have since left the
+       * game survived every promote — the list was holding #1000, #1417 and #6028 (all
+       * emigrated, two of them burned) as live audit targets. Same predicate the scan uses
+       * for a rival row: no owner = burned, emigration contract = out of the game. Neither
+       * can be audited, so both are dead weight crowding the paste list.
+       *
+       * Printed rather than dropped quietly: this rewrites a file the user curates by hand,
+       * and silently deleting ids from it would be indistinguishable from losing them.
+       */
+      const pruned = [];
+      const merged = candidates
+        .filter((t) => {
+          if (bigBoyOwnerOf.has(t) || allySet.has(t)) return false;
+          const owner = ownerOf.get(t) ?? null;
+          if (!owner) { pruned.push(`#${t} (burned/not in the collection)`); return false; }
+          if (isEmigratedOwner(owner)) { pruned.push(`#${t} (emigrated)`); return false; }
+          return true;
+        })
         .sort((a, b) => Number(a) - Number(b));
       fs.writeFileSync(path.join(dataDir, "rival-skippers.json"), JSON.stringify(merged, null, 2) + "\n");
       console.log(`  -> promoted ${newlyObserved.length}; data/rival-skippers.json now holds ${merged.length}`);
+      if (pruned.length > 0) {
+        console.log(`  -> dropped ${pruned.length} that can no longer be audited: ${pruned.join(", ")}`);
+      }
     } else {
       console.log(`  (re-run with --promote to add them to data/rival-skippers.json)`);
     }
@@ -1020,11 +1073,18 @@ async function main() {
     console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
     console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted");
     console.log("tip2ep/tipMax/tipBnd = PRIORITY FEE (gwei) that out-densities them with no bid — recent 2 epochs / peak / boundary blocks only");
+    // Levers quoted in different units cannot be compared as printed, so convert. The tip is
+    // charged over OUR_TIP_GAS (no bid tx on this route), which is what makes a flat bid the
+    // cheaper lever on a small bundle even when the gwei figure looks modest.
+    console.log(
+      `  tip -> ETH on this plan (${OUR_TIP_GAS.toLocaleString()} gas, no bid tx): 1 gwei = ${tipEth(1).toFixed(6)} ETH` +
+        ` · 100 gwei = ${tipEth(100).toFixed(4)} · 200 gwei = ${tipEth(200).toFixed(4)} · 400 gwei = ${tipEth(400).toFixed(4)}`,
+    );
     console.log("bid2ep/bidMax/bidBnd = same three bars priced as a FLAT BID at your configured tip instead · '-' = your tip already clears it · '·' = never observed defending in that window");
     console.log("tipBnd/bidBnd are the ones that matter for a boundary race: measured only in blocks that decided an audit, not quiet mid-epoch payments");
     // The beat columns are meaningless without the bundle they were priced for, and this
     // is the default output — most runs never see the fuller legend under --auditable-next.
-    console.log(`beat2ep/beatMax priced for ${PLAN_PAYMENTS} payment(s) + ${PLAN_AUDITS} audit(s) + payer = ${OUR_BUNDLE_GAS.toLocaleString()} gas @ ${OUR_TIP_GWEI} gwei tip · change with --payments N --audits M --tip G`);
+    console.log(`beat2ep/beatMax priced for ${PLAN_PAYMENTS} payment(s) + ${PLAN_AUDITS} audit(s) + payer = ${OUR_BUNDLE_GAS.toLocaleString()} gas @ ${OUR_TIP_GWEI} gwei tip (that tip costs ${((OUR_TIP_GWEI * OUR_BUNDLE_GAS) / 1e9).toFixed(4)} ETH across this bundle, on top of any bid below) · change with --payments N --audits M --tip G`);
     printLead();
   }
 }

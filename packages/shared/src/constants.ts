@@ -4,7 +4,7 @@
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.5.0" as const;
+export const VERSION = "1.5.5" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
@@ -174,4 +174,40 @@ export function bidToBeat(
 /** Total gas of a bundle carrying `payments` payments, `audits` audits and the bid tx. */
 export function bundleGas(payments: number, audits: number): number {
   return payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
+}
+
+/**
+ * Gas of the same bundle WITHOUT the coinbase-bid transaction.
+ *
+ * The tip route doesn't send one — that's the whole point of it — so pricing a tip against
+ * `bundleGas` would charge ~30,550 gas of a transaction that never exists on this path, and
+ * make the tip look worse than it is by exactly that much.
+ */
+export function tipOnlyBundleGas(payments: number, audits: number): number {
+  return payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
+}
+
+/**
+ * What a priority fee of `tipGwei` COSTS, in ETH, for the bundle you plan to send.
+ *
+ * The two levers are quoted in different units, which makes them hard to compare: a bid is
+ * already ETH, a tip is gwei-per-gas. This converts. It is the marginal cost of the tip
+ * only — base fee is paid either way and is excluded, so this is the like-for-like number
+ * to hold against a bid.
+ *
+ * Doing that comparison honestly reverses what this codebase used to claim. At EQUAL density
+ * the tip is the cheaper lever at every bundle size, because the bid route must also send —
+ * and tip — the CoinbasePayer transaction. Worked example at 446.6 gwei/gas of defense and a
+ * 130 gwei tip: tip-only is 448 gwei over 213,284 gas = 0.0956 ETH, while the bid route is
+ * 0.0772 of bid PLUS 0.0317 of tip over 243,834 gas = 0.1089 ETH. The gap (~0.0133) is just
+ * the payer tx's gas priced at that density, so it persists at 5+5 and 9+11 too.
+ *
+ * The bid figure looks smaller only because it is quoted on top of a tip you are still
+ * paying. What a bid actually buys is not a discount but SCOPE — it is a per-boundary lever,
+ * whereas the configured tip re-prices every transaction the bot sends, including routine
+ * mid-epoch payments. And the tip buys the thing a bid cannot: it still works on the ~1
+ * boundary in 10 built by a solo validator, which ignores coinbase transfers outright.
+ */
+export function tipCostEth(tipGwei: number, payments: number, audits: number): number {
+  return (tipGwei * tipOnlyBundleGas(payments, audits)) / 1e9;
 }

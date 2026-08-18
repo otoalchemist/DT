@@ -350,6 +350,44 @@ class Runtime {
    *  Held here rather than imported to avoid a runtime <-> strategy import cycle. */
   awayNextWakeSec: number | null = null;
 
+  /**
+   * Called with the new epoch every time chain state is applied, so a JIT arm whose epoch has
+   * passed is retired before anything can act on it. Registered by strategy.ts at import —
+   * injected rather than imported because strategy.ts already imports THIS module, and the
+   * expiry needs strategy's JIT bookkeeping.
+   */
+  private staleArmCheck: ((currentEpoch: bigint) => void) | null = null;
+
+  registerStaleArmCheck(fn: (currentEpoch: bigint) => void): void {
+    this.staleArmCheck = fn;
+  }
+
+  /**
+   * THE single place chain state is applied. Every path that learns the epoch goes through
+   * here, which is what makes the stale-arm check unmissable.
+   *
+   * It was previously a list of call sites, and that lost: the check was added to the engine
+   * tick, the unlock handler and the away-mode read, but POST /api/refresh also learns the
+   * epoch — and in away mode, with the engine paused, that is the path that normally runs. A
+   * bot could therefore sit with a four-day-old arm displayed as live, having read the
+   * current epoch minutes earlier. Anything that assigns these fields directly reintroduces
+   * exactly that gap, so don't: call this.
+   */
+  applyChainSnapshot(snap: {
+    state: number;
+    currentEpoch: bigint;
+    startTime: bigint;
+    citizenSupply: bigint;
+    citizensAddress: string;
+  }): void {
+    this.gameState = snap.state;
+    this.currentEpoch = snap.currentEpoch;
+    this.startTime = snap.startTime;
+    this.citizenSupply = snap.citizenSupply;
+    this.citizensAddress = snap.citizensAddress;
+    this.staleArmCheck?.(snap.currentEpoch);
+  }
+
   // spend tracking
   private spentThisEpoch = 0n;
   private spendEpoch: bigint | null = null;

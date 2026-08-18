@@ -173,6 +173,29 @@ export async function fetchEmigrationRoster(): Promise<EmigrationRecord[]> {
   return rosterCache("all-emigration-destinations", ROSTER_TTL_MS, scanEmigrations);
 }
 
+/**
+ * Token IDs that have emigrated, as a lookup set — for filtering a token list.
+ *
+ * Built from the EVENT roster, which is the only source that can answer this. Current
+ * ownership cannot: emigrating hands the citizen to the emigration contract, and then
+ * anyone may kill it, which BURNS the ERC-721 and makes `ownerOf` revert. Measured on
+ * mainnet: of 25 emigrations to date, 23 are burned and only 2 are still contract-held —
+ * so an `isEmigrated(ownerOf(id))` test would miss all but two of them. The `Emigrated`
+ * log never shrinks, so it still names all 25.
+ *
+ * Best-effort by design: returns an EMPTY set if the scan fails, so a filter built on it
+ * fails OPEN. Wrongly keeping an emigrated citizen wastes a reverting call; wrongly
+ * dropping a live one skips its payment and can cost the citizen.
+ */
+export async function emigratedTokenIdSet(): Promise<Set<string>> {
+  try {
+    return new Set((await fetchEmigrationRoster()).map((r) => r.tokenId.toString()));
+  } catch (err) {
+    logger.warn("Emigration roster unavailable, not filtering owned tokens:", (err as Error).message);
+    return new Set();
+  }
+}
+
 /** Drop the accumulated rosters and cursors. For tests, and for an RPC swap — a new
  *  client may talk to a different chain, where the old roster is meaningless. */
 export function resetEmigrationRoster(): void {
