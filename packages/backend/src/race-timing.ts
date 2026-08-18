@@ -59,16 +59,34 @@ function filePath(): string {
   return path.join(appConfig.dataDir, FILE);
 }
 
+/**
+ * Writes queued but not yet finished. These are fire-and-forget BY DESIGN — telemetry must
+ * never delay a boundary race — which leaves a test no way to know when a row has landed
+ * except to sleep, and a fixed sleep is a flake waiting for a loaded machine. This is the
+ * handle instead.
+ */
+const inFlight: Promise<void>[] = [];
+
+/** Track a detached telemetry write. Never rejects: callers already log their own failures. */
+function track(work: Promise<unknown>): void {
+  inFlight.push(work.then(() => undefined, () => undefined));
+}
+
+/** Wait for every queued telemetry write, including the lazy builder annotation. For tests. */
+export async function awaitRaceTimingWrites(): Promise<void> {
+  while (inFlight.length > 0) await inFlight.shift();
+}
+
 /** Append one row. Fire-and-forget: a telemetry failure must never affect a submission. */
 export function recordRaceSubmission(row: RaceTimingRow): void {
-  void (async () => {
+  track((async () => {
     try {
       await fsp.mkdir(appConfig.dataDir, { recursive: true });
       await fsp.appendFile(filePath(), JSON.stringify(row) + "\n");
     } catch (err) {
       logger.debug(`race timing: could not append: ${(err as Error).message}`);
     }
-  })();
+  })());
 }
 
 /**
@@ -83,7 +101,7 @@ export function recordRaceOutcome(txHash: string, landed: {
   transactionIndex: number;
   status: "included" | "reverted";
 }): void {
-  void (async () => {
+  track((async () => {
     try {
       const p = filePath();
       if (!fs.existsSync(p)) return;
@@ -106,11 +124,11 @@ export function recordRaceOutcome(txHash: string, landed: {
       await fsp.writeFile(p, out.join("\n") + "\n");
       // The builder that actually won is only knowable after the fact; fetch it lazily so
       // the analysis can attribute position to a builder without a second pass.
-      void annotateBuilder(landed.blockNumber);
+      track(annotateBuilder(landed.blockNumber));
     } catch (err) {
       logger.debug(`race timing: could not record outcome: ${(err as Error).message}`);
     }
-  })();
+  })());
 }
 
 /** Stamp the winning builder onto any resolved rows for `blockNumber` that lack it. */

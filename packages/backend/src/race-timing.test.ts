@@ -16,12 +16,14 @@ vi.mock("./chain.js", () => ({
   publicClient: { getBlock: vi.fn(async () => ({ extraData: "0x" + Buffer.from("Titan (titanbuilder.xyz)").toString("hex") })) },
 }));
 
-const { recordRaceSubmission, recordRaceOutcome } = await import("./race-timing.js");
+const { recordRaceSubmission, recordRaceOutcome, awaitRaceTimingWrites } = await import("./race-timing.js");
 
 const FILE = nodePath.join(tmpRoot, "race-timing.jsonl");
 // Real delay, not setImmediate: the writes are genuine async disk I/O (fs/promises), so
 // microtask draining does not wait for them to land.
-const flush = async () => { await new Promise((r) => setTimeout(r, 60)); };
+// Deterministic: waits for the actual writes rather than sleeping. A fixed 60ms sleep here
+// failed roughly 1 run in 4 under a full parallel suite, which is worse than no test.
+const flush = async () => { await awaitRaceTimingWrites(); };
 const read = () => fs.readFileSync(FILE, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 
 const HASH = "0xabc0000000000000000000000000000000000000000000000000000000000001";

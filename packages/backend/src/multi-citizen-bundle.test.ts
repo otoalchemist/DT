@@ -120,6 +120,7 @@ vi.mock("./nonce.js", () => ({
 }));
 
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
+const { awaitPendingMirrors } = await import("./flashbots.js");
 const { firePreBoundaryBundle } = await import("./strategy.js");
 
 /** The single eth_sendBundle payload (first target block). */
@@ -224,6 +225,7 @@ describe("multi-citizen boundary bundle: nothing can drop it", () => {
     await firePreBoundaryBundle();
     // 5 payments mirrored. Audits are bundle-only here (a bid backs them), and the bid is
     // only meaningful in the block it wins.
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(5);
   });
 });
@@ -265,6 +267,7 @@ describe("one failed payment does not stop the others", () => {
 
     const b = bundle();
     expect(b.revertingTxHashes ?? []).toHaveLength(b.txs.length); // still all-tolerant
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(4);          // 4 surviving payments mirrored
   });
 });

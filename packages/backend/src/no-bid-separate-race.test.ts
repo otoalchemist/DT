@@ -132,6 +132,7 @@ vi.mock("./emigration.js", () => ({ emigratedTokenIdSet: vi.fn(async () => new S
 
 // Deliberately NOT mocking ./nonce.js or ./flashbots.js — both are under test.
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
+const { awaitPendingMirrors } = await import("./flashbots.js");
 const { firePreBoundaryPay, firePreBoundaryAudit, combinedBundleActive } = await import("./strategy.js");
 const { fetchOwnedTokenIds } = await import("./index-tokens.js");
 
@@ -282,6 +283,7 @@ describe("no-bid boundary race: payments and audits as two separate bundles", ()
     // Nothing is revertible without a bid, and revertible is what makes a tx bundle-only.
     // The mirror is what can land in a vanilla-built boundary block.
     await runBothFires();
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(10);
   });
 
@@ -311,6 +313,7 @@ describe("no-bid boundary race: payments and audits as two separate bundles", ()
     const auditBundle = bundles().find((b) => kindsOf(b).includes(AUDIT))!;
     expect(auditBundle.txs).toHaveLength(5);
     expect(auditBundle.revertingTxHashes ?? []).toHaveLength(0);
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(10); // ...but every one is mirrored
   });
 
@@ -374,6 +377,7 @@ describe("audit-only boundary (nothing owed) — no bid, tip only", () => {
     const audits = wireTxs();
     expect(audits).toHaveLength(5);
     expect(audits.every((s) => s.tipGwei === AUDIT_TIP_GWEI)).toBe(true);
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(5);
   });
 

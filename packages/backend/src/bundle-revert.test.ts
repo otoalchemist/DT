@@ -39,9 +39,12 @@ vi.mock("./config.js", () => ({
 }));
 
 const sendRawTransaction = vi.fn(async () => "0xmirror");
+/** Timestamp the mocked chain head reports. Drives the mirror gate. */
+let headTs = 0n;
 vi.mock("./chain.js", () => ({
   publicClient: {
     getBlockNumber: vi.fn(async () => 100n),
+    getBlock: vi.fn(async () => ({ timestamp: headTs, baseFeePerGas: 1_000_000_000n })),
     sendRawTransaction,
     estimateGas: vi.fn(async () => 100_000n),
   },
@@ -81,7 +84,7 @@ vi.mock("./nonce.js", () => ({
   },
 }));
 
-const { submitTx, beginBundle, flushBundle, setRaceBoundary } = await import("./flashbots.js");
+const { submitTx, beginBundle, flushBundle, setRaceBoundary, awaitPendingMirrors, resetPendingMirrors } = await import("./flashbots.js");
 const { publicClient } = await import("./chain.js");
 
 /** Every eth_sendBundle body POSTed during a flush. */
@@ -304,5 +307,84 @@ describe("minTimestamp: a race can never execute before its boundary", () => {
     await queue({ race: true });
     await flushBundle();
     expect(publicClient.getBlockNumber).toHaveBeenCalledWith({ cacheTime: 0 });
+  });
+});
+
+/**
+ * The mempool mirror cannot carry `minTimestamp`, so the bundle guard does not protect it: a
+ * builder is free to put a mirrored payment or audit in a PRE-boundary block, where the epoch
+ * has not advanced and it reverts. Audit 0x44ce0008…b496 died exactly that way.
+ *
+ * So a race mirror is held until the slot before the boundary has produced a block. Once that
+ * block exists it is sealed, so the next one must be the boundary block. Waiting on the BLOCK
+ * rather than the clock is the point: that slot was published ~8s late, and any wall-clock
+ * lead would still have been swept into it.
+ */
+describe("mirror gate: a race mirror waits for the pre-boundary block", () => {
+  const BOUNDARY = 1787011175n; // 2026-08-17T23:59:35Z
+
+  beforeEach(() => {
+    // Controlled clock: the gate gives up once the boundary has passed, so with the real
+    // clock (now well past this boundary) it would resolve instantly and prove nothing.
+    vi.useFakeTimers();
+    vi.setSystemTime(Number(BOUNDARY - 5n) * 1000); // mid-race, 5s out
+    resetPendingMirrors(); // a gate left pending by a previous case must not be awaited here
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("does NOT broadcast while the head is still two slots back", async () => {
+    // Precisely the epoch-169 situation: submitted with the pre-boundary slot unfilled.
+    headTs = BOUNDARY - 24n;
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+    expect(sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("broadcasts once the pre-boundary block exists", async () => {
+    // The pre-boundary block is sealed, so the next block must be the boundary block and the
+    // mirror can no longer be mined too early.
+    headTs = BOUNDARY - 12n;
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+    await awaitPendingMirrors();
+    expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("broadcasts when the boundary itself has already arrived", async () => {
+    // Past the boundary every new block is at or after it, so holding buys nothing.
+    headTs = BOUNDARY;
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+    await awaitPendingMirrors();
+    expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not gate an ordinary tick — no race, no wait", async () => {
+    // beginBundle clears the boundary, so a routine bundle mirrors immediately as before.
+    headTs = BOUNDARY - 24n;
+    beginBundle();
+    await queue({ race: true });
+    await flushBundle();
+    expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("still reports ok for a gated mirror, so the caller cannot double-pay", async () => {
+    // ok gates whether jitPass marks a citizen handled. Reporting false for a mirror that has
+    // merely not been SENT yet would make it retry on a fresh nonce and pay twice.
+    headTs = BOUNDARY - 24n;
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    const r = await queue({ race: true });
+    const out = await flushBundle();
+    expect(sendRawTransaction).not.toHaveBeenCalled();       // genuinely still held
+    expect(out.get(r.nonce)?.ok).toBe(true);
+    expect(out.get(r.nonce)?.error).toBeUndefined();
+    expect(out.get(r.nonce)?.predictedTxHash).toBeDefined(); // receipt is still trackable
   });
 });

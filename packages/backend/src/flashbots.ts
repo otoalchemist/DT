@@ -305,6 +305,63 @@ export interface BundleTxResult {
 }
 
 /**
+ * Gated race mirrors that have not been sent yet. Detached from the flush on purpose (see
+ * below), so this is the only handle on them — exported for tests, which would otherwise be
+ * asserting against a send that may or may not have happened yet.
+ */
+const pendingMirrors: Promise<void>[] = [];
+
+/** Forget any still-pending gated mirror without awaiting it. For tests: a gate left
+ *  deliberately unresolved would otherwise make a later awaitPendingMirrors hang. */
+export function resetPendingMirrors(): void {
+  pendingMirrors.length = 0;
+}
+
+/** Wait for every gated mirror to have been attempted. For tests. */
+export async function awaitPendingMirrors(): Promise<void> {
+  while (pendingMirrors.length > 0) await pendingMirrors.shift();
+}
+
+/** One Ethereum slot. Boundaries are slot-aligned (86,400 / 12 = 7,200 exactly). */
+const SLOT_SECONDS = 12n;
+
+/**
+ * Hold a race mirror until the slot BEFORE the boundary has produced a block.
+ *
+ * `minTimestamp` protects the bundle copy, but a public-mempool transaction carries no such
+ * field — nothing stops a builder putting it in a pre-boundary block, where the epoch has not
+ * advanced and a payment or audit reverts. That is a real loss, not a hypothetical: audit
+ * 0x44ce0008…b496 reverted at index 5 of the pre-boundary block with `NotDelinquent()`,
+ * burning 0.024 ETH and its nonce, which killed the copy aimed at the boundary block.
+ *
+ * Once the pre-boundary block EXISTS it is sealed, so the next block must be the boundary
+ * block — and a transaction broadcast after that point cannot be mined too early. Waiting on
+ * the block rather than on the clock is what makes this robust to the actual failure: that
+ * slot was published ~8 seconds LATE, so any wall-clock lead would still have been swept in.
+ *
+ * Normally this makes the mirror go out EARLIER than before, not later: the pre-boundary slot
+ * starts a full 12s ahead of the boundary, so its block usually exists by boundary-11s,
+ * against the old fixed boundary-5s. It only delays when the slot is late, which is exactly
+ * when delay is the point.
+ *
+ * Deliberately gives up after the boundary passes: from then on every new block is at or past
+ * it, so broadcasting is safe regardless.
+ */
+async function preBoundarySlotSettled(boundaryTs: bigint): Promise<void> {
+  const deadlineMs = Number(boundaryTs) * 1000 + 2_000;
+  for (;;) {
+    try {
+      const b = await publicClient.getBlock({ blockTag: "latest" });
+      if (b.timestamp >= boundaryTs - SLOT_SECONDS) return;
+    } catch {
+      // Transient read failure: fall through to the wait and try again.
+    }
+    if (Date.now() >= deadlineMs) return;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
+/**
  * Send everything queued since beginBundle() as a single atomic multi-tx bundle
  * (txs in ascending-nonce order) per target block, mirroring each race-flagged tx
  * to the public mempool as a fallback. Returns a per-nonce result map so the
@@ -381,18 +438,31 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   );
 
   // Public-mempool mirror per race-flagged tx (identical tx: same nonce/sig, so
-  // only one copy of each can ever land). Fired concurrently with the bundle.
-  const broadcasts = queue.map((q) =>
-    q.race
-      ? publicClient
-          .sendRawTransaction({ serializedTransaction: q.signed })
-          .then((h) => ({ nonce: q.nonce, txHash: h as Hex | undefined }))
-          .catch((err) => {
-            logger.warn(`public broadcast (nonce ${q.nonce}) failed:`, (err as Error).message);
-            return { nonce: q.nonce, txHash: undefined as Hex | undefined };
-          })
-      : Promise.resolve({ nonce: q.nonce, txHash: undefined as Hex | undefined }),
-  );
+  // only one copy of each can ever land).
+  //
+  // On a RACE the mirror is held behind preBoundarySlotSettled and fired detached, because
+  // waiting here would hold `ticking` and push the following fire (the audit bundle) past the
+  // boundary it is racing into. Off a race — an ordinary tick — it goes out immediately and
+  // concurrently with the bundle, exactly as before.
+  // Local const so TS narrows it inside the closures below.
+  const raceTs = raceBoundaryTs;
+  const gate = raceTs !== null ? preBoundarySlotSettled(raceTs) : null;
+  const broadcasts = queue.map((q) => {
+    if (!q.race) return Promise.resolve({ nonce: q.nonce, txHash: undefined as Hex | undefined });
+    const send = () =>
+      publicClient
+        .sendRawTransaction({ serializedTransaction: q.signed })
+        .then((h) => ({ nonce: q.nonce, txHash: h as Hex | undefined }))
+        .catch((err) => {
+          logger.warn(`public broadcast (nonce ${q.nonce}) failed:`, (err as Error).message);
+          return { nonce: q.nonce, txHash: undefined as Hex | undefined };
+        });
+    if (gate === null) return send();
+    // Detached: resolve now so the flush is not blocked, and let the gate fire the send.
+    // Tracked so tests (and a shutdown) can wait for it — see awaitPendingMirrors.
+    pendingMirrors.push(gate.then(send).then(() => undefined));
+    return Promise.resolve({ nonce: q.nonce, txHash: undefined as Hex | undefined });
+  });
 
   const [settled, mirrors] = await Promise.all([
     Promise.allSettled(attempts),
@@ -440,13 +510,22 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   const txHashByNonce = new Map(mirrors.map((m) => [m.nonce, m.txHash]));
   for (const q of queue) {
     const txHash = txHashByNonce.get(q.nonce);
+    /**
+     * A gated race mirror has not been sent yet, so it reports no hash — but it IS a live
+     * path and must count as one. `ok` gates whether the caller marks a citizen handled
+     * (jitPass) or paid (queuePreBoundaryPayments); reporting false here would make it retry
+     * on a fresh nonce and pay the same citizen twice once the mirror lands. Biasing toward
+     * ok is the safe direction: the nonce is already committed and either the bundle or the
+     * pending mirror will carry it.
+     */
+    const mirrorPending = gate !== null && q.race;
     out.set(q.nonce, {
-      ok: bundleOk || txHash !== undefined,
+      ok: bundleOk || txHash !== undefined || mirrorPending,
       txHash,
       // Known for every tx whether or not it was broadcast — see BundleTxResult.
       predictedTxHash: keccak256(q.signed),
       bundleHash,
-      error: !bundleOk && txHash === undefined ? "no bundle accepted" : undefined,
+      error: !bundleOk && txHash === undefined && !mirrorPending ? "no bundle accepted" : undefined,
     });
   }
   return out;
