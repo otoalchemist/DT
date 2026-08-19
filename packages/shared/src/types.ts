@@ -171,7 +171,10 @@ export interface TargetScoreRow {
   tipE2?: number | null;
   tipE1?: number | null;
   /**
-   * Their DEFENSE DENSITY (tip + bid/gas) in each of those epochs, and the beat price for each.
+   * The DENSITY they mounted in each of those epochs — payment bundle or audit bundle, whichever
+   * was denser — and the beat price for each. A block does not care which side a bundle was on,
+   * so pricing these off payments alone left them blank at exactly the boundaries where a rival
+   * owed nothing and audited instead.
    * The visible Beat columns are priced from these three windows — two epochs ago, one epoch
    * ago, and peak — which replaced the old recent-2-epoch / peak / boundary-only trio.
    *

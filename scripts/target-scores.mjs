@@ -930,6 +930,32 @@ async function main() {
    */
   const priceTip = (gwei) => (gwei === null ? null : Math.ceil(gwei) + 1);
 
+  /**
+   * What each rival actually MOUNTED per epoch, whether it was paying or auditing.
+   *
+   * The per-epoch Beat columns price "what do I have to out-rank at that boundary", and a block
+   * does not care which side a bundle was on — 31 gwei/gas of audit bundle is exactly as much in
+   * the way as 31 gwei/gas of payment bundle. Pricing Beat -1 off payments alone left it blank
+   * at any boundary where the rival owed nothing, which is precisely the boundary an ally on the
+   * opposite schedule has to win.
+   *
+   * The denser bundle wins the slot, and its OWN tip is reported with it, so the tip and density
+   * in a row always come from the same bundle rather than being two unrelated maxima. Ties go to
+   * the payment, which is the more common case and the one the defense columns describe.
+   */
+  const mountedByEpoch = {}; // token -> Map(epoch -> { density, tip })
+  for (const t of rivals) {
+    const m = new Map();
+    for (const [E, density] of densityByEpoch[t] ?? new Map()) {
+      m.set(E, { density, tip: defense[t]?.byEpoch?.get(E) ?? 0 });
+    }
+    for (const [E, a] of atkByToken[t] ?? new Map()) {
+      const prev = m.get(E);
+      if (!prev || a.density > prev.density) m.set(E, { density: a.density, tip: a.tipGwei });
+    }
+    if (m.size > 0) mountedByEpoch[t] = m;
+  }
+
   // Score each live, non-emigrated rival.
   const rows = [];
   for (const t of rivals) {
@@ -982,9 +1008,12 @@ async function main() {
     // where the ordering assumption underneath all of this did not hold at all.
     //
     // (Defined once above the loop — the lead-bar pricing after it needs the same formula.)
-    // Ceiling: the strongest defense seen anywhere in the window. maxTip is the floor
-    // here so a tip-only defender is still priced when tracing is unavailable.
-    const defenseGwei = Math.max(dd.maxTip, bidDensity[t] ?? 0);
+    // Ceiling: the strongest thing seen anywhere in the window. maxTip is the floor here so a
+    // tip-only defender is still priced when tracing is unavailable, and the attack peak is
+    // included because Beat max must never read BELOW Beat -1 — a rival whose densest bundle was
+    // an audit one would otherwise price cheaper at its peak than at a specific epoch.
+    const atkPeak = atkByToken[t] ? Math.max(...[...atkByToken[t].values()].map((v) => v.density)) : 0;
+    const defenseGwei = Math.max(dd.maxTip, bidDensity[t] ?? 0, atkPeak);
     const beatBidEth = priceBid(defenseGwei);
     // Recent: the last 2 epochs only — likely cost at the NEXT boundary. null when it made
     // no payment in that span, which is a different statement from "it defends weakly".
@@ -1065,8 +1094,8 @@ async function main() {
       bidKindE2: bidKindByToken[t]?.e2 ?? null,
       bidKindE1: bidKindByToken[t]?.e1 ?? null,
       bidKindPeak: bidKindByToken[t]?.peak ?? null,
-      tipE2: dd.byEpoch?.has(E2.toString()) ? +dd.byEpoch.get(E2.toString()).toFixed(1) : null,
-      tipE1: dd.byEpoch?.has(E1.toString()) ? +dd.byEpoch.get(E1.toString()).toFixed(1) : null,
+      tipE2: mountedByEpoch[t]?.has(E2.toString()) ? +mountedByEpoch[t].get(E2.toString()).tip.toFixed(1) : null,
+      tipE1: mountedByEpoch[t]?.has(E1.toString()) ? +mountedByEpoch[t].get(E1.toString()).tip.toFixed(1) : null,
       /**
        * Every epoch this rival was observed defending, for the trend sparkline.
        *
@@ -1074,15 +1103,15 @@ async function main() {
        * walk every payment block in the window anyway. Widening --epochs costs Alchemy calls;
        * reading this out does not.
        */
-      densitySeries: Object.entries(Object.fromEntries(densityByEpoch[t] ?? new Map()))
-        .map(([epoch, density]) => ({ epoch: Number(epoch), density: +density.toFixed(1) }))
+      densitySeries: [...(mountedByEpoch[t] ?? new Map())]
+        .map(([epoch, v]) => ({ epoch: Number(epoch), density: +v.density.toFixed(1) }))
         .sort((a, b) => a.epoch - b.epoch),
-      defenseE2Gwei: densityByEpoch[t]?.has(E2.toString()) ? +densityByEpoch[t].get(E2.toString()).toFixed(1) : null,
-      defenseE1Gwei: densityByEpoch[t]?.has(E1.toString()) ? +densityByEpoch[t].get(E1.toString()).toFixed(1) : null,
-      beatBidE2Eth: densityByEpoch[t]?.has(E2.toString()) ? priceBid(densityByEpoch[t].get(E2.toString())) : null,
-      beatBidE1Eth: densityByEpoch[t]?.has(E1.toString()) ? priceBid(densityByEpoch[t].get(E1.toString())) : null,
-      beatTipE2Gwei: densityByEpoch[t]?.has(E2.toString()) ? priceTip(densityByEpoch[t].get(E2.toString())) : null,
-      beatTipE1Gwei: densityByEpoch[t]?.has(E1.toString()) ? priceTip(densityByEpoch[t].get(E1.toString())) : null,
+      defenseE2Gwei: mountedByEpoch[t]?.has(E2.toString()) ? +mountedByEpoch[t].get(E2.toString()).density.toFixed(1) : null,
+      defenseE1Gwei: mountedByEpoch[t]?.has(E1.toString()) ? +mountedByEpoch[t].get(E1.toString()).density.toFixed(1) : null,
+      beatBidE2Eth: mountedByEpoch[t]?.has(E2.toString()) ? priceBid(mountedByEpoch[t].get(E2.toString()).density) : null,
+      beatBidE1Eth: mountedByEpoch[t]?.has(E1.toString()) ? priceBid(mountedByEpoch[t].get(E1.toString()).density) : null,
+      beatTipE2Gwei: mountedByEpoch[t]?.has(E2.toString()) ? priceTip(mountedByEpoch[t].get(E2.toString()).density) : null,
+      beatTipE1Gwei: mountedByEpoch[t]?.has(E1.toString()) ? priceTip(mountedByEpoch[t].get(E1.toString()).density) : null,
       payBlkMin, payBlkMed, audited: aud,
       beatBidEth, defenseUnexplained, unexplainedReason,
       // The two levers, per rival. Same bar, priced both ways: a tip that needs no builder
@@ -1438,11 +1467,11 @@ async function main() {
     const best = [...rows].filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);
     console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
     console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted");
-    console.log("def -2/-1/max = THEIR priority tip in gwei at the -2 boundary / the -1 (LATEST) boundary / their peak · -1 is the current epoch, since epoch N's boundary is when N begins · '·' = no payment observed in that epoch");
+    console.log("def -2/-1/max = THEIR priority tip in gwei at the -2 boundary / the -1 (LATEST) boundary / their peak — the tip of whichever bundle was DENSER that epoch, so tip and density always come from the same bundle · '·' = they did nothing that epoch");
     console.log("trend = defense density per epoch as a sparkline, oldest to newest, scaled to THIS rival's own range (shape, not magnitude) · arrow = robust direction over the whole window: up = escalating, so price off Max; down = retreating, so recent is cheaper than Max suggests; right = steady");
     console.log("atk/def bid -2/-1/max = THEIR coinbase bid in ETH at the -2 boundary / the -1 (latest) boundary / their biggest in the window — counted whether it backed a PAYMENT or an AUDIT, since a bid buys position either way · Hedo at epoch 170 paid no tax and bid 0.03 behind ten audits, which a payment-only column reported as no bid at all");
     console.log("idx = lowest tx index they ever reached (position, not price) · theirBid -2/-1/max = their OWN coinbase bid in ETH over the same windows, leading zero dropped");
-    console.log("tip-2/tip-1/tipMax = PRIORITY FEE (gwei) that out-densities them with no bid, priced against what they mounted at the -2 boundary / the -1 (LATEST) boundary / at their peak");
+    console.log("tip-2/tip-1/tipMax = PRIORITY FEE (gwei) that out-densities them with no bid, priced against what they MOUNTED at the -2 boundary / the -1 (LATEST) boundary / at their peak — counting their audit bundles as well as their payments, since a block does not care which side a bundle was on");
     // Levers quoted in different units cannot be compared as printed, so convert. The tip is
     // charged over OUR_TIP_GAS (no bid tx on this route), which is what makes a flat bid the
     // cheaper lever on a small bundle even when the gwei figure looks modest.
