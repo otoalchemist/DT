@@ -151,12 +151,12 @@ export interface TargetScoreRow {
   bidPeakEth?: number | null;
   bidPeakRecent?: boolean | null;
   /**
-   * The same bid bucketed by epoch: `bidNowEth` is the CURRENT epoch, `bidPrevEth` the one
-   * before. Rendered with the peak as `now/-1/max`, because one number cannot distinguish a
-   * steady bidder you must price for every time from one that has stopped bidding.
+   * The same bid bucketed by epoch: two epochs ago and one epoch ago, rendered with the peak
+   * as -2/-1/max, because one number cannot distinguish a steady bidder you must price for
+   * every time from one that has stopped bidding.
    *
-   * "now" is the current epoch rather than "one ago" on purpose: the boundary for epoch N
-   * happens when epoch N begins, so a rival's freshest defense lands in the current epoch.
+   * A bid placed in the CURRENT epoch appears only in the peak — the two dated slots are the
+   * previous two epochs.
    */
   bidE2Eth?: number | null;
   bidE1Eth?: number | null;
@@ -175,6 +175,14 @@ export interface TargetScoreRow {
    * defenseBoundaryGwei and beatBoundaryEth are still populated for anything that wants
    * boundary-block-only defense; they just no longer have a column of their own.
    */
+  /**
+   * Defense density per epoch, oldest first — the series behind the trend sparkline.
+   *
+   * Free to produce: the scan already walks every payment block in the window to trace
+   * coinbase bids, so this is a read-out of work already done. Widening the window costs
+   * provider calls; this does not.
+   */
+  densitySeries?: { epoch: number; density: number }[];
   defenseE2Gwei?: number | null;
   defenseE1Gwei?: number | null;
   beatBidE2Eth?: number | null;

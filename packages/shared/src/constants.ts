@@ -4,7 +4,7 @@
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.6.1" as const;
+export const VERSION = "1.7.0" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
@@ -210,4 +210,68 @@ export function tipOnlyBundleGas(payments: number, audits: number): number {
  */
 export function tipCostEth(tipGwei: number, payments: number, audits: number): number {
   return (tipGwei * tipOnlyBundleGas(payments, audits)) / 1e9;
+}
+
+/** One epoch's observed defense density for a rival. */
+export interface DensityPoint {
+  epoch: number;
+  /** Peak (coinbase bid + priority tips) / gas that epoch, in gwei per gas. */
+  density: number;
+}
+
+export interface DensityTrend {
+  direction: "rising" | "falling" | "flat";
+  /** Least-squares slope in gwei/gas per epoch — the number `direction` is derived from. */
+  slopePerEpoch: number;
+  /** Change from the first observed epoch to the last, as a percentage of the first. */
+  changePct: number;
+  first: number;
+  last: number;
+  /** Epochs actually observed. Fewer than the window means the rival skipped some. */
+  points: number;
+}
+
+/**
+ * Which way a rival's defense is moving across the epochs it was observed defending.
+ *
+ * Uses a THEIL-SEN slope — the median of all pairwise slopes — not least squares. Rivals
+ * routinely pay 0.6 gwei mid-epoch when nothing is at risk, and a least-squares fit lets one
+ * such point dominate: a flat 364-gwei defender with a single cheap epoch measured a +12.5%
+ * slope and reported "rising", which is the opposite of the truth. The median of pairwise
+ * slopes is unmoved by a minority of outliers.
+ *
+ * The slope is judged relative to the mean so one threshold serves every scale — a rival at
+ * 2 gwei/gas and one at 450 are held to the same standard of "has this really moved".
+ *
+ * Division of labour worth keeping straight: this answers "is the general LEVEL moving", which
+ * is what decides whether to price the next boundary off the peak or off recent behaviour. It
+ * deliberately does not answer "what did they do last time" — the -2/-1/max columns do that,
+ * and `changePct` carries the raw first-to-last move for anyone who wants the endpoints.
+ *
+ * Returns null below two points: one observation is not a trend, and reporting "flat" for it
+ * would be a claim the data cannot support.
+ */
+export function densityTrend(series: DensityPoint[]): DensityTrend | null {
+  const pts = [...series].filter((p) => Number.isFinite(p.density)).sort((a, b) => a.epoch - b.epoch);
+  if (pts.length < 2) return null;
+  const n = pts.length;
+  // Median of pairwise slopes. n is at most the scan window (~10-20), so O(n^2) is nothing.
+  const slopes: number[] = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const dx = pts[j]!.epoch - pts[i]!.epoch;
+      if (dx !== 0) slopes.push((pts[j]!.density - pts[i]!.density) / dx);
+    }
+  }
+  slopes.sort((x, y) => x - y);
+  const mid = Math.floor(slopes.length / 2);
+  const slopePerEpoch =
+    slopes.length === 0 ? 0 : slopes.length % 2 === 1 ? slopes[mid]! : (slopes[mid - 1]! + slopes[mid]!) / 2;
+  const meanY = pts.reduce((s, p) => s + p.density, 0) / n;
+  const first = pts[0]!.density;
+  const last = pts[n - 1]!.density;
+  const rel = meanY === 0 ? 0 : slopePerEpoch / meanY;
+  const direction = Math.abs(rel) < 0.05 ? "flat" : rel > 0 ? "rising" : "falling";
+  const changePct = first === 0 ? (last === 0 ? 0 : 100) : ((last - first) / first) * 100;
+  return { direction, slopePerEpoch, changePct, first, last, points: n };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { bidToBeat, bundleGas, tipCostEth, tipOnlyBundleGas, type TargetScoreRow, type TargetScoresState } from "@dat-bot/shared";
+import { bidToBeat, bundleGas, densityTrend, tipCostEth, tipOnlyBundleGas, type TargetScoreRow, type TargetScoresState } from "@dat-bot/shared";
 import { api } from "./api.js";
 
 /**
@@ -73,6 +73,68 @@ function TipLine({ density, plan }: { density: number | null | undefined; plan: 
 }
 
 /**
+ * Defense density per epoch, as a sparkline plus a direction.
+ *
+ * A sparkline and not a full chart because the job is "which way is this moving", per row, for
+ * forty rows — axes would cost more space than they buy, and the def/beat columns beside it
+ * already carry the absolute numbers. Scaled to this rival's own min..max, so shape is the
+ * encoding and magnitude deliberately is not: a flat 2 gwei defender and a flat 450 gwei one
+ * look the same here, which is the point. The tooltip carries every value so the shape can
+ * never be mistaken for a height.
+ *
+ * One series, so no legend. The line is de-emphasis ink with the latest point in the direction
+ * colour, and the direction is carried by an ARROW GLYPH — never by colour alone. Rising is
+ * amber rather than green because a rival's defense climbing is bad news for the reader.
+ */
+function DensitySpark({ series }: { series?: { epoch: number; density: number }[] }) {
+  if (!series || series.length === 0) {
+    return <span className="muted" title="No payment observed in the window — nothing to trend.">·</span>;
+  }
+  const t = densityTrend(series);
+  const vals = series.map((p) => p.density);
+  const lo = Math.min(...vals);
+  const hi = Math.max(...vals);
+  const W = 54, H = 14, PAD = 2;
+  const x = (i: number) => (series.length === 1 ? W / 2 : PAD + (i * (W - PAD * 2)) / (series.length - 1));
+  const y = (v: number) => (hi === lo ? H / 2 : H - PAD - ((v - lo) / (hi - lo)) * (H - PAD * 2));
+  const colour =
+    t === null || t.direction === "flat"
+      ? "var(--muted)"
+      : t.direction === "rising" ? "var(--amber)" : "var(--green)";
+  const arrow = t === null ? "" : t.direction === "rising" ? "↑" : t.direction === "falling" ? "↓" : "→";
+  const title =
+    "Defense density by epoch (gwei/gas), oldest first:\n" +
+    series.map((p) => `  epoch ${p.epoch}: ${p.density}`).join("\n") +
+    (t === null
+      ? "\nOnly one epoch observed — not enough for a trend."
+      : `\n\n${t.direction.toUpperCase()} — ${t.slopePerEpoch >= 0 ? "+" : ""}${t.slopePerEpoch.toFixed(1)} gwei/gas per epoch` +
+        " (median of pairwise slopes, so one cheap mid-epoch payment cannot swing it)." +
+        ` First to last: ${t.first} → ${t.last} (${t.changePct >= 0 ? "+" : ""}${t.changePct.toFixed(0)}%), ${t.points} epoch(s) observed.` +
+        (t.direction === "rising"
+          ? " Escalating, so price the next boundary off Beat max rather than off what they did last."
+          : t.direction === "falling"
+            ? " Retreating, so Beat max is likely dearer than you need — check Beat -1."
+            : " Steady, so the Beat figures are reliable.")) +
+    "\nScaled to this rival's own range: the shape is the signal, not the height.";
+  return (
+    <span title={title} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+      <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`density trend ${t?.direction ?? "single observation"}`}>
+        <polyline
+          points={series.map((p, i) => `${x(i)},${y(p.density)}`).join(" ")}
+          fill="none"
+          stroke="var(--muted)"
+          strokeWidth={1.5}
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+        <circle cx={x(series.length - 1)} cy={y(vals[vals.length - 1]!)} r={2} fill={colour} />
+      </svg>
+      <span style={{ color: colour, fontSize: 11 }}>{arrow}</span>
+    </span>
+  );
+}
+
+/**
  * Make a small numeric field behave like one you can just retype: focus or click it and
  * the value is selected, so the next keystroke replaces it instead of appending.
  *
@@ -109,6 +171,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Epochs the owner's balance covers across all their citizens">Runway</th>
             <th style={cell} title="Can the owner afford the next-boundary catch-up?">Afford</th>
             <th style={cell} title="THEIR priority tip in gwei as -2/-1/max: two epochs ago, one epoch ago, and their peak. Three fields because a lone peak cannot tell a rival still defending at that level from one that defended once and has coasted since. · = no payment observed in that epoch, which is missing data rather than a cheap defense.">Def<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>-2/-1/max</span></th>
+            <th style={cell} title="Defense density per epoch, oldest to newest, scaled to this rival's own range — the shape is the signal, not the height (hover for every value). The arrow is the direction over the whole window, from a median-of-pairwise-slopes fit so one cheap mid-epoch payment cannot swing it: up = escalating, so price off Beat max; down = retreating, so Beat max is dearer than you need; right = steady. Costs no extra provider calls — the scan already reads these blocks.">Trend</th>
             <th style={cell} title="Lowest tx index this rival ever reached. Its own column because position is a different axis from price: index 0 on tip alone is expensive but beatable, whereas a bid-backed index 0 is genuinely out of reach.">Idx</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
             <th style={cell} title="THEIR biggest single coinbase bid over the whole window, in ETH — not what you would pay, which is the Beat columns. Shown as -2/-1/max: two epochs ago, one epoch ago, and the biggest seen over the whole window, so you can tell a steady bidder from one that has stopped. A bid placed in the CURRENT epoch appears only in max. Read it next to Beat max, because it is usually the explanation: a bid over a small bundle dominates density, so a rival can tip only 90 gwei and still cost 448 gwei/gas to out-rank. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Their bid<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>-2/-1/max</span></th>
@@ -171,6 +234,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                 {r.maxTip >= 10 ? r.maxTip.toFixed(0) : r.maxTip.toFixed(1)}
               </td>
               <td style={cell}>{r.bestIdx ?? "—"}</td>
+              <td style={cell}><DensitySpark series={r.densitySeries} /></td>
               <td style={cell} title={r.payBlkMin === null ? "no payment seen in window" : undefined}>
                 {r.payBlkMin === null ? "—" : `${r.payBlkMin}/${r.payBlkMed}`}
               </td>

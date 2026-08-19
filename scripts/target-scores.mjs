@@ -113,6 +113,28 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dataDir = path.join(root, "data");
 
 const GAME = "0xa448c7f618087dda1a3b128cad8a424fbae4b71f";
+/**
+ * Robust trend direction (Theil-Sen: median of pairwise slopes) over a rival's per-epoch
+ * defense density. Duplicated from densityTrend() in shared/constants.ts on purpose — this
+ * script runs standalone against an RPC and cannot import the workspace. The shared copy is
+ * the tested one; keep them in step.
+ */
+function densityTrend(series) {
+  const pts = [...series].filter((p) => Number.isFinite(p.density)).sort((a, b) => a.epoch - b.epoch);
+  if (pts.length < 2) return null;
+  const slopes = [];
+  for (let i = 0; i < pts.length; i++)
+    for (let j = i + 1; j < pts.length; j++) {
+      const dx = pts[j].epoch - pts[i].epoch;
+      if (dx !== 0) slopes.push((pts[j].density - pts[i].density) / dx);
+    }
+  slopes.sort((x, y) => x - y);
+  const mid = Math.floor(slopes.length / 2);
+  const slope = slopes.length === 0 ? 0 : slopes.length % 2 ? slopes[mid] : (slopes[mid - 1] + slopes[mid]) / 2;
+  const meanY = pts.reduce((s, p) => s + p.density, 0) / pts.length;
+  const rel = meanY === 0 ? 0 : slope / meanY;
+  return { direction: Math.abs(rel) < 0.05 ? "flat" : rel > 0 ? "rising" : "falling", slopePerEpoch: slope };
+}
 // Citizens held by ANY of these have left the main game. There are two routes now, and
 // scoring only the first meant ABBC emigrants were still ranked as live targets — #1000
 // came out 3rd-best on a scan while it was already out of the game, where an audit can only
@@ -884,6 +906,16 @@ async function main() {
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
       tipE2: dd.byEpoch?.has((ce - 2n).toString()) ? +dd.byEpoch.get((ce - 2n).toString()).toFixed(1) : null,
       tipE1: dd.byEpoch?.has((ce - 1n).toString()) ? +dd.byEpoch.get((ce - 1n).toString()).toFixed(1) : null,
+      /**
+       * Every epoch this rival was observed defending, for the trend sparkline.
+       *
+       * FREE: densityByEpoch is already filled in by the bid/density pass above, which has to
+       * walk every payment block in the window anyway. Widening --epochs costs Alchemy calls;
+       * reading this out does not.
+       */
+      densitySeries: Object.entries(Object.fromEntries(densityByEpoch[t] ?? new Map()))
+        .map(([epoch, density]) => ({ epoch: Number(epoch), density: +density.toFixed(1) }))
+        .sort((a, b) => a.epoch - b.epoch),
       defenseE2Gwei: densityByEpoch[t]?.has((ce - 2n).toString()) ? +densityByEpoch[t].get((ce - 2n).toString()).toFixed(1) : null,
       defenseE1Gwei: densityByEpoch[t]?.has((ce - 1n).toString()) ? +densityByEpoch[t].get((ce - 1n).toString()).toFixed(1) : null,
       beatBidE2Eth: densityByEpoch[t]?.has((ce - 2n).toString()) ? priceBid(densityByEpoch[t].get((ce - 2n).toString())) : null,
@@ -1077,6 +1109,29 @@ async function main() {
     const f = (x) => (x === null || x === undefined ? "·" : x >= 10 ? x.toFixed(0) : x.toFixed(1));
     return `${f(r.tipE2)}/${f(r.tipE1)}/${f(r.maxTip)}`.padStart(14);
   };
+  /**
+   * An eight-level ASCII sparkline of defense density per epoch, plus the direction.
+   *
+   * Scaled to THIS rival's own min..max, like every sparkline: it shows shape, not magnitude,
+   * and the def/beat columns beside it carry the absolute numbers. A flat run of a
+   * 2 gwei defender and a flat run of a 450 gwei one therefore look identical here, which is
+   * the intent — the question this column answers is "which way is it moving".
+   */
+  const sparkCol = (r) => {
+    const series = r.densitySeries ?? [];
+    if (series.length === 0) return "".padEnd(14);
+    const bars = "▁▂▃▄▅▆▇█".split("");
+    const vals = series.map((p) => p.density);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const spark = vals
+      .map((v) => bars[hi === lo ? 3 : Math.min(bars.length - 1, Math.floor(((v - lo) / (hi - lo)) * (bars.length - 1)))])
+      .join("");
+    const t = densityTrend(series);
+    // Arrow AND the word are carried by the caller's legend, never colour alone — this is a
+    // plain-text table, so the glyph IS the encoding.
+    const dir = t === null ? " " : t.direction === "rising" ? "↑" : t.direction === "falling" ? "↓" : "→";
+    return `${spark} ${dir}`.padEnd(14);
+  };
   /** Lowest tx index reached, its own column now — position is a different axis from price. */
   const idxCol = (r) => String(r.bestIdx ?? "-").padStart(4);
   /** Bid priced against boundary-block defence only — the block that actually decides an audit. */
@@ -1087,7 +1142,7 @@ async function main() {
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"} ${skipCol(r)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
-    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${defCol(r)} ${idxCol(r)} ${payBlkCol(r)} ${bidCol(r)}` +
+    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${defCol(r)} ${idxCol(r)} ${sparkCol(r)} ${payBlkCol(r)} ${bidCol(r)}` +
     ` | ${tipCol(r.beatTipE2Gwei)} ${tipCol(r.beatTipE1Gwei)} ${tipCol(r.beatTipGwei)}` +
     ` | ${e2Col(r)} ${e1Col(r)} ${beatCol(r)} | ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
   // The two right-hand groups are the point of the report: BEAT-BY-TIP is the priority fee
@@ -1095,7 +1150,7 @@ async function main() {
   // boundaries built by a solo validator that ignores coinbase transfers); BEAT-BY-BID is the
   // flat bid that gets there at YOUR configured tip instead.
   const header =
-    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd    def -2/-1/max  idx    payBlk    theirBid -2/-1/max" +
+    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd    def -2/-1/max  idx  trend           payBlk    theirBid -2/-1/max" +
     " | tip-2  tip-1 tipMax | bid-2  bid-1 bidMax | aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
@@ -1222,6 +1277,7 @@ async function main() {
     console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
     console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted");
     console.log("def -2/-1/max = THEIR priority tip in gwei, two epochs ago / one epoch ago / peak · '·' = no payment observed in that epoch");
+    console.log("trend = defense density per epoch as a sparkline, oldest to newest, scaled to THIS rival's own range (shape, not magnitude) · arrow = robust direction over the whole window: up = escalating, so price off Max; down = retreating, so recent is cheaper than Max suggests; right = steady");
     console.log("idx = lowest tx index they ever reached (position, not price) · theirBid -2/-1/max = their OWN coinbase bid in ETH over the same windows, leading zero dropped");
     console.log("tip-2/tip-1/tipMax = PRIORITY FEE (gwei) that out-densities them with no bid, priced against what they mounted TWO epochs ago / ONE epoch ago / at their peak");
     // Levers quoted in different units cannot be compared as printed, so convert. The tip is
