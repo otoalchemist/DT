@@ -62,8 +62,19 @@
 //             A ceiling, not a forecast: off-chain builder deals are invisible at any
 //             window length, and a peak from 8 epochs ago may never be repeated.
 //   aud       times ANY player successfully audited it in the window (proven catchable)
-//   bid       coinbase bid over the LAST 2 EPOCHS only — the "bidding right now" signal.
-//             ETH x bid-backed payments.
+//   theirBid  the RIVAL own coinbase bid — the biggest single one seen over the WHOLE
+//             window, in ETH. Not to be confused with bid2ep/bidMax/bidBnd, which are what
+//             YOU would have to bid.
+//             A trailing "*" means that peak is older than the last 2 epochs: they have bid
+//             this hard before and can again, but are not doing it right now.
+//             Read it next to beatMax, because it is usually the EXPLANATION for it. #2711
+//             tips only 90 gwei yet costs 448 gwei to beat, which looks impossible until you
+//             see the 0.0420 ETH bid it sends in a second transaction: over its small
+//             110,820-gas group that bid alone is 379 gwei/gas, i.e. 85% of the 448.
+//             This column deliberately reports the PEAK rather than a recent sum. It used to
+//             show only the last 2 epochs, so a rival that bid hard four epochs ago and
+//             coasted since read "-" while beatMax quoted a figure built from exactly that
+//             bid — which reads as a bug in the tool rather than a lull in their defense.
 //             A bid buys transaction position outright, so a bidder cures at index 0 and is
 //             near-unauditable however strapped it looks. Shared when one operator co-pays
 //             several citizens in a block. "?" = RPC has no trace_block.
@@ -392,6 +403,7 @@ async function main() {
     console.error(`tracing ${bidBlocks.length} payment blocks for coinbase bids…`);
   }
   const bidByToken = {}; // token -> { wei, pays } over the RECENT 2 epochs
+  const bidPeakByToken = {}; // token -> { wei, recent } — biggest single bid over the WHOLE window
   // Hoisted: the density calculation below needs the per-(block, sender) coinbase totals,
   // not just the per-token sums.
   const cbByBlockSender = new Map();
@@ -458,6 +470,24 @@ async function main() {
         if (wei <= 0n) continue;
         const e = (bidByToken[tok] ??= { wei: 0n, pays: 0 });
         e.wei += wei; e.pays++;
+      }
+      /**
+       * The PEAK bid over the WHOLE window, separately from the recent-2-epoch sum above.
+       *
+       * Without this a rival that bid hard four epochs ago and coasted since reads "-" in the
+       * bid column while beatMax quotes a number built from exactly that bid — the density
+       * calculation uses the full window, the column did not. #2711 is the case: 0.042 ETH at
+       * epochs 163 and 165 taking index 0 both times, nothing since, and a beat figure of 448
+       * gwei that looks unexplainable next to a blank bid column and a 90 gwei tip. 85% of
+       * that 448 IS the bid.
+       */
+      for (const l of payLogs) {
+        const tok = BigInt(l.topics[1]).toString(); const m = meta.get(l.transactionHash); if (!m) continue;
+        const wei = cbByBlockSender.get(`${m.blk}:${m.from}`) ?? 0n;
+        if (wei <= 0n) continue;
+        const e = (bidPeakByToken[tok] ??= { wei: 0n, recent: false });
+        if (wei > e.wei) e.wei = wei;
+        if (BigInt(l.blockNumber) >= bidWindowStart) e.recent = true;
       }
     }
   }
@@ -814,6 +844,10 @@ async function main() {
       // signal. null = RPC has no tracing (unknown).
       bidEth: tracingOk ? +eth(bidByToken[t]?.wei ?? 0n).toFixed(6) : null,
       bidPays: tracingOk ? (bidByToken[t]?.pays ?? 0) : null,
+      // Peak bid over the whole window + whether it is still recent. This is what explains a
+      // large beat figure on a rival that has not bid lately.
+      bidPeakEth: tracingOk ? +eth(bidPeakByToken[t]?.wei ?? 0n).toFixed(6) : null,
+      bidPeakRecent: tracingOk ? (bidPeakByToken[t]?.recent ?? false) : null,
       // ...and over the WHOLE window, which is what beatBid is priced against.
       bidWindowEth: tracingOk ? +eth(bidWindow[t]?.wei ?? 0n).toFixed(6) : null,
       bidWindowPays: tracingOk ? (bidWindow[t]?.pays ?? 0) : null,
@@ -927,7 +961,18 @@ async function main() {
       : r.unexplainedReason === "outranked-denser" ? "!" : "?").padStart(7);
   const beatNowCol = (r) =>
     (r.beatBidRecentEth === null ? "·" : r.beatBidRecentEth > 0 ? r.beatBidRecentEth.toFixed(4) : "-").padStart(7);
-  const bidCol = (r) => (r.bidEth === null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "-").padStart(8);
+  /**
+   * The rival OWN bid, peak over the window. "*" means the peak is older than the last 2
+   * epochs — they have bid this hard before and could again, but are not doing it right now.
+   * Shown as the peak rather than a recent sum so it can never read "-" while beatMax quotes
+   * a figure that the bid is what produced.
+   */
+  const bidCol = (r) => {
+    if (r.bidPeakEth === null && r.bidEth === null) return "?".padStart(9);
+    const peak = r.bidPeakEth ?? 0;
+    if (peak <= 0) return "-".padStart(9);
+    return `${peak.toFixed(4)}${r.bidPeakRecent ? " " : "*"}`.padStart(9);
+  };
   /** A tip bar in gwei, or "·" when the rival was never observed defending in that window. */
   const tipCol = (g) => (g === null || g === undefined ? "·" : String(g)).padStart(6);
   /** Bid priced against boundary-block defence only — the block that actually decides an audit. */
@@ -946,7 +991,7 @@ async function main() {
   // boundaries built by a solo validator that ignores coinbase transfers); BEAT-BY-BID is the
   // flat bid that gets there at YOUR configured tip instead.
   const header =
-    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk      bid" +
+    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk  theirBid" +
     " | tip2ep tipMax tipBnd | bid2ep bidMax bidBnd | aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 

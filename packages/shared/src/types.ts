@@ -136,6 +136,20 @@ export interface TargetScoreRow {
    */
   bidEth: number | null;
   bidPays: number | null;
+  /**
+   * The rival's BIGGEST single coinbase bid over the whole window, and whether that peak is
+   * still inside the recent 2 epochs.
+   *
+   * `bidEth` above is a recent-only sum, which meant a rival that bid hard four epochs ago and
+   * coasted since displayed no bid at all — while the Beat columns quoted a figure built from
+   * exactly that bid. #2711 is the case: tips 90 gwei, shows no recent bid, and costs 448 gwei
+   * to out-rank, because a 0.042 ETH bid over its small 110,820-gas group is 379 gwei/gas on
+   * its own. That reads as a broken tool rather than a lull in their defense.
+   *
+   * Optional: absent on rows cached before this field existed.
+   */
+  bidPeakEth?: number | null;
+  bidPeakRecent?: boolean | null;
   /** Same, over the WHOLE window — the bidding `beatBidEth` is actually priced against. */
   bidWindowEth?: number | null;
   bidWindowPays?: number | null;

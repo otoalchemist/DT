@@ -110,7 +110,7 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
             <th style={cell} title="Can the owner afford the next-boundary catch-up?">Afford</th>
             <th style={cell} title="Best (max) priority tip in gwei, and best (lowest) tx index reached">Def</th>
             <th style={cell} title="Blocks after the boundary they paid: fastest / median. 0 = pays in the boundary block">PayBlk</th>
-            <th style={cell} title="Coinbase bid over the last 2 epochs (ETH × bid-backed payments) — the 'are they bidding right now' signal, deliberately narrower than the window BeatBid is priced against. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Bid 2ep</th>
+            <th style={cell} title="THEIR biggest single coinbase bid over the whole window, in ETH — not what you would pay, which is the Beat columns. * means the peak is older than the last 2 epochs: they have defended this hard before and can again, but are not doing it now. Read it next to Beat max, because it is usually the explanation: a bid over a small bundle dominates density, so a rival can tip only 90 gwei and still cost 448 gwei/gas to out-rank. Shared when one operator co-pays several citizens in a block. ? = RPC has no tracing">Their bid</th>
             <th style={cell} title="What it takes to out-rank this rival's defense over the LAST 2 EPOCHS — the likely cost at the next boundary. Read it next to Beat/max: equal means a steady defender and the figure is reliable; a gap means it escalates. — = nothing needed. · = no payment in the last 2 epochs. Each cell shows BOTH ways past this rival: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid at all. Green means your current tip already clears it. The tip route works on every builder — including the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which sorts by priority fee and ignores coinbase transfers outright, where a bid buys nothing. And at equal density the tip is the CHEAPER lever, not the dearer one: the bid route must also send and tip the CoinbasePayer transaction (~30,550 gas), which costs it ~0.011-0.014 ETH more at any bundle size. The bid figure looks smaller only because it is quoted on top of a tip you are still paying. What the bid actually buys is scope: it is a per-boundary lever, while the configured tip re-prices every transaction the bot sends.">Beat 2ep<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
             <th style={cell} title="What it takes to out-rank this rival's PEAK defense density over the whole window — (coinbase bid + priority tips) / gas, the value-per-gas a builder sorts on. Peak, not recent: what you must clear is the strongest defense it has actually mounted. A ceiling, not a forecast — off-chain builder deals stay invisible. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids, and at equal density it is the cheaper lever — the bid route also sends and tips the CoinbasePayer tx (~30,550 gas), so it costs ~0.011-0.014 ETH more. The bid figure only looks smaller because it sits on top of a tip you already pay; what it really buys is scope, being per-boundary rather than a global tip change.">Beat max<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
             <th style={cell} title="THE COLUMN FOR A BOUNDARY RACE: what it takes to out-rank this rival in a boundary block specifically — its defense measured only on payments that landed at offset 0, rather than peaking across quiet mid-epoch payments where nobody is contesting position. 'free' means it was never seen paying in a boundary block at all: it stays auditable until it notices, so you can take it without winning any race and without spending anything. · = re-run the scan to populate this. Each cell shows BOTH levers: the top figure is the flat coinbase bid at your configured tip; the small figure under it is the priority fee that clears the same bar with no bid. Green = your current tip already clears it. Tip works on every builder including solo-built blocks that ignore coinbase bids, and at equal density it is the cheaper lever — the bid route also sends and tips the CoinbasePayer tx (~30,550 gas), so it costs ~0.011-0.014 ETH more. The bid figure only looks smaller because it sits on top of a tip you already pay; what it really buys is scope, being per-boundary rather than a global tip change.">Beat boundary<br/><span style={{fontWeight:400,fontSize:9,opacity:0.7}}>bid / tip</span></th>
@@ -166,10 +166,27 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
               <td style={cell} title={r.payBlkMin === null ? "no payment seen in window" : undefined}>
                 {r.payBlkMin === null ? "—" : `${r.payBlkMin}/${r.payBlkMed}`}
               </td>
-              <td style={{ ...cell, color: r.bidEth ? "var(--red)" : undefined, fontWeight: r.bidEth ? 600 : 400 }}
-                  title={r.bidEth == null ? "RPC has no tracing — unknown" : r.bidEth > 0 ? `${r.bidEth} ETH across ${r.bidPays} bid-backed payment(s) in the last 2 epochs` : "no coinbase bid in the last 2 epochs"}>
-                {r.bidEth == null ? "?" : r.bidEth > 0 ? `${r.bidEth.toFixed(4)}×${r.bidPays}` : "—"}
-              </td>
+              {/* THEIR bid, shown as the peak over the window rather than a recent sum — because
+                  it is usually what the Beat columns are pricing. A recent-only figure read "—"
+                  on #2711 while Beat max quoted 448 gwei that its 0.042 ETH bid is 85% of. */}
+              {(() => {
+                const peak = r.bidPeakEth ?? r.bidEth;
+                const stale = (r.bidPeakEth ?? 0) > 0 && r.bidPeakRecent === false;
+                const title =
+                  peak == null
+                    ? "RPC has no tracing — unknown"
+                    : peak > 0
+                      ? `Biggest single coinbase bid seen: ${peak} ETH${stale ? ", but NOT in the last 2 epochs — they have defended this hard before and can again, they just are not right now" : ""}. A bid over a small bundle dominates density, which is how a rival can tip only 90 gwei and still cost 448 gwei/gas to out-rank.`
+                      : "no coinbase bid seen in this window — its defense is priority fee only";
+                return (
+                  <td
+                    style={{ ...cell, color: peak ? (stale ? "var(--amber)" : "var(--red)") : undefined, fontWeight: peak ? 600 : 400 }}
+                    title={title}
+                  >
+                    {peak == null ? "?" : peak > 0 ? `${peak.toFixed(4)}${stale ? "*" : ""}` : "—"}
+                  </td>
+                );
+              })()}
               <td style={cell}>
                 {(() => {
                   const bid = beatFor(r.defenseRecentGwei, plan);
@@ -580,9 +597,10 @@ export function TargetScores({
             skips survived / skips that drew an audit, out of attempted (a skip = a boundary
             entered 2+ behind) ·
             Def = max tip gwei / best tx index · PayBlk = blocks after boundary they paid
-            (fastest / median; 0 = pays in the boundary block) · Bid 2ep = coinbase bid over
-            the last 2 epochs, ETH × payments (a bidder buys top-of-block and is near-
-            unauditable) · greyed rows are already under audit. Big boys are full targets but
+            (fastest / median; 0 = pays in the boundary block) · Their bid = the rival's own biggest coinbase bid over
+            the window, ETH, with * meaning the peak is older than the last 2 epochs (a bidder
+            buys top-of-block and is near-unauditable) — read it next to Beat max, because a bid
+            over a small bundle is usually what makes that number large · greyed rows are already under audit. Big boys are full targets but
             are listed in their own section rather than mixed into the ranked lists, because
             their scores sit low and would crowd out the weak rivals the score exists to find.
           </p>
