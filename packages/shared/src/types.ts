@@ -158,8 +158,29 @@ export interface TargetScoreRow {
    * "now" is the current epoch rather than "one ago" on purpose: the boundary for epoch N
    * happens when epoch N begins, so a rival's freshest defense lands in the current epoch.
    */
-  bidNowEth?: number | null;
-  bidPrevEth?: number | null;
+  bidE2Eth?: number | null;
+  bidE1Eth?: number | null;
+  /**
+   * Their own PRIORITY TIP two / one epoch(s) ago, paired with maxTip as -2/-1/max. Same
+   * reason as the bid triple: a lone peak cannot distinguish a rival still defending at that
+   * level from one that defended once and has coasted since.
+   */
+  tipE2?: number | null;
+  tipE1?: number | null;
+  /**
+   * Their DEFENSE DENSITY (tip + bid/gas) in each of those epochs, and the beat price for each.
+   * The visible Beat columns are priced from these three windows — two epochs ago, one epoch
+   * ago, and peak — which replaced the old recent-2-epoch / peak / boundary-only trio.
+   *
+   * defenseBoundaryGwei and beatBoundaryEth are still populated for anything that wants
+   * boundary-block-only defense; they just no longer have a column of their own.
+   */
+  defenseE2Gwei?: number | null;
+  defenseE1Gwei?: number | null;
+  beatBidE2Eth?: number | null;
+  beatBidE1Eth?: number | null;
+  beatTipE2Gwei?: number | null;
+  beatTipE1Gwei?: number | null;
   /** Same, over the WHOLE window — the bidding `beatBidEth` is actually priced against. */
   bidWindowEth?: number | null;
   bidWindowPays?: number | null;
