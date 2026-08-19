@@ -150,6 +150,16 @@ export interface TargetScoreRow {
    */
   bidPeakEth?: number | null;
   bidPeakRecent?: boolean | null;
+  /**
+   * The same bid bucketed by epoch: `bidNowEth` is the CURRENT epoch, `bidPrevEth` the one
+   * before. Rendered with the peak as `now/-1/max`, because one number cannot distinguish a
+   * steady bidder you must price for every time from one that has stopped bidding.
+   *
+   * "now" is the current epoch rather than "one ago" on purpose: the boundary for epoch N
+   * happens when epoch N begins, so a rival's freshest defense lands in the current epoch.
+   */
+  bidNowEth?: number | null;
+  bidPrevEth?: number | null;
   /** Same, over the WHOLE window — the bidding `beatBidEth` is actually priced against. */
   bidWindowEth?: number | null;
   bidWindowPays?: number | null;

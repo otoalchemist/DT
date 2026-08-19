@@ -62,11 +62,15 @@
 //             A ceiling, not a forecast: off-chain builder deals are invisible at any
 //             window length, and a peak from 8 epochs ago may never be repeated.
 //   aud       times ANY player successfully audited it in the window (proven catchable)
-//   theirBid  the RIVAL own coinbase bid — the biggest single one seen over the WHOLE
-//             window, in ETH. Not to be confused with bid2ep/bidMax/bidBnd, which are what
-//             YOU would have to bid.
-//             A trailing "*" means that peak is older than the last 2 epochs: they have bid
-//             this hard before and can again, but are not doing it right now.
+//   theirBid  the RIVAL own coinbase bid, as now/-1/max in ETH (leading zero dropped, so
+//             .042 = 0.042 ETH; "-" in a slot means no bid there). Not to be confused with
+//             bid2ep/bidMax/bidBnd, which are what YOU would have to bid.
+//             Three fields because one number cannot distinguish escalating from holding from
+//             gone quiet: ".042/.042/.042" is a steady bidder you must price for every time,
+//             "-/-/.042" is one that has stopped, and "-/.038/.042" is one that just did.
+//             "now" is the CURRENT epoch, because the boundary for epoch N happens when epoch
+//             N BEGINS — a rival's freshest defense lands in the current epoch, and labelling
+//             it "-1" would hide it.
 //             Read it next to beatMax, because it is usually the EXPLANATION for it. #2711
 //             tips only 90 gwei yet costs 448 gwei to beat, which looks impossible until you
 //             see the 0.0420 ETH bid it sends in a second transaction: over its small
@@ -404,6 +408,15 @@ async function main() {
   }
   const bidByToken = {}; // token -> { wei, pays } over the RECENT 2 epochs
   const bidPeakByToken = {}; // token -> { wei, recent } — biggest single bid over the WHOLE window
+  const bidHistByToken = {}; // token -> { now, prev } — biggest bid in each of the last 2 epochs
+  /** Which epoch a block falls in, off the sampled epoch grid. null if before the window. */
+  const epochOfBlock = (blk) => {
+    for (let E = ce; E >= firstEpoch; E--) {
+      const fb = epochFirstBlock.get(E.toString());
+      if (fb !== undefined && blk >= fb) return E;
+    }
+    return null;
+  };
   // Hoisted: the density calculation below needs the per-(block, sender) coinbase totals,
   // not just the per-token sums.
   const cbByBlockSender = new Map();
@@ -488,6 +501,22 @@ async function main() {
         const e = (bidPeakByToken[tok] ??= { wei: 0n, recent: false });
         if (wei > e.wei) e.wei = wei;
         if (BigInt(l.blockNumber) >= bidWindowStart) e.recent = true;
+        /**
+         * Per-epoch buckets for the two most recent epochs, so the column can show a trend
+         * (`now/-1/max`) instead of one number that hides whether they are escalating,
+         * holding, or have gone quiet.
+         *
+         * `now` is the CURRENT epoch, not "one ago", and that matters: the boundary for epoch
+         * N happens when epoch N BEGINS, so a rival's most recent boundary defense lands in
+         * the current epoch. Bucketing at -1/-2 would hide the freshest defense there is —
+         * the same class of blind spot the peak column was added to fix.
+         */
+        const bE = epochOfBlock(BigInt(l.blockNumber));
+        if (bE !== null) {
+          const h = (bidHistByToken[tok] ??= { now: 0n, prev: 0n });
+          if (bE === ce && wei > h.now) h.now = wei;
+          else if (bE === ce - 1n && wei > h.prev) h.prev = wei;
+        }
       }
     }
   }
@@ -847,6 +876,8 @@ async function main() {
       // Peak bid over the whole window + whether it is still recent. This is what explains a
       // large beat figure on a rival that has not bid lately.
       bidPeakEth: tracingOk ? +eth(bidPeakByToken[t]?.wei ?? 0n).toFixed(6) : null,
+      bidNowEth: tracingOk ? +eth(bidHistByToken[t]?.now ?? 0n).toFixed(6) : null,
+      bidPrevEth: tracingOk ? +eth(bidHistByToken[t]?.prev ?? 0n).toFixed(6) : null,
       bidPeakRecent: tracingOk ? (bidPeakByToken[t]?.recent ?? false) : null,
       // ...and over the WHOLE window, which is what beatBid is priced against.
       bidWindowEth: tracingOk ? +eth(bidWindow[t]?.wei ?? 0n).toFixed(6) : null,
@@ -967,11 +998,23 @@ async function main() {
    * Shown as the peak rather than a recent sum so it can never read "-" while beatMax quotes
    * a figure that the bid is what produced.
    */
+  /**
+   * The rival OWN bid as now/-1/max, in ETH with the leading zero dropped for width.
+   *
+   * Three fields because one number could not say whether a bidder is escalating, holding or
+   * has gone quiet, and those imply different things about the next boundary. `now` is the
+   * CURRENT epoch: the boundary for epoch N happens when epoch N begins, so the freshest
+   * defense lands there, and bucketing it as "-1" would hide it.
+   *
+   * `max` is the whole window, so this can never read all-dashes while beatMax quotes a
+   * figure that a bid produced — the blind spot that made #2711 look unexplainable.
+   */
   const bidCol = (r) => {
-    if (r.bidPeakEth === null && r.bidEth === null) return "?".padStart(9);
+    if (r.bidPeakEth === null && r.bidEth === null) return "?".padStart(15);
+    const f = (x) => (x > 0 ? x.toFixed(3).replace(/^0/, "") : "-");
     const peak = r.bidPeakEth ?? 0;
-    if (peak <= 0) return "-".padStart(9);
-    return `${peak.toFixed(4)}${r.bidPeakRecent ? " " : "*"}`.padStart(9);
+    if (peak <= 0) return "-".padStart(15);
+    return `${f(r.bidNowEth ?? 0)}/${f(r.bidPrevEth ?? 0)}/${f(peak)}`.padStart(15);
   };
   /** A tip bar in gwei, or "·" when the rival was never observed defending in that window. */
   const tipCol = (g) => (g === null || g === undefined ? "·" : String(g)).padStart(6);
@@ -991,7 +1034,7 @@ async function main() {
   // boundaries built by a solo validator that ignores coinbase transfers); BEAT-BY-BID is the
   // flat bid that gets there at YOUR configured tip instead.
   const header =
-    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk  theirBid" +
+    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd  tip  idx    payBlk   theirBid now/-1/max" +
     " | tip2ep tipMax tipBnd | bid2ep bidMax bidBnd | aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
