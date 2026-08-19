@@ -68,9 +68,13 @@
 //             Three fields because one number cannot distinguish escalating from holding from
 //             gone quiet: ".042/.042/.042" is a steady bidder you must price for every time,
 //             "-/-/.042" is one that has stopped, and "-/.038/.042" is one that just did.
-//             "now" is the CURRENT epoch, because the boundary for epoch N happens when epoch
-//             N BEGINS — a rival's freshest defense lands in the current epoch, and labelling
-//             it "-1" would hide it.
+//             "-1" is the LATEST boundary and "-2" the one before it. -1 is the CURRENT epoch,
+//             because the boundary for epoch N happens when epoch N BEGINS: at epoch 170, -1 is
+//             epoch 170 (boundary block 25785422) and -2 is epoch 169. The JSON carries
+//             epochE1/epochE2 so nothing has to infer the offset.
+//             A rival that pays every OTHER epoch will always show "·" in one of the two slots —
+//             that is its cadence, not missing data about a boundary it contested. #1612 pays at
+//             162, 164, 166, 168, 170, so its -2 (epoch 169) is permanently empty.
 //             Read it next to beatMax, because it is usually the EXPLANATION for it. #2711
 //             tips only 90 gwei yet costs 448 gwei to beat, which looks impossible until you
 //             see the 0.0420 ETH bid it sends in a second transaction: over its small
@@ -461,7 +465,21 @@ async function main() {
   }
   const bidByToken = {}; // token -> { wei, pays } over the RECENT 2 epochs
   const bidPeakByToken = {}; // token -> { wei, recent } — biggest single bid over the WHOLE window
-  const bidHistByToken = {}; // token -> { e2, e1 } — biggest bid two epochs ago / one epoch ago
+  const bidHistByToken = {}; // token -> { e2, e1 } — biggest bid at the -2 / -1 boundary
+  /**
+   * What the -2 and -1 columns point at, defined once.
+   *
+   * "-1" is the LATEST boundary, which is the CURRENT epoch: the boundary for epoch N happens
+   * when epoch N BEGINS, so the most recent defense anyone has mounted lands in ce. "-2" is the
+   * boundary before it. At ce=170 that means -1 = epoch 170 (boundary block 25785422) and
+   * -2 = epoch 169.
+   *
+   * Derived from one pair of constants because the previous version hard-coded ce-2/ce-1 at ten
+   * separate sites, which shifted the whole window a boundary into the past and hid the freshest
+   * defense there is.
+   */
+  const E1 = ce;      // the -1 column: the latest boundary
+  const E2 = ce - 1n; // the -2 column: the one before it
   // Hoisted: the density calculation below needs the per-(block, sender) coinbase totals,
   // not just the per-token sums.
   const cbByBlockSender = new Map();
@@ -559,8 +577,8 @@ async function main() {
         const bE = epochOfBlock(BigInt(l.blockNumber));
         if (bE !== null) {
           const h = (bidHistByToken[tok] ??= { e2: 0n, e1: 0n });
-          if (bE === ce - 2n && wei > h.e2) h.e2 = wei;
-          else if (bE === ce - 1n && wei > h.e1) h.e1 = wei;
+          if (bE === E2 && wei > h.e2) h.e2 = wei;
+          else if (bE === E1 && wei > h.e1) h.e1 = wei;
         }
       }
     }
@@ -904,8 +922,12 @@ async function main() {
       bribes, ins,
       ownerBalEth: +eth(bal).toFixed(4), cits, runwayEpochs: runway === Infinity ? null : +runway.toFixed(1),
       owesNextEth: +eth(owesNext).toFixed(4), affordNext, maxTip: +dd.maxTip.toFixed(1), bestIdx,
-      tipE2: dd.byEpoch?.has((ce - 2n).toString()) ? +dd.byEpoch.get((ce - 2n).toString()).toFixed(1) : null,
-      tipE1: dd.byEpoch?.has((ce - 1n).toString()) ? +dd.byEpoch.get((ce - 1n).toString()).toFixed(1) : null,
+      // Which epochs the -2/-1 columns actually are, so the UI can name them instead of
+      // leaving a reader to work out whether "-1" counts from the current epoch or the last one.
+      epochE1: Number(E1),
+      epochE2: Number(E2),
+      tipE2: dd.byEpoch?.has(E2.toString()) ? +dd.byEpoch.get(E2.toString()).toFixed(1) : null,
+      tipE1: dd.byEpoch?.has(E1.toString()) ? +dd.byEpoch.get(E1.toString()).toFixed(1) : null,
       /**
        * Every epoch this rival was observed defending, for the trend sparkline.
        *
@@ -916,12 +938,12 @@ async function main() {
       densitySeries: Object.entries(Object.fromEntries(densityByEpoch[t] ?? new Map()))
         .map(([epoch, density]) => ({ epoch: Number(epoch), density: +density.toFixed(1) }))
         .sort((a, b) => a.epoch - b.epoch),
-      defenseE2Gwei: densityByEpoch[t]?.has((ce - 2n).toString()) ? +densityByEpoch[t].get((ce - 2n).toString()).toFixed(1) : null,
-      defenseE1Gwei: densityByEpoch[t]?.has((ce - 1n).toString()) ? +densityByEpoch[t].get((ce - 1n).toString()).toFixed(1) : null,
-      beatBidE2Eth: densityByEpoch[t]?.has((ce - 2n).toString()) ? priceBid(densityByEpoch[t].get((ce - 2n).toString())) : null,
-      beatBidE1Eth: densityByEpoch[t]?.has((ce - 1n).toString()) ? priceBid(densityByEpoch[t].get((ce - 1n).toString())) : null,
-      beatTipE2Gwei: densityByEpoch[t]?.has((ce - 2n).toString()) ? priceTip(densityByEpoch[t].get((ce - 2n).toString())) : null,
-      beatTipE1Gwei: densityByEpoch[t]?.has((ce - 1n).toString()) ? priceTip(densityByEpoch[t].get((ce - 1n).toString())) : null,
+      defenseE2Gwei: densityByEpoch[t]?.has(E2.toString()) ? +densityByEpoch[t].get(E2.toString()).toFixed(1) : null,
+      defenseE1Gwei: densityByEpoch[t]?.has(E1.toString()) ? +densityByEpoch[t].get(E1.toString()).toFixed(1) : null,
+      beatBidE2Eth: densityByEpoch[t]?.has(E2.toString()) ? priceBid(densityByEpoch[t].get(E2.toString())) : null,
+      beatBidE1Eth: densityByEpoch[t]?.has(E1.toString()) ? priceBid(densityByEpoch[t].get(E1.toString())) : null,
+      beatTipE2Gwei: densityByEpoch[t]?.has(E2.toString()) ? priceTip(densityByEpoch[t].get(E2.toString())) : null,
+      beatTipE1Gwei: densityByEpoch[t]?.has(E1.toString()) ? priceTip(densityByEpoch[t].get(E1.toString())) : null,
       payBlkMin, payBlkMed, audited: aud,
       beatBidEth, defenseUnexplained, unexplainedReason,
       // The two levers, per rival. Same bar, priced both ways: a tip that needs no builder
@@ -1083,7 +1105,8 @@ async function main() {
    *
    * Three fields because one number could not say whether a bidder is escalating, holding or
    * has gone quiet, and those imply different things about the next boundary. The slots are
-   * two epochs ago and one epoch ago; a bid made in the CURRENT epoch shows only in `max`.
+   * the -2 boundary and the -1 (latest) boundary, where -1 is the CURRENT epoch — the boundary
+   * for epoch N happens when epoch N begins, so the freshest defense lands there.
    *
    * `max` is the whole window, so this can never read all-dashes while beatMax quotes a
    * figure that a bid produced — the blind spot that made #2711 look unexplainable.
@@ -1276,10 +1299,10 @@ async function main() {
     const best = [...rows].filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);
     console.log(`\nTop targets right now: ${best.length ? best.map((r) => `#${r.token} (${r.score})`).join(", ") : "none auditable"}`);
     console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted");
-    console.log("def -2/-1/max = THEIR priority tip in gwei, two epochs ago / one epoch ago / peak · '·' = no payment observed in that epoch");
+    console.log("def -2/-1/max = THEIR priority tip in gwei at the -2 boundary / the -1 (LATEST) boundary / their peak · -1 is the current epoch, since epoch N's boundary is when N begins · '·' = no payment observed in that epoch");
     console.log("trend = defense density per epoch as a sparkline, oldest to newest, scaled to THIS rival's own range (shape, not magnitude) · arrow = robust direction over the whole window: up = escalating, so price off Max; down = retreating, so recent is cheaper than Max suggests; right = steady");
     console.log("idx = lowest tx index they ever reached (position, not price) · theirBid -2/-1/max = their OWN coinbase bid in ETH over the same windows, leading zero dropped");
-    console.log("tip-2/tip-1/tipMax = PRIORITY FEE (gwei) that out-densities them with no bid, priced against what they mounted TWO epochs ago / ONE epoch ago / at their peak");
+    console.log("tip-2/tip-1/tipMax = PRIORITY FEE (gwei) that out-densities them with no bid, priced against what they mounted at the -2 boundary / the -1 (LATEST) boundary / at their peak");
     // Levers quoted in different units cannot be compared as printed, so convert. The tip is
     // charged over OUR_TIP_GAS (no bid tx on this route), which is what makes a flat bid the
     // cheaper lever on a small bundle even when the gwei figure looks modest.

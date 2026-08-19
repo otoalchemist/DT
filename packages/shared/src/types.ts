@@ -151,12 +151,15 @@ export interface TargetScoreRow {
   bidPeakEth?: number | null;
   bidPeakRecent?: boolean | null;
   /**
-   * The same bid bucketed by epoch: two epochs ago and one epoch ago, rendered with the peak
-   * as -2/-1/max, because one number cannot distinguish a steady bidder you must price for
-   * every time from one that has stopped bidding.
+   * The same bid bucketed by boundary, rendered with the peak as -2/-1/max, because one number
+   * cannot distinguish a steady bidder you must price for every time from one that has stopped.
    *
-   * A bid placed in the CURRENT epoch appears only in the peak — the two dated slots are the
-   * previous two epochs.
+   * "-1" is the LATEST boundary, which is the CURRENT epoch — the boundary for epoch N happens
+   * when epoch N begins — and "-2" is the one before it. `epochE1`/`epochE2` carry the actual
+   * numbers so nothing has to infer the offset.
+   *
+   * A rival that pays every OTHER epoch always leaves one slot empty; that is its cadence, not
+   * missing data about a boundary it contested.
    */
   bidE2Eth?: number | null;
   bidE1Eth?: number | null;
@@ -183,6 +186,10 @@ export interface TargetScoreRow {
    * provider calls; this does not.
    */
   densitySeries?: { epoch: number; density: number }[];
+  /** Which epochs the -1 and -2 columns are. Carried so the UI can name them rather than leave
+   *  a reader to work out whether the offset counts from the current epoch or the previous one. */
+  epochE1?: number;
+  epochE2?: number;
   defenseE2Gwei?: number | null;
   defenseE1Gwei?: number | null;
   beatBidE2Eth?: number | null;
