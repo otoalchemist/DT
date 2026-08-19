@@ -186,6 +186,31 @@ export interface TargetScoreRow {
    * provider calls; this does not.
    */
   densitySeries?: { epoch: number; density: number }[];
+  /**
+   * What this citizen's operator mounted while ATTACKING — density in gwei/gas per boundary, the
+   * bid inside it, its tip, and the beat price for the latest one.
+   *
+   * A different question from the defense columns. Those price "out-rank their cure so my audit
+   * lands"; these price "out-rank whatever they put in the block on an epoch when they owe
+   * nothing". For an ally whose payment schedule is opposite a rival's, this is the only bar that
+   * exists on those boundaries: Hedo at epoch 170 paid no tax and ran ten audits behind 0.03 ETH
+   * at 31 gwei/gas, so pricing off their 0.093 ETH payment bundle overpays roughly 3x.
+   *
+   * Attributed to the AUDITOR token, so one bundle lands on every row that rode it. When audits
+   * shared a bundle with payments the density is that whole bundle's — which is the right bar,
+   * since that is what a block actually sorted.
+   */
+  atkE2Gwei?: number | null;
+  atkE1Gwei?: number | null;
+  atkMaxGwei?: number | null;
+  atkBidE2Eth?: number | null;
+  atkBidE1Eth?: number | null;
+  atkTipE1?: number | null;
+  atkTipE2?: number | null;
+  beatBidAtkE1Eth?: number | null;
+  beatTipAtkE1Gwei?: number | null;
+  /** How many distinct boundaries this citizen was observed auditing in. */
+  atkAudits?: number;
   /** Which epochs the -1 and -2 columns are. Carried so the UI can name them rather than leave
    *  a reader to work out whether the offset counts from the current epoch or the previous one. */
   epochE1?: number;
