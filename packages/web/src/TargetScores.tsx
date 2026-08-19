@@ -164,9 +164,11 @@ function ScoreTable({ rows, empty, plan }: { rows: TargetScoreRow[]; empty: stri
                 {r.affordNext ? "yes" : "NO"}
               </td>
               <td style={cell} title={`Their tip: ${r.tipE2 ?? "none observed"} gwei two epochs ago, ${r.tipE1 ?? "none observed"} one epoch ago, ${r.maxTip} at peak.`}>
-                {(r.tipE2 ?? null) === null ? "·" : r.tipE2!.toFixed(0)}/
-                {(r.tipE1 ?? null) === null ? "·" : r.tipE1!.toFixed(0)}/
-                {r.maxTip.toFixed(0)}
+                {/* Sub-gwei tips keep a decimal, so 0.3 gwei does not print as "0" beside a
+                    "·" that means no payment at all. */}
+                {(r.tipE2 ?? null) === null ? "·" : r.tipE2! >= 10 ? r.tipE2!.toFixed(0) : r.tipE2!.toFixed(1)}/
+                {(r.tipE1 ?? null) === null ? "·" : r.tipE1! >= 10 ? r.tipE1!.toFixed(0) : r.tipE1!.toFixed(1)}/
+                {r.maxTip >= 10 ? r.maxTip.toFixed(0) : r.maxTip.toFixed(1)}
               </td>
               <td style={cell}>{r.bestIdx ?? "—"}</td>
               <td style={cell} title={r.payBlkMin === null ? "no payment seen in window" : undefined}>

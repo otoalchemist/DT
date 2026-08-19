@@ -1072,7 +1072,9 @@ async function main() {
    * payment that carried no tip.
    */
   const defCol = (r) => {
-    const f = (x) => (x === null || x === undefined ? "·" : x.toFixed(0));
+    // Sub-gwei tips keep a decimal: Hedo defends at 0.3 gwei, and printing that as "0" reads
+    // as "no tip at all" right beside "·", which means "no payment at all".
+    const f = (x) => (x === null || x === undefined ? "·" : x >= 10 ? x.toFixed(0) : x.toFixed(1));
     return `${f(r.tipE2)}/${f(r.tipE1)}/${f(r.maxTip)}`.padStart(14);
   };
   /** Lowest tx index reached, its own column now — position is a different axis from price. */
