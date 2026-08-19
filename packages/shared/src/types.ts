@@ -211,6 +211,14 @@ export interface TargetScoreRow {
   beatTipAtkE1Gwei?: number | null;
   /** How many distinct boundaries this citizen was observed auditing in. */
   atkAudits?: number;
+  /**
+   * Which side each bid slot backed: "payment", "audit", or "both" when a single boundary had
+   * both. The bid column counts a bid whichever it backed — position is position — so this is
+   * how a reader can still tell what they were doing with it.
+   */
+  bidKindE2?: "payment" | "audit" | "both" | null;
+  bidKindE1?: "payment" | "audit" | "both" | null;
+  bidKindPeak?: "payment" | "audit" | "both" | null;
   /** Which epochs the -1 and -2 columns are. Carried so the UI can name them rather than leave
    *  a reader to work out whether the offset counts from the current epoch or the previous one. */
   epochE1?: number;

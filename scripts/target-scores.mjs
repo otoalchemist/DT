@@ -494,6 +494,7 @@ async function main() {
   const bidByToken = {}; // token -> { wei, pays } over the RECENT 2 epochs
   const bidPeakByToken = {}; // token -> { wei, recent } — biggest single bid over the WHOLE window
   const bidHistByToken = {}; // token -> { e2, e1 } — biggest bid at the -2 / -1 boundary
+  const bidKindByToken = {}; // token -> { e2?, e1?, peak? } = "payment" | "audit" | "both"
   /**
    * What the -2 and -1 columns point at, defined once.
    *
@@ -607,6 +608,10 @@ async function main() {
           const h = (bidHistByToken[tok] ??= { e2: 0n, e1: 0n });
           if (bE === E2 && wei > h.e2) h.e2 = wei;
           else if (bE === E1 && wei > h.e1) h.e1 = wei;
+          const kd = (bidKindByToken[tok] ??= {});
+          const slot = bE === E1 ? "e1" : bE === E2 ? "e2" : null;
+          if (slot) kd[slot] = kd[slot] === "audit" ? "both" : "payment";
+          if (wei >= (bidPeakByToken[tok]?.wei ?? 0n)) kd.peak = kd.peak === "audit" || kd.peak === "both" ? "both" : "payment";
         }
       }
     }
@@ -676,6 +681,25 @@ async function main() {
       const byE = (atkByToken[auditor] ??= new Map());
       const prev = byE.get(E.toString());
       if (!prev || density > prev.density) byE.set(E.toString(), { density, bidWei, tipGwei });
+      /**
+       * Same bid, into the bid column's buckets. The column asks "what did this operator bid at
+       * that boundary" — a question whose answer does not depend on whether they were paying or
+       * auditing, and splitting it across two columns just made the reader do the union by eye.
+       * Hedo's 0.03 ETH at epoch 170 read as "no bid" purely because it backed audits.
+       */
+      if (bidWei > 0n) {
+        const h = (bidHistByToken[auditor] ??= { e2: 0n, e1: 0n });
+        if (E === E2 && bidWei > h.e2) h.e2 = bidWei;
+        else if (E === E1 && bidWei > h.e1) h.e1 = bidWei;
+        const pk = (bidPeakByToken[auditor] ??= { wei: 0n, recent: false });
+        if (bidWei > pk.wei) pk.wei = bidWei;
+        if (E >= E2) pk.recent = true;
+        // Which side each slot's bid backed, for the tooltip.
+        const kd = (bidKindByToken[auditor] ??= {});
+        const slot = E === E1 ? "e1" : E === E2 ? "e2" : null;
+        if (slot) kd[slot] = kd[slot] === "payment" ? "both" : "audit";
+        if (bidWei >= (bidPeakByToken[auditor]?.wei ?? 0n)) kd.peak = kd.peak === "payment" || kd.peak === "both" ? "both" : "audit";
+      }
     }
   }
 
@@ -1037,6 +1061,10 @@ async function main() {
       beatBidAtkE1Eth: atkByToken[t]?.has(E1.toString()) ? priceBid(atkByToken[t].get(E1.toString()).density) : null,
       beatTipAtkE1Gwei: atkByToken[t]?.has(E1.toString()) ? priceTip(atkByToken[t].get(E1.toString()).density) : null,
       atkAudits: atkByToken[t] ? [...atkByToken[t].keys()].length : 0,
+      // Which side each bid slot backed, so one column can say so instead of needing two.
+      bidKindE2: bidKindByToken[t]?.e2 ?? null,
+      bidKindE1: bidKindByToken[t]?.e1 ?? null,
+      bidKindPeak: bidKindByToken[t]?.peak ?? null,
       tipE2: dd.byEpoch?.has(E2.toString()) ? +dd.byEpoch.get(E2.toString()).toFixed(1) : null,
       tipE1: dd.byEpoch?.has(E1.toString()) ? +dd.byEpoch.get(E1.toString()).toFixed(1) : null,
       /**
@@ -1266,18 +1294,6 @@ async function main() {
     const dir = t === null ? " " : t.direction === "rising" ? "↑" : t.direction === "falling" ? "↓" : "→";
     return `${spark} ${dir}`.padEnd(14);
   };
-  /**
-   * What they mount when ATTACKING, as -2/-1/max in gwei/gas.
-   *
-   * The bar an ally has to clear on a boundary where this rival is not paying. Blank when they
-   * were never observed auditing, which is most rivals: this is the signature of an operator
-   * running offense, and it is worth being able to see at a glance.
-   */
-  const atkCol = (r) => {
-    const f = (x) => (x === null || x === undefined ? "·" : x >= 10 ? x.toFixed(0) : x.toFixed(1));
-    if (r.atkMaxGwei === null || r.atkMaxGwei === undefined) return "".padEnd(13);
-    return `${f(r.atkE2Gwei)}/${f(r.atkE1Gwei)}/${f(r.atkMaxGwei)}`.padEnd(13);
-  };
   /** Lowest tx index reached, its own column now — position is a different axis from price. */
   const idxCol = (r) => String(r.bestIdx ?? "-").padStart(4);
   /** Bid priced against boundary-block defence only — the block that actually decides an audit. */
@@ -1288,7 +1304,7 @@ async function main() {
   const fmt = (r) =>
     `#${r.token.padEnd(5)} ${String(r.behind).padStart(3)} ${r.under ? "A" : "-"} ${skipCol(r)} ${String(r.bribes).padStart(2)}  ${r.ins ? "Y" : "-"}  ` +
     `${r.ownerBalEth.toFixed(4).padStart(8)} ${String(r.cits).padStart(3)} ${(r.runwayEpochs === null ? "inf" : r.runwayEpochs.toFixed(1)).padStart(6)}  ` +
-    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${defCol(r)} ${idxCol(r)} ${sparkCol(r)} ${payBlkCol(r)} ${bidCol(r)} ${atkCol(r)}` +
+    `${r.owesNextEth.toFixed(4)} ${(r.affordNext ? "yes" : "NO").padStart(4)}  ${defCol(r)} ${idxCol(r)} ${sparkCol(r)} ${payBlkCol(r)} ${bidCol(r)}` +
     ` | ${tipCol(r.beatTipE2Gwei)} ${tipCol(r.beatTipE1Gwei)} ${tipCol(r.beatTipGwei)}` +
     ` | ${e2Col(r)} ${e1Col(r)} ${beatCol(r)} | ${String(r.audited).padStart(3)}  ${r.score.toFixed(2).padStart(5)}`;
   // The two right-hand groups are the point of the report: BEAT-BY-TIP is the priority fee
@@ -1296,7 +1312,7 @@ async function main() {
   // boundaries built by a solo validator that ignores coinbase transfers); BEAT-BY-BID is the
   // flat bid that gets there at YOUR configured tip instead.
   const header =
-    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd    def -2/-1/max  idx  trend           payBlk    theirBid -2/-1/max  atk -2/-1/max" +
+    "tok    beh A  clean/caught br ins  ownerBal cit runway  owesNxt afrd    def -2/-1/max  idx  trend           payBlk   atk/def bid -2/-1/max" +
     " | tip-2  tip-1 tipMax | bid-2  bid-1 bidMax | aud  score";
   // beh column doubles as the timing cue: 1 = becomes auditable next boundary, 2+ = already auditable.
 
@@ -1424,7 +1440,7 @@ async function main() {
     console.log("A = under audit · clean/caught of N = skips survived / skips that drew an audit, out of skips attempted");
     console.log("def -2/-1/max = THEIR priority tip in gwei at the -2 boundary / the -1 (LATEST) boundary / their peak · -1 is the current epoch, since epoch N's boundary is when N begins · '·' = no payment observed in that epoch");
     console.log("trend = defense density per epoch as a sparkline, oldest to newest, scaled to THIS rival's own range (shape, not magnitude) · arrow = robust direction over the whole window: up = escalating, so price off Max; down = retreating, so recent is cheaper than Max suggests; right = steady");
-    console.log("atk -2/-1/max = density (gwei/gas) they mounted while AUDITING, not paying — the bar to clear on a boundary where they owe nothing · blank = never seen auditing · Hedo at epoch 170: no payment, 10 audits, 0.03 ETH bid, 31 gwei/gas");
+    console.log("atk/def bid -2/-1/max = THEIR coinbase bid in ETH at the -2 boundary / the -1 (latest) boundary / their biggest in the window — counted whether it backed a PAYMENT or an AUDIT, since a bid buys position either way · Hedo at epoch 170 paid no tax and bid 0.03 behind ten audits, which a payment-only column reported as no bid at all");
     console.log("idx = lowest tx index they ever reached (position, not price) · theirBid -2/-1/max = their OWN coinbase bid in ETH over the same windows, leading zero dropped");
     console.log("tip-2/tip-1/tipMax = PRIORITY FEE (gwei) that out-densities them with no bid, priced against what they mounted at the -2 boundary / the -1 (LATEST) boundary / at their peak");
     // Levers quoted in different units cannot be compared as printed, so convert. The tip is
