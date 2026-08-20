@@ -343,9 +343,11 @@ describe("persistence", () => {
 
 describe("published-page bridge", () => {
   /**
-   * The shareable page ingests this ledger verbatim (paste GET /api/treasury into its
-   * import box). It reads a fixed set of fields, so renaming one here would silently
-   * produce an empty public ledger rather than an error. Pin the contract.
+   * The public page (the `gubnah` repo, published at gubnah.xyz) bakes this ledger in
+   * verbatim. It reads a fixed set of fields, so renaming one here would silently produce
+   * an empty public ledger rather than an error — and the break would land in a different
+   * repo, where nothing here would catch it. Pin the contract; gubnah's `npm test` pins
+   * the other side.
    */
   it("exposes exactly the fields the published page reads", async () => {
     seedCitizens();

@@ -23,10 +23,7 @@
     "rival-skippers": "node scripts/rival-skippers.mjs",
     "rival-builder-bids": "node scripts/rival-builder-bids.mjs",
     "target-scores": "node scripts/target-scores.mjs",
-    "race-timing": "node scripts/race-timing.mjs",
-    "publish-treasury": "node scripts/publish-treasury.mjs",
-    "deploy-treasury": "node scripts/publish-treasury.mjs && npx wrangler pages deploy site/dist --project-name=gubnah --branch=main --commit-dirty=true",
-    "check-treasury": "node scripts/check-treasury-site.mjs"
+    "race-timing": "node scripts/race-timing.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
