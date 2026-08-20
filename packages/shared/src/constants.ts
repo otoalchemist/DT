@@ -4,7 +4,7 @@
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.8.3" as const;
+export const VERSION = "1.8.4" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
@@ -274,4 +274,33 @@ export function densityTrend(series: DensityPoint[]): DensityTrend | null {
   const direction = Math.abs(rel) < 0.05 ? "flat" : rel > 0 ? "rising" : "falling";
   const changePct = first === 0 ? (last === 0 ? 0 : 100) : ((last - first) / first) * 100;
   return { direction, slopePerEpoch, changePct, first, last, points: n };
+}
+
+/**
+ * Pull the bare Alchemy API key out of whatever the user actually pasted.
+ *
+ * The key is interpolated straight into three URLs, so anything unexpected in it produces a
+ * malformed URL and viem's transport throws — which surfaced as an unexplained HTTP 500 the
+ * moment someone saved their key, with the real cause only in the server log. The likely
+ * culprits are all paste artefacts rather than user error:
+ *
+ *  - Alchemy's dashboard shows the FULL https URL with a copy button, so pasting it yields
+ *    `https://eth-mainnet.g.alchemy.com/v2/https://eth-mainnet.g.alchemy.com/v2/KEY`;
+ *  - copying from a terminal, notes app or email drags in whitespace or a trailing newline;
+ *  - quotes get added by a shell or a smart-quoting editor.
+ *
+ * Returns null when what is left cannot be a key, so the caller can answer 400 with something
+ * actionable instead of 500 with a stack trace.
+ */
+export function normalizeAlchemyKey(input: string): string | null {
+  let k = input.trim().replace(/^["'\s]+|["'\s]+$/g, "");
+  // A pasted endpoint: take the last path segment of any alchemy.com URL form (v2 or nft/v3).
+  const m = k.match(/alchemy\.com\/(?:nft\/)?v\d\/([^/?#\s]+)/i);
+  if (m) k = m[1]!;
+  // Strip a stray trailing slash left by a copied URL.
+  k = k.replace(/\/+$/, "");
+  // Keys are URL path segments: letters, digits, - and _ only. Anything else would corrupt
+  // every derived URL, and a silent pass-through is what turned this into a 500.
+  if (k.length === 0 || !/^[A-Za-z0-9_-]+$/.test(k)) return null;
+  return k;
 }

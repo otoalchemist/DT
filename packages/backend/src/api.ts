@@ -23,6 +23,7 @@ import { getGameSnapshot } from "./contract.js";
 import { invalidateTokenCaches } from "./index-tokens.js";
 import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
+import { normalizeAlchemyKey } from "@dat-bot/shared";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
@@ -517,10 +518,36 @@ export async function buildServer(): Promise<FastifyInstance> {
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    const { alchemyApiKey, mode } = parsed.data;
+    const { alchemyApiKey: rawKey, mode } = parsed.data;
+
+    /**
+     * Normalise before anything touches it. The key is interpolated into three URLs, so a
+     * paste artefact produced a malformed URL, viem's transport threw, and this handler —
+     * which had no try/catch — answered a bare HTTP 500 with the cause only in the server
+     * log. Alchemy's dashboard offers the FULL https endpoint with a copy button, so pasting
+     * that is the likely path, and it is indistinguishable from a broken install to whoever
+     * hit it.
+     */
+    let alchemyApiKey: string | undefined;
+    if (rawKey !== undefined) {
+      const clean = normalizeAlchemyKey(rawKey);
+      if (clean === null) {
+        return reply.code(400).send({
+          error:
+            "That does not look like an Alchemy API key. Paste just the key — the part after " +
+            "/v2/ in your endpoint URL — not the whole https:// address, and without quotes.",
+        });
+      }
+      alchemyApiKey = clean;
+    }
 
     const existing = loadSettings();
 
+    // Everything below writes a file and rebuilds the RPC clients, either of which can throw
+    // (an unwritable data/ directory, a URL viem rejects). Reported rather than raised: a 500
+    // with no body told the user nothing, and this is the first thing anyone does after
+    // installing, so it is the worst possible place to be unhelpful.
+    try {
     if (alchemyApiKey) {
       saveSettings({ ...existing, alchemyApiKey, ...(mode ? { mode } : {}) });
       process.env.ALCHEMY_API_KEY = alchemyApiKey;
@@ -552,7 +579,22 @@ export async function buildServer(): Promise<FastifyInstance> {
       logger.info(`Submission mode switched to: ${mode}`);
     }
 
-    return { ok: true, mode: appConfig.mode };
+      return { ok: true, mode: appConfig.mode };
+    } catch (err) {
+      const msg = (err as Error).message;
+      logger.error("Saving settings failed:", msg);
+      activity.add({
+        kind: "error",
+        status: "skipped",
+        message: `Could not save settings: ${msg}`,
+      });
+      return reply.code(500).send({
+        error:
+          `Could not save settings: ${msg}. ` +
+          `If this mentions permission or a path, the bot cannot write its data folder — ` +
+          `move it out of a read-only or synced location and try again.`,
+      });
+    }
   });
 
   // --- reads for the dashboard ---
