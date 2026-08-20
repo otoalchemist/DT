@@ -93,9 +93,40 @@ npm run dev                 # starts backend (:8787) + dashboard (:5173)
 
 **One-click launch:** double-click **`start.bat`** on Windows or **`start.command`**
 on macOS. Either one installs dependencies on first run, starts the dev server, and
-opens the dashboard. On macOS the first launch may need a right-click → **Open** to
-clear Gatekeeper, and if double-click doesn't run it, mark it executable once with
-`chmod +x start.command`.
+opens the dashboard.
+
+**macOS: "`start.command` Not Opened — Apple could not verify…"**
+
+This is Gatekeeper, and it is about where the file came from rather than what is in
+it: a browser stamps `com.apple.quarantine` on the ZIP, and everything extracted
+from it inherits the flag. On macOS 15 (Sequoia) the old right-click → **Open**
+bypass no longer clears it. Pick whichever suits you:
+
+```bash
+# 1. Just run it from Terminal — nothing to bypass. Gatekeeper gates double-click
+#    launching a quarantined file, not `bash` reading one.
+cd ~/Downloads/DT-master && bash start.command
+
+# 2. Or strip the flag once for the whole folder, and double-click works after.
+xattr -cr ~/Downloads/DT-master
+chmod +x ~/Downloads/DT-master/start.command
+```
+
+Or: **System Settings → Privacy & Security**, scroll to Security, and click
+**Open Anyway** on the line naming `start.command` (it only appears after the
+launch has been blocked once), then open it again.
+
+**Cloning avoids this entirely** — git-created files are never quarantined, so
+there is no dialog to clear:
+
+```bash
+git clone https://github.com/otoalchemist/DT.git
+cd DT && bash start.command
+```
+
+Notarizing the launcher would not help: a bare `.command` cannot be notarized on
+its own, so it would mean shipping a signed app bundle and an Apple Developer
+account to wrap a script that runs `npm`.
 
 Open the dashboard at **`http://localhost:5173`** and:
 
