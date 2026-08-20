@@ -687,18 +687,23 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post("/api/treasury/participant", async (req, reply) => {
+    const addr = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "invalid address");
     const schema = z.object({
-      address: z.string().regex(/^0x[0-9a-fA-F]{40}$/, "invalid address"),
+      address: addr,
       nickname: z.string().max(60).nullable().optional(),
       optIn: z.boolean().optional(),
+      /** Null clears the override and hands the count back to the ownership index. */
+      citizensOverride: z.number().int().min(0).max(100_000).nullable().optional(),
+      /** Other wallets this person holds citizens in. */
+      linked: z.array(addr).max(50).optional(),
       remove: z.boolean().optional(),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    const { address, nickname, optIn, remove } = parsed.data;
+    const { address, nickname, optIn, citizensOverride, linked, remove } = parsed.data;
     try {
       if (remove) removeParticipant(address);
-      else upsertParticipant({ address, nickname, optIn });
+      else upsertParticipant({ address, nickname, optIn, citizensOverride, linked });
       return await buildTreasuryLedger();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });

@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emigration Treasury</title>
+<meta name="description" content="Contribution ledger and fair-share reconciliation for the Dept of Death emigration treasury.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Spectral:ital,wght@0,400;0,600;0,700;1,400&display=swap">
+<style>
+:root{
+  --ground:#0a0c05; --office:#0f1207; --office-2:#151a09; --rule:#28300f;
+  --acid:#c9f73f; --acid-dim:#93b82c; --paper:#e9e5d9; --paper-3:#d2ccb8;
+  --ink:#14160c; --ink-soft:#4b4f38; --ink-faint:#7d8163; --stamp:#a4322b; --olive:#8b9366;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--ground);color:var(--paper);
+  font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased;
+}
+h1,h2{margin:0;text-wrap:balance}
+a{color:var(--acid)}
+.sheet a{color:var(--ink);text-decoration-color:var(--ink-faint);text-underline-offset:2px}
+.sheet a:hover{color:var(--stamp)}
+.sheet .sub a{color:var(--ink-faint)}
+.sheet .sub a:hover{color:var(--stamp)}
+:focus-visible{outline:2px solid var(--acid);outline-offset:2px}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+
+.masthead{border-bottom:1px solid var(--rule);background:var(--office)}
+.masthead .wrap{display:flex;align-items:center;gap:20px;flex-wrap:wrap;padding:22px 24px}
+.mark{font-weight:700;font-size:26px;letter-spacing:-.04em;color:var(--acid);border:1px solid var(--acid);padding:1px 9px 3px;line-height:1}
+.dept{font-size:13px;letter-spacing:.22em;text-transform:uppercase;color:var(--acid);font-weight:500}
+.masthead .status{margin-left:auto;display:flex;align-items:center;gap:9px;font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--olive)}
+.beacon{width:3px;height:13px;background:var(--stamp);display:inline-block}
+
+.strip{border-bottom:1px solid var(--rule);background:var(--office-2)}
+.strip .wrap{padding:0}
+.strip-grid{display:grid;grid-template-columns:repeat(4,1fr)}
+.kpi{padding:22px 24px 24px;border-left:1px solid var(--rule)}
+.kpi:first-child{border-left:0}
+.k-label{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--olive)}
+.k-value{font-size:27px;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.k-unit{font-size:14px;color:var(--olive);font-weight:400;margin-left:4px}
+.k-note{font-size:11.5px;color:var(--olive);margin-top:4px;letter-spacing:.04em}
+.kpi.hero .k-value{color:var(--acid)}
+
+main{padding:34px 0 0}
+.sheet{background:var(--paper);color:var(--ink);padding:30px 32px 34px;margin-bottom:22px}
+.sheet-head{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;border-bottom:1.5px solid var(--ink);padding-bottom:12px}
+.circular{font-size:11.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--stamp);font-weight:600}
+.spacer{margin-left:auto}
+.sheet-note{font-size:12px;color:var(--ink-faint);letter-spacing:.04em}
+.sheet h2{font-family:Spectral,Georgia,serif;font-size:34px;font-weight:700;letter-spacing:-.015em;margin:18px 0 0}
+.lede{font-family:Spectral,Georgia,serif;font-size:17px;line-height:1.5;color:var(--ink-soft);max-width:62ch;margin:9px 0 0}
+
+.scroll{overflow-x:auto;margin-top:20px}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+thead th{text-align:left;font-size:10.5px;letter-spacing:.17em;text-transform:uppercase;color:var(--ink-faint);font-weight:600;padding:0 12px 8px;white-space:nowrap;border-bottom:1px solid var(--ink)}
+tbody td{padding:11px 12px;border-bottom:1px solid var(--paper-3);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.who{font-weight:600;font-size:14px}
+.sub{font-size:11.5px;color:var(--ink-faint);letter-spacing:.02em;word-break:break-all}
+.stripe{border-left:3px solid transparent}
+.stripe.owes{border-left-color:var(--stamp)}
+.stripe.credit{border-left-color:var(--acid-dim)}
+.empty{padding:26px 12px;color:var(--ink-faint);font-family:Spectral,Georgia,serif;font-size:16px}
+tr.dropped{opacity:.45}
+
+.chip{display:inline-block;font-size:10px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;padding:3px 7px;white-space:nowrap}
+.chip.owes{background:var(--stamp);color:var(--paper)}
+.chip.credit{background:var(--acid-dim);color:var(--ink)}
+.chip.square{border:1px solid var(--ink-faint);color:var(--ink-soft)}
+.chip.pledged{border:1px dashed var(--ink-faint);color:var(--ink-soft)}
+.chip.manual{background:var(--paper-3);color:var(--ink-soft)}
+.chip.dir-in{background:var(--acid-dim);color:var(--ink)}
+.chip.dir-out{background:var(--stamp);color:var(--paper)}
+.chip.confirmed{border:1px solid var(--acid-dim);color:var(--ink-soft)}
+
+footer{border-top:1px solid var(--rule);padding:24px 0 46px;font-size:11.5px;color:var(--olive);letter-spacing:.08em}
+footer .addr{color:var(--paper);word-break:break-all}
+footer p{margin:0 0 7px;max-width:88ch;line-height:1.7}
+
+@media (max-width:860px){
+  .strip-grid{grid-template-columns:repeat(2,1fr)}
+  .kpi:nth-child(3){border-left:0}
+  .kpi:nth-child(n+3){border-top:1px solid var(--rule)}
+  .sheet{padding:24px 18px 26px}
+  .sheet h2{font-size:26px}
+  .wrap{padding:0 16px}
+}
+@media (max-width:560px){
+  .strip-grid{grid-template-columns:1fr}
+  .kpi{border-left:0;border-top:1px solid var(--rule)}
+  .kpi:first-child{border-top:0}
+}
+</style>
+</head>
+<body>
+<script type="application/json" id="ledger">{"wallet":"0x9e5c3061910af922a8f60da430324e33cd364a79","raisedWei":"0","deployedWei":"0","onHandWei":"0","totalCitizens":0,"perCitizenWei":null,"participants":[],"movements":[],"syncedAt":null,"lastScannedBlock":null,"syncAvailable":false,"syncError":null,"citizensAvailable":false}</script>
+<div id="root"></div>
+<script>
+(function () {
+  "use strict";
+
+  // A read-only rendering of the ledger the Death & Taxes bot produces. Every amount
+  // arrives as a decimal wei string and stays a BigInt here — nothing is ever parsed
+  // into a float, so what this page shows reconciles to the wei with the chain.
+
+  var EXPLORER = "https://etherscan.io";
+  var ledger = JSON.parse(document.getElementById("ledger").textContent);
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  /** Exact wei -> ETH, trimmed. */
+  function eth(wei, digits) {
+    if (wei == null) return "—";
+    var v;
+    try { v = BigInt(wei); } catch (e) { return "—"; }
+    var neg = v < 0n;
+    if (neg) v = -v;
+    var whole = (v / 1000000000000000000n).toString();
+    var frac = (v % 1000000000000000000n).toString();
+    while (frac.length < 18) frac = "0" + frac;
+    frac = frac.slice(0, digits == null ? 5 : digits).replace(/0+$/, "");
+    return (neg ? "−" : "") + whole + (frac ? "." + frac : "");
+  }
+
+  function signed(wei) {
+    if (wei == null) return "—";
+    var v = BigInt(wei);
+    if (v === 0n) return "0";
+    return (v > 0n ? "+" : "") + eth(wei);
+  }
+
+  function plural(n, word) {
+    return n + " " + word + (n === 1 ? "" : "s");
+  }
+
+  function shortAddr(a) {
+    var s = String(a || "");
+    return s.length > 12 ? s.slice(0, 6) + "…" + s.slice(-4) : s;
+  }
+
+  function name(p) {
+    return p.nickname || p.ens || shortAddr(p.address);
+  }
+
+  function link(path, text) {
+    return '<a href="' + EXPLORER + path + '" target="_blank" rel="noreferrer">' + esc(text) + "</a>";
+  }
+
+  function kpi(label, value, unit, note, hero) {
+    return '<div class="kpi' + (hero ? " hero" : "") + '">' +
+      '<div class="k-label">' + esc(label) + "</div>" +
+      '<div class="k-value">' + esc(value) + '<span class="k-unit">' + esc(unit) + "</span></div>" +
+      '<div class="k-note">' + esc(note) + "</div></div>";
+  }
+
+  function position(p) {
+    if (p.position === "uncounted") return '<span class="chip pledged">not counted</span>';
+    if (p.position === "square") return '<span class="chip square">square</span>';
+    if (p.position === "credit") return '<span class="chip credit">credit ' + esc(eth(p.deltaWei)) + "</span>";
+    return '<span class="chip owes">owes ' + esc(eth(String(-BigInt(p.deltaWei)))) + "</span>";
+  }
+
+  function participantRow(p) {
+    var cls = "stripe";
+    if (p.position === "owes") cls += " owes";
+    else if (p.position === "credit") cls += " credit";
+
+    var tags = "";
+    if (p.optIn && BigInt(p.contributedWei) === 0n) tags += ' <span class="chip pledged">pledged</span>';
+    if (p.departuresConfirmed > 0) {
+      tags += ' <span class="chip confirmed">' + plural(p.departuresConfirmed, "departure") + " confirmed</span>";
+    }
+
+    var wallets = '<div class="sub">' + link("/address/" + p.address, p.address) + "</div>";
+    if (p.linked && p.linked.length) {
+      wallets += '<div class="sub">also holds in ' +
+        p.linked.map(function (a) { return link("/address/" + a, shortAddr(a)); }).join(", ") + "</div>";
+    }
+
+    return '<tr class="' + cls + '">' +
+      '<td><span class="who">' + esc(name(p)) + "</span>" + tags + wallets + "</td>" +
+      '<td class="num">' + p.citizens +
+        (p.citizensSource === "manual" ? ' <span class="chip manual">set</span>' : "") + "</td>" +
+      '<td class="num">' + esc(eth(p.contributedWei)) + "</td>" +
+      '<td class="num">' + esc(eth(p.fairShareWei)) + "</td>" +
+      '<td class="num">' + esc(signed(p.deltaWei)) + "</td>" +
+      "<td>" + position(p) + "</td></tr>";
+  }
+
+  function movementRow(m) {
+    return '<tr' + (m.excluded ? ' class="dropped"' : "") + ">" +
+      '<td class="sub">' + esc(m.timestamp ? m.timestamp.slice(0, 10) : "—") + "</td>" +
+      '<td><span class="chip dir-' + esc(m.dir) + '">' + esc(m.dir) + "</span>" +
+        (m.category === "internal" ? ' <span class="sub">internal</span>' : "") + "</td>" +
+      "<td>" + link("/address/" + m.counterparty, m.counterparty) +
+        (m.note ? '<div class="sub">' + esc(m.note) + "</div>" : "") +
+        (m.excluded ? '<div class="sub">not counted</div>' : "") + "</td>" +
+      '<td class="num">' + esc(eth(m.valueWei)) + "</td>" +
+      "<td>" + link("/tx/" + m.hash, shortAddr(m.hash)) + "</td></tr>";
+  }
+
+  var counted = ledger.participants.length;
+  var inCount = ledger.movements.filter(function (m) { return m.dir === "in" && !m.excluded; }).length;
+  var outCount = ledger.movements.filter(function (m) { return m.dir === "out" && !m.excluded; }).length;
+
+  document.getElementById("root").innerHTML =
+    '<header class="masthead"><div class="wrap">' +
+      '<span class="mark">d/t</span>' +
+      '<span class="dept">Dept of Death · Emigration Treasury</span>' +
+      '<span class="status"><span class="beacon"></span>' +
+        (ledger.syncedAt ? "Synced " + esc(ledger.syncedAt.slice(0, 10)) : "Not yet synced") +
+      "</span>" +
+    "</div></header>" +
+
+    '<section class="strip"><div class="wrap"><div class="strip-grid">' +
+      kpi("Raised", eth(ledger.raisedWei), "ETH", plural(inCount, "deposit")) +
+      kpi("Deployed", eth(ledger.deployedWei), "ETH", plural(outCount, "departure") + " paid") +
+      kpi("On hand", eth(ledger.onHandWei), "ETH", "unspent balance") +
+      kpi("Fair share", eth(ledger.perCitizenWei), "ETH",
+          ledger.perCitizenWei == null
+            ? "nothing deployed yet"
+            : "per citizen · " + ledger.totalCitizens + " counted", true) +
+    "</div></div></section>" +
+
+    '<main class="wrap">' +
+      '<section class="sheet">' +
+        '<div class="sheet-head"><span class="circular">Schedule A — Reconciliation</span>' +
+          '<span class="spacer"></span>' +
+          '<span class="sheet-note">' + counted + " counted · " + ledger.totalCitizens + " citizens</span>" +
+        "</div>" +
+        "<h2>What each holder owes the door.</h2>" +
+        '<p class="lede">Every ETH that leaves this wallet buys a departure, and the bill is ' +
+          "split by the citizens each participant holds. Contribute already and you carry a " +
+          "credit; pledge and stand still and you carry a debt.</p>" +
+        '<div class="scroll"><table><thead><tr>' +
+          '<th>Holder</th><th class="num">Citizens</th><th class="num">Contributed</th>' +
+          '<th class="num">Fair share</th><th class="num">Delta</th><th>Position</th>' +
+        "</tr></thead><tbody>" +
+        (ledger.participants.length
+          ? ledger.participants.map(participantRow).join("")
+          : '<tr><td colspan="6" class="empty">Nobody has contributed or pledged yet.</td></tr>') +
+        "</tbody></table></div>" +
+      "</section>" +
+
+      '<section class="sheet">' +
+        '<div class="sheet-head"><span class="circular">Schedule B — Movements</span>' +
+          '<span class="spacer"></span>' +
+          '<span class="sheet-note">in = contribution · out = departure paid</span>' +
+        "</div>" +
+        "<h2>The wallet, line by line.</h2>" +
+        '<div class="scroll"><table><thead><tr>' +
+          '<th>Date</th><th>Flow</th><th>Counterparty</th><th class="num">ETH</th><th>Tx</th>' +
+        "</tr></thead><tbody>" +
+        (ledger.movements.length
+          ? ledger.movements.map(movementRow).join("")
+          : '<tr><td colspan="5" class="empty">No movements recorded yet.</td></tr>') +
+        "</tbody></table></div>" +
+      "</section>" +
+    "</main>" +
+
+    '<footer><div class="wrap">' +
+      "<p>Treasury wallet · " + link("/address/" + ledger.wallet, ledger.wallet) + "</p>" +
+      "<p>Published from the Death &amp; Taxes bot, which reads this wallet directly. " +
+        "Citizen counts come from the Citizen ownership index; a count marked " +
+        "<em>set</em> was entered by hand because that holder's citizens sit in a wallet " +
+        "the index cannot attribute to them.</p>" +
+      "<p>Verify every figure against the chain before you send anything. This page is a " +
+        "record, not an authority — and never a wallet address given by DM.</p>" +
+    "</div></footer>";
+})();
+</script>
+</body>
+</html>

@@ -719,8 +719,21 @@ export interface TreasuryParticipant {
   ens: string | null;
   /** Operator-set label, shown ahead of the ENS name when present. */
   nickname: string | null;
-  /** Live count from the Citizen ownership index — not hand-entered. */
+  /**
+   * Citizens counted toward this holder. Live from the ownership index by default,
+   * summed across their funding address and any linked wallets; a manual override
+   * replaces that when the operator has better information.
+   */
   citizens: number;
+  /** "chain" = live from the ownership index. "manual" = an operator override, which
+   *  does NOT move as citizens die or emigrate. Shown, so a stale count is visible. */
+  citizensSource: "chain" | "manual";
+  /**
+   * Other wallets belonging to this same person. The wallet that funds the treasury is
+   * often not the wallet holding the citizens, so without this a contributor reads as
+   * holding nothing. Their contributions and citizens both fold into this row.
+   */
+  linked: string[];
   /** Pledged to contribute when the game ends, without having sent ETH yet. */
   optIn: boolean;
   contributedWei: string;

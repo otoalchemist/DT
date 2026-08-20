@@ -110,6 +110,8 @@ export const api = {
     address: string;
     nickname?: string | null;
     optIn?: boolean;
+    citizensOverride?: number | null;
+    linked?: string[];
     remove?: boolean;
   }) => req<TreasuryLedger>("/api/treasury/participant", { method: "POST", body: JSON.stringify(body) }),
   treasuryMovement: (body: { key: string; excluded?: boolean; note?: string }) =>

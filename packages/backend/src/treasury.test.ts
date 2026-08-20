@@ -371,3 +371,100 @@ describe("published-page bridge", () => {
     expect(JSON.parse(JSON.stringify(l)).movements[0].valueWei).toBe(l.movements[0]!.valueWei);
   });
 });
+
+describe("holders whose citizens live in another wallet", () => {
+  const HOLDING = "0x6666666666666666666666666666666666666666";
+
+  it("counts citizens from a linked wallet, not just the funding one", async () => {
+    // Alice funds from her hot wallet but holds every citizen in a vault.
+    liveCitizens = Array.from({ length: 4 }, (_, i) => ({ id: BigInt(i), owner: HOLDING }));
+    inbound = [transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("8") })];
+    outbound = [transfer({ id: "out-1", hash: "0xb1", from: TREASURY, to: PLAYER, wei: eth("8") })];
+    await syncTreasury();
+
+    const before = await buildTreasuryLedger();
+    expect(before.participants[0]!.citizens).toBe(0); // the bug this linkage fixes
+
+    upsertParticipant({ address: ALICE, linked: [HOLDING] });
+    const after = await buildTreasuryLedger();
+    expect(after.participants[0]!.citizens).toBe(4);
+    expect(after.participants[0]!.citizensSource).toBe("chain");
+    expect(after.totalCitizens).toBe(4);
+    expect(after.participants[0]!.deltaWei).toBe("0"); // paid 8, owes 8
+  });
+
+  it("folds a linked wallet's own contributions into one row", async () => {
+    liveCitizens = [{ id: 1n, owner: HOLDING }];
+    inbound = [
+      transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("3") }),
+      transfer({ id: "in-2", hash: "0xa2", from: HOLDING, to: TREASURY, wei: eth("2") }),
+    ];
+    await syncTreasury();
+    upsertParticipant({ address: ALICE, linked: [HOLDING], nickname: "Alice" });
+
+    const l = await buildTreasuryLedger();
+    expect(l.participants).toHaveLength(1);
+    expect(l.participants[0]!.contributedWei).toBe((5n * 10n ** 18n).toString());
+  });
+
+  it("never lists a linked wallet as its own participant", async () => {
+    liveCitizens = [{ id: 1n, owner: HOLDING }];
+    inbound = [transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("1") })];
+    await syncTreasury();
+    upsertParticipant({ address: HOLDING, optIn: true }); // pledged in its own right...
+    upsertParticipant({ address: ALICE, linked: [HOLDING] }); // ...then claimed by Alice
+
+    const l = await buildTreasuryLedger();
+    expect(l.participants.map((p) => p.address)).toEqual([ALICE]);
+    expect(l.totalCitizens).toBe(1); // counted once, not twice
+  });
+
+  it("lets an explicit override beat the index", async () => {
+    liveCitizens = [{ id: 1n, owner: ALICE }];
+    inbound = [transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("1") })];
+    outbound = [transfer({ id: "out-1", hash: "0xb1", from: TREASURY, to: PLAYER, wei: eth("10") })];
+    await syncTreasury();
+    upsertParticipant({ address: ALICE, citizensOverride: 12 });
+
+    const l = await buildTreasuryLedger();
+    expect(l.participants[0]!.citizens).toBe(12);
+    expect(l.participants[0]!.citizensSource).toBe("manual");
+    expect(l.totalCitizens).toBe(12);
+  });
+
+  it("hands the count back to the index when the override is cleared", async () => {
+    liveCitizens = [{ id: 1n, owner: ALICE }, { id: 2n, owner: ALICE }];
+    inbound = [transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("1") })];
+    await syncTreasury();
+    upsertParticipant({ address: ALICE, citizensOverride: 9 });
+    expect((await buildTreasuryLedger()).participants[0]!.citizens).toBe(9);
+
+    upsertParticipant({ address: ALICE, citizensOverride: null });
+    const l = await buildTreasuryLedger();
+    expect(l.participants[0]!.citizens).toBe(2);
+    expect(l.participants[0]!.citizensSource).toBe("chain");
+  });
+
+  it("refuses to link a wallet to itself", async () => {
+    inbound = [transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("1") })];
+    await syncTreasury();
+    upsertParticipant({ address: ALICE, linked: [ALICE, HOLDING, HOLDING] });
+    const l = await buildTreasuryLedger();
+    expect(l.participants[0]!.linked).toEqual([HOLDING]); // self dropped, dupe collapsed
+  });
+
+  it("keeps a nickname, pledge and linkage across separate edits", async () => {
+    liveCitizens = [{ id: 1n, owner: HOLDING }];
+    inbound = [transfer({ id: "in-1", hash: "0xa1", from: ALICE, to: TREASURY, wei: eth("1") })];
+    await syncTreasury();
+    upsertParticipant({ address: ALICE, nickname: "Alice" });
+    upsertParticipant({ address: ALICE, linked: [HOLDING] });
+    upsertParticipant({ address: ALICE, optIn: true });
+
+    const p = (await buildTreasuryLedger()).participants[0]!;
+    expect(p.nickname).toBe("Alice");
+    expect(p.linked).toEqual([HOLDING]);
+    expect(p.optIn).toBe(true);
+    expect(p.citizens).toBe(1);
+  });
+});

@@ -74,6 +74,38 @@ export function Treasury({ explorerBase }: { explorerBase?: string | null }) {
     }
   };
 
+  /** Override the live citizen count, or clear the override by blanking the field. */
+  const saveCitizens = (p: TreasuryParticipant, raw: string) => {
+    const text = raw.trim();
+    if (text === "") {
+      if (p.citizensSource === "manual") {
+        void run(() => api.treasuryParticipant({ address: p.address, citizensOverride: null }));
+      }
+      return;
+    }
+    const n = Number(text);
+    if (!Number.isInteger(n) || n < 0) {
+      setError("Citizens must be a whole number, zero or more.");
+      return;
+    }
+    // Typing back the number already shown is not an edit — but it IS one if that number
+    // came from the chain, because pinning it is exactly what the operator meant.
+    if (n === p.citizens && p.citizensSource === "manual") return;
+    void run(() => api.treasuryParticipant({ address: p.address, citizensOverride: n }));
+  };
+
+  /** Claim other wallets for this holder — the funding wallet often holds no citizens. */
+  const saveLinked = (p: TreasuryParticipant, raw: string) => {
+    const linked = raw.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
+    const bad = linked.find((a) => !/^0x[0-9a-fA-F]{40}$/.test(a));
+    if (bad) {
+      setError(`"${bad}" isn't a wallet address — 40 hex characters after 0x.`);
+      return;
+    }
+    if (linked.join(",") === p.linked.join(",")) return;
+    void run(() => api.treasuryParticipant({ address: p.address, linked }));
+  };
+
   const addOptIn = () => {
     const address = newAddress.trim();
     if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
@@ -178,8 +210,51 @@ export function Treasury({ explorerBase }: { explorerBase?: string | null }) {
                       {p.departuresConfirmed} departure{p.departuresConfirmed === 1 ? "" : "s"} confirmed
                     </span>
                   )}
+                  <input
+                    type="text"
+                    key={`linked-${p.address}-${p.linked.join(",")}`}
+                    defaultValue={p.linked.join(", ")}
+                    placeholder="also holds citizens in 0x… (comma separated)"
+                    disabled={busy}
+                    title="Wallets belonging to this same person. Their citizens and contributions fold into this row."
+                    onBlur={(e) => saveLinked(p, e.target.value)}
+                    style={{ display: "block", width: "100%", marginTop: 4, fontSize: 11 }}
+                  />
                 </td>
-                <td style={{ textAlign: "right" }}>{p.citizens}</td>
+                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                  <input
+                    type="number"
+                    min={0}
+                    key={`cit-${p.address}-${p.citizens}-${p.citizensSource}`}
+                    defaultValue={p.citizens}
+                    disabled={busy}
+                    title={
+                      p.citizensSource === "manual"
+                        ? "Set by hand — this does not move as citizens die or emigrate"
+                        : "Live from the ownership index. Type a number to override it."
+                    }
+                    onBlur={(e) => saveCitizens(p, e.target.value)}
+                    style={{
+                      width: 62,
+                      textAlign: "right",
+                      fontWeight: p.citizensSource === "manual" ? 600 : 400,
+                    }}
+                  />
+                  {p.citizensSource === "manual" && (
+                    <button
+                      onClick={() =>
+                        void run(() =>
+                          api.treasuryParticipant({ address: p.address, citizensOverride: null }),
+                        )
+                      }
+                      disabled={busy}
+                      title="Clear the override and go back to the live count"
+                      style={{ marginLeft: 4, padding: "0 5px", fontSize: 11 }}
+                    >
+                      ↺
+                    </button>
+                  )}
+                </td>
                 <td style={{ textAlign: "right" }}>{weiToEthExact(p.contributedWei)}</td>
                 <td style={{ textAlign: "right" }}>{weiToEthExact(p.fairShareWei)}</td>
                 <td style={{ textAlign: "right" }}>{weiToEthSigned(p.deltaWei)}</td>
@@ -290,9 +365,11 @@ export function Treasury({ explorerBase }: { explorerBase?: string | null }) {
         )}{" "}
         is a contribution; ETH out buys a departure. The bill for the departures bought so
         far is split across the citizens held by everyone who has contributed or pledged, so
-        a holder's position is what they paid minus their share. Citizen counts and names
-        come from the chain, not from this panel — what you set here is who intends to pay,
-        what to call them, and which movements shouldn't count.
+        a holder's position is what they paid minus their share. Counts and names come from
+        the chain by default — but the wallet that funds the pot is often not the wallet
+        holding the citizens, so claim the other wallets under a holder's name and both
+        their citizens and their contributions fold into that row. Type a number over the
+        count to pin it by hand instead; ↺ hands it back to the live index.
       </p>
     </div>
   );

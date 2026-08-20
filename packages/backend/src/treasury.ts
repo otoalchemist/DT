@@ -187,6 +187,14 @@ interface RosterEntry {
   address: string;
   nickname: string | null;
   optIn: boolean;
+  /**
+   * An explicit count set by the operator, overriding whatever the ownership index says.
+   * The escape hatch for a holder whose citizens the index cannot attribute — but it is
+   * a snapshot, so it does not move as citizens die or emigrate.
+   */
+  citizensOverride: number | null;
+  /** Other wallets belonging to this person. Their citizens and contributions fold in. */
+  linked: string[];
 }
 
 interface TreasuryFile {
@@ -347,6 +355,17 @@ export async function buildTreasuryLedger(): Promise<TreasuryLedger> {
     (a, b) => b.blockNumber - a.blockNumber || a.hash.localeCompare(b.hash),
   );
 
+  // A person may fund from one wallet and hold citizens in another, so every address is
+  // first folded onto whichever roster entry claims it. Without this, the funding wallet
+  // reads as holding nothing and its owner looks permanently in credit.
+  const linkOf = new Map<string, string>();
+  for (const entry of Object.values(state.roster)) {
+    for (const linked of entry.linked ?? []) {
+      if (linked !== entry.address) linkOf.set(linked, entry.address);
+    }
+  }
+  const canonical = (a: string): string => linkOf.get(a) ?? a;
+
   let raised = 0n;
   let deployed = 0n;
   const contributed = new Map<string, bigint>();
@@ -355,12 +374,13 @@ export async function buildTreasuryLedger(): Promise<TreasuryLedger> {
   for (const m of movements) {
     if (m.excluded) continue;
     const wei = BigInt(m.valueWei);
+    const who = canonical(m.counterparty);
     if (m.dir === "in") {
       raised += wei;
-      contributed.set(m.counterparty, (contributed.get(m.counterparty) ?? 0n) + wei);
+      contributed.set(who, (contributed.get(who) ?? 0n) + wei);
     } else {
       deployed += wei;
-      paidTo.set(m.counterparty, (paidTo.get(m.counterparty) ?? 0) + 1);
+      paidTo.set(who, (paidTo.get(who) ?? 0) + 1);
     }
   }
 
@@ -370,14 +390,28 @@ export async function buildTreasuryLedger(): Promise<TreasuryLedger> {
   // merely paid a subsidy to — is not splitting the bill and must not dilute the divisor.
   const addresses = new Set<string>([
     ...contributed.keys(),
-    ...Object.values(state.roster).filter((r) => r.optIn).map((r) => r.address),
+    ...Object.values(state.roster)
+      .filter((r) => r.optIn && !linkOf.has(r.address))
+      .map((r) => r.address),
   ]);
 
-  const totalCitizens = [...addresses].reduce((sum, a) => sum + (citizens.get(a) ?? 0), 0);
+  /** Citizens counted toward one holder: their override, else the chain sum across
+   *  their own wallet and every wallet linked to it. */
+  const heldBy = (address: string): { count: number; source: "chain" | "manual" } => {
+    const entry = state.roster[address];
+    if (entry?.citizensOverride != null) return { count: entry.citizensOverride, source: "manual" };
+    const wallets = [address, ...(entry?.linked ?? [])];
+    return {
+      count: wallets.reduce((sum, w) => sum + (citizens.get(w) ?? 0), 0),
+      source: "chain",
+    };
+  };
+
+  const totalCitizens = [...addresses].reduce((sum, a) => sum + heldBy(a).count, 0);
   const perCitizen = totalCitizens > 0 ? deployed / BigInt(totalCitizens) : null;
 
   const participants: TreasuryParticipant[] = [...addresses].map((address) => {
-    const held = citizens.get(address) ?? 0;
+    const { count: held, source: citizensSource } = heldBy(address);
     const paid = contributed.get(address) ?? 0n;
     // Multiply before dividing so the split is exact to the wei rather than compounding
     // a rounded per-citizen rate across every holder.
@@ -390,6 +424,8 @@ export async function buildTreasuryLedger(): Promise<TreasuryLedger> {
       ens: null,
       nickname: roster?.nickname ?? null,
       citizens: held,
+      citizensSource,
+      linked: roster?.linked ?? [],
       optIn: roster?.optIn ?? false,
       contributedWei: paid.toString(),
       fairShareWei: fair === null ? null : fair.toString(),
@@ -430,15 +466,23 @@ export async function buildTreasuryLedger(): Promise<TreasuryLedger> {
 /* Operator edits                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** Set the nickname and/or opt-in pledge for an address. */
+/** Set the nickname, pledge, citizen override and/or linked wallets for an address. */
 export function upsertParticipant(input: {
   address: string;
   nickname?: string | null;
   optIn?: boolean;
+  citizensOverride?: number | null;
+  linked?: string[];
 }): void {
   const state = load();
   const address = input.address.toLowerCase();
   const existing = state.roster[address];
+  // A wallet cannot be linked to itself, and duplicates would double-count its citizens.
+  const linked =
+    input.linked === undefined
+      ? (existing?.linked ?? [])
+      : [...new Set(input.linked.map((a) => a.toLowerCase()))].filter((a) => a !== address);
+
   save({
     ...state,
     roster: {
@@ -447,6 +491,11 @@ export function upsertParticipant(input: {
         address,
         nickname: input.nickname === undefined ? (existing?.nickname ?? null) : input.nickname,
         optIn: input.optIn === undefined ? (existing?.optIn ?? false) : input.optIn,
+        citizensOverride:
+          input.citizensOverride === undefined
+            ? (existing?.citizensOverride ?? null)
+            : input.citizensOverride,
+        linked,
       },
     },
   });

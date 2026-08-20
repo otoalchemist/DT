@@ -16,6 +16,9 @@ data/config.json
 # Emigration treasury ledger: the scanned movements plus YOUR roster of who has
 # pledged, what to call them, and which movements don't count. Local state.
 data/treasury.json
+
+# Published static treasury page — regenerate with `npm run publish-treasury`
+site/dist/
 # Hashes of the last auto-synced default lists (local sync bookkeeping, see list-sync.ts)
 data/.list-sync.json
 # Race telemetry: local experiment data about this install’s own submissions

@@ -562,6 +562,40 @@ the last good figures stay on screen with the reason attached.
 Set `TREASURY_ADDRESS` in `.env` to reconcile a different pot. The ledger and your roster
 live in `data/treasury.json`, which is gitignored.
 
+### When the citizens aren't in the funding wallet
+
+The wallet that funds the pot is frequently **not** the wallet holding the citizens — a
+contributor pays from a hot wallet and keeps their Citizens in a vault. Left alone, the
+ownership index attributes nothing to the funding address, so that contributor reads as
+holding zero, owing nothing, and sitting on a permanent credit.
+
+Two ways to fix it, both in the Treasury panel:
+
+- **Claim their other wallets.** Type the vault addresses under the holder's name. Their
+  citizens *and* any contributions from those wallets fold into that one row, and the
+  count stays live — it still moves as citizens die or emigrate.
+- **Type a count over the top.** Sets an explicit number, marked `set` so it is visible as
+  a hand-entered figure. Use it when you know the holding but not the address. It is a
+  snapshot and will not move on its own; `↺` hands the count back to the live index.
+
+### Publishing a public page
+
+`npm run publish-treasury` bakes the current ledger into a standalone HTML file at
+`site/dist/treasury.html`:
+
+```bash
+npm run publish-treasury                    # from a running bot on :8787
+npm run publish-treasury -- --in led.json   # ...or from a saved ledger
+```
+
+Upload that one file anywhere static — Cloudflare Pages, Netlify, GitHub Pages, S3. It has
+no dependencies and makes no requests except the webfont.
+
+The published page is **read-only by construction**: it contains no inputs, no buttons and
+no API to post to, so a visitor cannot rewrite the record because there is nothing there to
+write to. Editing happens in your dashboard; publishing is how the public copy catches up.
+Re-run it whenever you want the public page to reflect a refresh.
+
 ## Race post-mortem
 
 Compare your transaction against a rival's to diagnose *why* you lost a race —
