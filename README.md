@@ -580,21 +580,40 @@ Two ways to fix it, both in the Treasury panel:
 
 ### Publishing a public page
 
-`npm run publish-treasury` bakes the current ledger into a standalone HTML file at
-`site/dist/treasury.html`:
+`npm run publish-treasury` bakes the current ledger into a standalone page at
+`site/dist/index.html`, alongside a `_headers` file:
 
 ```bash
 npm run publish-treasury                    # from a running bot on :8787
 npm run publish-treasury -- --in led.json   # ...or from a saved ledger
+npm run deploy-treasury                     # ...and push it to Cloudflare Pages
 ```
 
-Upload that one file anywhere static — Cloudflare Pages, Netlify, GitHub Pages, S3. It has
-no dependencies and makes no requests except the webfont.
+The output is one self-contained file. It has no dependencies and makes no requests except
+the webfont, so any static host serves it — the deploy script targets Cloudflare Pages
+(project `gubnah`), but uploading `site/dist/` anywhere works just as well.
 
-The published page is **read-only by construction**: it contains no inputs, no buttons and
-no API to post to, so a visitor cannot rewrite the record because there is nothing there to
-write to. Editing happens in your dashboard; publishing is how the public copy catches up.
-Re-run it whenever you want the public page to reflect a refresh.
+`site/dist` is owned by the publisher and wiped on every run. A page left behind from an
+earlier run would deploy alongside the new one and serve a stale ledger from its old URL,
+which is worse than not publishing at all — it still looks live.
+
+The published page is **read-only by construction**: no inputs, no buttons, and no API to
+post to, so a visitor cannot rewrite the record because there is nothing there to write to.
+The generated `_headers` locks it down further — `script-src` carries a hash of the page's
+own script, so no injected script can execute even if one reaches the markup. Editing
+happens in your dashboard; publishing is how the public copy catches up.
+
+**First deploy:**
+
+1. `npx wrangler login` — authorises the CLI against your Cloudflare account.
+2. `npm run deploy-treasury` — creates the project and returns a `*.pages.dev` URL.
+3. In the Cloudflare dashboard, **Workers & Pages → gubnah → Custom domains**, add
+   `gubnah.xyz`. The domain has to be on Cloudflare DNS; the apex works directly, with no
+   `www` redirect needed.
+
+Afterwards it is one command per refresh. Note the page publishes contributor addresses
+next to their nicknames — a permanent, indexable link between a name and a wallet. Leave
+nicknames blank if your contributors would rather not have that.
 
 ## Race post-mortem
 
