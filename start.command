@@ -19,6 +19,27 @@ if command -v node >/dev/null 2>&1; then
     BOT_UPDATE_FROM_LAUNCHER=1 node scripts/update.mjs
 fi
 
+# Node version gate. engines">=20" is advisory — npm does not enforce it — and an older
+# Node lets Vite start while the backend dies, which surfaces only as endless
+# "ECONNREFUSED 127.0.0.1:8787" proxy errors from the web side with the real cause scrolled
+# away. Say it plainly instead.
+if command -v node >/dev/null 2>&1; then
+    NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
+    if [ "$NODE_MAJOR" -lt 20 ]; then
+        echo
+        echo "ERROR: Node $(node -v) is too old — this bot needs Node 20 or newer."
+        echo "Install it from https://nodejs.org (or: brew install node@22) and run this again."
+        read -r -p "Press Return to close..."
+        exit 1
+    fi
+else
+    echo
+    echo "ERROR: Node.js is not installed (or not on PATH for this shell)."
+    echo "Install Node 20+ from https://nodejs.org, then run this again."
+    read -r -p "Press Return to close..."
+    exit 1
+fi
+
 # Install dependencies on first run (or after a clean clone)
 if [ ! -d "node_modules" ]; then
     echo "Installing dependencies, this may take a minute..."

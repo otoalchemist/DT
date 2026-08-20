@@ -128,6 +128,30 @@ Notarizing the launcher would not help: a bare `.command` cannot be notarized on
 its own, so it would mean shipping a signed app bundle and an Apple Developer
 account to wrap a script that runs `npm`.
 
+**Endless `ECONNREFUSED 127.0.0.1:8787` / every action returns HTTP 500**
+
+The dashboard is up but the backend is not, so Vite's proxy fails every `/api` call —
+including saving your Alchemy key, which makes it look like the key was rejected. It
+was not: nothing reached the backend.
+
+The real error is in the SAME terminal, scrolled up above the repeated `[web]` lines,
+prefixed `[backend]`. To see it on its own:
+
+```bash
+npm run dev:backend
+```
+
+The usual causes, in order:
+
+- **Node older than 20.** `node -v` — Vite runs on 18, the backend does not. The
+  launcher now refuses to start on anything older instead of half-working.
+- **A `node_modules` copied from another machine.** esbuild and other packages ship
+  platform-specific binaries, so a folder moved from Windows (or restored from a
+  backup) breaks `tsx`. Copy `data/` across between machines, never `node_modules`.
+  Fix: `rm -rf node_modules package-lock.json && npm install`
+- **A half-finished `npm install`** (dropped network). Same fix as above.
+- **Port 8787 already in use** by an earlier run: `lsof -ti tcp:8787 | xargs kill -9`.
+
 Open the dashboard at **`http://localhost:5173`** and:
 
 1. **Create a hot wallet** — generate a fresh burner or import a private key. It's
