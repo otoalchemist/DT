@@ -1,5 +1,6 @@
 import type {
   BotStatus,
+  TreasuryLedger,
   StrategyConfig,
   ActivityEntry,
   OwnedTokenStatus,
@@ -98,4 +99,19 @@ export const api = {
     req<{ ok: boolean; mode: string }>("/api/settings", { method: "POST", body: JSON.stringify({ mode }) }),
   postMortem: (ours: string[], rivals: string[]) =>
     req<PostMortemResult>("/api/postmortem", { method: "POST", body: JSON.stringify({ ours, rivals }) }),
+
+  treasury: () => req<TreasuryLedger>("/api/treasury"),
+  treasuryKeys: () => req<Record<string, string>>("/api/treasury/keys"),
+  treasuryRefresh: () =>
+    req<{ added: number; scannedTo: number; ledger: TreasuryLedger }>("/api/treasury/refresh", {
+      method: "POST",
+    }),
+  treasuryParticipant: (body: {
+    address: string;
+    nickname?: string | null;
+    optIn?: boolean;
+    remove?: boolean;
+  }) => req<TreasuryLedger>("/api/treasury/participant", { method: "POST", body: JSON.stringify(body) }),
+  treasuryMovement: (body: { key: string; excluded?: boolean; note?: string }) =>
+    req<TreasuryLedger>("/api/treasury/movement", { method: "POST", body: JSON.stringify(body) }),
 };

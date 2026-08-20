@@ -679,3 +679,88 @@ export interface BotStatus {
   /** True when the Alchemy NFT API (or token overrides) are configured. */
   nftConfigured: boolean;
 }
+
+/* ---------------------------------------------------------------------------
+ * Emigration treasury
+ *
+ * Every ETH amount is a decimal WEI string, matching balanceWei above: the values are
+ * bigints on both sides and only the JSON hop between them is a string. They are never
+ * JS numbers — 0.11661 ETH is not representable in a float, and a treasury that
+ * mis-sums by a rounding error is worse than no treasury at all.
+ * ------------------------------------------------------------------------- */
+
+/** One ETH movement into or out of the treasury wallet. */
+export interface TreasuryMovement {
+  hash: string;
+  /** "in" = a contribution to the pot. "out" = a departure subsidy paid. */
+  dir: "in" | "out";
+  /** Sender (in) or recipient (out), lowercased. */
+  counterparty: string;
+  valueWei: string;
+  blockNumber: number;
+  /** ISO-8601, from the transfer's block timestamp. */
+  timestamp: string | null;
+  /** "external" = a plain ETH transfer; "internal" = ETH moved by a contract, which is
+   *  how a multisig or a disperse contract shows up. Both are real money. */
+  category: "external" | "internal";
+  /**
+   * Operator annotation. Not every deposit is a contribution (your own top-up, a
+   * returned payment) and not every withdrawal buys a departure (a refund, a mistake).
+   * Excluded movements stay visible in the ledger but leave the fair-share maths alone.
+   */
+  excluded: boolean;
+  note: string;
+}
+
+/** A holder who has either contributed already or opted in to contribute later. */
+export interface TreasuryParticipant {
+  address: string;
+  /** Reverse-resolved on-chain; null when the address has no reverse record. */
+  ens: string | null;
+  /** Operator-set label, shown ahead of the ENS name when present. */
+  nickname: string | null;
+  /** Live count from the Citizen ownership index — not hand-entered. */
+  citizens: number;
+  /** Pledged to contribute when the game ends, without having sent ETH yet. */
+  optIn: boolean;
+  contributedWei: string;
+  /** deployed × citizens ÷ totalCitizens, or null when nothing has been deployed. */
+  fairShareWei: string | null;
+  /** contributedWei − fairShareWei. Positive = ahead, negative = behind. */
+  deltaWei: string | null;
+  position: "credit" | "owes" | "square" | "uncounted";
+  /**
+   * Payouts to this address that a matching `Emigrated` event confirms. The whole point
+   * of the pot is buying departures, so a subsidy that bought one is worth telling apart
+   * from a subsidy that did not.
+   */
+  departuresConfirmed: number;
+}
+
+export interface TreasuryLedger {
+  wallet: string;
+  raisedWei: string;
+  deployedWei: string;
+  onHandWei: string;
+  /** Summed across participants only — a holder who neither paid nor pledged is not
+   *  splitting the bill and must not dilute it. */
+  totalCitizens: number;
+  perCitizenWei: string | null;
+  participants: TreasuryParticipant[];
+  movements: TreasuryMovement[];
+  /** ISO-8601 of the last successful chain sync. */
+  syncedAt: string | null;
+  lastScannedBlock: number | null;
+  /**
+   * False when the configured RPC can't serve the transfer history (the scan needs
+   * Alchemy's alchemy_getAssetTransfers). The ledger still works — movements can be
+   * recorded by hand — but it will not refresh itself.
+   */
+  syncAvailable: boolean;
+  /** Why the last sync failed, or null. Surfaced rather than swallowed: a treasury
+   *  showing stale figures as though they were live is a correctness bug. */
+  syncError: string | null;
+  /** True when citizen counts came from the ownership index; false when it is
+   *  unconfigured, in which case every count reads 0 and shares can't be split. */
+  citizensAvailable: boolean;
+}

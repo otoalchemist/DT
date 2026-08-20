@@ -275,3 +275,14 @@ export function densityTrend(series: DensityPoint[]): DensityTrend | null {
   const changePct = first === 0 ? (last === 0 ? 0 : 100) : ((last - first) / first) * 100;
   return { direction, slopePerEpoch, changePct, first, last, points: n };
 }
+
+/**
+ * The community emigration treasury.
+ *
+ * ETH sent IN is a contribution toward buying departures; ETH sent OUT is a subsidy paid
+ * to a player for accepting emigration. Nothing about this wallet is enforced on-chain —
+ * it is a pot people fund voluntarily — so the ledger's job is to make both directions
+ * auditable rather than to control them. Overridable via TREASURY_ADDRESS for anyone
+ * running their own pot.
+ */
+export const TREASURY_ADDRESS = "0x9e5c3061910af922a8f60da430324e33cd364a79" as const;

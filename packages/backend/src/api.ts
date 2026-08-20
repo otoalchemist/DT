@@ -29,6 +29,15 @@ import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
 import { getTargetScores, startTargetScores } from "./target-scores.js";
 import { runPostMortem } from "./postmortem.js";
 import { syncDefaultLists } from "./list-sync.js";
+import {
+  buildTreasuryLedger,
+  syncTreasury,
+  upsertParticipant,
+  removeParticipant,
+  annotateMovement,
+  movementKeys,
+  syncAvailable as treasurySyncAvailable,
+} from "./treasury.js";
 
 const strategyPatch = z
   .object({
@@ -637,6 +646,78 @@ export async function buildServer(): Promise<FastifyInstance> {
       // The epoch may have rolled while idle, which changes when the next wake is due.
       if (runtime.strategy.awayMode) scheduleAwayWake();
       return runtime.status();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  // --- emigration treasury -------------------------------------------------
+  // ETH into the community wallet is a contribution; ETH out buys a departure. The
+  // ledger reconciles the two and splits the bill by citizens held. Reads never touch
+  // the chain for transfer history — that only happens on an explicit refresh — so the
+  // panel stays responsive while a scan is a deliberate act.
+
+  app.get("/api/treasury", async (_req, reply) => {
+    try {
+      return await buildTreasuryLedger();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  app.get("/api/treasury/keys", async () => movementKeys());
+
+  app.post("/api/treasury/refresh", async (_req, reply) => {
+    if (!appConfig.httpUrl) {
+      return reply.code(400).send({ error: "No RPC configured — set the Alchemy key first." });
+    }
+    if (!treasurySyncAvailable()) {
+      return reply.code(400).send({
+        error: "Auto-sync needs an Alchemy endpoint. Record movements by hand, or set ALCHEMY_API_KEY.",
+      });
+    }
+    try {
+      const { added, scannedTo } = await syncTreasury();
+      return { added, scannedTo, ledger: await buildTreasuryLedger() };
+    } catch (err) {
+      // The stored ledger is untouched by a failed scan, so the panel keeps showing the
+      // last good figures with the reason attached rather than blanking.
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  app.post("/api/treasury/participant", async (req, reply) => {
+    const schema = z.object({
+      address: z.string().regex(/^0x[0-9a-fA-F]{40}$/, "invalid address"),
+      nickname: z.string().max(60).nullable().optional(),
+      optIn: z.boolean().optional(),
+      remove: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    const { address, nickname, optIn, remove } = parsed.data;
+    try {
+      if (remove) removeParticipant(address);
+      else upsertParticipant({ address, nickname, optIn });
+      return await buildTreasuryLedger();
+    } catch (err) {
+      return reply.code(500).send({ error: (err as Error).message });
+    }
+  });
+
+  app.post("/api/treasury/movement", async (req, reply) => {
+    const schema = z.object({
+      key: z.string().min(1),
+      excluded: z.boolean().optional(),
+      note: z.string().max(200).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    try {
+      if (!annotateMovement(parsed.data.key, parsed.data)) {
+        return reply.code(404).send({ error: "No such movement in the ledger." });
+      }
+      return await buildTreasuryLedger();
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
     }

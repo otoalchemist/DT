@@ -522,6 +522,46 @@ reading much into the numbers; the script says so when the sample is under 10.
 
 ---
 
+## Emigration treasury
+
+A shared pot that pays players to accept emigration: ETH sent **into** the treasury wallet
+is a contribution, ETH sent **out** is a departure subsidy. The **Treasury** panel
+reconciles the two and tells each contributor where they stand.
+
+The bill for the departures bought so far is split across the citizens held by everyone
+who has either contributed or pledged to. Your **fair share** is that per-citizen rate
+times what you hold; your **position** is what you have actually paid minus that share —
+a *credit* if you are ahead, *owes* if you are behind. A wallet the treasury merely paid
+is not splitting the bill and never dilutes the divisor.
+
+Two inputs come from the chain rather than from you, so they cannot quietly rot:
+
+| From the chain | From you |
+| --- | --- |
+| Movements in and out of the wallet | Who has **pledged** to contribute later |
+| **Citizen counts** per holder, live from the ownership index | What to **call** them |
+| **ENS names**, reverse-resolved | Which movements **don't count** |
+
+That last one matters: not every deposit is a contribution (your own top-up, a returned
+payment) and not every withdrawal buys a departure. Uncheck one and it stays on the record
+but leaves the maths alone — and a later refresh will not clobber the annotation.
+
+Because the pot exists to buy departures, each payout is checked against the `Emigrated`
+event log: a subsidy that actually bought a departure is marked confirmed, and one that
+did not is not.
+
+Every amount is held and summed as **wei**, never as a floating-point number of ETH —
+0.11661 ETH does not survive a float round-trip, and a treasury that mis-sums by a
+rounding error is worse than no treasury at all.
+
+**Refreshing needs an Alchemy endpoint.** The transfer history comes from
+`alchemy_getAssetTransfers`, which other RPCs do not serve; on one of those the panel still
+works, but you record movements by hand. A failed scan never overwrites the stored ledger —
+the last good figures stay on screen with the reason attached.
+
+Set `TREASURY_ADDRESS` in `.env` to reconcile a different pot. The ledger and your roster
+live in `data/treasury.json`, which is gitignored.
+
 ## Race post-mortem
 
 Compare your transaction against a rival's to diagnose *why* you lost a race —

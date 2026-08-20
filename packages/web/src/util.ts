@@ -38,3 +38,33 @@ export function timeAgo(ts: number): string {
 
 export const gameStateLabel = (n: number | null): string =>
   n === 0 ? "Configuring" : n === 1 ? "Live" : n === 2 ? "Ended" : "—";
+
+/**
+ * Exact wei → ETH decimal string.
+ *
+ * `weiToEth` above routes through a float, which is fine for a balance readout but not
+ * for a ledger that has to reconcile to the wei — 0.11661 ETH does not survive the trip.
+ * This one stays in bigint the whole way.
+ */
+export function weiToEthExact(wei: string | null | undefined, maxDigits = 5): string {
+  if (wei == null) return "—";
+  let v: bigint;
+  try {
+    v = BigInt(wei);
+  } catch {
+    return "—";
+  }
+  const neg = v < 0n;
+  if (neg) v = -v;
+  const whole = (v / 10n ** 18n).toString();
+  const frac = (v % 10n ** 18n).toString().padStart(18, "0").slice(0, maxDigits).replace(/0+$/, "");
+  return `${neg ? "−" : ""}${whole}${frac ? `.${frac}` : ""}`;
+}
+
+/** Same, with an explicit sign — for a delta where "ahead" and "behind" both matter. */
+export function weiToEthSigned(wei: string | null | undefined, maxDigits = 5): string {
+  if (wei == null) return "—";
+  const v = BigInt(wei);
+  if (v === 0n) return "0";
+  return `${v > 0n ? "+" : ""}${weiToEthExact(wei, maxDigits)}`;
+}

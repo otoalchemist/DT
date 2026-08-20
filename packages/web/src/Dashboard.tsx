@@ -17,6 +17,7 @@ import { JitPanel } from "./JitPanel.js";
 import { PostMortem } from "./PostMortem.js";
 import { TargetScores } from "./TargetScores.js";
 import { Wallets } from "./Wallets.js";
+import { Treasury } from "./Treasury.js";
 import { weiToEth, shortAddr, countdown, timeAgo, gameStateLabel } from "./util.js";
 
 const riskBadge: Record<string, string> = {
@@ -852,6 +853,8 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
             {status?.citizenSupply ?? "—"} → 69 endgame, so killed emigrants stay listed.
           </p>
         </div>
+
+        <Treasury explorerBase={explorerBase} />
       </div>
 
     </div>
