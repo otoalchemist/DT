@@ -611,6 +611,20 @@ happens in your dashboard; publishing is how the public copy catches up.
    `gubnah.xyz`. The domain has to be on Cloudflare DNS; the apex works directly, with no
    `www` redirect needed.
 
+**Check it landed:**
+
+```bash
+npm run check-treasury                              # defaults to https://gubnah.xyz
+npm run check-treasury -- --url https://x.pages.dev
+```
+
+Publishing fails quietly in ways a browser will not show you: the `_headers` file not
+applied so the CSP never ships, a header that no longer matches the page it guards, or —
+the common one — a deploy that silently did not happen, leaving an old ledger up while you
+believe it is current. This checks all of them from outside and exits non-zero on failure,
+so it can gate a deploy. It also compares the live ledger against your local build and
+says so when you have something unpublished.
+
 Afterwards it is one command per refresh. Note the page publishes contributor addresses
 next to their nicknames — a permanent, indexable link between a name and a wallet. Leave
 nicknames blank if your contributors would rather not have that.

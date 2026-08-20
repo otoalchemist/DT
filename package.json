@@ -25,7 +25,8 @@
     "target-scores": "node scripts/target-scores.mjs",
     "race-timing": "node scripts/race-timing.mjs",
     "publish-treasury": "node scripts/publish-treasury.mjs",
-    "deploy-treasury": "node scripts/publish-treasury.mjs && npx wrangler pages deploy site/dist --project-name=gubnah --branch=main --commit-dirty=true"
+    "deploy-treasury": "node scripts/publish-treasury.mjs && npx wrangler pages deploy site/dist --project-name=gubnah --branch=main --commit-dirty=true",
+    "check-treasury": "node scripts/check-treasury-site.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
