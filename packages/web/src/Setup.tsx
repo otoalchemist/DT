@@ -150,6 +150,26 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
         </p>
       )}
 
+      {/**
+       * Deterrent copy for anyone running a leaked build. Shown alongside the gates rather than
+       * instead of them: the gates are what actually refuse an unlock, this is only there to
+       * make a non-member think twice before bothering.
+       *
+       * Deliberately NOT backed by telemetry. Nothing in this bot phones home, so "we see you"
+       * is a bluff, and making it literal would mean tracking everyone who runs it — teammates
+       * included — which is a far worse trade than a leaked copy. What IS real is on-chain: the
+       * ally gate reads the roster at unlock, and every audit and payment this bot sends is
+       * public, so a non-member's activity is as visible to the team as anyone else's.
+       */}
+      {(gated || allyGated) && existing && (
+        <p
+          className="err"
+          style={{ fontWeight: 600, border: "1px solid var(--red)", borderRadius: 6, padding: "8px 10px", margin: "8px 0" }}
+        >
+          If you are not a member. We see you 😈. Have fun moving your assets.
+        </p>
+      )}
+
       {error && <p className="err">{error}</p>}
 
       <div className="row" style={{ marginTop: 8 }}>
