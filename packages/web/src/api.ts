@@ -45,7 +45,7 @@ export const api = {
   unlock: (passphrase: string, accessCode?: string) =>
     req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase, accessCode }) }),
   /** Whether this build gates unlock behind a team access code. */
-  accessGate: () => req<{ required: boolean }>("/api/access-gate"),
+  accessGate: () => req<{ required: boolean; allyGate: boolean }>("/api/access-gate"),
   lock: () => req<{ ok: boolean }>("/api/lock", { method: "POST" }),
   getConfig: () => req<StrategyConfig>("/api/config"),
   defaultRivalTargets: () => req<{ tokenIds: string[] }>("/api/default-rival-targets"),

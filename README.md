@@ -168,6 +168,26 @@ different group: set `BOT_ACCESS_CODE_SHA256` to the hash of your own code —
 node -e 'console.log(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' YOURCODE
 ```
 
+**Allied-Citizen check.** Released builds also check the chain at unlock: the wallet you open
+must hold at least one Citizen on the shared ally roster (`data/ally-tokens.json`, refreshed
+from master at every start). There is nothing to type — if your wallet holds a rostered token
+the unlock proceeds, and if it does not you get a message saying so.
+
+This is the same members-only sign as the code above, with one difference worth knowing: a
+code can be forwarded to anyone and the leak is invisible, while roster membership cannot be
+pasted and is revoked by taking an id off the list. Two gates that fail differently, so a leak
+of either one alone still leaves a stranger outside.
+
+If you have just joined, ask for your token id to be added to the roster, then **restart the
+bot** so it picks up the new list.
+
+The check **fails open**: if the RPC is unreachable, or the roster is missing or unreadable,
+the unlock is allowed and the reason is logged. A wrong denial would lock you out of your own
+wallet, and a bot that cannot unlock cannot pay taxes — that costs far more than a wrong
+allow on a gate that is advisory anyway. Only a clean roster read that finds no match denies.
+
+Running your own fork, or locked out by a stale roster: set `BOT_ALLY_GATE_OFF=1`.
+
 Open the dashboard at **`http://localhost:5173`** and:
 
 1. **Create a hot wallet** — generate a fresh burner or import a private key. It's

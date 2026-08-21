@@ -51,9 +51,22 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
   // Only prompt for the team code on a build that gates it — a fork running with
   // BOT_ACCESS_CODE_OFF=1 should not ask for something it will never check.
   const [gated, setGated] = useState(false);
+  // The roster gate needs no input from the user, so it is surfaced only as an
+  // expectation to set BEFORE they try — the server does the actual checking, and its
+  // rejection lands in `error` below.
+  const [allyGated, setAllyGated] = useState(false);
   const [accessCode, setAccessCode] = useState("");
   useEffect(() => {
-    void api.accessGate().then((g) => setGated(g.required)).catch(() => setGated(false));
+    void api
+      .accessGate()
+      .then((g) => {
+        setGated(g.required);
+        setAllyGated(g.allyGate);
+      })
+      .catch(() => {
+        setGated(false);
+        setAllyGated(false);
+      });
   }, []);
 
   return (
@@ -127,6 +140,14 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
             it does not unlock your key, it just gates this build.
           </span>
         </label>
+      )}
+
+      {allyGated && existing && (
+        <p className="hint">
+          This build also checks the chain on unlock: the wallet must hold at least one
+          Citizen on the team roster. Nothing to enter — if your token is not on the list
+          yet, ask for it to be added, then restart the bot.
+        </p>
       )}
 
       {error && <p className="err">{error}</p>}

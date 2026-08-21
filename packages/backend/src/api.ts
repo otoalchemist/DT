@@ -25,6 +25,7 @@ import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { normalizeAlchemyKey } from "@dat-bot/shared";
 import { accessCodeMatches, accessCodeRequired } from "./access-code.js";
+import { allyGateRequired, checkAllyHolding } from "./ally-gate.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
@@ -178,7 +179,10 @@ export async function buildServer(): Promise<FastifyInstance> {
   // --- keystore lifecycle ---
   /** Whether this build gates unlock behind a team access code, so the UI can show the field
    *  only when it applies (a fork with BOT_ACCESS_CODE_OFF=1 should not prompt for one). */
-  app.get("/api/access-gate", async () => ({ required: accessCodeRequired() }));
+  app.get("/api/access-gate", async () => ({
+    required: accessCodeRequired(),
+    allyGate: allyGateRequired(),
+  }));
 
   app.get("/api/keystore", async () => {
     const files = loadWallets(appConfig.dataDir);
@@ -358,6 +362,38 @@ export async function buildServer(): Promise<FastifyInstance> {
         const account = accountFromPrivateKey(decryptPrivateKey(f, parsed.data.passphrase));
         return { account, label: f.label ?? (i === 0 ? "primary" : `wallet-${i + 1}`), balanceWei: null };
       });
+      /**
+       * Second gate: the unlocked wallets must hold a Citizen on the shared ally roster.
+       *
+       * Placed HERE for two reasons. It runs after decryption because it needs the addresses,
+       * which only exist once the keystore is open. And it runs before setWallets so a denial
+       * leaves the runtime exactly as locked as it was — no half-open state where the engine
+       * could be started against a wallet the gate just rejected.
+       *
+       * checkAllyHolding never throws and fails open on any indeterminate reading; see
+       * ally-gate.ts for why a wrong deny is far more expensive than a wrong allow.
+       */
+      const allyVerdict = await checkAllyHolding(wallets.map((w) => w.account.address));
+      if (!allyVerdict.ok) {
+        logger.warn(
+          `Unlock denied by the ally gate: none of ${wallets.length} wallet(s) holds a rostered ` +
+            `citizen (${allyVerdict.checked} live roster entries checked)`,
+        );
+        return reply.code(403).send({
+          error:
+            "No allied Citizen found in this wallet. This build is gated to the team: the " +
+            "wallet you unlock must hold at least one Citizen on the shared ally roster. If " +
+            "you have just joined, ask for your token id to be added to the roster, then " +
+            "restart the bot so it syncs the new list.",
+        });
+      }
+      if (allyVerdict.reason === "indeterminate") {
+        // Loud on purpose: this is the branch that lets an unlock through WITHOUT proof, so
+        // the reason has to be in the log rather than inferred from a silent success.
+        logger.warn(`Ally gate not evaluated (${allyVerdict.detail}) - allowing the unlock`);
+      } else if (allyVerdict.reason === "held") {
+        logger.info(`Ally gate satisfied: citizen #${allyVerdict.tokenId} held by ${allyVerdict.address}`);
+      }
       runtime.setWallets(wallets);
       nonces.retain(runtime.addresses as `0x${string}`[]);
       runtime.chainId = await getChainId();
