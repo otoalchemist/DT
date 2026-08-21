@@ -35,7 +35,26 @@ function targetSortKey(t: TargetTokenStatus): number {
   return 4;
 }
 
-function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: string }) {
+/**
+ * `onAudit` makes the "auditable" badge itself the button, rather than adding a column of
+ * buttons that would be empty on almost every row — most rivals are current or already under
+ * audit, and only the auditable ones can be acted on at all. The badge already marks exactly
+ * that set, so it is the natural affordance.
+ *
+ * Absent when the wallet is locked or the game is not live, in which case the badge renders as
+ * a plain label: a button that always answers "unlock first" is worse than no button.
+ */
+function TargetsTable({
+  rows,
+  empty,
+  onAudit,
+  busy,
+}: {
+  rows: TargetTokenStatus[];
+  empty: string;
+  onAudit?: (tokenId: string) => void;
+  busy?: string | null;
+}) {
   if (rows.length === 0) return <p className="muted" style={{ fontSize: 12 }}>{empty}</p>;
   const sorted = [...rows].sort((a, b) => targetSortKey(a) - targetSortKey(b));
   return (
@@ -52,7 +71,19 @@ function TargetsTable({ rows, empty }: { rows: TargetTokenStatus[]; empty: strin
                 : t.auditDueTimestamp !== "0"
                   ? <span className="badge warn">under audit</span>
                   : t.auditable
-                    ? <span className="badge warn">auditable</span>
+                    ? onAudit
+                      ? (
+                        <button
+                          className="badge warn"
+                          style={{ cursor: "pointer", font: "inherit", padding: "1px 6px" }}
+                          disabled={busy === t.tokenId}
+                          onClick={() => onAudit(t.tokenId)}
+                          title={`Audit #${t.tokenId} now, at the network's normal gas price — no coinbase bid and not the boundary-race tip, because nothing is contesting this. Costs 0.00069 ETH plus gas, uses one audit slot, and starts its 24h kill clock. An auditor is chosen from your citizens automatically.`}
+                        >
+                          {busy === t.tokenId ? "auditing…" : "auditable ▸ audit"}
+                        </button>
+                      )
+                      : <span className="badge warn">auditable</span>
                     : t.delinquent
                       ? <span className="badge">delinquent</span>
                       : <span className="badge off">current</span>}
@@ -402,6 +433,64 @@ export function Dashboard({
   // Slots are the scarce resource, not targets: an owned citizen audits at most
   // `auditLimit` times per epoch, and auditor-role citizens carry more than one.
   const auditCapacity = tokens.reduce((n, t) => n + (t.auditLimit ?? 1), 0);
+  // Auditable RIGHT NOW and not already under audit — the set the buttons can act on. Distinct
+  // from totalAuditableNext, which counts what becomes auditable when the epoch turns.
+  const auditableNow = [...board.values()].filter((t) => t.auditable && t.auditDueTimestamp === "0").length;
+
+  /**
+   * Manual audits. Same confirm-then-submit shape as the token actions below, because this also
+   * spends real ETH the moment it is confirmed: 0.00069 ETH per audit plus gas, and it burns an
+   * audit slot that cannot be recovered this epoch.
+   */
+  const [auditBusy, setAuditBusy] = useState<string | null>(null);
+  const [auditMsg, setAuditMsg] = useState<{ text: string; err: boolean } | null>(null);
+  const runAudit = async (tokenId: string) => {
+    if (!confirm(
+      `Audit rival #${tokenId} now?
+
+` +
+      `Sends a REAL transaction at the network's normal gas price — no coinbase bid and not the ` +
+      `boundary-race tip, since nothing is contesting this block.
+
+` +
+      `Costs 0.00069 ETH plus gas, uses one of your audit slots for this epoch, and starts a 24h ` +
+      `clock after which anyone can kill #${tokenId} unless it pays or spends a bribe.`,
+    )) return;
+    setAuditBusy(tokenId);
+    setAuditMsg(null);
+    try {
+      const res = await api.auditRival(tokenId);
+      setAuditMsg({ text: res.message, err: false });
+      await refresh();
+    } catch (e) {
+      setAuditMsg({ text: (e as Error).message, err: true });
+    } finally {
+      setAuditBusy(null);
+    }
+  };
+  const runAuditAll = async () => {
+    if (!confirm(
+      `Audit every auditable rival, up to your ${auditCapacity} audit slot(s)?
+
+` +
+      `Sends one REAL transaction per rival at normal network gas — 0.00069 ETH each plus gas.
+
+` +
+      `Stops when the slots run out, so with more auditable rivals than slots the rest are left ` +
+      `alone and reported.`,
+    )) return;
+    setAuditBusy("all");
+    setAuditMsg(null);
+    try {
+      const res = await api.auditAll();
+      setAuditMsg({ text: res.message, err: !res.ok });
+      await refresh();
+    } catch (e) {
+      setAuditMsg({ text: (e as Error).message, err: true });
+    } finally {
+      setAuditBusy(null);
+    }
+  };
 
   // Manual per-token actions. `tokenBusy` keys off `${tokenId}:${action}` so only the
   // pressed button shows a spinner, and both buttons on that row lock while it runs.
@@ -776,16 +865,34 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
             )}
             <span className="muted">{totalAuditableNext} total auditable</span>
             <span className="muted">· {auditCapacity} slot{auditCapacity === 1 ? "" : "s"}</span>
+            {/* Only shown when there is something to audit AND a wallet to audit with — a
+                button that can only fail is worse than no button. */}
+            {auditableNow > 0 && status?.unlocked && (
+              <button
+                className="badge warn"
+                style={{ cursor: "pointer", font: "inherit", padding: "1px 6px" }}
+                disabled={auditBusy !== null}
+                onClick={runAuditAll}
+                title={`Audit all ${auditableNow} auditable rival(s) now, at normal network gas, bounded by your ${auditCapacity} audit slot(s) this epoch. 0.00069 ETH each plus gas.`}
+              >
+                {auditBusy === "all" ? "auditing…" : `audit all ${auditableNow}`}
+              </button>
+            )}
           </div>
+          {auditMsg && (
+            <div className={auditMsg.err ? "err" : "hint"} style={{ fontSize: 11, margin: "2px 0 6px 0" }}>
+              {auditMsg.text}
+            </div>
+          )}
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>My rivals ({myTargets.length})</div>
-          <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." />
+          <TargetsTable rows={myTargets} empty="No pinned rivals — add token IDs in Config." onAudit={status?.unlocked ? runAudit : undefined} busy={auditBusy} />
           <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0", lineHeight: 1.5 }}>
             Pinned rivals always appear here, even while paid up. Everything below is
             shown only while it's delinquent, under audit, or killable.
           </p>
           <div className="spacer" />
           <div className="muted" style={{ ...sectionLabel, marginBottom: 4 }}>Others ({otherTargets.length})</div>
-          <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." />
+          <TargetsTable rows={otherTargets} empty="No other delinquent/killable rivals found." onAudit={status?.unlocked ? runAudit : undefined} busy={auditBusy} />
           {currentRivals > 0 && (
             <p
               className="muted"

@@ -26,7 +26,7 @@ import { resolveJitTarget } from "./logic.js";
 import { normalizeAlchemyKey } from "@dat-bot/shared";
 import { accessCodeMatches, accessCodeRequired } from "./access-code.js";
 import { allyGateRequired, checkAllyHolding } from "./ally-gate.js";
-import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, manualAudit, manualAuditAll, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
@@ -480,6 +480,36 @@ export async function buildServer(): Promise<FastifyInstance> {
     try { id = BigInt(parsed.data.tokenId); } catch { return reply.code(400).send({ error: "Invalid token ID" }); }
     const res = await manualUseBribe(id);
     if (!res.ok) return reply.code(400).send({ error: res.message });
+    return res;
+  });
+
+  /**
+   * Audit one rival now, on normal network gas. The manual counterpart to the boundary race:
+   * no bid, no boundary timestamp, no race tip — pressing a button mid-epoch is not competing
+   * for a slot. The auditor is chosen for the user from whatever has an audit left this epoch.
+   */
+  app.post("/api/rival/audit", async (req, reply) => {
+    const parsed = tokenAction.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    let id: bigint;
+    try { id = BigInt(parsed.data.tokenId); } catch { return reply.code(400).send({ error: "Invalid token ID" }); }
+    const res = await manualAudit(id);
+    if (!res.ok) return reply.code(400).send({ error: res.message });
+    return res;
+  });
+
+  /**
+   * Audit every auditable rival, bounded by the audit slots left this epoch.
+   *
+   * Returns 200 with the per-target breakdown even when it audited nothing, because "no capacity"
+   * and "nobody is auditable" are ordinary answers the panel should display rather than errors to
+   * swallow. Only a genuine failure (locked, game not live, busy) is a 4xx.
+   */
+  app.post("/api/rival/audit-all", async (_req, reply) => {
+    const res = await manualAuditAll();
+    if (!res.ok && res.audited.length === 0 && /Unlock|not live|busy/i.test(res.message)) {
+      return reply.code(400).send({ error: res.message });
+    }
     return res;
   });
 

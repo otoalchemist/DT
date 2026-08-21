@@ -2559,8 +2559,15 @@ async function waitForIdle(timeoutMs = 5_000): Promise<boolean> {
  */
 async function runManualAction(
   tokenId: bigint,
-  kind: "pay-taxes" | "use-bribe",
-  build: () => Promise<{ intent: TxIntent; message: string } | { error: string }>,
+  kind: "pay-taxes" | "use-bribe" | "audit",
+  /**
+   * May return an `actingTokenId` when the token that must SIGN differs from the token the
+   * action is about. An audit is the case: it is owner-only on the AUDITOR, while the id the
+   * user clicked is the rival being audited. Without this the holder lookup would run against a
+   * token we do not own, and the call would be signed by the wrong wallet and revert on-chain
+   * after paying gas.
+   */
+  build: () => Promise<{ intent: TxIntent; message: string; actingTokenId?: bigint } | { error: string }>,
 ): Promise<ManualActionResult> {
   if (!runtime.unlocked || !runtime.account) return { ok: false, message: "Unlock the wallet first" };
   if (runtime.gameState !== 1) return { ok: false, message: "Game is not live" };
@@ -2582,9 +2589,10 @@ async function runManualAction(
     const built = await build();
     if ("error" in built) return { ok: false, message: built.error };
 
-    const holder = walletForToken(tokenId);
+    const acting = built.actingTokenId ?? tokenId;
+    const holder = walletForToken(acting);
     if (!holder) {
-      return { ok: false, message: `No unlocked wallet holds #${tokenId} — add its key to act on it` };
+      return { ok: false, message: `No unlocked wallet holds #${acting} — add its key to act on it` };
     }
     // Min-balance floor applies to the wallet that will actually pay, not the total
     // across wallets: a funded wallet must not let an empty one send a tx it cannot
@@ -2664,6 +2672,173 @@ export async function manualUseBribe(tokenId: bigint): Promise<ManualActionResul
       message: `Manual bribe clear of audit on #${tokenId} (still delinquent afterwards, normal gas)`,
     };
   });
+}
+
+/**
+ * Audit ONE rival now, on the network's normal gas — the manual counterpart to the boundary
+ * race.
+ *
+ * Deliberately not a race: there is no bid, no boundary timestamp and no dynamic tip, just
+ * `estimateMaxPriorityFeePerGas` like every other manual action. Pressing a button mid-epoch is
+ * not competing for a slot, and inheriting the configured race tip would spend several hundred
+ * gwei to do something nobody is contesting.
+ *
+ * The auditor is chosen for the user, because it is not a meaningful choice: any owned citizen
+ * that is itself current and has an audit left this epoch does the same job. It is picked fresh
+ * from `findEligibleAuditors`, which reads `auditsUsedInEpoch` on-chain, so a slot already spent
+ * by an automatic sweep earlier in the epoch cannot be double-booked into `AuditLimitReached`.
+ */
+export async function manualAudit(targetTokenId: bigint): Promise<ManualActionResult> {
+  return runManualAction(targetTokenId, "audit", async () => {
+    const epoch = runtime.currentEpoch ?? 0n;
+    /**
+     * Through filterLiveTokenIds first, for two reasons: batchGetTargetStatuses needs the owner,
+     * and a BURNED token still answers lastEpochPaid from a surviving mapping. Auditing one of
+     * those reverts with ERC721NonexistentToken after paying gas, so a dead id must be refused
+     * here rather than diagnosed from a failed transaction.
+     */
+    const live = await filterLiveTokenIds(runtime.citizensAddress as Address, [targetTokenId]);
+    if (live.length === 0) return { error: `#${targetTokenId} no longer exists (killed and burned)` };
+    const [target] = await batchGetTargetStatuses(live, epoch, BigInt(Math.floor(Date.now() / 1000)));
+    if (!target) return { error: `Could not read #${targetTokenId}` };
+    if (!target.auditable) {
+      return {
+        error:
+          `#${targetTokenId} is not auditable right now (${target.epochsBehind} epoch(s) behind — ` +
+          `needs 2). Nothing was sent.`,
+      };
+    }
+    if (target.auditDueTimestamp !== "0") {
+      return { error: `#${targetTokenId} is already under audit — a second audit would revert` };
+    }
+    const owned = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
+    const auditors = await findEligibleAuditors(owned, epoch);
+    const from = auditors[0];
+    if (from === undefined) {
+      return {
+        error:
+          "No audit capacity left: every citizen you hold is either behind on taxes or has " +
+          "already used its audits this epoch.",
+      };
+    }
+    return {
+      intent: { to: appConfig.gameAddress, data: encodeAudit(from, targetTokenId), value: AUDIT_COST_WEI },
+      message: `Manual audit #${targetTokenId} from #${from} (normal gas)`,
+      actingTokenId: from,
+    };
+  });
+}
+
+/** What a mass audit did, per target, so the UI can report partial success honestly. */
+export interface MassAuditResult {
+  ok: boolean;
+  message: string;
+  audited: { target: string; from: string; txHash?: string }[];
+  skipped: { target: string; reason: string }[];
+  /** Audit slots still unused after this run. */
+  capacityLeft: number;
+}
+
+/**
+ * Audit every auditable rival, up to the audit slots currently available.
+ *
+ * One batch, so on mainnet they go out as a single bundle and share one nonce run rather than
+ * racing each other. Normal gas throughout, same reasoning as the single audit.
+ *
+ * Capacity is the binding constraint and it is reported rather than silently hit: a user with 3
+ * slots and 8 auditable rivals should be told 5 were left alone, not left wondering. Targets are
+ * taken in the order the panel shows them, so the result matches what was on screen.
+ */
+export async function manualAuditAll(): Promise<MassAuditResult> {
+  const empty = { audited: [], skipped: [], capacityLeft: 0 };
+  if (!runtime.unlocked || !runtime.account) return { ok: false, message: "Unlock the wallet first", ...empty };
+  if (runtime.gameState !== 1) return { ok: false, message: "Game is not live", ...empty };
+  if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment", ...empty };
+
+  ticking = true;
+  committedThisTickWei = new Map();
+  beginBatch();
+  const audited: { target: string; from: string; txHash?: string }[] = [];
+  const skipped: { target: string; reason: string }[] = [];
+  let capacityLeft = 0;
+  try {
+    const [owned] = await Promise.all([
+      fetchOwnedAcrossWallets(runtime.citizensAddress as Address),
+      refreshSnapshot(),
+      nonces.syncAll(runtime.addresses as Address[], appConfig.mode),
+    ]);
+    const epoch = runtime.currentEpoch ?? 0n;
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    const auditors = await findEligibleAuditors(owned, epoch);
+    capacityLeft = auditors.length;
+    if (auditors.length === 0) {
+      return {
+        ok: false,
+        message:
+          "No audit capacity: every citizen you hold is either behind on taxes or has already " +
+          "used its audits this epoch.",
+        audited, skipped, capacityLeft: 0,
+      };
+    }
+
+    // Same candidate set the offense sweep uses, so allies and emigrants are already excluded
+    // and this cannot audit a teammate.
+    const { candidates } = await fetchOffenseCandidatesWithSkips();
+    const statuses = await batchGetTargetStatuses(candidates, epoch, nowSec);
+    const auditable = statuses.filter((t) => t.auditable && t.auditDueTimestamp === "0");
+    if (auditable.length === 0) {
+      return { ok: false, message: "No rival is auditable right now", audited, skipped, capacityLeft };
+    }
+
+    let slot = 0;
+    for (const t of auditable) {
+      const from = auditors[slot];
+      if (from === undefined) {
+        skipped.push({ target: t.tokenId, reason: "no audit slots left" });
+        continue;
+      }
+      const holder = walletForToken(from);
+      if (!holder) {
+        skipped.push({ target: t.tokenId, reason: `no unlocked wallet holds auditor #${from}` });
+        continue;
+      }
+      const res = await act(
+        { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI },
+        "audit",
+        {
+          tokenId: t.tokenId,
+          wallet: holder,
+          message: `Mass audit #${t.tokenId} from #${from} (normal gas)`,
+          race: true,
+          normalGas: true,
+        },
+      );
+      if (res?.ok) {
+        audited.push({ target: t.tokenId, from: from.toString(), txHash: res.txHash });
+        slot++;
+      } else {
+        skipped.push({ target: t.tokenId, reason: res?.error ?? "failed to submit" });
+      }
+    }
+    capacityLeft = Math.max(0, auditors.length - slot);
+    const tail = skipped.length > 0 ? `, ${skipped.length} skipped` : "";
+    return {
+      ok: audited.length > 0,
+      message:
+        audited.length > 0
+          ? `Audited ${audited.length} rival(s)${tail}. ${capacityLeft} audit slot(s) left this epoch.`
+          : `Nothing audited${tail}`,
+      audited, skipped, capacityLeft,
+    };
+  } catch (err) {
+    const message = (err as Error).message;
+    activity.add({ kind: "error", status: "skipped", message: `Mass audit failed: ${message}` });
+    return { ok: false, message, audited, skipped, capacityLeft };
+  } finally {
+    await flushBatch();
+    nonces.resetAll();
+    ticking = false;
+  }
 }
 
 // `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary

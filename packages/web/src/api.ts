@@ -46,6 +46,18 @@ export const api = {
     req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase, accessCode }) }),
   /** Whether this build gates unlock behind a team access code. */
   accessGate: () => req<{ required: boolean; allyGate: boolean }>("/api/access-gate"),
+  /** Audit one rival now, at normal network gas (not a race — no bid, no race tip). */
+  auditRival: (tokenId: string) =>
+    req<{ ok: boolean; message: string; txHash?: string }>("/api/rival/audit", {
+      method: "POST", body: JSON.stringify({ tokenId }),
+    }),
+  /** Audit every auditable rival, bounded by the audit slots left this epoch. */
+  auditAll: () =>
+    req<{
+      ok: boolean; message: string; capacityLeft: number;
+      audited: { target: string; from: string; txHash?: string }[];
+      skipped: { target: string; reason: string }[];
+    }>("/api/rival/audit-all", { method: "POST" }),
   lock: () => req<{ ok: boolean }>("/api/lock", { method: "POST" }),
   getConfig: () => req<StrategyConfig>("/api/config"),
   defaultRivalTargets: () => req<{ tokenIds: string[] }>("/api/default-rival-targets"),
