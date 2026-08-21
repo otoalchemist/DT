@@ -355,6 +355,50 @@ function nextBoundarySec(startTime: bigint, nowSec: bigint): bigint {
 }
 
 /**
+ * How late a fire may be and still be racing the boundary it was armed for.
+ *
+ * The pre-boundary fires contend for one tick lock and retry every 150ms, so an audit fire
+ * routinely starts after the payment fire has finished — and sometimes after the boundary has
+ * passed. Two minutes is generous: past that the race is lost regardless, and what matters is
+ * that we do not silently switch to racing TOMORROW's boundary.
+ */
+const RACE_GRACE_SECONDS = 120n;
+
+/**
+ * The boundary this fire is racing, derived from the CLOCK rather than from runtime.currentEpoch.
+ *
+ * currentEpoch is refreshed by ticks, so reading it after a delay gives the epoch we are now IN
+ * rather than the one we were armed for — and `currentEpoch + 1` then points a full day ahead.
+ * That was survivable until minTimestamp: a bundle stamped with tomorrow's boundary cannot be
+ * included in any block of this window, so every audit died silently while payments (which pin
+ * the armed epoch) landed. This is the same class of bug fixed for the combined fire in 5c92ffc;
+ * the standalone audit path was left re-deriving.
+ *
+ * Just past a boundary we are still racing THAT boundary, not the next one — hence the grace.
+ */
+function racedBoundary(startTime: bigint, nowSec: bigint, currentEpoch: bigint | null): { targetEpoch: bigint; boundaryTs: bigint } {
+  // No epoch known yet (pre-first-snapshot): fall back to the clock grid alone.
+  if (currentEpoch === null) {
+    const next = nextBoundarySec(startTime, nowSec);
+    const previous = next - EPOCH_DURATION_SECONDS;
+    const boundaryTs = nowSec >= previous && nowSec - previous <= RACE_GRACE_SECONDS ? previous : next;
+    return { targetEpoch: (boundaryTs - startTime) / EPOCH_DURATION_SECONDS + 1n, boundaryTs };
+  }
+  // Epoch N begins at startTime + (N-1)*EPOCH, so this is the boundary that STARTED the epoch
+  // we are in, and the next one is a day later.
+  const startedThisEpoch = startTime + (currentEpoch - 1n) * EPOCH_DURATION_SECONDS;
+  const nextBoundary = startTime + currentEpoch * EPOCH_DURATION_SECONDS;
+  // Just past the boundary that started this epoch? Then that is the race we are in — the fire
+  // was armed before it and only ran after, which is the normal consequence of waiting behind
+  // the payment fire's tick lock. Anything else is racing the next one.
+  const justRolled = nowSec >= startedThisEpoch && nowSec - startedThisEpoch <= RACE_GRACE_SECONDS;
+  return justRolled
+    ? { targetEpoch: currentEpoch, boundaryTs: startedThisEpoch }
+    : { targetEpoch: currentEpoch + 1n, boundaryTs: nextBoundary };
+}
+
+
+/**
  * Is the epoch a JIT arm names already OVER? Answered from the CLOCK when it can be,
  * because that works when `runtime.currentEpoch` is still null.
  *
@@ -1169,7 +1213,10 @@ export function schedulePreBoundaryAudit(): void {
     return;
   }
   noteRaceArmed("audit", auditTarget);
-  preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
+  preBoundaryAuditTimer = setTimeout(
+    () => void firePreBoundaryAudit({ targetEpoch: auditTarget, boundaryTs: boundary }),
+    Math.min(deltaMs, 2_000_000_000),
+  );
 }
 
 /** Pre-submit audits (skip-sim) for rivals that will be auditable in the FIRST
@@ -1310,7 +1357,7 @@ export async function queuePreBoundaryAudits(
 }
 
 /** Standalone pre-boundary audit bundle. Used when combinedBoundaryBundle is OFF. */
-export async function firePreBoundaryAudit(): Promise<void> {
+export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; boundaryTs: bigint }): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
@@ -1318,17 +1365,28 @@ export async function firePreBoundaryAudit(): Promise<void> {
   if (ticking) {
     const b = boundaryForArmedFire();
     if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("audit", b);
-    setTimeout(() => void firePreBoundaryAudit(), 150);
+    // Carry the armed boundary through the retry, or a delayed fire re-derives it and lands
+    // on the wrong day — which is the bug this whole path exists to avoid.
+    setTimeout(() => void firePreBoundaryAudit(armed), 150);
     return;
   }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
   committedThisTickWei = new Map();
   beginBatch();
-  const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
-  // Telemetry only: lets the flush record how early this race was sent (race-timing.ts).
+  /**
+   * Pinned to the boundary passed in by the scheduler, or derived from the clock — never from
+   * currentEpoch + 1. See racedBoundary: this fire waits behind the payment fire's tick lock, so
+   * by the time it runs currentEpoch may already have advanced, and the old derivation then
+   * stamped the bundle with TOMORROW's boundary. minTimestamp made that fatal rather than merely
+   * late: no block in the window can satisfy it, so every audit vanished without an error while
+   * payments landed normally.
+   */
+  const armedRace = armed ?? racedBoundary(runtime.startTime ?? 0n, nowSec, runtime.currentEpoch);
+  const targetEpoch = armedRace.targetEpoch;
+  const boundaryTs = armedRace.boundaryTs;
+  // Bounds the bundle (minTimestamp) and measures the lead in race telemetry.
   setRaceBoundary(boundaryTs);
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
