@@ -707,6 +707,32 @@ export function schedulePreBoundaryPay(): void {
   preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(), Math.min(deltaMs, 2_000_000_000));
 }
 
+/**
+ * Tokens the payment fire queued for THIS boundary, so the audit fire that follows can count
+ * them as current.
+ *
+ * Without this a single-citizen holder on the no-bid path can pay OR audit at a boundary, never
+ * both: the chain still reads the citizen as behind when the audit sweep runs, so it is not an
+ * eligible auditor and the sweep reports "0 auditor slot(s)". Observed alternating exactly with
+ * whether a payment was due — epoch 169 audited, 170 did not, 171 audited, 172 did not.
+ *
+ * Safe across two separate bundles for one reason: both come from the SAME wallet on sequential
+ * nonces (payTaxes is owner-only, so the payer IS the auditor token's owner, which is the wallet
+ * that signs the audit). A block must order a sender's transactions by ascending nonce, so the
+ * audit can only ever execute AFTER that wallet's payment executes. If the payment does not land,
+ * the audit cannot land either — there is a nonce gap — so crediting it can never produce an
+ * audit running against an unpaid auditor. Same guarantee the combined bundle relies on, just
+ * spanning two bundles instead of one.
+ *
+ * Keyed by epoch so a stale set from an earlier boundary is ignored rather than trusted.
+ */
+let paidForBoundary: { epoch: string; tokens: Set<string> } | null = null;
+
+/** Forget the paid-this-boundary set. For tests. */
+export function resetPaidForBoundary(): void {
+  paidForBoundary = null;
+}
+
 // Fixed gas for a pre-boundary payTaxes — we can't eth_estimateGas it (the value
 // is invalid against current state), so pass a generous fixed limit.
 const PRE_BOUNDARY_GAS = 120_000n;
@@ -861,6 +887,8 @@ export async function firePreBoundaryPay(): Promise<void> {
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     const paid = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
+    // Hand these to the audit fire, which runs next and would otherwise see them as behind.
+    paidForBoundary = { epoch: targetEpoch.toString(), tokens: paid };
     if (paid.size > 0) await maybeQueueCoinbaseBid("payment");
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
@@ -1096,15 +1124,21 @@ async function findPreBoundaryAuditors(
     if (!ok && paidInBundle.has(key)) {
       // Paid one epoch earlier in THIS bundle -> current by the time it audits.
       //
-      // NOTE: unreachable while JIT sends the flat one-epoch amount. Rescuing a token
-      // into eligibility requires it to be 2+ behind at targetEpoch, but on-chain
-      // payTaxes(id,1) then costs epochsBehind * epoch * base (verified: a 2-behind
-      // token quotes 2x), so preBoundaryTaxWei's 1x underpays and the boundary sim
-      // rejects it — such a token never lands in paidInBundle. A token that IS paid
-      // successfully was exactly 1 behind, which already passes the check above.
-      // Kept because it is the correct rule and activates the moment the pre-boundary
-      // payment learns to quote catch-up amounts (which costs 2x, so it is gated on
-      // maxAutoPayEpochs by design).
+      // REACHABLE, and load-bearing — an earlier note here claimed the opposite, that a
+      // 2-behind token could never land in paidInBundle because payTaxes(id,1) would underpay
+      // and the sim would reject it. Measured on mainnet across three consecutive boundaries
+      // (#2036 at blocks 25771071 / 25785422 / 25799777), that is wrong twice over: the flat
+      // one-epoch amount at the CURRENT rate is accepted, and it advances lastEpochPaid by TWO
+      // epochs (170 -> 172), i.e. it makes the citizen fully current rather than one epoch
+      // less behind.
+      //
+      // This is exactly the case that silently cost audits: a single-citizen holder sits 2
+      // behind at every other boundary, isEligibleAuditor refuses it, and the sweep logs
+      // "1 auditable target(s), 0 auditor slot(s), queued 0" — alternating with whether a
+      // payment was due (epoch 169 audited, 170 did not, 171 audited, 172 did not).
+      //
+      // +1n rather than targetEpoch is deliberate: the on-chain effect is at least +1, and
+      // crediting the smaller advance cannot over-qualify a token.
       ok = isEligibleAuditor((lep.result as bigint) + 1n, targetEpoch, 0n, limitV);
       if (ok) needsPayment.add(key);
     }
@@ -1329,9 +1363,18 @@ export async function firePreBoundaryAudit(): Promise<void> {
      * That keeps the mempool copy, which is the only thing that can land in the ~1 boundary
      * in 10 built by a solo validator.
      */
+    /**
+     * Credit citizens the payment fire just queued for this same boundary. They still read as
+     * behind on-chain, but their payment carries a LOWER nonce from the same wallet, so the audit
+     * cannot execute before it (see paidForBoundary). Those auditors go out unsimulated and
+     * revert-tolerant, because simulating one against pre-payment state would wrongly fail.
+     */
+    const paidInBundle =
+      paidForBoundary?.epoch === targetEpoch.toString() ? paidForBoundary.tokens : new Set<string>();
     const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
       revertible: true,
       bundleOnly: false,
+      paidInBundle,
     });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
     if (queuedAudit) await maybeQueueCoinbaseBid("audit");

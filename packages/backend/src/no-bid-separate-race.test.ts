@@ -141,7 +141,7 @@ vi.mock("./emigration.js", () => ({ emigratedTokenIdSet: vi.fn(async () => new S
 // Deliberately NOT mocking ./nonce.js or ./flashbots.js — both are under test.
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { awaitPendingMirrors } = await import("./flashbots.js");
-const { firePreBoundaryPay, firePreBoundaryAudit, combinedBundleActive } = await import("./strategy.js");
+const { firePreBoundaryPay, firePreBoundaryAudit, combinedBundleActive, resetPaidForBoundary } = await import("./strategy.js");
 const { fetchOwnedTokenIds } = await import("./index-tokens.js");
 const { batchGetTargetStatuses } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
@@ -552,5 +552,115 @@ describe("a large holder: 10 payments + 10 audits, no bid", () => {
     const payBundle = bundles().find((b) => kindsOf(b).includes(PAY))!;
     expect(payBundle.txs).toHaveLength(10);
     expect(payBundle.revertingTxHashes ?? []).toHaveLength(10);
+  });
+});
+
+/**
+ * The field failure: a ONE-citizen holder on the no-bid path could pay or audit at a boundary,
+ * never both.
+ *
+ * The audit sweep runs after the payment fire and reads the chain, where the citizen is still
+ * behind — so it is not an eligible auditor and the sweep logs "1 auditable target(s), 0 auditor
+ * slot(s), queued 0". It alternated exactly with whether a payment was due: epoch 169 audited,
+ * 170 did not, 171 audited, 172 did not.
+ *
+ * The combined bundle solves this with `paidInBundle`, but that path needs a coinbase bid, which
+ * is precisely what this configuration does not have.
+ */
+describe("a citizen paid at this boundary can still audit (no bid)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chainNonce += 50;
+    resetPaidForBoundary();
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]); // ONE citizen, as in the report
+    // This describe is a SIBLING of the one above, so none of its beforeEach ran: the fetch stub
+    // and the signing account have to be installed here too. Without the signer nothing gets
+    // queued at all, which reads as "the fix does not work" rather than "the harness is missing".
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ jsonrpc: "2.0", id: 1, result: { bundleHash: "0xbundle" } }),
+      text: async () => "{}",
+    })) as unknown as typeof fetch);
+    runtime.setWallets([
+      {
+        account: {
+          address: ADDR,
+          signTransaction: vi.fn(async (tx: { data?: string; nonce: number; maxPriorityFeePerGas: bigint }) =>
+            fakeSign(tx.data && tx.data !== "0x" ? tx.data.slice(2, 10) : "99999999", tx.nonce, Number(tx.maxPriorityFeePerGas) / 1e9)),
+          signMessage: vi.fn(async () => "0xsig"),
+        } as unknown as PrivateKeyAccount,
+        label: "test",
+        balanceWei: 100_000_000_000_000_000_000n,
+      },
+    ]);
+    runtime.running = true;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    runtime.citizenSupply = 500n;
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    // TWO behind, which is what the field case actually was: at targetEpoch the citizen is
+    // itself auditable, so isEligibleAuditor REFUSES it and the sweep reports 0 auditor slots.
+    // One behind would already pass, which is why an earlier version of this fixture passed
+    // whether or not the fix was present.
+    ownedLep = TARGET_EPOCH - 2n;
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      preBoundaryPay: true, preBoundaryAudit: true,
+      jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH), jitTokenIds: [],
+      offenseEnabled: true, autoAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 100_000, offenseMaxBaseFeeGwei: 100_000,
+      endgameOnlyWithin: null,
+      coinbaseBidEth: 0, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: "",
+      separateOffenseGas: true,
+      priorityFeeGwei: PAY_TIP_GWEI, dynamicTipEnabled: false,
+      offensePriorityFeeGwei: AUDIT_TIP_GWEI, offenseDynamicTipEnabled: false,
+      offenseTargetTokenIds: ["501"],
+    } as typeof runtime.strategy;
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      },
+    ] as never);
+  });
+
+  afterEach(() => { runtime.setWallets([]); runtime.running = false; vi.unstubAllGlobals(); });
+
+  it("audits from the citizen it is paying in the same boundary", async () => {
+    await firePreBoundaryPay();
+    await firePreBoundaryAudit();
+    const kinds = bundles().map(kindsOf).flat();
+    expect(kinds).toContain(PAY);   // it paid...
+    expect(kinds).toContain(AUDIT); // ...and audited from the same citizen, which used to be lost
+  });
+
+  it("puts the audit on a HIGHER nonce than the payment — the reason this is safe", async () => {
+    // A block orders one sender's txs by ascending nonce, so the audit cannot execute before the
+    // payment. If the payment never lands, the audit cannot either (nonce gap), so crediting it
+    // can never run an audit against an unpaid auditor.
+    await firePreBoundaryPay();
+    await firePreBoundaryAudit();
+    const pay = wireTxs().filter((s) => s.sel === PAY).map((s) => s.nonce);
+    const audit = wireTxs().filter((s) => s.sel === AUDIT).map((s) => s.nonce);
+    expect(pay).toHaveLength(1);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!).toBeGreaterThan(pay[0]!);
+  });
+
+  it("does NOT credit a paid set from a different boundary", async () => {
+    // Keyed by epoch: a stale set must be ignored, or an audit would be sent unsimulated against
+    // an auditor that nothing paid this time round.
+    await firePreBoundaryPay();          // records the set for TARGET_EPOCH
+    runtime.currentEpoch = TARGET_EPOCH; // ...then the chain moves on
+    runtime.strategy = { ...runtime.strategy, jitTargetEpoch: Number(TARGET_EPOCH + 1n) } as typeof runtime.strategy;
+    ownedLep = TARGET_EPOCH + 1n;        // and the citizen is current, so nothing is owed
+    vi.mocked(globalThis.fetch).mockClear();
+    await firePreBoundaryAudit();
+    // The audit may or may not queue on its own merits; what matters is that no PAYMENT-credited
+    // auditor was invented for an epoch the payment fire never ran for.
+    const auditBundles = bundles().map(kindsOf).filter((k) => k.includes(AUDIT));
+    for (const b of auditBundles) expect(b.every((x) => x === AUDIT)).toBe(true);
   });
 });
