@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "./api.js";
 import { shortAddr } from "./util.js";
 
@@ -38,7 +38,7 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
     setError(null);
     setBusy(true);
     try {
-      await api.unlock(passphrase);
+      await api.unlock(passphrase, accessCode);
       onUnlocked();
     } catch (e) {
       setError((e as Error).message);
@@ -48,6 +48,13 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
   };
 
   const existing = hasKeystore || createdAddr;
+  // Only prompt for the team code on a build that gates it — a fork running with
+  // BOT_ACCESS_CODE_OFF=1 should not ask for something it will never check.
+  const [gated, setGated] = useState(false);
+  const [accessCode, setAccessCode] = useState("");
+  useEffect(() => {
+    void api.accessGate().then((g) => setGated(g.required)).catch(() => setGated(false));
+  }, []);
 
   return (
     <div className="center panel">
@@ -106,6 +113,22 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
         />
       </label>
 
+      {gated && existing && (
+        <label>
+          Team access code
+          <input
+            type="password"
+            value={accessCode}
+            onChange={(e) => setAccessCode(e.target.value)}
+            placeholder="the code you were given"
+          />
+          <span className="hint">
+            This build is gated to the team. The code is separate from your wallet passphrase —
+            it does not unlock your key, it just gates this build.
+          </span>
+        </label>
+      )}
+
       {error && <p className="err">{error}</p>}
 
       <div className="row" style={{ marginTop: 8 }}>
@@ -114,7 +137,7 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
             {busy ? "Creating…" : "Create keystore"}
           </button>
         ) : (
-          <button className="primary" disabled={busy || !passphrase} onClick={unlock}>
+          <button className="primary" disabled={busy || !passphrase || (gated && !accessCode)} onClick={unlock}>
             {busy ? "Unlocking…" : "Unlock"}
           </button>
         )}

@@ -24,6 +24,7 @@ import { invalidateTokenCaches } from "./index-tokens.js";
 import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { normalizeAlchemyKey } from "@dat-bot/shared";
+import { accessCodeMatches, accessCodeRequired } from "./access-code.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
@@ -175,6 +176,10 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   // --- keystore lifecycle ---
+  /** Whether this build gates unlock behind a team access code, so the UI can show the field
+   *  only when it applies (a fork with BOT_ACCESS_CODE_OFF=1 should not prompt for one). */
+  app.get("/api/access-gate", async () => ({ required: accessCodeRequired() }));
+
   app.get("/api/keystore", async () => {
     const files = loadWallets(appConfig.dataDir);
     return {
@@ -326,9 +331,22 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post("/api/unlock", async (req, reply) => {
-    const schema = z.object({ passphrase: z.string() });
+    const schema = z.object({ passphrase: z.string(), accessCode: z.string().optional() });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    /**
+     * Team access gate, checked BEFORE the keystore is touched so a wrong code cannot be used
+     * to probe passphrases. Deliberately a distinct message from a bad passphrase: conflating
+     * "you are not on the team" with "you typed your own passphrase wrong" would send users
+     * hunting for the wrong problem.
+     */
+    if (!accessCodeMatches(parsed.data.accessCode ?? "")) {
+      return reply.code(403).send({
+        error:
+          "Access code required. This build is gated to the team — enter the code you were " +
+          "given alongside your wallet passphrase.",
+      });
+    }
     const files = loadWallets(appConfig.dataDir);
     if (files.length === 0) return reply.code(400).send({ error: "No keystore found" });
     try {

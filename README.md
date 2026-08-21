@@ -152,6 +152,22 @@ The usual causes, in order:
 - **A half-finished `npm install`** (dropped network). Same fix as above.
 - **Port 8787 already in use** by an earlier run: `lsof -ti tcp:8787 | xargs kill -9`.
 
+**Team access code.** Released builds ask for a shared code at unlock, alongside your wallet
+passphrase. It is a separate field and a separate thing: it does **not** unlock your key, it
+only gates this build. Ask whoever gave you the bot for the code.
+
+> This is a members-only sign, not a lock. The repository is public and the check runs on your
+> own machine, so anyone determined can remove it and rebuild — do not mistake it for security.
+> The shipped constant is a SHA-256 hash rather than the code itself, so the code is not
+> published along with the source.
+
+Running your own fork and don't want the gate: set `BOT_ACCESS_CODE_OFF=1`. Building for a
+different group: set `BOT_ACCESS_CODE_SHA256` to the hash of your own code —
+
+```bash
+node -e 'console.log(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' YOURCODE
+```
+
 Open the dashboard at **`http://localhost:5173`** and:
 
 1. **Create a hot wallet** — generate a fresh burner or import a private key. It's
