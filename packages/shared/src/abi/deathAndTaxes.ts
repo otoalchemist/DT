@@ -62,6 +62,17 @@ export const deathAndTaxesAbi = [
     "type": "error"
   },
   {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "tokenId",
+        "type": "uint256"
+      }
+    ],
+    "name": "ERC721NonexistentToken",
+    "type": "error"
+  },
+  {
     "inputs": [],
     "name": "EthTransferFailed",
     "type": "error"

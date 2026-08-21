@@ -34,7 +34,25 @@ export function resolveGas(s: StrategyConfig, offense: boolean): GasSettings {
   };
 }
 
-/** A token is auditable once it is >= 2 epochs behind (matches contract `_audit`). */
+/**
+ * A token is auditable once it is >= 2 epochs behind.
+ *
+ * DO NOT tighten this to `=== 2`. The temptation is real — audits against targets reading 3+
+ * epochs behind do revert on-chain — but the cause is not depth and the cure is not here.
+ *
+ * Measured at boundary block 25799777: every rival reading 3+ behind was ALREADY BURNED.
+ * `audit()` reverted with `ERC721NonexistentToken(target)`, not a depth error, because
+ * `lastEpochPaid` is a mapping that survives the burn and keeps serving a stale number for a
+ * citizen that no longer exists. A citizen only dies by being audited at 2 behind and failing
+ * to clear (see isKillable), so in a well-policed game nothing LIVE ever gets past 2 — at that
+ * block all 78 live citizens were within 2, and the six rivals reading 4/6/12/22/23/24 behind
+ * were all dead. `filterLiveTokenIds` in the offense pipeline is what keeps them out of the
+ * target set, and that is the correct place for it.
+ *
+ * The reason tightening it would be actively harmful: isEligibleAuditor is defined as
+ * `!isAuditable(...)`, so narrowing this to exactly 2 would make a citizen 3+ behind read as
+ * an ELIGIBLE AUDITOR — the opposite of what it means.
+ */
 export function isAuditable(lastEpochPaid: bigint, currentEpoch: bigint): boolean {
   return lastEpochPaid + 2n <= currentEpoch;
 }

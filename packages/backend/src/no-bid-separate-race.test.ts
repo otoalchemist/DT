@@ -649,6 +649,26 @@ describe("a citizen paid at this boundary can still audit (no bid)", () => {
     expect(audit[0]!).toBeGreaterThan(pay[0]!);
   });
 
+  /**
+   * The SECOND casualty of a delayed audit fire, and the one the boundary-pin tests do not
+   * reach: paidForBoundary is keyed by epoch, so a fire that re-derived its target after the
+   * roll stopped matching the set the payment fire had just handed it, and silently reported
+   * "0 auditor slot(s)" again — indistinguishable from the bug that credit was added to fix.
+   *
+   * Pinning the armed epoch is what keeps the key aligned. This asserts the credit survives,
+   * where audit-boundary-pin.test.ts asserts the bundle's timestamp survives.
+   */
+  it("still credits the payment when the boundary lands before the audit fire runs", async () => {
+    await firePreBoundaryPay(); // records the paid set for TARGET_EPOCH
+    // The boundary arrives while the audit fire is still behind the tick lock. The citizen is
+    // deliberately left reading 2 behind on-chain — its payment is an unmined private bundle,
+    // so ONLY the credit can make it an eligible auditor.
+    runtime.currentEpoch = TARGET_EPOCH;
+    expect(ownedLep).toBe(TARGET_EPOCH - 2n);
+    await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY_TS });
+    expect(bundles().map(kindsOf).flat()).toContain(AUDIT);
+  });
+
   it("does NOT credit a paid set from a different boundary", async () => {
     // Keyed by epoch: a stale set must be ignored, or an audit would be sent unsimulated against
     // an auditor that nothing paid this time round.
