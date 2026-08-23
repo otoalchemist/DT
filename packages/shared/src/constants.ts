@@ -212,6 +212,42 @@ export function tipCostEth(tipGwei: number, payments: number, audits: number): n
   return (tipGwei * tipOnlyBundleGas(payments, audits)) / 1e9;
 }
 
+/**
+ * The single tip a bundle behaves as, when its payments and its audits carry DIFFERENT tips.
+ *
+ * The bot really does price them apart — `resolveGas` hands audits `offensePriorityFeeGwei`
+ * whenever `separateOffenseGas` is on — so a panel that priced everything at one tip was
+ * answering a question nobody had configured.
+ *
+ * A builder sorts on total priority value over total gas, so the honest single number is the
+ * GAS-weighted mean, not the arithmetic one: audits burn ~130k gas each against ~83k for a
+ * payment, so an audit tip pulls the blend harder than a payment tip does, per action.
+ *
+ * Weighted this way the blend is exact rather than an approximation — every existing formula
+ * keeps working untouched, because `blend * totalGas` is identically
+ * `payTip * payGas + auditTip * auditGas`. So `tipCostEth(blend, ...)` is the true cost of
+ * both tips together, and `bidToBeat(density, blend, ...)` is the true bid still needed.
+ *
+ * Degenerate cases fall out correctly: no payments blends to the audit tip, no audits to the
+ * payment tip, and an empty bundle to the payment tip rather than dividing by zero.
+ *
+ * One caveat this cannot express: with no coinbase bid the bot sends payments and audits as
+ * SEPARATE bundles, so on that path each has its own density and neither is the blend. The
+ * blend is exact for one fused bundle and an average for two.
+ */
+export function blendedTipGwei(
+  payments: number,
+  audits: number,
+  payTipGwei: number,
+  auditTipGwei: number,
+): number {
+  const payGas = payments * GAS_PER_PAYMENT;
+  const auditGas = audits * GAS_PER_AUDIT;
+  const total = payGas + auditGas;
+  if (total <= 0) return payTipGwei;
+  return (payTipGwei * payGas + auditTipGwei * auditGas) / total;
+}
+
 /** One epoch's observed defense density for a rival. */
 export interface DensityPoint {
   epoch: number;
