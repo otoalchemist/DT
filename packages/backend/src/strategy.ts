@@ -297,14 +297,14 @@ export function startEngine(): void {
     unwatchBlocks = wsClient.watchBlocks({
       onBlock: (block) => {
         primeBlockCache(block);
-        void tick();
+        void tick(false, true);
       },
       onError: (err) => logger.warn("Block subscription error:", (err as Error).message),
     });
     activity.add({ kind: "info", status: "info", message: "Block subscription active (WebSocket)" });
   } else {
     // Fallback: poll every 12s if no WebSocket URL is configured.
-    timer = setInterval(() => void tick(), TICK_MS);
+    timer = setInterval(() => void tick(false, true), TICK_MS);
     activity.add({ kind: "info", status: "info", message: "Polling every 12s (no WebSocket configured)" });
   }
   void tick();
@@ -673,20 +673,91 @@ function boundaryForArmedFire(): bigint | null {
   return runtime.startTime + (epoch - 1n) * EPOCH_DURATION_SECONDS;
 }
 
+/**
+ * How long before an armed pre-boundary fire routine ticks stop taking the lock, and how
+ * long after the boundary they stay out.
+ *
+ * BEFORE is a full slot, not a token margin, and that sizing is the whole point. The tick
+ * that costs a race does not START inside the lead — it starts on the block BEFORE and runs
+ * into it. Measured on the epoch-174 boundary: the fire was due at :30 against a :35
+ * boundary, and the tick that held the lock had begun at :23. A window that opened at :30
+ * would not have touched it. Opening a slot earlier means at most one tick is ever in
+ * flight when the window opens, and it has a whole block to drain.
+ *
+ * AFTER is short: the post-boundary JIT tick is a BOUNDARY tick and exempt anyway, so this
+ * only stops a routine tick grabbing the lock in the same second the boundary lands.
+ */
+const RACE_QUIET_BEFORE_SEC = 12n;
+const RACE_QUIET_AFTER_SEC = 2n;
+
+/**
+ * The boundary a routine tick must keep out of the way of, or null when there is none.
+ *
+ * Only suppresses when a fire is actually ARMED — with offense off and nothing owed there is
+ * no race to protect, and going quiet then would just stop work for no reason.
+ *
+ * What a skipped tick costs is nothing that cannot wait ~15s: proactive pay, auto-defend
+ * (a 24h clock), the kill sweep and mid-epoch offense all resume on the next block. What it
+ * BUYS is the boundary race itself, plus a second effect worth having — a routine tick is
+ * what advances currentEpoch mid-window, which is the root the epoch-shift bugs grew from.
+ */
+// Exported for tests: the window SIZING is the fix, and getting it wrong is silent — a
+// window that opens too late looks identical to one that works until a boundary is lost.
+export function routineTickMustYield(nowSec: bigint): bigint | null {
+  const s = runtime.strategy;
+  const payArmed = s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null;
+  const auditArmed = s.preBoundaryAudit && s.offenseEnabled && s.autoAudit;
+  if (!payArmed && !auditArmed) return null;
+  const boundary = boundaryForArmedFire();
+  if (boundary === null) return null;
+  const leadSec = BigInt(Math.ceil(effectiveLeadMs() / 1000));
+  const opens = boundary - leadSec - RACE_QUIET_BEFORE_SEC;
+  const closes = boundary + RACE_QUIET_AFTER_SEC;
+  return nowSec >= opens && nowSec <= closes ? boundary : null;
+}
+
 /** A pre-boundary fire was ready but blocked by an in-flight tick until the boundary had
  *  already passed. Distinct from warnRaceMissed (armed too late): here the timer fired ON
  *  TIME and the engine's own tick is what cost the race, which is actionable — it points at
  *  tick duration, not at a sleeping machine. Reported once per boundary. */
 const tickLostRaceFor = new Map<string, bigint>();
+
+/**
+ * How late a fire has to be before it is worth reporting.
+ *
+ * Two seconds, because that is what it actually costs. The old threshold was "the boundary
+ * has already passed", which is ~12s of slip — and MISSING THE BOUNDARY BLOCK only needs a
+ * couple. That gap swallowed a real failure: on the epoch-174 boundary four payments fired
+ * at :33 against a :35 boundary, missed the block by one, and every one of them reverted
+ * with IncorrectPayment once a rival's audits landed first. The boundary had not passed, so
+ * nothing was logged at all and the operator saw only the reverts.
+ */
+const RACE_DELAY_WARN_SEC = 2n;
+
+/** Report a pre-boundary fire that was ready on time but is being held off by a routine
+ *  tick. Distinct from warnRaceMissed (armed too late): here the timer fired ON TIME and the
+ *  engine's own tick is what is costing the race, which points at tick duration rather than
+ *  at a sleeping machine. Reported once per boundary per kind. */
 function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
   if (tickLostRaceFor.get(kind) === boundarySec) return;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  // Due when the scheduler armed it, which is one lead before the boundary — NOT at the
+  // boundary itself. Measuring against the boundary is what made this silent.
+  const dueSec = boundarySec - BigInt(Math.ceil(effectiveLeadMs() / 1000));
+  const lateSec = nowSec - dueSec;
+  if (lateSec < RACE_DELAY_WARN_SEC) return;
   tickLostRaceFor.set(kind, boundarySec);
-  const lateSec = Number(BigInt(Math.floor(Date.now() / 1000)) - boundarySec);
+  const past = nowSec >= boundarySec;
   const msg =
-    `Pre-boundary ${kind} race was ready on time but a routine tick was still running, and ` +
-    `the boundary has now passed (${lateSec}s ago). The payment/audit will still go out on ` +
-    `the next tick, a block late. If this repeats, the tick is taking too long — consider ` +
-    `pinning fewer offense targets or raising the pre-boundary lead.`;
+    `Pre-boundary ${kind} race was ready on time but a routine tick held the engine for ` +
+    `${lateSec}s` +
+    (past
+      ? `, and the boundary has now passed. It will go out on the next tick, a block late.`
+      : `. It still went out before the boundary, but late enough to risk missing the ` +
+        `boundary BLOCK — which is what decides the race, not the second on the clock.`) +
+    ` Routine ticks are supposed to stay out of this window (see routineTickMustYield); if ` +
+    `this repeats, a tick is overrunning a full slot — pin fewer offense targets, or raise ` +
+    `the pre-boundary lead so the window opens earlier.`;
   logger.warn(msg);
   activity.add({ kind: "info", status: "info", message: msg });
 }
@@ -917,7 +988,7 @@ export async function firePreBoundaryPay(): Promise<void> {
   // Same tick-contention report as the combined fire — see warnRaceLostToTick.
   if (ticking) {
     const b = boundaryForArmedFire();
-    if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("payment", b);
+    if (b !== null) warnRaceLostToTick("payment", b);
     setTimeout(() => void firePreBoundaryPay(), 150);
     return;
   }
@@ -1364,7 +1435,7 @@ export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; bounda
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
   if (ticking) {
     const b = boundaryForArmedFire();
-    if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("audit", b);
+    if (b !== null) warnRaceLostToTick("audit", b);
     // Carry the armed boundary through the retry, or a delayed fire re-derives it and lands
     // on the wrong day — which is the bug this whole path exists to avoid.
     setTimeout(() => void firePreBoundaryAudit(armed), 150);
@@ -1469,9 +1540,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
   // that turned up a block late (the epoch-162 miss), with nothing in the log to say why.
   if (ticking) {
     const boundarySec = boundaryForArmedFire();
-    if (boundarySec !== null && BigInt(Math.floor(Date.now() / 1000)) >= boundarySec) {
-      warnRaceLostToTick("bundle", boundarySec);
-    }
+    if (boundarySec !== null) warnRaceLostToTick("bundle", boundarySec);
     setTimeout(() => void firePreBoundaryBundle(), 150);
     return;
   }
@@ -2844,9 +2913,22 @@ export async function manualAuditAll(): Promise<MassAuditResult> {
 // `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary
 // at the next epoch boundary — every other tick (block watch, poll, JIT/offense
 // boundary ticks) leaves already-delinquent citizens alone.
-async function tick(fireProactivePay = false): Promise<void> {
+async function tick(fireProactivePay = false, routine = false): Promise<void> {
   if (ticking) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  /**
+   * Stay out of an armed boundary race.
+   *
+   * `routine` defaults to FALSE so this fails safe: a boundary-timed tick that forgot to
+   * identify itself still runs. Only the block subscription and the poll opt in.
+   */
+  if (routine) {
+    const boundary = routineTickMustYield(BigInt(Math.floor(Date.now() / 1000)));
+    if (boundary !== null) {
+      logger.debug(`routine tick skipped: inside the armed boundary window for ${boundary}`);
+      return;
+    }
+  }
   ticking = true;
   committedThisTickWei = new Map(); // fresh spend budget for this tick
   beginBatch();
