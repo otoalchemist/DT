@@ -149,7 +149,7 @@ export function Config({
   // segments, so the moment you typed the "," or Enter that starts a second id, the value
   // round-tripped back without it and the separator vanished as you typed. There was no
   // way to reach a second line by hand. Editing the text and deriving the ids from it —
-  // the same split PostMortem uses for tx hashes — keeps separators alive while typing.
+  // the same split the postmortem CLI uses for tx hashes — keeps separators alive while typing.
   const [targetsDraft, setTargetsDraft] = useState<string>(cfg.offenseTargetTokenIds.join("\n"));
   const targetsKey = cfg.offenseTargetTokenIds.join(",");
   // Re-seed only when the list changed from OUTSIDE this box — a template button, a reset,

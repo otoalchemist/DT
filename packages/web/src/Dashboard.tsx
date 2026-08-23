@@ -14,7 +14,7 @@ import {
 import { api } from "./api.js";
 import { Config } from "./Config.js";
 import { JitPanel } from "./JitPanel.js";
-import { PostMortem } from "./PostMortem.js";
+import { Treasury } from "./Treasury.js";
 import { TargetScores } from "./TargetScores.js";
 import { Wallets } from "./Wallets.js";
 import { weiToEth, shortAddr, countdown, timeAgo, gameStateLabel } from "./util.js";
@@ -815,7 +815,11 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
           // is on. With it off, audits ride the PAYMENT tip — reading offensePriorityFeeGwei
           // unconditionally priced the bundle at a tip the bot wasn't going to bid, which
           // overstated every beat figure (the gap is charged across the whole bundle gas).
-          tipGwei={
+          // Both tips, because the panel now prices payments and audits apart the same way
+          // resolveGas does: audits take offensePriorityFeeGwei only when separateOffenseGas
+          // is on, and otherwise ride the payment tip.
+          payTipGwei={config?.priorityFeeGwei ?? 20.1}
+          auditTipGwei={
             (config?.separateOffenseGas ? config?.offensePriorityFeeGwei : config?.priorityFeeGwei) ?? 20.1
           }
           ownedCitizens={tokens.length}
@@ -826,7 +830,7 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
         />
 
         <div className="spacer" />
-        <PostMortem />
+        <Treasury />
 
       </div>
 

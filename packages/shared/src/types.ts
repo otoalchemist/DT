@@ -338,6 +338,31 @@ export interface LeadBar {
 }
 
 /** State of the on-demand rival scan behind the dashboard's "Analyze targets" button. */
+/** One epoch's contribution to the prize pool. */
+export interface TreasuryEpochRow {
+  epoch: number;
+  /** First block of this epoch — the boundary block, where most of its tax lands. */
+  boundaryBlock: string;
+  /** Wei the treasury gained during this epoch. Decimal string: JSON has no bigint. */
+  treasuryWei: string;
+  projectWei: string;
+  /** True for the epoch still running, whose figure is only the part banked so far. */
+  live: boolean;
+}
+
+export interface TreasuryState {
+  treasuryAddress: string;
+  projectAddress: string;
+  /** Current balances, not the sum of the rows — the pool predates the window shown. */
+  treasuryTotalWei: string;
+  projectTotalWei: string;
+  /** Citizens that survive to split the pool. Mirrors the contract's WINNERS. */
+  winners: number;
+  rows: TreasuryEpochRow[];
+  computedAt: number;
+  error: string | null;
+}
+
 export interface TargetScoresState {
   running: boolean;
   /** Epoch the scan was computed against; null until one completes. */

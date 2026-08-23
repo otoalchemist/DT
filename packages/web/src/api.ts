@@ -5,8 +5,8 @@ import type {
   OwnedTokenStatus,
   TargetTokenStatus,
   EmigratedTokenStatus,
-  PostMortemResult,
   TargetScoresState,
+  TreasuryState,
   BigBoyStatus,
 } from "@dat-bot/shared";
 
@@ -70,6 +70,8 @@ export const api = {
     req<BotStatus>("/api/jit", { method: "POST", body: JSON.stringify(body) }),
   tokens: () => req<OwnedTokenStatus[]>("/api/tokens"),
   // On-demand rival scoring. POST starts a background scan; GET polls for the result.
+  treasury: () => req<TreasuryState>("/api/treasury"),
+  refreshTreasury: () => req<TreasuryState>("/api/treasury/refresh", { method: "POST" }),
   targetScores: () => req<TargetScoresState>("/api/target-scores"),
   runTargetScores: () => req<TargetScoresState>("/api/target-scores", { method: "POST" }),
   // Manual per-token actions — normal network gas at press time, not the race tips.
@@ -110,6 +112,4 @@ export const api = {
     req<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify({ alchemyApiKey }) }),
   saveMode: (mode: "mainnet" | "public") =>
     req<{ ok: boolean; mode: string }>("/api/settings", { method: "POST", body: JSON.stringify({ mode }) }),
-  postMortem: (ours: string[], rivals: string[]) =>
-    req<PostMortemResult>("/api/postmortem", { method: "POST", body: JSON.stringify({ ours, rivals }) }),
 };

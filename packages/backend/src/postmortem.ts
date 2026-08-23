@@ -2,8 +2,10 @@
 // transactions for the same epoch and explain, per pair, whether we lost on
 // TIMING (landed in a later block) or on FEE (same block, out-priced).
 //
-// Reusable core: runPostMortem() returns structured PostMortemResult (used by
-// the API + UI). The CLI wrapper below prints it as a table.
+// Reusable core: runPostMortem() returns a structured PostMortemResult; the CLI wrapper
+// below prints it as a table. It had a dashboard panel and an /api/postmortem route too,
+// both removed when the Prize pool section took that slot — the CLI is the surviving entry
+// point, and it is the same race analysis, so nothing was lost but the button.
 //
 // Usage (run with tsx from packages/backend):
 //   tsx src/postmortem.ts <ours> [<rival> ...]

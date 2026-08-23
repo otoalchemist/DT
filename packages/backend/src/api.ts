@@ -30,7 +30,7 @@ import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, s
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
-import { runPostMortem } from "./postmortem.js";
+import { getTreasuryHistory, invalidateTreasuryCache } from "./treasury.js";
 import { syncDefaultLists } from "./list-sync.js";
 
 const strategyPatch = z
@@ -152,6 +152,10 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   // --- on-demand rival scoring (dashboard "Analyze targets") ---
   // The scan takes minutes, so POST starts it in the background and the UI polls GET.
+  // Prize-pool growth. Read-only and heavily cached, so it is safe to poll and safe to call
+  // while locked - it reads public chain state and touches no wallet.
+  app.get("/api/treasury", async () => getTreasuryHistory());
+  app.post("/api/treasury/refresh", async () => { invalidateTreasuryCache(); return getTreasuryHistory(); });
   app.get("/api/target-scores", async () => getTargetScores());
   app.post("/api/target-scores", async () => startTargetScores());
 
@@ -771,29 +775,6 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/activity", async (req) => {
     const limit = Number((req.query as { limit?: string }).limit ?? 200);
     return activity.recent(limit);
-  });
-
-  // --- race post-mortem: compare our tx(s) vs rival tx(s) on-chain ---
-  app.post("/api/postmortem", async (req, reply) => {
-    const hash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "invalid tx hash");
-    const schema = z.object({
-      ours: z.array(hash).min(1).max(20),
-      rivals: z.array(hash).max(20).default([]),
-    });
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    if (!appConfig.httpUrl) {
-      return reply.code(400).send({ error: "No RPC configured — set the Alchemy key first." });
-    }
-    try {
-      const result = await runPostMortem(
-        parsed.data.ours as `0x${string}`[],
-        parsed.data.rivals as `0x${string}`[],
-      );
-      return result;
-    } catch (err) {
-      return reply.code(500).send({ error: (err as Error).message });
-    }
   });
 
   // --- websocket: push status + activity ---
