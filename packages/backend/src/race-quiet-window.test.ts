@@ -169,3 +169,65 @@ describe("routine ticks yield inside an armed boundary window", () => {
     expect(routineTickMustYield(at(-6))).toBeNull();
   });
 });
+
+/**
+ * Who the delay warning blames.
+ *
+ * The warning fired on a healthy boundary and said "a routine tick held the engine", which
+ * sent an operator looking at tick duration. The holder was the PAYMENT fire, and the audit
+ * fire waiting behind it is the architecture: the audit needs the paid-in-bundle credit the
+ * payment produces, and the payment's lower nonce is what makes crediting it safe.
+ */
+describe("the delay warning names the real holder", () => {
+  it("stays silent when the audit is waiting on its own payment fire", async () => {
+    const { __setTickingOwnerForTest, __warnRaceLostToTickForTest, __resetRaceWarnForTest } =
+      (await import("./strategy.js")) as unknown as {
+        __setTickingOwnerForTest: (o: string | null) => void;
+        __warnRaceLostToTickForTest: (kind: string, boundarySec: bigint) => void;
+        __resetRaceWarnForTest: () => void;
+      };
+    const { activity } = await import("./activity.js");
+    __resetRaceWarnForTest();
+    vi.mocked(activity.add).mockClear();
+    arm();
+    __setTickingOwnerForTest("the payment fire");
+    __warnRaceLostToTickForTest("audit", BOUNDARY);
+    expect(activity.add).not.toHaveBeenCalled();
+  });
+
+  it("still reports when something unrelated holds the lock, and names it", async () => {
+    const { __setTickingOwnerForTest, __warnRaceLostToTickForTest, __resetRaceWarnForTest } =
+      (await import("./strategy.js")) as unknown as {
+        __setTickingOwnerForTest: (o: string | null) => void;
+        __warnRaceLostToTickForTest: (kind: string, boundarySec: bigint) => void;
+        __resetRaceWarnForTest: () => void;
+      };
+    const { activity } = await import("./activity.js");
+    __resetRaceWarnForTest();
+    vi.mocked(activity.add).mockClear();
+    arm();
+    __setTickingOwnerForTest("a routine tick");
+    __warnRaceLostToTickForTest("audit", BOUNDARY);
+    expect(activity.add).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(activity.add).mock.calls[0]![0]!.message as string;
+    expect(msg).toContain("a routine tick held the engine");
+  });
+
+  it("a payment race delayed by the payment fire is impossible, so it is never suppressed", async () => {
+    // Only the AUDIT waits on the payment. Suppressing by owner alone would have hidden a
+    // genuine payment delay if the same owner string ever appeared, so the kind is checked too.
+    const { __setTickingOwnerForTest, __warnRaceLostToTickForTest, __resetRaceWarnForTest } =
+      (await import("./strategy.js")) as unknown as {
+        __setTickingOwnerForTest: (o: string | null) => void;
+        __warnRaceLostToTickForTest: (kind: string, boundarySec: bigint) => void;
+        __resetRaceWarnForTest: () => void;
+      };
+    const { activity } = await import("./activity.js");
+    __resetRaceWarnForTest();
+    vi.mocked(activity.add).mockClear();
+    arm();
+    __setTickingOwnerForTest("the payment fire");
+    __warnRaceLostToTickForTest("payment", BOUNDARY);
+    expect(activity.add).toHaveBeenCalledTimes(1);
+  });
+});

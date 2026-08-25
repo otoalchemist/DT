@@ -48,6 +48,17 @@ let awayStartedEngine = false;
 let preBoundaryBundleTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
+/**
+ * WHICH work holds `ticking`, in words fit for an activity entry.
+ *
+ * Exists because the delay warning was blaming the wrong thing. The audit fire ALWAYS waits
+ * behind the payment fire on a boundary where a payment is due — that is the architecture,
+ * not a fault: the audit needs the paid-in-bundle credit the payment fire produces, and a
+ * lower nonce is what makes crediting it safe. Reporting that expected wait as "a routine
+ * tick held the engine" sent an operator hunting for tick duration when nothing was wrong
+ * with the tick at all.
+ */
+let tickingOwner: string | null = null;
 // Randomized once per engine start (see startEngine) and used to reorder the
 // rival sweep (offensePass, firePreBoundaryAudit, firePreBoundaryKill) so every
 // bot instance doesn't audit/kill candidates in the same identical order — the
@@ -752,6 +763,17 @@ const RACE_DELAY_WARN_SEC = 2n;
  *  at a sleeping machine. Reported once per boundary per kind. */
 function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
   if (tickLostRaceFor.get(kind) === boundarySec) return;
+  /**
+   * The audit fire waiting on the PAYMENT fire is the design, not a fault.
+   *
+   * They are scheduled for the same instant and share one lock, so on any boundary where a
+   * payment is due the audit ALWAYS queues behind it — and must, because it needs the
+   * paid-in-bundle credit the payment fire produces, and the payment's lower nonce is what
+   * makes crediting it safe at all. Reporting that as "a routine tick held the engine" fired
+   * on a perfectly healthy boundary and pointed the operator at tick duration, which was
+   * never the problem. Same for the combined fire, which owns both halves by definition.
+   */
+  if (kind === "audit" && (tickingOwner === "the payment fire" || tickingOwner === "the combined pay+audit fire")) return;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   // Due when the scheduler armed it, which is one lead before the boundary — NOT at the
   // boundary itself. Measuring against the boundary is what made this silent.
@@ -761,8 +783,8 @@ function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
   tickLostRaceFor.set(kind, boundarySec);
   const past = nowSec >= boundarySec;
   const msg =
-    `Pre-boundary ${kind} race was ready on time but a routine tick held the engine for ` +
-    `${lateSec}s` +
+    `Pre-boundary ${kind} race was ready on time but ${tickingOwner ?? "other work"} held the engine ` +
+    `for ${lateSec}s` +
     (past
       ? `, and the boundary has now passed. It will go out on the next tick, a block late.`
       : `. It still went out before the boundary, but late enough to risk missing the ` +
@@ -773,6 +795,34 @@ function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
   logger.warn(msg);
   activity.add({ kind: "info", status: "info", message: msg });
 }
+
+/**
+ * Say when the endgame gate is what stopped an offense sweep. Once per boundary: the audit
+ * fire can be re-entered by its own retry loop, and a line per retry would bury the point.
+ */
+const endgameSkipFor = new Map<string, bigint>();
+function noteEndgameGateSkip(boundarySec: bigint | null): void {
+  const key = "audit";
+  if (boundarySec !== null && endgameSkipFor.get(key) === boundarySec) return;
+  if (boundarySec !== null) endgameSkipFor.set(key, boundarySec);
+  const s = runtime.strategy;
+  const left = (runtime.citizenSupply ?? 0n) - WINNERS;
+  const msg =
+    `Pre-boundary audit skipped: endgame-only mode is set to ${s.endgameOnlyWithin} and ` +
+    `${left} citizen(s) are still above the ${WINNERS} that win, so offense stays off until ` +
+    `the field is closer. Payments are unaffected. Clear "Endgame only within" to audit now.`;
+  logger.info(msg);
+  activity.add({ kind: "info", status: "skipped", message: msg });
+}
+
+// Exported for tests ONLY: the suppression rule is a behaviour ("do not blame a tick for a
+// wait that is architectural") with no other observable, and driving it through two real
+// fires would test the scheduler rather than the rule.
+export function __setTickingOwnerForTest(o: string | null): void { tickingOwner = o; }
+export function __warnRaceLostToTickForTest(kind: string, boundarySec: bigint): void {
+  warnRaceLostToTick(kind, boundarySec);
+}
+export function __resetRaceWarnForTest(): void { tickLostRaceFor.clear(); endgameSkipFor.clear(); }
 
 /** Fire an extra tick precisely at the armed epoch's boundary (near-instant JIT pay). */
 export function scheduleJitBoundary(): void {
@@ -1005,6 +1055,7 @@ export async function firePreBoundaryPay(): Promise<void> {
     return;
   }
   ticking = true;
+  tickingOwner = "the payment fire";
   committedThisTickWei = new Map();
   beginBatch();
   const targetEpoch = BigInt(s.jitTargetEpoch);
@@ -1024,6 +1075,7 @@ export async function firePreBoundaryPay(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1483,8 +1535,20 @@ export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; bounda
     setTimeout(() => void firePreBoundaryAudit(armed), 150);
     return;
   }
-  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
+  /**
+   * The endgame gate, which used to return in total silence.
+   *
+   * That silence cost a diagnosis: an operator saw the delay warning above, then nothing at
+   * all, and no audits — indistinguishable from "the sweep ran and found no targets". Supply
+   * is what decides this, so with 78 citizens and 69 winners any endgameOnlyWithin under 9
+   * switches every pre-boundary audit off while payments carry on normally.
+   */
+  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) {
+    noteEndgameGateSkip(boundaryForArmedFire());
+    return;
+  }
   ticking = true;
+  tickingOwner = "the audit fire";
   committedThisTickWei = new Map();
   beginBatch();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
@@ -1556,6 +1620,7 @@ export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; bounda
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1587,6 +1652,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
     return;
   }
   ticking = true;
+  tickingOwner = "the combined pay+audit fire";
   committedThisTickWei = new Map();
   beginBatch();
   /**
@@ -1675,6 +1741,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1725,6 +1792,7 @@ async function firePreBoundaryKill(): Promise<void> {
   if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
+  tickingOwner = "the kill fire";
   committedThisTickWei = new Map();
   beginBatch();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
@@ -1765,6 +1833,7 @@ async function firePreBoundaryKill(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -2824,6 +2893,7 @@ async function runManualAction(
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -3032,6 +3102,7 @@ export async function manualAuditAll(): Promise<MassAuditResult> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -3055,6 +3126,7 @@ async function tick(fireProactivePay = false, routine = false): Promise<void> {
     }
   }
   ticking = true;
+  tickingOwner = routine ? "a routine tick" : "a boundary tick";
   committedThisTickWei = new Map(); // fresh spend budget for this tick
   beginBatch();
   try {
@@ -3099,6 +3171,7 @@ async function tick(fireProactivePay = false, routine = false): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
