@@ -16,11 +16,25 @@ export type SubmitMode = "public" | "mainnet" | "local";
 export class NonceManager {
   private next: number | null = null;
   private reservedCeil: number | null = null; // one past the highest nonce reserved this session
-  private lastOnchain = -1;
-  private lastOnchainChangeMs = 0;
-  // If pending hasn't advanced past our held reservation for this long, an
-  // un-mined bundle has almost certainly been dropped (bundles expire after ~2
-  // blocks), so we release the nonce rather than stick behind a permanent gap.
+  /**
+   * When we last reserved a nonce the chain has not caught up to yet.
+   *
+   * This — NOT the last time the chain's nonce moved — is what the staleness check below has
+   * to measure, and getting it wrong cost a real payment at the epoch-176 boundary. Two fires
+   * 2.4s apart both signed nonce 11946: the audit mined, the payment was permanently
+   * invalidated, the citizen stayed 2 behind, a rival audited it in the same block, and
+   * catching up cost double the taxes.
+   *
+   * The reason chain movement is the wrong clock: in away mode the engine sleeps between
+   * boundaries, so when it wakes the wallet's nonce has been unchanged for hours. Judging our
+   * reservation by that made every FIRST reservation of a session instantly "stale", and the
+   * second fire of the same boundary reused its nonce. Reservation age has no such coupling —
+   * a 2.4s-old reservation reads as 2.4s old no matter how long the wallet sat idle.
+   */
+  private reservedAtMs = 0;
+  // If the chain hasn't advanced past our held reservation for this long, an un-mined bundle
+  // has almost certainly been dropped (bundles expire after ~2 blocks), so we release the
+  // nonce rather than stick behind a permanent gap.
   private static readonly STALE_MS = 90_000;
 
   /** Re-sync at the start of a tick. `mode` decides whether to trust the mempool
@@ -28,13 +42,10 @@ export class NonceManager {
   async sync(address: Address, mode: SubmitMode): Promise<void> {
     const onchain = await publicClient.getTransactionCount({ address, blockTag: "pending" });
     const nowMs = Date.now();
-    if (onchain !== this.lastOnchain) {
-      this.lastOnchain = onchain;
-      this.lastOnchainChangeMs = nowMs;
-    }
 
     const holding = mode === "mainnet" && this.reservedCeil !== null && onchain < this.reservedCeil;
-    if (holding && nowMs - this.lastOnchainChangeMs <= NonceManager.STALE_MS) {
+    // Age of OUR reservation, not of the chain's last move — see reservedAtMs.
+    if (holding && nowMs - this.reservedAtMs <= NonceManager.STALE_MS) {
       // Keep our reserved nonce — the chain just hasn't seen the bundle yet.
       this.next = Math.max(onchain, this.reservedCeil!);
     } else {
@@ -56,7 +67,14 @@ export class NonceManager {
     if (this.next === null) throw new Error("NonceManager.reserve called before sync");
     const n = this.next;
     this.next = n + 1;
-    if (this.reservedCeil === null || this.next > this.reservedCeil) this.reservedCeil = this.next;
+    if (this.reservedCeil === null || this.next > this.reservedCeil) {
+      this.reservedCeil = this.next;
+      // Stamped on every ceiling RAISE, so back-to-back fires in one boundary each refresh
+      // the hold. Biased toward holding too long on purpose: an over-held nonce self-heals
+      // the moment the chain advances (or after STALE_MS), while an under-held one silently
+      // drops a transaction — which is the failure this exists to prevent.
+      this.reservedAtMs = Date.now();
+    }
     return n;
   }
 
