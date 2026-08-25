@@ -355,6 +355,18 @@ function nextBoundarySec(startTime: bigint, nowSec: bigint): bigint {
 }
 
 /**
+ * How long before a boundary the mid-epoch sweep stops using cheap gas.
+ *
+ * Not about the sweep's own inclusion — it's about the nonce. Sweep audits sign from the
+ * same wallets the boundary payment does, and nonces are consumed in order: a cheap audit
+ * still pending when the boundary fires holds a nonce the payment sits behind, and no tip
+ * on the payment can jump it. Three minutes is ~15 blocks, far more than a
+ * suggestion-plus-1-gwei tx needs, and costs at most a handful of race-priced audits per
+ * epoch (the boundary path is what audits at a boundary anyway).
+ */
+const SWEEP_QUIET_WINDOW_SECONDS = 180n;
+
+/**
  * How late a fire may be and still be racing the boundary it was armed for.
  *
  * The pre-boundary fires contend for one tick lock and retry every 150ms, so an audit fire
@@ -1153,8 +1165,16 @@ export async function fetchOffenseCandidates(): Promise<{ id: bigint; owner: Add
 
 /** `fetchOffenseCandidates` plus the IDs it dropped as emigrated, so a caller can
  *  tell "this pin left the game" apart from "this pin was burned/killed" when
- *  explaining a skip. Same work, one return value richer. */
-export async function fetchOffenseCandidatesWithSkips(): Promise<{
+ *  explaining a skip. Same work, one return value richer.
+ *
+ *  `includeUnpinned` unions the pins with the capped enumeration instead of scanning
+ *  only the pins, for the mid-epoch sweep (see sweepUnpinned). Pins stay FIRST in the
+ *  returned order so a caller handing out scarce auditor slots serves them before
+ *  anything discovered this way. Opt-in per call site on purpose: the boundary paths
+ *  spend race gas and must stay narrow. */
+export async function fetchOffenseCandidatesWithSkips(
+  opts: { includeUnpinned?: boolean } = {},
+): Promise<{
   candidates: { id: bigint; owner: Address }[];
   emigrated: Set<string>;
 }> {
@@ -1169,11 +1189,21 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
       logger.warn(`offense target #${raw} is not a valid token ID; ignoring it`);
     }
   }
-  // Pinned mode: the pins ARE the candidate set (bypass the enumeration cap).
-  const ids =
-    pinnedIds.length > 0
-      ? pinnedIds
-      : await fetchCandidateTokenIds(citizens);
+  // Pinned mode: the pins ARE the candidate set (bypass the enumeration cap). Widened
+  // mode unions both — the pins still bypass the cap (that's why they're listed first
+  // and deduped, rather than trusting the enumeration to contain them).
+  let ids: bigint[];
+  if (pinnedIds.length === 0) {
+    ids = await fetchCandidateTokenIds(citizens);
+  } else if (opts.includeUnpinned) {
+    const seen = new Set(pinnedIds.map((x) => x.toString()));
+    ids = [...pinnedIds];
+    for (const id of await fetchCandidateTokenIds(citizens)) {
+      if (!seen.has(id.toString())) ids.push(id);
+    }
+  } else {
+    ids = pinnedIds;
+  }
   const liveRaw = await filterLiveTokenIds(citizens, ids);
   // Allies are never offense candidates. The rival lists shouldn't contain one, but this
   // is the last line of defence: a stale pin, a hand-edited target list or a regenerated
@@ -1201,7 +1231,19 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
   if (allySkipped > 0) {
     logger.warn(`offense candidates: skipped ${allySkipped} ALLIED citizen(s) — check your target list`);
   }
-  return { candidates: orderBySalt(inGame, (t) => t.id.toString(), engineSalt), emigrated };
+  // Salt-order within each group, but keep pins ahead of everything discovered by
+  // enumeration. Auditor slots are finite and handed out in list order, so without this
+  // a widened sweep could spend the last slot on a random rival and skip a pinned one.
+  // Two separate orderBySalt calls rather than one plus a sort: the salt ordering is the
+  // anti-collision mechanism (it staggers which target each ally hits first), and a
+  // stable sort over one shuffled list would preserve it inside each group anyway — this
+  // just makes the grouping explicit instead of implicit in sort stability.
+  const ordered = orderBySalt(inGame, (t) => t.id.toString(), engineSalt);
+  if (pinnedSet.size === 0) return { candidates: ordered, emigrated };
+  const pins: { id: bigint; owner: Address }[] = [];
+  const rest: { id: bigint; owner: Address }[] = [];
+  for (const t of ordered) (pinnedSet.has(t.id.toString()) ? pins : rest).push(t);
+  return { candidates: [...pins, ...rest], emigrated };
 }
 
 /** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
@@ -2504,9 +2546,60 @@ async function offensePass(
     if (supply - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   }
 
-  const live = await fetchOffenseCandidates();
-  const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = pinnedTargetSet(s);
+  // Widen the AUDIT half of the sweep past the pins when asked. Kills are deliberately
+  // left narrow (see the kill branch below), and the boundary paths call
+  // fetchOffenseCandidates() without the flag, so this affects the mid-epoch sweep only.
+  const wide = pinned !== null && s.sweepUnpinned && s.autoAudit;
+
+  /**
+   * Read the auditor pool FIRST, and bail before touching the candidate set if there is
+   * nothing it could do with one.
+   *
+   * Audit capacity is per-epoch, so the sweep spends it in the first tick or two after a
+   * boundary and then has none for the remaining ~7,000 ticks of the epoch. Those ticks
+   * used to enumerate the field, multicall ownerOf over it, and multicall a status for
+   * every rival — all to discover the pool was empty. That was already wasteful at pinned
+   * width; with sweepUnpinned it is the whole live field, twice per tick.
+   *
+   * Costs one round-trip of concurrency on the ticks that DO have capacity (auditors and
+   * statuses used to be fetched together). Worth it: the sweep is mid-epoch work with no
+   * deadline — the boundary paths are what race — and the trade is one extra round-trip on
+   * a handful of ticks against two large multicalls on thousands of them.
+   *
+   * Only safe to skip when autoKill is off, since a kill needs no auditor. With it on,
+   * nextKillDeadlineSec also has to stay fresh for schedulePreBoundaryKill.
+   */
+  const auditors = s.autoAudit ? await findEligibleAuditors(ownedIds, currentEpoch) : [];
+  if (auditors.length === 0 && !s.autoKill) {
+    logger.debug("offense sweep: no audit capacity left this epoch and autoKill is off — skipping");
+    return;
+  }
+
+  const live = (await fetchOffenseCandidatesWithSkips({ includeUnpinned: wide })).candidates;
+  const owned = new Set(ownedIds.map((x) => x.toString()));
+
+  /**
+   * Price mid-epoch sweep audits at normal gas rather than the offense race tip.
+   *
+   * A mid-epoch audit contests nobody: the rivals who intended to cure did it at the
+   * boundary, and if one does front-run us the revert refunds BOTH the 0.00069 fee and
+   * the audit slot, so a lost cheap audit costs only gas. At a 131 gwei offense tip an
+   * audit is ~0.0178 ETH against ~0.0010 at normal gas — 17x for a race that isn't
+   * happening.
+   *
+   * The exception is the quiet window before a boundary. These txs come from the same
+   * wallets the boundary fires use, so a cheap one still pending when the boundary
+   * arrives holds a nonce the payment queues behind — and a higher nonce cannot be mined
+   * before a lower one no matter what it pays. Inside the window we pay race gas so
+   * nothing lingers. (The +1 gwei bump in normalFees is the other half of this: priced
+   * exactly AT the node's suggestion, a tx is a coin-flip per block.)
+   */
+  const untilBoundary =
+    runtime.startTime === null ? null : nextBoundarySec(runtime.startTime, nowSec) - nowSec;
+  const inBoundaryQuietWindow =
+    untilBoundary !== null && untilBoundary <= SWEEP_QUIET_WINDOW_SECONDS;
+  const sweepNormalGas = s.sweepNormalGas && !inBoundaryQuietWindow;
 
   // Narrow to tokens we could actually act on BEFORE reading their status, then
   // fetch all their statuses in ONE multicall — a serial getTargetStatus per
@@ -2515,21 +2608,21 @@ async function offensePass(
   const candidates = live.filter(({ id }) => {
     const key = id.toString();
     if (owned.has(key)) return false; // never audit our own
-    if (pinned && !pinned.has(key)) return false; // not on the target list
+    // Unpinned tokens are in the set only when `wide`, and then only the audit branch
+    // may act on them — the kill branch re-checks the pin itself.
+    if (pinned && !pinned.has(key) && !wide) return false; // not on the target list
     return true;
   });
+  const statuses = await batchGetTargetStatuses(candidates, currentEpoch, nowSec);
 
-  // The auditor pool (owned tokens usable as an audit "from" this tick — each
-  // backs one audit, since a token audits at most `auditLimit` times/epoch) and
-  // the target statuses are independent reads, so fetch them concurrently. We hand
-  // auditors out one per target so multiple rivals can be audited in a single
-  // epoch instead of reusing one token and reverting with AuditLimitReached.
-  const [auditors, statuses] = await Promise.all([
-    findEligibleAuditors(ownedIds, currentEpoch),
-    batchGetTargetStatuses(candidates, currentEpoch, nowSec),
-  ]);
+  // Auditors are handed out one per target so multiple rivals can be audited in a single
+  // epoch instead of reusing one token and reverting with AuditLimitReached. The pool was
+  // read above, before the candidate set, so an epoch with no capacity left costs nothing.
   let auditorIdx = 0;
   let noAuditorSkips = 0;
+  // How many of this sweep's audits hit a rival that is NOT on the pinned list, so the
+  // activity line can say the widening is what found them.
+  let unpinnedAudits = 0;
   // Set when the sweep stopped early because the guardrail failed for a reason that
   // applies to the whole block (base fee over cap). Reported below so an offense pass
   // that did nothing is never silent about why.
@@ -2549,6 +2642,11 @@ async function offensePass(
     }
 
     if (s.autoKill && t.killable) {
+      // Kills stay PINNED-ONLY even when the audit sweep is widened. A kill is a race
+      // against every other killer for the same reward, so it needs race gas — and
+      // widening a race-gas action is a spend increase the sweep widening deliberately
+      // isn't. `wide` is the only way an unpinned token reaches this loop.
+      if (pinned && !pinned.has(t.tokenId)) continue;
       const guard = await canSpend(0n, true);
       // A fee spike fails identically for every remaining target — stop the sweep
       // instead of re-awaiting the same verdict once per rival.
@@ -2572,9 +2670,20 @@ async function offensePass(
       const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },
         "audit",
-        { tokenId: auditFrom.toString(), targetTokenId: t.tokenId, message: `Audit delinquent #${t.tokenId} from #${auditFrom}`, race: true },
+        {
+          tokenId: auditFrom.toString(),
+          targetTokenId: t.tokenId,
+          message: `Audit delinquent #${t.tokenId} from #${auditFrom}`,
+          // `race` is the mempool mirror, not the tip — keep it either way so the audit
+          // lands without depending on a builder. Only the PRICE changes below.
+          race: true,
+          normalGas: sweepNormalGas,
+        },
       );
-      if (res?.ok) auditorIdx++; // consume this auditor only if the audit actually went out
+      if (res?.ok) {
+        auditorIdx++; // consume this auditor only if the audit actually went out
+        if (pinned && !pinned.has(t.tokenId)) unpinnedAudits++;
+      }
     }
   }
 
@@ -2584,6 +2693,22 @@ async function offensePass(
       status: "info",
       message: `Audited ${auditorIdx} rival(s) this sweep; ${noAuditorSkips} more auditable but no eligible auditor token left (each audits up to its per-epoch limit).`,
     });
+  }
+
+  // Debug, not activity: the sweep runs every block, so an entry per sweep would flood
+  // the feed. What's worth recording is that the widening spent slots on rivals the pin
+  // list wouldn't have reached — otherwise those audits read as pins the user forgot.
+  if (unpinnedAudits > 0) {
+    logger.debug(
+      `offense sweep: ${unpinnedAudits} of ${auditorIdx} audit(s) went to unpinned rivals ` +
+        `(sweepUnpinned) at ${sweepNormalGas ? "normal" : "race"} gas`,
+    );
+  }
+  if (inBoundaryQuietWindow && s.sweepNormalGas) {
+    logger.debug(
+      `offense sweep: within ${SWEEP_QUIET_WINDOW_SECONDS}s of the boundary — using race gas ` +
+        `so no cheap tx is left holding a nonce the boundary payment would queue behind`,
+    );
   }
 
   // Debug, not activity: a fee spike lasts many blocks and the sweep runs every block, so

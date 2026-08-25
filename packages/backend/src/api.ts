@@ -65,6 +65,8 @@ const strategyPatch = z
     autoKill: z.boolean(),
     endgameOnlyWithin: z.number().int().min(0).nullable(),
     offenseTargetTokenIds: z.array(z.string()),
+    sweepUnpinned: z.boolean(),
+    sweepNormalGas: z.boolean(),
     preBoundaryAudit: z.boolean(),
     preBoundaryKill: z.boolean(),
     combinedBoundaryBundle: z.boolean(),

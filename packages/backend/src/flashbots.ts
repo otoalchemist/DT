@@ -100,11 +100,25 @@ function hostOf(url: string): string {
 // Pure — takes an already-fetched block so the caller can share one read across
 // the fee calc, the gas estimate, and the target-block derivation.
 /**
+ * Added on top of the node's suggested priority fee for every `normalGas` submission.
+ *
+ * The suggestion is a percentile of recent blocks, so a tx priced exactly AT it is a
+ * coin-flip for the next block and can sit for several. That matters beyond latency:
+ * these txs come from the same wallet the boundary fires use, so one stuck at a low
+ * tip holds a nonce that every later payment queues behind (a higher nonce cannot be
+ * mined before a lower one, no matter what it pays). One gwei over the suggestion is
+ * a rounding error on cost — ~0.00013 ETH on a 130k-gas audit — and buys out of that
+ * whole failure mode.
+ */
+const NORMAL_GAS_TIP_BUMP_WEI = 1_000_000_000n; // +1 gwei
+
+/**
  * "Normal" network gas, read at submit time — the node's own suggested priority fee
- * rather than any of the configured race/offense tips. Used by manual, user-initiated
- * actions (pay-to-current / use-bribe from the dashboard), which aren't racing anyone
- * and shouldn't inherit boundary-race pricing. Falls back to 1 gwei if the node has
- * no suggestion.
+ * (plus NORMAL_GAS_TIP_BUMP_WEI) rather than any of the configured race/offense tips.
+ * Used by manual, user-initiated actions (pay-to-current / use-bribe / audit from the
+ * dashboard) and by the mid-epoch offense sweep — none of which are racing anyone, and
+ * so shouldn't inherit boundary-race pricing. Falls back to 1 gwei if the node has no
+ * suggestion.
  */
 async function normalFees(block: Block): Promise<{
   maxFeePerGas: bigint;
@@ -118,6 +132,7 @@ async function normalFees(block: Block): Promise<{
   } catch {
     priority = 1_000_000_000n; // 1 gwei
   }
+  priority += NORMAL_GAS_TIP_BUMP_WEI;
   return { maxFeePerGas: baseFee * 2n + priority, maxPriorityFeePerGas: priority, baseFee };
 }
 

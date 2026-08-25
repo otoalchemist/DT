@@ -527,6 +527,17 @@ export interface StrategyConfig {
   endgameOnlyWithin: number | null;
   /** Specific rival token IDs to target. Empty array = target any delinquent rival. */
   offenseTargetTokenIds: string[];
+  /** Widen the MID-EPOCH audit sweep past `offenseTargetTokenIds` to every auditable
+   *  rival (allies and emigrants still excluded). Pinned targets are still served
+   *  FIRST, so scarce auditor slots go to them before anyone discovered this way.
+   *  Boundary audits and kills stay pinned-only regardless — this only spends the
+   *  capacity that would otherwise sit unused for the rest of the epoch. */
+  sweepUnpinned: boolean;
+  /** Price MID-EPOCH sweep audits at the network's normal gas (+1 gwei) instead of the
+   *  offense race tip. A mid-epoch audit is contesting nobody: the rivals who meant to
+   *  cure did so at the boundary, and a revert refunds both the fee and the audit slot,
+   *  so a lost race costs only gas. Boundary audits keep the race tip. */
+  sweepNormalGas: boolean;
   /** ADVANCED: pre-submit audits ~preBoundaryLeadMs before the epoch boundary so
    *  they land in the FIRST block of the epoch (auditing rivals the instant they
    *  become delinquent, like a batch-auditor) instead of the block after.

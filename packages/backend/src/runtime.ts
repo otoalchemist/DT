@@ -182,6 +182,14 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   autoKill: false, // opt-in: killing an expired-audit token is free but aggressive
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadRivalSkippers(),
+  // The mid-epoch sweep goes wide and cheap; the boundary stays narrow and expensive.
+  // Pins exist to say "these are worth race gas at the boundary", which is a different
+  // question from "is this rival auditable at all" — and unused audit capacity is worth
+  // nothing at the next boundary, since it resets per epoch. Auditability only SHRINKS
+  // during an epoch (currentEpoch is fixed while lastEpochPaid rises), so a slot held
+  // back mid-epoch is a slot spent on nobody.
+  sweepUnpinned: true,
+  sweepNormalGas: true,
   preBoundaryAudit: true,
   preBoundaryKill: true, // race kills into the first block after audit expiry (no-op unless autoKill is on)
   // On by default, but self-guarding: it only fuses payment + audit into one bundle

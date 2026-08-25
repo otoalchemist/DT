@@ -105,6 +105,7 @@ function AlchemyKeySection() {
 const STRATEGY_FIELDS: (keyof StrategyConfig)[] = [
   "offenseEnabled", "autoAudit", "autoKill", "preBoundaryAudit", "preBoundaryKill",
   "endgameOnlyWithin", "offenseTargetTokenIds",
+  "sweepUnpinned", "sweepNormalGas",
   "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
   "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
   "racePublicMempool", "minBalanceEth", "maxPaymentEth", "autoDefendAudit",
@@ -272,6 +273,37 @@ export function Config({
       <label className="check">
         <input type="checkbox" checked={cfg.autoKill} onChange={chk("autoKill")} disabled={!cfg.offenseEnabled} />
         Auto-kill expired-audit tokens (free, gas only)
+      </label>
+      {/* The two mid-epoch sweep settings. Both are about spending audit capacity that
+          would otherwise expire unused at the next boundary — capacity resets per epoch,
+          and a rival can only become LESS auditable as an epoch runs, so a slot held back
+          is a slot spent on nobody. Boundary audits and kills are unaffected by either. */}
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.sweepUnpinned}
+          onChange={chk("sweepUnpinned")}
+          disabled={!cfg.offenseEnabled || !cfg.autoAudit}
+        />
+        Sweep beyond the target list — audit any auditable rival
+        <span className="hint" style={{ display: "block" }}>
+          Mid-epoch only, and only after every pinned target has been served. Allies and
+          emigrants are still excluded, and kills stay limited to the list below.
+        </span>
+      </label>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.sweepNormalGas}
+          onChange={chk("sweepNormalGas")}
+          disabled={!cfg.offenseEnabled || !cfg.autoAudit}
+        />
+        Mid-epoch audits at normal gas (~17x cheaper)
+        <span className="hint" style={{ display: "block" }}>
+          A mid-epoch audit races nobody, and if a rival does cure first the revert refunds
+          both the fee and the audit slot — so a lost one costs only gas. Boundary audits keep
+          the offense tip, as does the last few minutes before a boundary.
+        </span>
       </label>
       {/* Race audits/kills into the boundary block (preBoundaryAudit / preBoundaryKill)
           are intentionally not rendered — we always want them ON so offense competes in
