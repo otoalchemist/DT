@@ -172,7 +172,7 @@ export function resetOwnedEmigrantNotice(): void {
 // Activity entries whose tx was queued into the current bundle batch (mainnet).
 // flushBatch fills in each one's txHash/bundleHash and starts receipt tracking
 // once the whole tick's txs are sent together as one atomic bundle.
-let batchEntries: { entryId: string; nonce: number }[] = [];
+let batchEntries: { entryId: string; nonce: number; address: Address }[] = [];
 
 /** Open a bundle batch for a tick so all its txs go out as one atomic multi-tx
  *  bundle (mainnet only; public/local send each tx immediately as before). */
@@ -194,7 +194,7 @@ async function flushBatch(): Promise<void> {
     logger.error("bundle flush error:", (err as Error).message);
     return;
   }
-  for (const { entryId, nonce } of entries) {
+  for (const { entryId, nonce, address } of entries) {
     const r = results.get(nonce);
     if (!r) continue;
     activity.update(entryId, {
@@ -205,8 +205,9 @@ async function flushBatch(): Promise<void> {
     // Flip submitted -> included/reverted once it lands. A bundle-only tx (a revertible
     // audit riding a payment bundle) was never broadcast so it has no `txHash`, but its
     // hash is derivable from the signed tx — poll that instead of leaving it stuck.
-    if (r.txHash) void trackReceipt(entryId, r.txHash);
-    else if (r.predictedTxHash) void trackReceipt(entryId, r.predictedTxHash, false);
+    const dead = { address, nonce };
+    if (r.txHash) void trackReceipt(entryId, r.txHash, true, dead);
+    else if (r.predictedTxHash) void trackReceipt(entryId, r.predictedTxHash, false, dead);
   }
 }
 
@@ -2001,6 +2002,10 @@ async function trackReceipt(
   entryId: string,
   txHash: `0x${string}`,
   broadcast = true,
+  // Who signed it and at what nonce. Optional only because older callers predate the
+  // check below; supply it wherever you can — it is what turns "no receipt" from a
+  // shrug into a verdict.
+  signer?: { address: Address; nonce: number },
 ): Promise<void> {
   try {
     const receipt = await publicClient.waitForTransactionReceipt({
@@ -2022,7 +2027,49 @@ async function trackReceipt(
       ...(broadcast ? {} : { txHash }),
     });
   } catch (err) {
-    // Timed out or RPC error — leave the entry as "submitted".
+    /**
+     * No receipt inside the window. "Lost the race" and "this transaction can never land"
+     * look identical here, and the difference is the whole story — so ask the chain which
+     * one it is instead of leaving the row at "submitted" forever.
+     *
+     * The test is the nonce. If the chain has moved PAST our nonce and our hash still has no
+     * receipt, then something else consumed that nonce and this transaction is permanently
+     * dead. That is the exact signature of the epoch-176 collision, where a payment sat at
+     * "submitted" while the citizen it was meant to save went unpaid, fell 2 epochs behind,
+     * and got audited — and nothing in the feed said so. A dropped bundle, by contrast,
+     * leaves the nonce unconsumed and is genuinely just a lost race.
+     *
+     * Deliberately an ERROR, not info: a payment that can never land is the most expensive
+     * silent failure this bot has, and it needs to survive a glance at the feed.
+     */
+    if (signer) {
+      try {
+        const chainNonce = await publicClient.getTransactionCount({
+          address: signer.address,
+          blockTag: "latest",
+        });
+        if (chainNonce > signer.nonce) {
+          activity.update(entryId, { status: "skipped" });
+          activity.add({
+            kind: "error",
+            status: "skipped",
+            message:
+              `Transaction ${txHash.slice(0, 10)}… can never land: nonce ${signer.nonce} was ` +
+              `consumed by a different transaction (wallet is now at ${chainNonce}). ` +
+              `Whatever this was meant to do did NOT happen — check the citizen it covered.`,
+          });
+          logger.error(
+            `dead tx ${txHash.slice(0, 10)}…: nonce ${signer.nonce} consumed by another tx ` +
+              `(chain at ${chainNonce})`,
+          );
+          return;
+        }
+      } catch (probeErr) {
+        logger.warn(`could not classify stuck tx ${txHash.slice(0, 10)}…: ${(probeErr as Error).message}`);
+      }
+    }
+    // Nonce not yet consumed: a dropped bundle or a slow chain. Leave it as "submitted" —
+    // it may still land, and force-marking it either way would be a guess.
     logger.warn(`receipt tracking for ${txHash.slice(0, 10)}… failed: ${(err as Error).message}`);
   }
 }
@@ -2114,14 +2161,15 @@ async function act(
     // Queued into a bundle batch (mainnet): the tx isn't sent yet, so its hashes
     // and receipt tracking are reconciled by flushBatch at end of tick.
     if (result.queued) {
-      batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+      batchEntries.push({ entryId: entry.id, nonce: result.nonce, address: signer.account.address });
       return result;
     }
     // Watch for the receipt so the entry flips submitted -> included/reverted. A pure
     // Flashbots submission has no broadcast txHash, but the hash it will have if it lands
     // is just keccak of the signed tx — poll that so bundle-only sends resolve too.
-    if (result.txHash) void trackReceipt(entry.id, result.txHash);
-    else if (result.predictedTxHash) void trackReceipt(entry.id, result.predictedTxHash, false);
+    const dead = { address: signer.account.address, nonce: result.nonce };
+    if (result.txHash) void trackReceipt(entry.id, result.txHash, true, dead);
+    else if (result.predictedTxHash) void trackReceipt(entry.id, result.predictedTxHash, false, dead);
     return result;
   } catch (err) {
     activity.add({
