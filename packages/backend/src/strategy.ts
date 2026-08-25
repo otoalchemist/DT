@@ -2837,6 +2837,7 @@ async function runManualAction(
   if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment" };
 
   ticking = true;
+  tickingOwner = "a manual action from the dashboard";
   committedThisTickWei = new Map();
   beginBatch();
   try {
@@ -3020,6 +3021,7 @@ export async function manualAuditAll(): Promise<MassAuditResult> {
   if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment", ...empty };
 
   ticking = true;
+  tickingOwner = "a manual audit-all";
   committedThisTickWei = new Map();
   beginBatch();
   const audited: { target: string; from: string; txHash?: string }[] = [];
