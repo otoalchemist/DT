@@ -412,6 +412,15 @@ describe("audit-only boundary (nothing owed) — no bid, tip only", () => {
     expect(sendRawTransaction).toHaveBeenCalledTimes(5);
   });
 
+  it("does not look back when no payment shared the boundary", async () => {
+    // Nothing flushed before us, so there is no earlier block to catch up to and the extra
+    // post per builder would buy nothing. Worth pinning: buildernet rate-limits ~3 req/IP/s.
+    await runBothFires();
+    const auditBlocks = bundles().filter((b) => kindsOf(b).every((k) => k === AUDIT))
+      .map((b) => Number(b.blockNumber));
+    expect(auditBlocks).toHaveLength(2);
+  });
+
   it("has NO nonce dependency, so an audit-only boundary cannot be blocked by a payment", async () => {
     // The audit-only case is strictly simpler: the audits start at the chain's own nonce
     // instead of queuing behind a payment bundle that has to land first.
@@ -506,14 +515,36 @@ describe("both fires inside the lead, with the real scheduler contention", () =>
     expect(calls).toBeLessThanOrEqual(40);
   });
 
-  it("produces exactly two bundles per builder per target block — no duplicate submissions", async () => {
-    // A retry loop that re-queued would double-submit the same nonces to the same builder.
+  it("posts each fire once per target block — no duplicate submissions", async () => {
+    // A retry loop that re-queued would double-submit the same nonces to the same builder,
+    // which shows up as one fire posting the SAME block twice.
     await runBothFires();
-    const perBlock = new Map<string, number>();
-    for (const b of bundles()) perBlock.set(b.blockNumber, (perBlock.get(b.blockNumber) ?? 0) + 1);
-    // 1 builder x 2 target blocks x 2 fires = 4 posts, 2 per block.
-    expect([...perBlock.values()].every((n) => n === 2)).toBe(true);
-    expect(bundles()).toHaveLength(4);
+    const pay = bundles().filter((b) => kindsOf(b).includes(PAY));
+    const audit = bundles().filter((b) => kindsOf(b).every((k) => k === AUDIT));
+    expect(new Set(pay.map((b) => b.blockNumber)).size).toBe(pay.length);
+    expect(new Set(audit.map((b) => b.blockNumber)).size).toBe(audit.length);
+  });
+
+  it("gives the AUDIT a look-back block the payment does not get", async () => {
+    /**
+     * The two fires flush separately and each reads the head fresh, so a block landing in
+     * the gap leaves the payment aimed at [N+1, N+2] and the audit at [N+2, N+3] — the
+     * payment takes the boundary block and the audit cannot reach it. The audit therefore
+     * also aims one block BEHIND its own head.
+     *
+     * Safe only because minTimestamp already makes a pre-boundary block ineligible, so the
+     * extra shot is either the payment's block or nothing. The payment fire does not get one:
+     * it flushes FIRST, so a block behind its head is one already mined.
+     */
+    await runBothFires();
+    const payBlocks = bundles().filter((b) => kindsOf(b).includes(PAY))
+      .map((b) => Number(b.blockNumber)).sort((a, b) => a - b);
+    const auditBlocks = bundles().filter((b) => kindsOf(b).every((k) => k === AUDIT))
+      .map((b) => Number(b.blockNumber)).sort((a, b) => a - b);
+    expect(payBlocks).toHaveLength(2);
+    expect(auditBlocks).toHaveLength(3);
+    expect(auditBlocks[0]).toBe(payBlocks[0]! - 1);
+    expect(auditBlocks.slice(1)).toEqual(payBlocks);
   });
 });
 

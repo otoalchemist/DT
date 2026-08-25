@@ -78,7 +78,7 @@ vi.mock("./flashbots.js", () => ({
   beginBundle: vi.fn(),
   flushBundle: vi.fn(async () => new Map()),
   queueCoinbaseBid: vi.fn(async () => false),
-  setRaceBoundary: vi.fn(),
+  setRaceBoundary: vi.fn(), setRaceLookBack: vi.fn(),
 }));
 
 vi.mock("./contract.js", () => ({

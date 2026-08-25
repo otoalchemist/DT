@@ -23,7 +23,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { emigratedTokenIdSet } from "./emigration.js";
-import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, setRaceBoundary, type TxIntent, type SubmitResult } from "./flashbots.js";
+import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, setRaceBoundary, setRaceLookBack, type TxIntent, type SubmitResult } from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, excludedTokenSet, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 import { recordRaceOutcome } from "./race-timing.js";
@@ -1606,6 +1606,15 @@ export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; bounda
      */
     const paidInBundle =
       paidForBoundary?.epoch === targetEpoch.toString() ? paidForBoundary.tokens : new Set<string>();
+    /**
+     * Aim one block earlier as well, but ONLY when a payment shared this boundary.
+     *
+     * The payment fire flushed first and read its own head; if a block landed between that
+     * flush and this one, it is aimed a block ahead of us and we cannot reach the block it
+     * took. Looking back covers that. On an audit-only boundary there is no earlier fire to
+     * catch up to, so the extra post per builder would buy nothing.
+     */
+    setRaceLookBack(paidInBundle.size > 0);
     const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
       revertible: true,
       bundleOnly: false,

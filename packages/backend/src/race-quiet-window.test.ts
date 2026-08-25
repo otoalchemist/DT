@@ -59,7 +59,7 @@ vi.mock("./index-tokens.js", () => ({
 }));
 vi.mock("./flashbots.js", () => ({
   submitTx: vi.fn(), beginBundle: vi.fn(), flushBundle: vi.fn(async () => new Map()),
-  queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(),
+  queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(), setRaceLookBack: vi.fn(),
 }));
 vi.mock("./contract.js", () => ({
   getGameSnapshot: vi.fn(async () => ({ state: 1, currentEpoch: 174n, startTime: 0n, citizensAddress: "0x00000000000000000000000000000000000000cc", citizenSupply: 78n })),

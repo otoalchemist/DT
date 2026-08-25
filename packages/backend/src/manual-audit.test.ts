@@ -116,7 +116,7 @@ vi.mock("./flashbots.js", () => ({
     return { ok: true, simulated: false, txHash: "0xhash", nonce: 1, valueWei: intent.value, gasWei: 0n };
   }),
   beginBundle: vi.fn(), flushBundle: vi.fn(async () => new Map()),
-  queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(),
+  queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(), setRaceLookBack: vi.fn(),
 }));
 
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");

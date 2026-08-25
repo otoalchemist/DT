@@ -295,11 +295,40 @@ export function setRaceBoundary(ts: bigint | null): void {
   raceBoundaryTs = ts;
 }
 
+/**
+ * Also aim this bundle one block EARLIER than the head says.
+ *
+ * Set only by the audit fire, and only when a payment shared the same boundary. The two
+ * fires flush separately and each reads the head fresh at flush time (see targetBlock
+ * below), so a block landing in the gap between them leaves the payment aimed at
+ * [N+1, N+2] and the audit at [N+2, N+3]. The payment then takes the boundary block and
+ * the audit CANNOT — its window starts one block too late, which on a boundary is the
+ * whole race. The gap is the audit fire's own work plus up to 150ms of retry, call it
+ * ~0.6-1.0s against 12s slots, so roughly one boundary in twelve to twenty.
+ *
+ * Looking back is safe precisely BECAUSE minTimestamp exists. A block earlier than the
+ * boundary cannot satisfy it, so the extra shot is either the payment's block — the one we
+ * want — or simply ineligible. Without minTimestamp this would be the epoch-169 hazard
+ * deliberately: a bundle mined an epoch early, reverting and burning the nonce.
+ *
+ * Not set for the payment fire, which runs FIRST and would spend the extra shot on a block
+ * already mined, nor for an audit-only boundary, where there is no earlier fire to catch up
+ * to. That keeps the cost at one extra post per builder, once per boundary that needs it —
+ * worth minding because buildernet rate-limits at ~3 req/IP/s.
+ */
+let raceLookBack = false;
+
+/** Ask the open batch to also aim one block earlier — see raceLookBack. */
+export function setRaceLookBack(on: boolean): void {
+  raceLookBack = on;
+}
+
 /** Open a batching window: subsequent mainnet submitTx calls queue their signed
  *  tx instead of sending, until flushBundle() emits them as one bundle. */
 export function beginBundle(): void {
   bundleQueue = [];
   raceBoundaryTs = null; // a stale boundary must not leak into the next batch
+  raceLookBack = false; // ...and neither may a stale look-back
 }
 
 export interface BundleTxResult {
@@ -418,11 +447,17 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   // how long the builders took to acknowledge (telemetry only — see race-timing.ts).
   const submittedAtMs = Date.now();
 
-  // One multi-tx bundle, fanned out to every builder for the next two blocks.
+  // One multi-tx bundle, fanned out to every builder for the next two blocks — three when
+  // looking back, so a sibling fire that flushed one block earlier is still reachable.
+  // Guarded against a nonsensical block 0 for completeness; in practice the head is huge.
+  const targetBlocks =
+    raceLookBack && targetBlock > 1n
+      ? [targetBlock - 1n, targetBlock, targetBlock + 1n]
+      : [targetBlock, targetBlock + 1n];
   const acceptedBy = new Set<string>();
   const bundleHashes: string[] = [];
   const attempts = appConfig.builderUrls.flatMap((url) =>
-    [targetBlock, targetBlock + 1n].map(async (blk) => {
+    targetBlocks.map(async (blk) => {
       const params: Record<string, unknown> = { txs: signedList, blockNumber: toHex(blk) };
       if (revertingTxHashes.length > 0) params.revertingTxHashes = revertingTxHashes;
       /**

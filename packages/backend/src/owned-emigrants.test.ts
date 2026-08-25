@@ -39,7 +39,7 @@ vi.mock("./nonce.js", () => ({
 
 vi.mock("./flashbots.js", () => ({
   submitTx: vi.fn(async () => ({ ok: true, simulated: false, txHash: "0xhash", nonce: 0, valueWei: 0n, gasWei: 0n })),
-  beginBundle: vi.fn(), flushBundle: vi.fn(async () => new Map()), queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(),
+  beginBundle: vi.fn(), flushBundle: vi.fn(async () => new Map()), queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(), setRaceLookBack: vi.fn(),
 }));
 
 vi.mock("./contract.js", () => ({
