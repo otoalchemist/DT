@@ -32,6 +32,15 @@ const BOUNDARY_TS = (TARGET_EPOCH - 1n) * 86_400n;
 
 const OWNED = [10n, 20n, 30n, 40n, 50n];          // 5 citizens, all one epoch behind
 const RIVALS = ["501", "502", "503", "504", "505"]; // 5 auditable rivals, 5 auditor slots
+/**
+ * Auditable rivals that are NOT pinned, returned by the collection enumeration.
+ *
+ * These exist purely as decoys for the mid-epoch sweep's widening (sweepUnpinned). A
+ * pre-boundary fire must never touch them: the boundary spends race gas, and the pin list is
+ * what says who is worth it. If a boundary fire ever inherits the widening, every audit
+ * assertion in this file that counts 5 starts counting 7.
+ */
+const UNPINNED_DECOYS = [601n, 602n];
 
 /**
  * The chain's pending nonce. Held constant DURING a test — private bundles are unmined while
@@ -44,6 +53,10 @@ let chainNonce = 100;
 /** lastEpochPaid for OWNED citizens. One behind by default (a payment is owed); a test can
  *  set it current to model an audit-only boundary. Read at call time by the multicall mock. */
 let ownedLep = TARGET_EPOCH - 1n;
+/** auditLimit per owned citizen. 1 by default (5 citizens -> 5 slots, exactly matching the 5
+ *  pinned rivals). Raised in the widening tests so slots OUTNUMBER pins — with equal counts a
+ *  wrongly-widened fire still audits only the 5 pins and the test proves nothing. */
+let auditLimitVal = 1n;
 const PAY_TIP_GWEI = 300;
 const AUDIT_TIP_GWEI = 150;
 
@@ -70,7 +83,7 @@ vi.mock("./chain.js", () => ({
       contracts.map((c) => ({
         status: "success" as const,
         result:
-          c.functionName === "auditLimit" ? 1n
+          c.functionName === "auditLimit" ? auditLimitVal
           : c.functionName === "auditDueTimestamp" ? 0n
           : c.functionName === "auditsUsedInEpoch" ? 0n
           : ownedLep, // lastEpochPaid for owned citizens (see ownedLep)
@@ -106,9 +119,13 @@ vi.mock("./contract.js", () => ({
     citizensAddress: "0x00000000000000000000000000000000000000cc", startTime: 0n,
   })),
   batchGetOwnedStatuses: vi.fn(async () => []),
-  batchGetTargetStatuses: vi.fn(async () =>
-    RIVALS.map((tokenId) => ({
-      tokenId, owner: "0x00000000000000000000000000000000000000dd",
+  // Maps over the tokens it was GIVEN rather than returning RIVALS unconditionally. The
+  // difference matters since the mid-epoch sweep can widen its candidate set past the pins
+  // (sweepUnpinned): a hard-coded return would make a boundary fire that wrongly inherited
+  // the widening look identical to one that didn't.
+  batchGetTargetStatuses: vi.fn(async (tokens: { id: bigint }[]) =>
+    tokens.map(({ id }) => ({
+      tokenId: id.toString(), owner: "0x00000000000000000000000000000000000000dd",
       lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
       auditable: true, auditDueTimestamp: "0", killable: false,
     })),
@@ -126,7 +143,7 @@ vi.mock("./contract.js", () => ({
 
 vi.mock("./index-tokens.js", () => ({
   fetchOwnedTokenIds: vi.fn(async () => OWNED),
-  fetchCandidateTokenIds: vi.fn(async () => []),
+  fetchCandidateTokenIds: vi.fn(async () => UNPINNED_DECOYS),
   ownershipIndexingAvailable: vi.fn(() => true),
 }));
 
@@ -143,7 +160,7 @@ const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { awaitPendingMirrors } = await import("./flashbots.js");
 const { firePreBoundaryPay, firePreBoundaryAudit, combinedBundleActive, resetPaidForBoundary } = await import("./strategy.js");
 const { fetchOwnedTokenIds } = await import("./index-tokens.js");
-const { batchGetTargetStatuses } = await import("./contract.js");
+const { batchGetTargetStatuses, encodeAudit } = await import("./contract.js");
 const { publicClient } = await import("./chain.js");
 
 const PAY = "11111111", AUDIT = "22222222";
@@ -193,6 +210,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   chainNonce += 50; // past any ceiling the previous case reserved
   ownedLep = TARGET_EPOCH - 1n; // default: a payment is owed
+  auditLimitVal = 1n;
   vi.mocked(fetchOwnedTokenIds).mockResolvedValue(OWNED);
   sendRawTransaction.mockClear();
   getTransactionCount.mockClear();
@@ -684,3 +702,218 @@ describe("a citizen paid at this boundary can still audit (no bid)", () => {
     for (const b of auditBundles) expect(b.every((x) => x === AUDIT)).toBe(true);
   });
 });
+
+/**
+ * The boundary race must be untouched by the mid-epoch offense sweep's two settings
+ * (sweepUnpinned / sweepNormalGas). Both default to ON, so every case above already runs with
+ * them enabled — these make the invariant explicit instead of incidental, because the ways it
+ * could break are silent:
+ *
+ *  - a widened boundary fire spends RACE gas on rivals nobody chose (~0.018 ETH each), and
+ *    steals the auditor slots the pinned targets were meant to get;
+ *  - a boundary audit priced at "normal" gas loses the slot to any rival paying a real tip.
+ *
+ * The enumeration returns UNPINNED_DECOYS, so a leak is visible rather than mocked away.
+ *
+ * Worth knowing when reading a failure here: the pin restriction on the boundary audit path is
+ * enforced TWICE, independently — once by the candidate source (it scans only pins) and again by
+ * queuePreBoundaryAudits' own `(!pinned || pinned.has(...))` filter. Breaking either one alone
+ * still passes, which was verified by mutation; these cases fail only when both go. So they pin
+ * the observable behaviour rather than guarding one line, and the redundancy is deliberate.
+ */
+describe("the mid-epoch sweep settings must not reach the boundary fires (no bid)", () => {
+  /** [auditor, target] pairs the fire actually built calldata for. */
+  const auditPairs = (): [string, string][] =>
+    vi.mocked(encodeAudit).mock.calls.map(([from, target]) => [String(from), String(target)]);
+  const pinned = new Set(RIVALS);
+
+  beforeEach(() => {
+    // The sibling describe above pins batchGetTargetStatuses to a single-rival
+    // mockResolvedValue, and vi.clearAllMocks() clears CALLS but not IMPLEMENTATIONS — so
+    // without restoring the input-mapping version here every case below sees one rival and
+    // reads as "only 1 audit fired" rather than "the fixture is stale".
+    vi.mocked(batchGetTargetStatuses).mockImplementation(async (tokens: { id: bigint }[]) =>
+      tokens.map(({ id }) => ({
+        tokenId: id.toString(), owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      })) as never,
+    );
+    runtime.strategy = {
+      ...runtime.strategy, sweepUnpinned: true, sweepNormalGas: true,
+    } as typeof runtime.strategy;
+  });
+
+  it("audit-only boundary audits ONLY pinned rivals, never an enumerated one", async () => {
+    ownedLep = TARGET_EPOCH; // nothing owed -> audit-only path
+    // 10 slots for 5 pins, so there is spare capacity a widened fire WOULD spend on the two
+    // decoys. With slots == pins the pinned-first ordering hides the leak entirely.
+    auditLimitVal = 2n;
+    await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY_TS });
+    const targets = auditPairs().map(([, t]) => t);
+    expect(targets.length).toBe(5); // the 5 pinned rivals and nothing else
+    expect(targets.every((t) => pinned.has(t))).toBe(true);
+    for (const decoy of UNPINNED_DECOYS) expect(targets).not.toContain(decoy.toString());
+  });
+
+  it("audit-only boundary still prices at the AUDIT tip, not normal gas", async () => {
+    // normalFees (+1 gwei over the node's suggestion) backs the sweep and the manual buttons.
+    // If it ever reached here the audits would go out at single-digit gwei into the most
+    // contested block of the day.
+    ownedLep = TARGET_EPOCH;
+    await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY_TS });
+    const audits = wireTxs().filter((t) => t.sel === AUDIT);
+    expect(audits.length).toBe(5);
+    expect(audits.every((a) => a.tipGwei === AUDIT_TIP_GWEI)).toBe(true);
+  });
+
+  it("payment + audit boundary is unchanged: 5 pinned audits, own tips, ascending nonces", async () => {
+    ownedLep = TARGET_EPOCH - 1n; // a payment is owed -> both fires run
+    auditLimitVal = 2n;           // spare capacity, so a widened fire would be visible
+    await runBothFires();
+    await awaitPendingMirrors();
+
+    const targets = auditPairs().map(([, t]) => t);
+    expect(targets.every((t) => pinned.has(t))).toBe(true);
+    for (const decoy of UNPINNED_DECOYS) expect(targets).not.toContain(decoy.toString());
+
+    const pays = wireTxs().filter((t) => t.sel === PAY);
+    const audits = wireTxs().filter((t) => t.sel === AUDIT);
+    expect(pays).toHaveLength(5);
+    expect(audits).toHaveLength(5);
+    expect(pays.every((p) => p.tipGwei === PAY_TIP_GWEI)).toBe(true);
+    expect(audits.every((a) => a.tipGwei === AUDIT_TIP_GWEI)).toBe(true);
+    // Every audit behind every payment — the property that makes an unmined payment
+    // unable to be skipped over, and the one a stray extra tx would break.
+    expect(Math.max(...pays.map((p) => p.nonce))).toBeLessThan(Math.min(...audits.map((a) => a.nonce)));
+    // 10 distinct sequential nonces, no gaps: proof no sweep tx crept into the same wallets.
+    const nonces = wireTxs().map((t) => t.nonce).sort((a, b) => a - b);
+    expect(new Set(nonces).size).toBe(10);
+    expect(nonces[9]! - nonces[0]!).toBe(9);
+  });
+
+  it("payment + audit boundary still mirrors all 10 and stamps both bundles with the boundary", async () => {
+    ownedLep = TARGET_EPOCH - 1n;
+    await runBothFires();
+    await awaitPendingMirrors();
+    expect(sendRawTransaction).toHaveBeenCalledTimes(10);
+    // minTimestamp is what stops a pre-boundary tx executing early — the failure that caused
+    // the epoch-166 misfire. It must survive any change to how offense is priced.
+    const stamped = bundles();
+    expect(stamped.length).toBeGreaterThan(0);
+    expect(stamped.every((b) => b.minTimestamp === Number(BOUNDARY_TS))).toBe(true);
+  });
+
+  it("turning the sweep settings OFF changes nothing about the boundary fires", async () => {
+    // The other half of the claim: if these assertions passed only because the settings were
+    // on, the boundary path would be reading them somewhere it shouldn't.
+    runtime.strategy = {
+      ...runtime.strategy, sweepUnpinned: false, sweepNormalGas: false,
+    } as typeof runtime.strategy;
+    ownedLep = TARGET_EPOCH - 1n;
+    await runBothFires();
+    await awaitPendingMirrors();
+    const audits = wireTxs().filter((t) => t.sel === AUDIT);
+    expect(audits).toHaveLength(5);
+    expect(audits.every((a) => a.tipGwei === AUDIT_TIP_GWEI)).toBe(true);
+    expect(auditPairs().every(([, t]) => pinned.has(t))).toBe(true);
+  });
+});
+
+/**
+ * The SHARED-gas configuration: separateOffenseGas OFF, so payments and audits go out at the
+ * same priorityFeeGwei. This is a live config, so it needs its own coverage.
+ *
+ * The question it answers: with no tip advantage for the payment, does the payment still
+ * execute BEFORE the audit? It does, and the reason is worth being precise about, because the
+ * intuitive answer ("price the payment higher so it sorts first") is not the mechanism.
+ *
+ * Ordering is enforced by the NONCE, not the tip. firePreBoundaryPay runs first and reserves
+ * the lower nonces; firePreBoundaryAudit gets the ones above. A higher nonce from the same
+ * wallet cannot be mined before a lower one at ANY price, so the audit physically cannot
+ * overtake the payment even at an identical tip. If the payment fails to land, the audit
+ * cannot land either — it degrades to "neither" rather than "audit reverts because the
+ * auditor is still delinquent", which is the failure the ordering exists to prevent.
+ *
+ * That matters here specifically because these citizens pay and then audit at the same
+ * boundary: an audit executing first would come from a delinquent auditor and revert.
+ */
+describe("shared gas for payment and audit (separateOffenseGas off, no bid)", () => {
+  const SHARED_TIP_GWEI = 400; // one tip for both halves, as configured live
+
+  beforeEach(() => {
+    vi.mocked(batchGetTargetStatuses).mockImplementation(async (tokens: { id: bigint }[]) =>
+      tokens.map(({ id }) => ({
+        tokenId: id.toString(), owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      })) as never,
+    );
+    runtime.strategy = {
+      ...runtime.strategy,
+      separateOffenseGas: false,
+      priorityFeeGwei: SHARED_TIP_GWEI,
+      dynamicTipEnabled: false,
+    } as typeof runtime.strategy;
+  });
+
+  it("prices payments and audits identically — proving the shared profile is in effect", async () => {
+    // Guards the premise of every case below: if resolveGas still handed audits the offense
+    // profile, they would go out at AUDIT_TIP_GWEI and the ordering claim would be untested.
+    ownedLep = TARGET_EPOCH - 1n;
+    await runBothFires();
+    await awaitPendingMirrors();
+    const txs = wireTxs();
+    expect(txs).toHaveLength(10);
+    expect(txs.every((t) => t.tipGwei === SHARED_TIP_GWEI)).toBe(true);
+  });
+
+  it("still puts every payment on a LOWER nonce than every audit", async () => {
+    ownedLep = TARGET_EPOCH - 1n;
+    await runBothFires();
+    await awaitPendingMirrors();
+    const pays = wireTxs().filter((t) => t.sel === PAY);
+    const audits = wireTxs().filter((t) => t.sel === AUDIT);
+    expect(pays).toHaveLength(5);
+    expect(audits).toHaveLength(5);
+    // The whole answer: equal tips, and the payment still cannot be overtaken.
+    expect(Math.max(...pays.map((p) => p.nonce))).toBeLessThan(Math.min(...audits.map((a) => a.nonce)));
+  });
+
+  it("leaves no nonce gap, so a builder cannot include the audits without the payments", async () => {
+    // A gap would let a block contain the audit half alone — the auditor would still be
+    // delinquent at execution and every audit would revert, burning gas on 5 txs.
+    ownedLep = TARGET_EPOCH - 1n;
+    await runBothFires();
+    await awaitPendingMirrors();
+    const nonces = wireTxs().map((t) => t.nonce).sort((a, b) => a - b);
+    expect(new Set(nonces).size).toBe(10);
+    expect(nonces[9]! - nonces[0]!).toBe(9);
+  });
+
+  it("still stamps both bundles with the boundary timestamp", async () => {
+    // Shared pricing must not disturb the guard that stops a pre-boundary tx executing early.
+    ownedLep = TARGET_EPOCH - 1n;
+    await runBothFires();
+    await awaitPendingMirrors();
+    const stamped = bundles();
+    expect(stamped.length).toBeGreaterThan(0);
+    expect(stamped.every((b) => b.minTimestamp === Number(BOUNDARY_TS))).toBe(true);
+  });
+
+  it("audit-only boundary uses the shared tip too, and audits only pinned rivals", async () => {
+    ownedLep = TARGET_EPOCH; // nothing owed
+    await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY_TS });
+    await awaitPendingMirrors();
+    const audits = wireTxs().filter((t) => t.sel === AUDIT);
+    expect(audits).toHaveLength(5);
+    expect(audits.every((a) => a.tipGwei === SHARED_TIP_GWEI)).toBe(true);
+    expect(auditPairs2().every(([, t]) => new Set(RIVALS).has(t))).toBe(true);
+  });
+});
+
+/** [auditor, target] pairs built this test run. Duplicated from the sibling describe so
+ *  neither depends on the other's scope. */
+function auditPairs2(): [string, string][] {
+  return vi.mocked(encodeAudit).mock.calls.map(([from, target]) => [String(from), String(target)]);
+}
