@@ -78,7 +78,7 @@ vi.mock("./runtime.js", () => ({
 let nonceCounter = 0;
 vi.mock("./nonce.js", () => ({
   nonces: {
-    for: () => ({ reserve: () => nonceCounter++, peek: () => nonceCounter }),
+    for: () => ({ reserve: () => nonceCounter++, peek: () => nonceCounter, markSigned: () => {} }),
     syncAll: vi.fn(async () => {}),
     resetAll: vi.fn(),
   },

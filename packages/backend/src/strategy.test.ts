@@ -70,7 +70,7 @@ vi.mock("./nonce.js", () => ({
   // Per-address registry. The real one hands each wallet its own counter; the tests
   // only need the calls to be inert.
   nonces: {
-    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0) })),
+    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0), markSigned: vi.fn() })),
     syncAll: vi.fn(async () => {}),
     resetAll: vi.fn(),
     retain: vi.fn(),

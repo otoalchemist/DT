@@ -262,6 +262,9 @@ async function simulateAtTimestamp(
 interface QueuedTx {
   signed: Hex;
   nonce: number;
+  /** Which wallet signed it. Nonces are per-account, so fate-tracking a multi-wallet bundle
+   *  needs this to reach the right NonceManager rather than the primary's. */
+  from: Address;
   race: boolean;
   /** Allowed to revert without invalidating the bundle (eth_sendBundle
    *  revertingTxHashes). Used for the coinbase bid so a misconfigured payer can
@@ -454,6 +457,21 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
     raceLookBack && targetBlock > 1n
       ? [targetBlock - 1n, targetBlock, targetBlock + 1n]
       : [targetBlock, targetBlock + 1n];
+  /**
+   * Tell each wallet's NonceManager what it signed at which nonce, so a later sync can look
+   * up whether that tx is still alive instead of timing the reservation out. Done here rather
+   * than at sign time because the LAST reachable block is only known once the fan-out shape
+   * is decided (a look-back bundle spans three blocks, not two).
+   */
+  const lastTargetBlock = targetBlocks[targetBlocks.length - 1]!;
+  for (const q of queue) {
+    nonces.for(q.from).markSigned(q.nonce, {
+      hash: keccak256(q.signed),
+      lastTargetBlock,
+      mirrored: q.race,
+    });
+  }
+
   const acceptedBy = new Set<string>();
   const bundleHashes: string[] = [];
   const attempts = appConfig.builderUrls.flatMap((url) =>
@@ -612,7 +630,7 @@ export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<
       maxFeePerGas,
       maxPriorityFeePerGas,
     );
-    bundleQueue.push({ signed, nonce, race: false, revertible: true,
+    bundleQueue.push({ signed, nonce, from: account.address, race: false, revertible: true,
       gasLimit: COINBASE_BID_GAS, priorityFeeWei: maxPriorityFeePerGas, bidWei });
     logger.info(`coinbase bid queued: ${formatEther(bidWei)} ETH to builder via ${payer.slice(0, 10)}… (nonce ${nonce})`);
     return true;
@@ -761,8 +779,8 @@ export async function submitTx(
   // whole tick's txs go out as ONE atomic multi-tx bundle with valid sequential
   // nonces (see flushBundle). Hashes are filled in by the caller after flush.
   if (bundleQueue !== null) {
-    bundleQueue.push({ signed, nonce, race: opts.race ?? false, revertible: opts.revertible ?? false,
-      gasLimit: gas, priorityFeeWei: maxPriorityFeePerGas });
+    bundleQueue.push({ signed, nonce, from: account.address, race: opts.race ?? false,
+      revertible: opts.revertible ?? false, gasLimit: gas, priorityFeeWei: maxPriorityFeePerGas });
     return { ...base, ok: true, queued: true, targetBlock };
   }
 
@@ -771,6 +789,13 @@ export async function submitTx(
   // submitting to one relay means only winning when that relay's builder wins. All
   // attempts run in parallel; unreachable builders are tolerated — succeed if ANY
   // accepts.
+  // Same fate-tracking as the batched path; this bundle spans exactly two blocks.
+  nonceManager.markSigned(nonce, {
+    hash: keccak256(signed),
+    lastTargetBlock: targetBlock + 1n,
+    mirrored: opts.race ?? false,
+  });
+
   const bundleHashes: string[] = [];
   const acceptedBy = new Set<string>();
   const attempts = appConfig.builderUrls.flatMap((url) =>

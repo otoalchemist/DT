@@ -75,6 +75,14 @@ vi.mock("./chain.js", () => ({
     getBalance: vi.fn(async () => 100_000_000_000_000_000_000n),
     getBlockNumber: vi.fn(async () => 100n),
     getTransactionCount,
+    /**
+     * Every tx this file signs is mirrored, so the node knows it and reports it PENDING.
+     * Present so the nonce manager's evidence check actually runs here: without it the probe
+     * throws, falls through to the STALE_MS backstop, and the separate-fire nonce ordering
+     * below would be passing on the old clock rather than on the new evidence path — which is
+     * precisely the mechanism these cases exist to protect.
+     */
+    getTransaction: vi.fn(async () => ({ blockNumber: null })),
     request,
     sendRawTransaction,
     estimateGas: vi.fn(async () => 100_000n),

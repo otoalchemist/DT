@@ -58,7 +58,7 @@ vi.mock("./activity.js", () => {
 
 vi.mock("./nonce.js", () => ({
   nonces: {
-    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0) })),
+    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0), markSigned: vi.fn() })),
     syncAll: vi.fn(async () => {}),
     resetAll: vi.fn(),
     retain: vi.fn(),

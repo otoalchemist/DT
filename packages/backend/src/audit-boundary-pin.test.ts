@@ -108,7 +108,7 @@ vi.mock("./race-timing.js", () => ({ recordRaceOutcome: vi.fn(), recordRaceSubmi
 vi.mock("./emigration.js", () => ({ emigratedTokenIdSet: vi.fn(async () => new Set<string>()) }));
 vi.mock("./nonce.js", () => ({
   nonces: {
-    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 5), reserve: vi.fn(() => 5) })),
+    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 5), reserve: vi.fn(() => 5), markSigned: vi.fn() })),
     syncAll: vi.fn(async () => {}), resetAll: vi.fn(), retain: vi.fn(),
   },
 }));
