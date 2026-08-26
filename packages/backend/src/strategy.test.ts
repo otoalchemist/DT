@@ -1649,6 +1649,63 @@ describe("multi-wallet: manual actions resolve the owning wallet before signing"
 // bundle, the builder dropped it, the bundle-only coinbase bid died with it, and the
 // audits trickled out through the mempool naked — landing at tx index 40 instead of 0 and
 // every one reverting with AuditAlreadyActive.
+/**
+ * A sweep that sends nothing has to say why.
+ *
+ * It always reported the COUNT, so a zero was never invisible — but with targets and slots
+ * available "queued 0" reads as a broken bot. The realistic trigger is the SEPARATE offense
+ * base-fee cap: payments and audits carry independent ceilings, so a base fee between them
+ * sends every payment and stops every audit, and the reason only went to logger.debug.
+ */
+describe("the audit sweep names its blocker when nothing went out", () => {
+  it("says the base-fee cap stopped it, instead of just reporting zero", async () => {
+    const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
+    const { activity } = await import("./activity.js");
+    const { queuePreBoundaryAudits, resetTickBudget } = await import("./strategy.js");
+    const { batchGetTargetStatuses } = await import("./contract.js");
+    const { fetchOwnedTokenIds } = await import("./index-tokens.js");
+
+    const TARGET_EPOCH = 200n;
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    // An unlocked wallet holding #10, or the auditor pool is empty and the sweep breaks at
+    // "0 auditor slot(s)" before it ever reaches the spend guard this test is about.
+    useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount, 10n ** 19n);
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      },
+    ] as never);
+    // Offense capped BELOW the block's base fee while payments stay generous — the exact
+    // asymmetry that sends every payment and stops every audit.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true,
+      separateOffenseGas: true,
+      maxBaseFeeGwei: 500,
+      offenseMaxBaseFeeGwei: 1, // block base fee in this harness is 10 gwei
+      offenseTargetTokenIds: ["501"],
+      minBalanceEth: 0, maxPaymentEth: 0,
+    } as typeof runtime.strategy;
+    resetTickBudget();
+    vi.mocked(activity.add).mockClear();
+
+    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: true, bundleOnly: false });
+
+    const msgs = vi.mocked(activity.add).mock.calls.map((c) => String(c[0]?.message ?? ""));
+    const summary = msgs.find((m) => m.includes("Pre-boundary audit (epoch"));
+    expect(summary).toBeDefined();
+    expect(summary).toContain("queued 0");
+    // The point: the reason is in the feed, not only in logger.debug.
+    expect(summary).toMatch(/none sent: .*over cap/i);
+  });
+});
+
 describe("pre-boundary audit-only fire: revert-tolerant either way, never bundle-only", () => {
   const ADDR = "0x1111111111111111111111111111111111111111" as const;
   const PAYER = "0x00000000000000000000000000000000000000b1";

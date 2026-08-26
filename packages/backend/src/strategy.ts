@@ -1473,6 +1473,21 @@ export async function queuePreBoundaryAudits(
 
   let idx = 0;
   let queued = 0;
+  /**
+   * Why nothing was sent, when nothing was sent.
+   *
+   * The sweep already reports the COUNT unconditionally, so a zero is never invisible — but
+   * it never said the reason, and "queued 0" with targets and slots available reads as a
+   * broken bot. The payment path names its blocker; this one dropped it to logger.debug,
+   * which is not in the activity feed the operator actually reads.
+   *
+   * The realistic trigger is the SEPARATE offense base-fee cap: payments and audits carry
+   * independent ceilings, so a base fee between them sends every payment and silently stops
+   * every audit. Boundary blocks run at ~0.05 gwei against a 69.1 default, so it is rare —
+   * but rare and silent is the combination that costs a whole boundary before anyone looks.
+   */
+  let blockedBy: string | null = null;
+  let deferred = 0;
   for (const t of auditable) {
     if (idx >= auditors.length) break; // out of auditor capacity this epoch
     // Pick the auditor first: the audit is signed by whichever wallet holds it, so the
@@ -1481,8 +1496,16 @@ export async function queuePreBoundaryAudits(
     const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(from));
     // Fee over cap fails for every remaining target too, and here the wasted awaits eat
     // the pre-boundary lead window itself — stop rather than scan on.
-    if (guard.fatal) { logger.debug(`pre-boundary audit stopped early: ${guard.reason}`); break; }
-    if (!guard.ok) continue;
+    if (guard.fatal) {
+      blockedBy = guard.reason ?? "spend guard";
+      logger.debug(`pre-boundary audit stopped early: ${blockedBy}`);
+      break;
+    }
+    if (!guard.ok) {
+      deferred++;
+      blockedBy ??= guard.reason ?? null;
+      continue;
+    }
     // An auditor that only qualifies via a payment earlier in THIS bundle can't be
     // simulated: the sim runs the audit alone against pre-payment state and would
     // wrongly revert. Send it unsimulated — it rides allowed-to-revert, so the worst
@@ -1517,7 +1540,13 @@ export async function queuePreBoundaryAudits(
   activity.add({
     kind: "info",
     status: "info",
-    message: `Pre-boundary audit (epoch ${targetEpoch}): ${auditable.length} auditable target(s), ${auditors.length} auditor slot(s), queued ${queued}`,
+    message:
+      `Pre-boundary audit (epoch ${targetEpoch}): ${auditable.length} auditable target(s), ` +
+      `${auditors.length} auditor slot(s), queued ${queued}` +
+      (deferred > 0 ? `, ${deferred} deferred` : "") +
+      // Only when nothing went out: with something queued the blocker cost an opportunity,
+      // not the boundary, and naming it every time would bury the counts that matter.
+      (queued === 0 && blockedBy ? ` — none sent: ${blockedBy}` : ""),
   });
   return queued > 0;
 }
