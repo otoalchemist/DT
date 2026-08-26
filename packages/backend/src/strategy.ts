@@ -1269,20 +1269,44 @@ export async function fetchOffenseCandidatesWithSkips(
   const pinnedSet = new Set(pinnedIds.map((x) => x.toString()));
   const emigrated = new Set<string>();
   const inGame: { id: bigint; owner: Address }[] = [];
-  let allySkipped = 0;
+  /**
+   * Allies are counted in TWO buckets, because only one of them is a problem.
+   *
+   * A PINNED ally is a real config error: someone put a teammate on the target list, and the
+   * only reason nothing bad happened is this filter. That deserves a warning naming the ids.
+   *
+   * An ENUMERATED ally is completely normal once the sweep is widened past the pins
+   * (sweepUnpinned) — the candidate set is then the whole live field, which of course
+   * contains every teammate. Warning about it fired ~7,000 times a day telling operators to
+   * "check your target list" when their list was fine, which is worse than saying nothing:
+   * it trains people to ignore a message that does mean something when it names pins.
+   */
+  const pinnedAllies: string[] = [];
+  let enumeratedAllies = 0;
   for (const t of liveRaw) {
     const key = t.id.toString();
     if (isEmigrated(t.owner)) emigrated.add(key);
-    else if (allySet.has(key)) allySkipped++;
-    else inGame.push(t);
+    else if (allySet.has(key)) {
+      if (pinnedSet.has(key)) pinnedAllies.push(key);
+      else enumeratedAllies++;
+    } else inGame.push(t);
   }
   if (emigrated.size > 0) {
     logger.debug(
       `offense candidates: skipped ${emigrated.size} emigrated citizen(s) — out of the main game`,
     );
   }
-  if (allySkipped > 0) {
-    logger.warn(`offense candidates: skipped ${allySkipped} ALLIED citizen(s) — check your target list`);
+  if (pinnedAllies.length > 0) {
+    logger.warn(
+      `offense candidates: your target list contains ${pinnedAllies.length} ALLIED citizen(s) ` +
+        `— #${pinnedAllies.join(", #")}. They were skipped; remove them from the list.`,
+    );
+  }
+  if (enumeratedAllies > 0) {
+    logger.debug(
+      `offense candidates: skipped ${enumeratedAllies} allied citizen(s) found by enumeration ` +
+        `(expected when the sweep is widened past the pins)`,
+    );
   }
   // Salt-order within each group, but keep pins ahead of everything discovered by
   // enumeration. Auditor slots are finite and handed out in list order, so without this

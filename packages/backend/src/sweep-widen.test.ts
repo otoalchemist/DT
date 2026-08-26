@@ -129,6 +129,15 @@ vi.mock("./activity.js", () => ({
   activity: { add: vi.fn(() => ({ id: "e1" })), update: vi.fn(), recent: vi.fn(() => []) },
 }));
 vi.mock("./race-timing.js", () => ({ recordRaceOutcome: vi.fn(), recordRaceSubmission: vi.fn() }));
+const warns: string[] = [];
+const debugs: string[] = [];
+vi.mock("./logger.js", () => ({
+  logger: {
+    warn: vi.fn((...a: unknown[]) => { warns.push(a.join(" ")); }),
+    debug: vi.fn((...a: unknown[]) => { debugs.push(a.join(" ")); }),
+    info: vi.fn(), error: vi.fn(),
+  },
+}));
 vi.mock("./emigration.js", () => ({ emigratedTokenIdSet: vi.fn(async () => new Set<string>()) }));
 // The ally roster is the one hard block on targeting, so it must be a real input here.
 // loadAllyTokens reads data/ally-tokens.json from the (deliberately nonexistent) scratch
@@ -182,6 +191,8 @@ beforeEach(() => {
   chainNonce += 50; // past any nonce ceiling a previous case reserved
   auditLimit = 1n;
   auditsUsed = 0n;
+  warns.length = 0;
+  debugs.length = 0;
   candidateIds = [501n, 502n, 503n, ALLY];
   auditableIds = new Set(["501", "502", "503", ALLY.toString()]);
   killableIds = new Set();
@@ -366,5 +377,46 @@ describe("no-capacity short-circuit", () => {
     auditsUsed = 0n;
     await sweep();
     expect(auditedTargets().length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The ally guard's REPORTING, which the widening broke.
+ *
+ * Widening the sweep past the pins makes the candidate set the whole live field, so it now
+ * contains every teammate by construction. The guard still excluded them — but it warned
+ * about it, once per tick, ~7,000 times a day, telling operators to "check your target list"
+ * when their list was fine. That is worse than silence: it trains people to ignore a message
+ * that DOES mean something when the ally is actually pinned.
+ */
+describe("reporting allied citizens the sweep skipped", () => {
+  const allyWarning = () => warns.filter((w) => /ALLIED/i.test(w));
+
+  it("does not warn when an ally merely turns up in the enumeration", async () => {
+    auditLimit = 2n;
+    await sweep();
+    // Non-vacuity: the ally really was in the candidate set and really was excluded.
+    expect(auditedTargets().length).toBeGreaterThan(0);
+    expect(auditedTargets()).not.toContain(ALLY.toString());
+    expect(allyWarning()).toEqual([]);
+    // The skip is still recorded, just at debug level — silence would hide the guard working.
+    expect(debugs.some((d) => /found by enumeration/i.test(d))).toBe(true);
+  });
+
+  it("DOES warn, naming the id, when an ally is on the target list", async () => {
+    // The case the warning exists for: a teammate pinned as a target. Only this filter stops
+    // the bot auditing them, so it has to be loud and it has to say which token.
+    runtime.strategy = {
+      ...runtime.strategy,
+      offenseTargetTokenIds: ["501", ALLY.toString()],
+    } as typeof runtime.strategy;
+    auditLimit = 2n;
+    await sweep();
+    const w = allyWarning();
+    expect(w).toHaveLength(1);
+    expect(w[0]).toMatch(new RegExp("#" + ALLY.toString()));
+    expect(w[0]).toMatch(/remove them from the list/i);
+    // Still never audited, warning or not.
+    expect(auditedTargets()).not.toContain(ALLY.toString());
   });
 });
