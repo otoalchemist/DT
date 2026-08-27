@@ -1342,12 +1342,17 @@ export async function fetchOffenseCandidatesWithSkips(
 /** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
  *  auditable at `targetEpoch` (so still current now) and with full capacity
  *  (the new epoch has 0 audits used). One audit per token. */
-async function findPreBoundaryAuditors(
-  ownedIds: bigint[],
-  targetEpoch: bigint,
-  paidInBundle: Set<string> = new Set(),
-): Promise<{ auditors: bigint[]; needsPayment: Set<string> }> {
-  if (ownedIds.length === 0) return { auditors: [], needsPayment: new Set() };
+/** What the chain says about each owned citizen's auditor potential. A pure read, so it can
+ *  be fetched before the engine lock is held — see prefetchAuditInputs. */
+export interface AuditorState {
+  id: bigint;
+  lastEpochPaid: bigint;
+  auditLimit: bigint;
+}
+
+/** The multicall half of the auditor lookup: one round trip, no policy. */
+async function readAuditorState(ownedIds: bigint[]): Promise<AuditorState[]> {
+  if (ownedIds.length === 0) return [];
   const results = await publicClient.multicall({
     allowFailure: true,
     contracts: ownedIds.flatMap((id) => [
@@ -1355,6 +1360,30 @@ async function findPreBoundaryAuditors(
       { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
     ]),
   });
+  const out: AuditorState[] = [];
+  for (let i = 0; i < ownedIds.length; i++) {
+    const lep = results[i * 2];
+    const limit = results[i * 2 + 1];
+    // A partly-failed slice drops the token, exactly as before: an unknown auditor is not
+    // an eligible one.
+    if (lep?.status !== "success" || limit?.status !== "success") continue;
+    out.push({ id: ownedIds[i]!, lastEpochPaid: lep.result as bigint, auditLimit: limit.result as bigint });
+  }
+  return out;
+}
+
+/**
+ * The policy half: which of those citizens may audit at `targetEpoch`, and in what order.
+ *
+ * Split from the read so the round trip can happen outside the engine lock while a sibling
+ * fire still holds it. This half stays inside, because it needs `paidInBundle` — the set the
+ * payment fire produces, which does not exist until that fire has run.
+ */
+function selectAuditors(
+  state: AuditorState[],
+  targetEpoch: bigint,
+  paidInBundle: Set<string> = new Set(),
+): { auditors: bigint[]; needsPayment: Set<string> } {
   /** One entry per eligible citizen with its remaining capacity, dealt out below. */
   const perToken: { id: bigint; slots: number }[] = [];
   // Auditors that only qualify BECAUSE a payment precedes them in this bundle. The
@@ -1362,16 +1391,13 @@ async function findPreBoundaryAuditors(
   // can't see the queued payment) — the caller sends those unsimulated, riding
   // allowed-to-revert so they can never drop the payment.
   const needsPayment = new Set<string>();
-  for (let i = 0; i < ownedIds.length; i++) {
-    const lep = results[i * 2];
-    const limit = results[i * 2 + 1];
-    if (lep?.status !== "success" || limit?.status !== "success") continue;
-    const limitV = limit.result as bigint;
-    const key = ownedIds[i]!.toString();
+  for (const entry of state) {
+    const limitV = entry.auditLimit;
+    const key = entry.id.toString();
     // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet,
     // so remaining capacity == auditLimit. Add one pool entry per available audit
     // so auditor-role tokens (limit > 1) can hit multiple rivals at the boundary.
-    let ok = isEligibleAuditor(lep.result as bigint, targetEpoch, 0n, limitV);
+    let ok = isEligibleAuditor(entry.lastEpochPaid, targetEpoch, 0n, limitV);
     if (!ok && paidInBundle.has(key)) {
       // Paid one epoch earlier in THIS bundle -> current by the time it audits.
       //
@@ -1390,11 +1416,11 @@ async function findPreBoundaryAuditors(
       //
       // +1n rather than targetEpoch is deliberate: the on-chain effect is at least +1, and
       // crediting the smaller advance cannot over-qualify a token.
-      ok = isEligibleAuditor((lep.result as bigint) + 1n, targetEpoch, 0n, limitV);
+      ok = isEligibleAuditor(entry.lastEpochPaid + 1n, targetEpoch, 0n, limitV);
       if (ok) needsPayment.add(key);
     }
     if (!ok) continue;
-    perToken.push({ id: ownedIds[i]!, slots: Number(limitV) });
+    perToken.push({ id: entry.id, slots: Number(limitV) });
   }
 
   /**
@@ -1486,22 +1512,75 @@ export function schedulePreBoundaryAudit(): void {
  *
  * Returns whether any queued.
  */
+/**
+ * Everything the audit sweep reads before it decides anything.
+ *
+ * All four are pure reads that touch none of the state the engine lock guards
+ * (committedThisTickWei, batchEntries, bundleQueue, the nonce sequence), so they can run
+ * while a sibling fire still holds it — which is the entire point.
+ *
+ * At the epoch-178 boundary an ally's payment fire held the lock for about four seconds
+ * after its last transaction was queued, spending it inside its own builder fan-out. The
+ * audit fire could not even BEGIN these reads until that finished, so it ran three seconds
+ * past the boundary, by which time a rival had taken both of its targets inside the boundary
+ * block. It reported "0 auditable target(s)" and queued nothing.
+ *
+ * Reading early means acting on state up to a few seconds old, and that is the right trade
+ * for a race: a target taken between the read and the submit costs one reverted audit, which
+ * is revert-tolerant on this path and a few tenths of a milli-ETH. Reading late costs the
+ * whole boundary, which is what actually happened.
+ *
+ * `targetEpoch` is carried so a consumer can tell whether the prefetch still answers its
+ * question — see the guard in queuePreBoundaryAudits.
+ */
+export interface AuditInputs {
+  targetEpoch: bigint;
+  ownedIds: bigint[];
+  auditorState: AuditorState[];
+  candidates: Awaited<ReturnType<typeof fetchOffenseCandidatesWithSkips>>["candidates"];
+  emigrated: Set<string>;
+  statuses: Awaited<ReturnType<typeof batchGetTargetStatuses>>;
+}
+
+/** Fetch those reads, overlapping the independent ones. Exported so the fire can start it
+ *  before taking the lock, and for tests. */
+export async function prefetchAuditInputs(targetEpoch: bigint, nowSec: bigint): Promise<AuditInputs> {
+  const [ownedIds, offense] = await Promise.all([
+    fetchOwnedAcrossWallets(runtime.citizensAddress as Address),
+    fetchOffenseCandidatesWithSkips(),
+  ]);
+  const [auditorState, statuses] = await Promise.all([
+    readAuditorState(ownedIds),
+    batchGetTargetStatuses(offense.candidates, targetEpoch, nowSec),
+  ]);
+  return { targetEpoch, ownedIds, auditorState, candidates: offense.candidates, emigrated: offense.emigrated, statuses };
+}
+
 // Exported for tests: this is the audit-queue unit that a boundary miss like
 // token 1612 flows through, so an integration test drives it directly.
 export async function queuePreBoundaryAudits(
   targetEpoch: bigint,
   nowSec: bigint,
   boundaryTs: bigint,
-  opts: { revertible: boolean; bundleOnly: boolean; paidInBundle?: Set<string> },
+  opts: { revertible: boolean; bundleOnly: boolean; paidInBundle?: Set<string>; prefetched?: AuditInputs },
 ): Promise<boolean> {
   const s = runtime.strategy;
-  const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
-  const { auditors, needsPayment } = await findPreBoundaryAuditors(ownedIds, targetEpoch, opts.paidInBundle);
-
-  const { candidates: live, emigrated } = await fetchOffenseCandidatesWithSkips();
+  /**
+   * Use the caller's prefetch only if it answers THIS question.
+   *
+   * The epoch is the whole of it: statuses are computed against a target epoch, so a
+   * prefetch taken for a different one would classify every rival wrongly. A mismatch can
+   * only happen on the fallback path where the race is re-derived from the clock, and the
+   * cost of not trusting it is one extra set of reads — cheap next to a wrong answer.
+   */
+  const input =
+    opts.prefetched && opts.prefetched.targetEpoch === targetEpoch
+      ? opts.prefetched
+      : await prefetchAuditInputs(targetEpoch, nowSec);
+  const { ownedIds, candidates: live, emigrated, statuses } = input;
+  const { auditors, needsPayment } = selectAuditors(input.auditorState, targetEpoch, opts.paidInBundle);
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = pinnedTargetSet(s);
-  const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
   // Rivals that will be auditable AT the target epoch (2+ behind) and aren't already
   // under audit — the full set, independent of how many auditor slots we have.
   const auditable = statuses.filter(
@@ -1621,17 +1700,40 @@ export async function queuePreBoundaryAudits(
 }
 
 /** Standalone pre-boundary audit bundle. Used when combinedBoundaryBundle is OFF. */
-export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; boundaryTs: bigint }): Promise<void> {
+export async function firePreBoundaryAudit(
+  armed?: { targetEpoch: bigint; boundaryTs: bigint },
+  pending?: Promise<AuditInputs | null>,
+): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
+  /**
+   * Start the sweep's reads NOW, before the lock, and carry the same promise across every
+   * retry so they happen once rather than per attempt.
+   *
+   * This is the fix for a boundary lost at epoch 178: the payment fire held the lock through
+   * its own builder fan-out, and the audit fire could not begin reading until that finished,
+   * so it ran three seconds past the boundary and found its targets already taken. The reads
+   * touch nothing the lock guards, so there is no reason for them to wait on it.
+   *
+   * A failed prefetch resolves to null rather than rejecting, and the sweep then reads for
+   * itself — losing the overlap but never the audit.
+   */
+  const entryNow = BigInt(Math.floor(Date.now() / 1000));
+  const plannedRace = armed ?? racedBoundary(runtime.startTime ?? 0n, entryNow, runtime.currentEpoch);
+  const inputs =
+    pending ??
+    prefetchAuditInputs(plannedRace.targetEpoch, entryNow).catch((err: unknown) => {
+      logger.debug(`audit prefetch failed, falling back to reading under the lock: ${(err as Error).message}`);
+      return null;
+    });
   if (ticking) {
     const b = boundaryForArmedFire();
     if (b !== null) warnRaceLostToTick("audit", b);
     // Carry the armed boundary through the retry, or a delayed fire re-derives it and lands
     // on the wrong day — which is the bug this whole path exists to avoid.
-    setTimeout(() => void firePreBoundaryAudit(armed), 150);
+    setTimeout(() => void firePreBoundaryAudit(armed, inputs), 150);
     return;
   }
   /**
@@ -1714,10 +1816,13 @@ export async function firePreBoundaryAudit(armed?: { targetEpoch: bigint; bounda
      * catch up to, so the extra post per builder would buy nothing.
      */
     setRaceLookBack(paidInBundle.size > 0);
+    // Usually already resolved: it has been running since before we took the lock.
+    const prefetched = await inputs;
     const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
       revertible: true,
       bundleOnly: false,
       paidInBundle,
+      prefetched: prefetched ?? undefined,
     });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
     if (queuedAudit) await maybeQueueCoinbaseBid("audit");

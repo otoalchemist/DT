@@ -148,7 +148,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, prefetchAuditInputs, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -1666,6 +1666,75 @@ describe("multi-wallet: manual actions resolve the owning wallet before signing"
  * anything invalidating that citizen took all three with it. Nothing is bought by that
  * coupling.
  */
+/**
+ * The sweep's reads happen OUTSIDE the engine lock.
+ *
+ * At epoch 178 an ally's payment fire held the lock through its own builder fan-out, so the
+ * audit fire could not begin reading until that finished and ran three seconds past the
+ * boundary — its targets already taken. The reads touch nothing the lock guards, so the fire
+ * now starts them before acquiring it and hands the result to the sweep.
+ *
+ * What has to hold: a prefetch for THIS epoch is used as-is, and one for a different epoch is
+ * discarded rather than trusted, because statuses are classified against a target epoch.
+ */
+describe("the audit sweep uses a prefetch taken outside the lock", () => {
+  const TARGET_EPOCH = 200n;
+  const inputsFor = (epoch: bigint) => ({
+    targetEpoch: epoch,
+    ownedIds: [10n],
+    auditorState: [{ id: 10n, lastEpochPaid: 1_000_000n, auditLimit: 1n }],
+    candidates: [{ id: 501n, owner: "0x00000000000000000000000000000000000000dd" as const }],
+    emigrated: new Set<string>(),
+    statuses: [{
+      tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+      lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+      auditable: true, auditDueTimestamp: "0", killable: false,
+    }],
+  });
+
+  beforeEach(() => {
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount, 10n ** 19n);
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, offenseTargetTokenIds: ["501"],
+    } as typeof runtime.strategy;
+    resetTickBudget();
+  });
+
+  it("reuses a prefetch instead of reading again", async () => {
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(inputsFor(TARGET_EPOCH).statuses as never);
+    // Built through the REAL prefetch, because fetchOwnedAcrossWallets also fills the
+    // token -> wallet map that act() signs from; a hand-made object skips that and the
+    // sweep then refuses every audit for want of a holder.
+    const pre = await prefetchAuditInputs(TARGET_EPOCH, 0n);
+    vi.mocked(batchGetTargetStatuses).mockClear();
+    vi.mocked(fetchOwnedTokenIds).mockClear();
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, {
+      revertible: true, bundleOnly: false, prefetched: pre,
+    });
+    expect(queued).toBe(true);
+    // The whole point: no round trip under the lock.
+    expect(batchGetTargetStatuses).not.toHaveBeenCalled();
+    expect(fetchOwnedTokenIds).not.toHaveBeenCalled();
+  });
+
+  it("discards a prefetch taken for a different epoch and reads fresh", async () => {
+    // Statuses are classified against a target epoch, so one fetched for another epoch
+    // would mislabel every rival. Cheaper to re-read than to be wrong.
+    vi.mocked(batchGetTargetStatuses).mockClear();
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([] as never);
+    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, {
+      revertible: true, bundleOnly: false, prefetched: { ...inputsFor(TARGET_EPOCH + 1n), targetEpoch: TARGET_EPOCH + 1n } as never,
+    });
+    expect(batchGetTargetStatuses).toHaveBeenCalled();
+  });
+});
+
 describe("the auditor pool spreads audits across distinct auditors", () => {
   const OWNED_MULTI = [10n, 20n, 30n];
 

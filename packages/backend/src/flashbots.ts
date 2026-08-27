@@ -190,11 +190,25 @@ async function signTx(
  * - local: broadcasts the raw tx to the node (anvil).
  */
 const RELAY_TIMEOUT_MS = 10_000;
-// Bundle submission is time-critical and fans out to several builders: a slow or
-// dead endpoint must not hold up the caller (submitTx awaits all attempts, so a
-// 10s hang would stall every later token in a boundary race). Healthy builders
-// ack in <1s, and one that can't answer before the block is built is useless to us.
-const SEND_BUNDLE_TIMEOUT_MS = 3_000;
+/**
+ * How long to wait for one builder to acknowledge a bundle.
+ *
+ * Bundle submission is time-critical and fans out to every builder: a slow or dead endpoint
+ * must not hold up the caller. The attempts run concurrently, so the cost of this is max()
+ * and not sum() — but that means ONE slow builder sets the floor for the whole fan-out, and
+ * the caller holds the engine lock throughout.
+ *
+ * Cut from 3s. At the epoch-178 boundary a payment fire held the lock for about four seconds
+ * after its last transaction was queued, and the audit fire that queues behind it did not run
+ * until three seconds PAST the boundary — by which time a rival had taken both of its targets
+ * inside the boundary block. Ten builders at three target blocks is thirty posts, and at 3s
+ * any one of them could buy that outcome on its own.
+ *
+ * Healthy builders ack in well under a second. One that cannot answer in 1.2s was not going to
+ * have our bundle in the block it is racing for, so waiting on it trades a certain delay for a
+ * submission that is already too late to matter — and we still have nine others.
+ */
+const SEND_BUNDLE_TIMEOUT_MS = 1_200;
 
 async function flashbotsRpcWithTimeout(
   method: string,
