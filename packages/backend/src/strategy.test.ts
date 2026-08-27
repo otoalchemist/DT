@@ -1657,6 +1657,70 @@ describe("multi-wallet: manual actions resolve the owning wallet before signing"
  * base-fee cap: payments and audits carry independent ceilings, so a base fee between them
  * sends every payment and stops every audit, and the reason only went to logger.debug.
  */
+/**
+ * Audit slots are dealt round-robin, not token by token.
+ *
+ * At the epoch-178 boundary an ally held 15 slots across 9 citizens and spent all three of
+ * its audits on #358 — the first eligible citizen, which carries auditLimit 3. The three
+ * audits were separate transactions with separate outcomes, yet shared one auditor, so
+ * anything invalidating that citizen took all three with it. Nothing is bought by that
+ * coupling.
+ */
+describe("the auditor pool spreads audits across distinct auditors", () => {
+  const OWNED_MULTI = [10n, 20n, 30n];
+
+  beforeEach(() => {
+    runtime.currentEpoch = 199n;
+    runtime.startTime = 0n;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount, 10n ** 19n);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue(OWNED_MULTI);
+    // auditLimit THREE per citizen. The harness default is 1, and with one slot each the
+    // round-robin and token-by-token deals produce the identical list — the assertion below
+    // would pass against the bug it exists to catch.
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: { contracts: { functionName: string }[] }) =>
+      contracts.map((c) => ({
+        status: "success" as const,
+        result: c.functionName === "auditLimit" ? 3n : 1_000_000n,
+      }))) as never);
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0,
+      offenseTargetTokenIds: ["501", "502", "503"],
+    } as typeof runtime.strategy;
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+      ["501", "502", "503"].map((tokenId) => ({
+        tokenId, owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: "198", delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      })) as never,
+    );
+    resetTickBudget();
+  });
+
+  it("uses a different auditor per audit when several are eligible", async () => {
+    // Nine slots across three citizens (3 each). Dealt token-by-token all three audits land
+    // on #10 — the epoch-178 shape; dealt round-robin they land on #10, #20, #30.
+    vi.mocked(encodeAudit).mockClear();
+    await queuePreBoundaryAudits(200n, 0n, 0n, { revertible: true, bundleOnly: false });
+    const auditors = vi.mocked(encodeAudit).mock.calls.map((c) => String(c[0]));
+    expect(auditors).toHaveLength(3);
+    expect(new Set(auditors).size).toBe(3);
+    expect(auditors).toEqual(["10", "20", "30"]);
+  });
+
+  it("still fills from one auditor when it is the only eligible citizen", async () => {
+    // Degenerate case: the deal must not lose capacity a single multi-slot citizen has.
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    vi.mocked(encodeAudit).mockClear();
+    await queuePreBoundaryAudits(200n, 0n, 0n, { revertible: true, bundleOnly: false });
+    const auditors = vi.mocked(encodeAudit).mock.calls.map((c) => String(c[0]));
+    expect(auditors).toEqual(["10", "10", "10"]);
+  });
+});
+
 describe("the audit sweep names its blocker when nothing went out", () => {
   it("says the base-fee cap stopped it, instead of just reporting zero", async () => {
     const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");

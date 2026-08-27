@@ -1339,7 +1339,8 @@ async function findPreBoundaryAuditors(
       { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
     ]),
   });
-  const eligible: bigint[] = [];
+  /** One entry per eligible citizen with its remaining capacity, dealt out below. */
+  const perToken: { id: bigint; slots: number }[] = [];
   // Auditors that only qualify BECAUSE a payment precedes them in this bundle. The
   // chain still reads them as behind, so their audit can't be simulated (the sim
   // can't see the queued payment) — the caller sends those unsimulated, riding
@@ -1377,7 +1378,35 @@ async function findPreBoundaryAuditors(
       if (ok) needsPayment.add(key);
     }
     if (!ok) continue;
-    for (let k = 0n; k < limitV; k++) eligible.push(ownedIds[i]!);
+    perToken.push({ id: ownedIds[i]!, slots: Number(limitV) });
+  }
+
+  /**
+   * Deal the slots round-robin, not token by token.
+   *
+   * Pushing each token `auditLimit` times in a row put every audit of a sweep on the FIRST
+   * eligible citizen: at the epoch-178 boundary an ally held 15 slots across 9 citizens and
+   * spent all three of its audits on #358, because #358 sits first and carries a limit of 3.
+   *
+   * That concentrates a risk that has no reason to be concentrated. The audits are separate
+   * transactions with separate outcomes, but they shared one auditor, so anything that
+   * invalidated that citizen would have taken all three down together — and at that very
+   * boundary #358 WAS invalidated, audited by a rival twenty indices before its own payment
+   * could land. The three audits failed on their targets first, so the concentration did not
+   * decide it that night; it is simply a coupling we get nothing for.
+   *
+   * Round-robin makes the failures independent wherever capacity allows, and costs nothing
+   * when there is only one eligible auditor — the deal degenerates to the old order.
+   */
+  const eligible: bigint[] = [];
+  for (let round = 0; ; round++) {
+    let dealt = false;
+    for (const t of perToken) {
+      if (round >= t.slots) continue;
+      eligible.push(t.id);
+      dealt = true;
+    }
+    if (!dealt) break;
   }
   return { auditors: eligible, needsPayment };
 }
