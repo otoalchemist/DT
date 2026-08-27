@@ -2070,6 +2070,42 @@ export function scheduleDefenseBoundary(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.enabled || !s.proactivePay) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
+  /**
+   * Stand down when a pre-boundary payment fire already owns this boundary.
+   *
+   * The two pay the SAME citizens. maybeAutoArmPayment arms exactly those with
+   * `lastEpochPaid < currentEpoch` — the ones that go 2 behind when the boundary lands — and
+   * queuePreBoundaryPayments pays that armed set. By the time this tick would run, the
+   * payment fire has already covered them 3.5s earlier, at the race tip, aimed at the
+   * boundary block. There is nothing left for it to find.
+   *
+   * What it does instead is take the engine lock at boundary - 1.5s and run a FULL tick —
+   * snapshot, nonce sync, owned tokens, auto-arm, auto-defend, jitPass, offensePass, flush —
+   * squarely inside the window the audit fire is retrying in. It is a boundary tick, so
+   * routineTickMustYield deliberately exempts it, and if proactivePayPass finds nothing it
+   * logs nothing, so the delay it causes is invisible.
+   *
+   * That is the shape of the epoch-178 loss: an ally's payments landed at index 35-38 of the
+   * boundary block, its audit fire did not run until three seconds PAST the boundary, and by
+   * then a rival had taken both of its targets inside that block.
+   *
+   * Unarmed boundaries are untouched: proactive pay is the only defense there, and with no
+   * payment fire there is nothing to collide with.
+   *
+   * The cost, stated plainly: if the payment fire is armed but its guards trip (min-balance
+   * floor, fee cap), proactive pay no longer runs as a second attempt that boundary. It would
+   * hit the same guards, so the loss is small — but it is not nothing.
+   */
+  const paymentFireOwnsThisBoundary =
+    s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null &&
+    BigInt(s.jitTargetEpoch) === runtime.currentEpoch + 1n &&
+    !armedEpochIsOver(s.jitTargetEpoch);
+  if (paymentFireOwnsThisBoundary) {
+    logger.debug(
+      `defense boundary tick stood down for epoch ${s.jitTargetEpoch}: the pre-boundary payment fire covers it`,
+    );
+    return;
+  }
 
   // Epoch boundary that starts epoch (current+1) is startTime + current*DURATION.
   const nextEpochBoundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS;

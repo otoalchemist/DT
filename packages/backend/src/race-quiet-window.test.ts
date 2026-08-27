@@ -263,3 +263,58 @@ describe("the delay warning names the real holder", () => {
     expect(activity.add).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * The defense boundary tick stands down when the payment fire owns the boundary.
+ *
+ * It fires at boundary - 1.5s and runs a FULL tick, and being a boundary tick it is exempt
+ * from routineTickMustYield by design — so it lands inside the audit fire's retry window and
+ * can hold the lock past the boundary. It pays the same citizens the payment fire armed, so
+ * on an armed boundary there is nothing for it to do but get in the way.
+ *
+ * Asserted through the observable: whether it arms a timer at all.
+ */
+describe("the defense boundary tick yields to an armed payment fire", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    arm();
+    /**
+     * Put the boundary 60s in the FUTURE.
+     *
+     * The shared fixture derives it from epoch arithmetic with startTime 0, which lands in
+     * 1970 — so scheduleDefenseBoundary takes its immediate-fire branch and arms no timer
+     * whatever the stand-down does. Both assertions below would then hold against the bug
+     * they exist to catch.
+     */
+    runtime.startTime = BigInt(Math.floor(Date.now() / 1000)) + 60n - BigInt(ARMED_EPOCH - 1) * EPOCH;
+    runtime.strategy = { ...runtime.strategy, enabled: true, proactivePay: true } as typeof runtime.strategy;
+  });
+
+  it("does not arm when a payment fire is armed for this same boundary", async () => {
+    const { scheduleDefenseBoundary, clearAwayTimers } = (await import("./strategy.js")) as unknown as {
+      scheduleDefenseBoundary: () => void; clearAwayTimers: () => void;
+    };
+    runtime.running = true;
+    scheduleDefenseBoundary();
+    // No timer armed => nothing will take the lock at boundary - 1.5s.
+    expect(vi.getTimerCount()).toBe(0);
+    clearAwayTimers();
+    runtime.running = false;
+    vi.useRealTimers();
+  });
+
+  it("still arms when nothing is owed, because then it is the only defense", async () => {
+    const { scheduleDefenseBoundary, clearAwayTimers } = (await import("./strategy.js")) as unknown as {
+      scheduleDefenseBoundary: () => void; clearAwayTimers: () => void;
+    };
+    runtime.running = true;
+    // No JIT arm: proactive pay is the only thing covering these citizens, and there is no
+    // payment fire for it to collide with.
+    runtime.strategy = { ...runtime.strategy, jitEnabled: false, jitTargetEpoch: null } as typeof runtime.strategy;
+    scheduleDefenseBoundary();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    clearAwayTimers();
+    runtime.running = false;
+    vi.useRealTimers();
+  });
+});
