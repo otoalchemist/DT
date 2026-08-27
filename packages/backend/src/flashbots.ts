@@ -435,6 +435,37 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
   // never drop a mandatory payment. A tx hash is keccak(signed tx).
   const revertingTxHashes = queue.filter((q) => q.revertible).map((q) => keccak256(q.signed));
   /**
+   * Which block to aim a RACE at: the first one whose slot can satisfy the boundary.
+   *
+   * `head + 1` is the wrong answer and cost real money. The fire runs ~3-4s before the
+   * boundary, so `head + 1` is the block for the CURRENT slot — whose timestamp is still
+   * BEFORE the boundary. A payment priced for the next epoch cannot execute there: it
+   * reverts, and the revert still consumes the nonce, which kills the copy aimed at the real
+   * boundary block. Measured over 10 boundaries: every race that landed in its own first
+   * target reverted, and every race that succeeded did so in `target + 1`.
+   *
+   * `minTimestamp` was supposed to make the too-early block harmless, and it does not
+   * reliably: at the epoch-178 boundary a bundle carrying minTimestamp = 23:59:35 was
+   * included by Titan in a block stamped 23:59:23 and reverted. With a 10-builder fan-out
+   * the likeliest route is orderflow sharing — a partner treating the bundle's transaction
+   * as ordinary flow, which drops the constraint. So the guard cannot be the only defence:
+   * we simply never offer a builder a block that is too early.
+   *
+   * Derived from the SAME block we read the number from, so a stale head is self-correcting:
+   * an older block has a proportionally larger gap to the boundary and the arithmetic lands
+   * on the same absolute block either way.
+   *
+   * A MISSED slot makes this overshoot (fewer blocks than slots), so we aim one block late
+   * and lose the race while still succeeding. That is the cheap direction — undershooting
+   * reverts and burns a nonce; overshooting only costs position.
+   */
+  function raceTargetFrom(headNumber: bigint, headTs: bigint, boundaryTs: bigint): bigint {
+    if (boundaryTs <= headTs) return headNumber + 1n; // boundary already passed
+    const slotsAway = (boundaryTs - headTs + SLOT_SECONDS - 1n) / SLOT_SECONDS; // ceil
+    return headNumber + (slotsAway < 1n ? 1n : slotsAway);
+  }
+
+  /**
    * Fresh head, deliberately uncached.
    *
    * viem caches `getBlockNumber` for `cacheTime`, which defaults to `pollingInterval`
@@ -443,18 +474,39 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
    * when 25778247 already existed, so the bundle was aimed at [25778247, 25778248] where
    * 25778247 was ALREADY MINED. One of the two target blocks was spent on a block that could
    * never include us, halving the fan-out that exists to survive a missed slot.
+   *
+   * On a race we need the head's TIMESTAMP as well as its number, so this reads the block
+   * rather than just the number — one call either way.
    */
-  const targetBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 1n;
+  let targetBlock: bigint;
+  if (raceBoundaryTs !== null) {
+    const head = await publicClient.getBlock({ blockTag: "latest" });
+    // Only trust the derivation when the head actually carried both fields. A block with no
+    // number or timestamp would otherwise compute a target near zero and send the bundle
+    // nowhere — silently losing the race it was meant to win.
+    targetBlock =
+      head?.number != null && head?.timestamp != null
+        ? raceTargetFrom(head.number, head.timestamp, raceBoundaryTs)
+        : (await publicClient.getBlockNumber({ cacheTime: 0 })) + 1n;
+  } else {
+    targetBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 1n;
+  }
 
   // Stamped here, immediately before the fan-out, so it measures OUR send time and not
   // how long the builders took to acknowledge (telemetry only — see race-timing.ts).
   const submittedAtMs = Date.now();
 
-  // One multi-tx bundle, fanned out to every builder for the next two blocks — three when
-  // looking back, so a sibling fire that flushed one block earlier is still reachable.
-  // Guarded against a nonsensical block 0 for completeness; in practice the head is huge.
+  /**
+   * One multi-tx bundle, fanned out to every builder for the target block and the next.
+   *
+   * The look-back (a third shot at `targetBlock - 1`) is NOT used on a race any more. It
+   * existed so an audit fire could reach the block a payment fire had already aimed at, back
+   * when each derived its own target from its own head and they could disagree. Both now
+   * derive the target from the boundary timestamp, so they agree by construction — and on a
+   * race `targetBlock - 1` is precisely the pre-boundary block that reverts.
+   */
   const targetBlocks =
-    raceLookBack && targetBlock > 1n
+    raceBoundaryTs === null && raceLookBack && targetBlock > 1n
       ? [targetBlock - 1n, targetBlock, targetBlock + 1n]
       : [targetBlock, targetBlock + 1n];
   /**
@@ -683,9 +735,20 @@ export async function submitTx(
     : computeFees(opts.offense ?? false, latest);
   const gasWei = gas * maxFeePerGas;
   // Reuse the block's own number instead of a separate getBlockNumber round-trip.
-  // Only used for sim context + reporting here; the actual bundle target block is
-  // re-derived fresh at flush time (see flushBundle).
-  const targetBlock = (latest.number ?? (await publicClient.getBlockNumber())) + 1n;
+  // Used for sim context + reporting, and — when no batch is open — as this single-tx
+  // bundle's actual target. On a pre-boundary race (`simTimestamp` is the boundary) that
+  // must be the block whose slot can satisfy the boundary, NOT head + 1: head + 1 is the
+  // current slot, still in the old epoch, where the tx reverts and burns its nonce. Same
+  // reasoning as flushBundle's raceTargetFrom — see the long note there.
+  const headNumber = latest.number ?? (await publicClient.getBlockNumber());
+  let targetBlock = headNumber + 1n;
+  if (opts.simTimestamp !== undefined && latest.number != null && latest.timestamp != null) {
+    const boundaryTs = opts.simTimestamp;
+    if (boundaryTs > latest.timestamp) {
+      const slotsAway = (boundaryTs - latest.timestamp + SLOT_SECONDS - 1n) / SLOT_SECONDS;
+      targetBlock = headNumber + (slotsAway < 1n ? 1n : slotsAway);
+    }
+  }
 
   // Nonce is only reserved after simulation passes to avoid burning nonces on reverts.
   const base: SubmitResult = {

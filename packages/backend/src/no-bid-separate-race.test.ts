@@ -71,7 +71,12 @@ const getTransactionCount = vi.fn(async () => chainNonce);
 const request = vi.fn(async () => "0x");
 vi.mock("./chain.js", () => ({
   publicClient: {
-    getBlock: vi.fn(async () => ({ baseFeePerGas: 1_000_000_000n })),
+    // number + timestamp matter now: a race derives its target block from the boundary, so a
+    // head without them falls back to head + 1 and the derivation goes untested. Head at
+    // boundary - 24s => head + 1 is the PRE-boundary block, head + 2 is the boundary block.
+    getBlock: vi.fn(async () => ({
+      baseFeePerGas: 1_000_000_000n, number: 100n, timestamp: BOUNDARY_TS - 24n,
+    })),
     getBalance: vi.fn(async () => 100_000_000_000_000_000_000n),
     getBlockNumber: vi.fn(async () => 100n),
     getTransactionCount,
@@ -533,26 +538,38 @@ describe("both fires inside the lead, with the real scheduler contention", () =>
     expect(new Set(audit.map((b) => b.blockNumber)).size).toBe(audit.length);
   });
 
-  it("gives the AUDIT a look-back block the payment does not get", async () => {
+  it("aims BOTH fires at the boundary block, and never at the pre-boundary one", async () => {
     /**
-     * The two fires flush separately and each reads the head fresh, so a block landing in
-     * the gap leaves the payment aimed at [N+1, N+2] and the audit at [N+2, N+3] — the
-     * payment takes the boundary block and the audit cannot reach it. The audit therefore
-     * also aims one block BEHIND its own head.
+     * This replaces the look-back added in 9ac8ce2, and the reason belongs here rather than
+     * in a quietly-edited assertion.
      *
-     * Safe only because minTimestamp already makes a pre-boundary block ineligible, so the
-     * extra shot is either the payment's block or nothing. The payment fire does not get one:
-     * it flushes FIRST, so a block behind its head is one already mined.
+     * The look-back existed because each fire read its own head, so a block landing between
+     * the two flushes left the payment aimed at [N+1, N+2] and the audit at [N+2, N+3] — the
+     * payment took the boundary block and the audit could not reach it. Its safety argument
+     * was explicit: safe only because minTimestamp already makes a pre-boundary block
+     * ineligible, so the extra shot is either the payment's block or nothing.
+     *
+     * That premise turned out to be false. At the epoch-178 boundary a bundle carrying
+     * minTimestamp = 23:59:35 was included by Titan in a block stamped 23:59:23 and reverted,
+     * burning the nonce its boundary-block copy needed. Over ten boundaries, every race that
+     * landed in its own FIRST target reverted and every one that succeeded landed in
+     * target + 1. With a ten-builder fan-out the likeliest route is orderflow sharing, where a
+     * partner treats the bundle's transaction as ordinary flow and the constraint is gone.
+     *
+     * So the target is derived from the boundary TIMESTAMP instead. Both fires land on the
+     * same block whenever they read the head — a superset of what the look-back bought — and
+     * no bundle is ever offered a block that would execute an epoch early.
      */
     await runBothFires();
     const payBlocks = bundles().filter((b) => kindsOf(b).includes(PAY))
       .map((b) => Number(b.blockNumber)).sort((a, b) => a - b);
     const auditBlocks = bundles().filter((b) => kindsOf(b).every((k) => k === AUDIT))
       .map((b) => Number(b.blockNumber)).sort((a, b) => a - b);
-    expect(payBlocks).toHaveLength(2);
-    expect(auditBlocks).toHaveLength(3);
-    expect(auditBlocks[0]).toBe(payBlocks[0]! - 1);
-    expect(auditBlocks.slice(1)).toEqual(payBlocks);
+    // Head 100 at boundary - 24s => 100 + ceil(24/12) = 102 is the boundary block.
+    expect(payBlocks).toEqual([102, 103]);
+    expect(auditBlocks).toEqual([102, 103]);
+    expect(auditBlocks).toEqual(payBlocks); // agreement by construction, no look-back needed
+    expect([...payBlocks, ...auditBlocks]).not.toContain(101); // the pre-boundary block
   });
 });
 
