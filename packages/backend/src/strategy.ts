@@ -2657,6 +2657,11 @@ export async function maybeAutoArmPayment(
   schedulePreBoundaryPay();
   schedulePreBoundaryAudit();
   schedulePreBoundaryBundle();
+  // The defense tick reads the arm too: it stands down when a payment fire owns the boundary,
+  // and it is otherwise scheduled ONLY from refreshSnapshot, which runs BEFORE this function
+  // in the same tick. Without this line the stand-down misses the tick that arms and waits for
+  // the next one — self-correcting within a block, but only because a tick happens to follow.
+  scheduleDefenseBoundary();
   // Always in away mode to reach here, and the wake window is picked from what is armed —
   // so it has to be recomputed now that a payment is due.
   scheduleAwayWake();
