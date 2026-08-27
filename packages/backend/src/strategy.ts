@@ -764,18 +764,34 @@ const RACE_DELAY_WARN_SEC = 2n;
  *  at a sleeping machine. Reported once per boundary per kind. */
 function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
   if (tickLostRaceFor.get(kind) === boundarySec) return;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
   /**
-   * The audit fire waiting on the PAYMENT fire is the design, not a fault.
+   * The audit fire waiting on the PAYMENT fire is the design — but only while the race is
+   * still winnable.
    *
    * They are scheduled for the same instant and share one lock, so on any boundary where a
-   * payment is due the audit ALWAYS queues behind it — and must, because it needs the
-   * paid-in-bundle credit the payment fire produces, and the payment's lower nonce is what
-   * makes crediting it safe at all. Reporting that as "a routine tick held the engine" fired
-   * on a perfectly healthy boundary and pointed the operator at tick duration, which was
-   * never the problem. Same for the combined fire, which owns both halves by definition.
+   * payment is due the audit ALWAYS queues behind it, and must: it needs the paid-in-bundle
+   * credit the payment produces, and the payment's lower nonce is what makes crediting it
+   * safe. Reporting a two-second wait as a fault fired on healthy boundaries and pointed at
+   * tick duration, which was never the problem.
+   *
+   * Suppressing it UNCONDITIONALLY was too much, and cost a boundary. At epoch 178 an ally's
+   * payment fire held the lock through its own builder fan-out; the audit fire got in at
+   * :38 against a :35 boundary, by which time a rival had taken both its targets inside the
+   * boundary block. The sweep reported "0 auditable target(s)" and nothing said why — the one
+   * warning built for this was silenced because the holder was a sibling. Its payments sat at
+   * index 35-38 of that block and the rival's audits at 60, so the race was there to win.
+   *
+   * So: quiet while there is still time, loud once the boundary has passed. A sibling holding
+   * the lock past the boundary has cost the block, whatever its reason for holding it.
    */
-  if (kind === "audit" && (tickingOwner === "the payment fire" || tickingOwner === "the combined pay+audit fire")) return;
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (
+    kind === "audit" &&
+    nowSec < boundarySec &&
+    (tickingOwner === "the payment fire" || tickingOwner === "the combined pay+audit fire")
+  ) {
+    return;
+  }
   // Due when the scheduler armed it, which is one lead before the boundary — NOT at the
   // boundary itself. Measuring against the boundary is what made this silent.
   const dueSec = boundarySec - BigInt(Math.ceil(effectiveLeadMs() / 1000));

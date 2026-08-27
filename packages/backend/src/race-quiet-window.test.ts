@@ -179,7 +179,12 @@ describe("routine ticks yield inside an armed boundary window", () => {
  * payment produces, and the payment's lower nonce is what makes crediting it safe.
  */
 describe("the delay warning names the real holder", () => {
-  it("stays silent when the audit is waiting on its own payment fire", async () => {
+  /** A boundary still ahead of the real clock — the race is winnable, the wait is normal. */
+  const soon = () => BigInt(Math.floor(Date.now() / 1000)) + 60n;
+  /** A boundary already behind us — the block is gone whoever was holding the lock. */
+  const past = () => BigInt(Math.floor(Date.now() / 1000)) - 60n;
+
+  it("stays silent when the audit is waiting on its own payment fire and there is still time", async () => {
     const { __setTickingOwnerForTest, __warnRaceLostToTickForTest, __resetRaceWarnForTest } =
       (await import("./strategy.js")) as unknown as {
         __setTickingOwnerForTest: (o: string | null) => void;
@@ -191,8 +196,35 @@ describe("the delay warning names the real holder", () => {
     vi.mocked(activity.add).mockClear();
     arm();
     __setTickingOwnerForTest("the payment fire");
-    __warnRaceLostToTickForTest("audit", BOUNDARY);
+    __warnRaceLostToTickForTest("audit", soon());
     expect(activity.add).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The suppression above was UNCONDITIONAL and that cost a boundary. At epoch 178 an ally's
+   * payment fire held the lock through its own builder fan-out; the audit fire got in at :38
+   * against a :35 boundary, by which time a rival had taken both its targets inside the
+   * boundary block. The sweep said "0 auditable target(s)" and the one warning built for this
+   * was silent, because the holder was a sibling. Its payments sat at index 35-38 of that
+   * block against the rival's audits at 60 — the race was there to win.
+   */
+  it("reports the sibling wait once the boundary has passed, because the block is gone", async () => {
+    const { __setTickingOwnerForTest, __warnRaceLostToTickForTest, __resetRaceWarnForTest } =
+      (await import("./strategy.js")) as unknown as {
+        __setTickingOwnerForTest: (o: string | null) => void;
+        __warnRaceLostToTickForTest: (kind: string, boundarySec: bigint) => void;
+        __resetRaceWarnForTest: () => void;
+      };
+    const { activity } = await import("./activity.js");
+    __resetRaceWarnForTest();
+    vi.mocked(activity.add).mockClear();
+    arm();
+    __setTickingOwnerForTest("the payment fire");
+    __warnRaceLostToTickForTest("audit", past());
+    expect(activity.add).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(activity.add).mock.calls[0]![0]!.message as string;
+    expect(msg).toContain("the payment fire held the engine");
+    expect(msg).toContain("boundary has now passed");
   });
 
   it("still reports when something unrelated holds the lock, and names it", async () => {
