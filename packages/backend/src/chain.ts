@@ -59,8 +59,27 @@ export async function getLatestBlockCached(maxAgeMs = BLOCK_CACHE_MS): Promise<B
  * triggers then only needs the base fee / number / gas from it. Without this the tick
  * threw that block away and re-read the identical data over HTTP: one wasted
  * eth_getBlockByNumber per block (~7.2k/day at 12s blocks).
+ *
+ * VALIDATED, because the header is whatever the socket delivered rather than something we
+ * asked for. A reconnect (or a provider mid-maintenance) can hand `onBlock` an undefined or
+ * partial frame, and caching one poisons every reader for the whole TTL: `getLatestBlockCached`
+ * hands back the bad value, and `runtime.lastBlock = latest.number` in refreshSnapshot throws
+ * "Cannot read properties of undefined (reading 'number')" on every tick until it ages out.
+ *
+ * That is not hypothetical. At the epoch-180 boundary an ally's engine threw exactly that,
+ * which is why they paused and restarted 38s before the boundary — and the restart is what
+ * lost them the race (see the cold-start guard in startEngine). The crash itself was cheap;
+ * what it cost was the operator's confidence at the worst possible moment.
+ *
+ * Dropping a bad frame is strictly safer than storing it: the previous block stays cached and
+ * ages out on its own, and any reader past the TTL re-reads over HTTP. A `null` number is the
+ * marker of a PENDING block, which is equally unusable as "latest" here.
  */
-export function primeBlockCache(block: Block): void {
+export function primeBlockCache(block: Block | null | undefined): void {
+  if (block == null || block.number == null || block.timestamp == null) {
+    logger.warn("ignored a block-subscription frame with no number/timestamp");
+    return;
+  }
   cachedBlock = { at: Date.now(), block };
 }
 
