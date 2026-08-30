@@ -319,7 +319,54 @@ export function startEngine(): void {
     timer = setInterval(() => void tick(false, true), TICK_MS);
     activity.add({ kind: "info", status: "info", message: "Polling every 12s (no WebSocket configured)" });
   }
-  void tick();
+
+  /**
+   * The opening tick is a COLD one, and a cold tick is not a routine tick.
+   *
+   * It reads everything uncached — snapshot, per-wallet balances, owned tokens, emigration
+   * rosters, target statuses — and holds the engine lock for the whole of it.
+   * routineTickMustYield cannot stop it, and is not what guards this: that window opens at
+   * `boundary - lead - 12s`, sized for a tick that starts at most one block early, while a
+   * restart can begin well before it and run straight through the fire. The wider
+   * coldStartMustDeferTick budget is the one that covers this.
+   *
+   * Measured at the epoch-180 boundary. An ally's engine threw a tick error (the poisoned
+   * block cache primeBlockCache now rejects), so they paused at boundary-57s and restarted at
+   * boundary-38s — 21 seconds before the quiet window even opens. The opening tick still held
+   * the lock when the fire came due, so the payments queued at boundary-0.9s instead of
+   * boundary-5s. By flush the boundary block already existed, raceTargetFrom correctly aimed
+   * at the block AFTER it, and both payments reverted against a rival audit that had landed in
+   * the block they were meant to be in. They were index 1 and 2 at 369 gwei — first in the
+   * wrong block.
+   *
+   * When a race is already armed the schedulers are all this start actually owes. Every fire
+   * re-syncs its own nonces and reads its own inputs (firePreBoundaryPay calls nonces.syncAll
+   * itself), and a pause/restart leaves in memory the chain state a refresh would rewrite. So
+   * arm the timers and let the first BLOCK tick do the refresh once the boundary is past.
+   *
+   * Fails open in the case that actually needs a tick: routineTickMustYield returns null when
+   * startTime is unknown — a genuinely cold process that has never read the chain — because
+   * ticking is what reads it, and going quiet there would be self-sustaining. It also returns
+   * null when nothing is armed, and an unarmed boundary has no race to protect.
+   */
+  const quiet = coldStartMustDeferTick(BigInt(Math.floor(Date.now() / 1000)));
+  if (quiet === null) {
+    void tick();
+    return;
+  }
+  activity.add({
+    kind: "info",
+    status: "info",
+    message:
+      `Engine started inside the epoch boundary window — holding back the opening refresh so ` +
+      `it cannot own the engine while the pre-boundary race fires. The armed timers are set ` +
+      `and will fire normally; routine ticking resumes once the boundary has passed.`,
+  });
+  scheduleJitBoundary();
+  schedulePreBoundaryPay();
+  schedulePreBoundaryAudit();
+  schedulePreBoundaryBundle();
+  scheduleDefenseBoundary();
 }
 
 export function stopEngine(): void {
@@ -736,6 +783,49 @@ export function routineTickMustYield(nowSec: bigint): bigint | null {
   if (boundary === null) return null;
   const leadSec = BigInt(Math.ceil(effectiveLeadMs() / 1000));
   const opens = boundary - leadSec - RACE_QUIET_BEFORE_SEC;
+  const closes = boundary + RACE_QUIET_AFTER_SEC;
+  return nowSec >= opens && nowSec <= closes ? boundary : null;
+}
+
+/**
+ * How close to an armed boundary a COLD start must not run its opening tick.
+ *
+ * Deliberately far wider than RACE_QUIET_BEFORE_SEC, because it answers a different question.
+ * The routine window is sized for a tick with ONE BLOCK of work ahead of it. The opening tick
+ * has all of it — snapshot, per-wallet balances, owned tokens, emigration rosters, target
+ * statuses, every one uncached — and holds the engine lock for the whole of it.
+ *
+ * Reusing the routine window here would be worse than useless: it opens at `boundary - lead -
+ * 12s`, and the restart that actually lost epoch 180 happened at boundary-38s, TWENTY-ONE
+ * SECONDS before that window opens. A guard that cannot see the case it was written for is
+ * the kind that looks correct in review and changes nothing on the night.
+ *
+ * 90s is the measured floor rounded up hard: a restart 38s out was still holding the lock when
+ * the fire came due 33s later, so anything under ~40s is demonstrably too small. Erring large
+ * is close to free — the only thing a deferred opening tick delays is a refresh the armed
+ * fires do not read (each re-syncs its own nonces and re-reads its own inputs), and the next
+ * block tick performs it anyway once the boundary is past.
+ */
+const COLD_START_QUIET_SEC = 90n;
+
+/**
+ * The boundary a cold start must not tick into, or null when it is safe to open with a tick.
+ *
+ * Fails open in the two cases that genuinely need the tick, matching routineTickMustYield:
+ * nothing armed (no race to protect), and an unknown startTime (a process that has never read
+ * the chain — the tick is what reads it, so deferring would be self-sustaining).
+ */
+// Exported for tests: like the routine window, getting this SIZING wrong is silent. A budget
+// that is too small looks identical to one that works, right up until a boundary is lost.
+export function coldStartMustDeferTick(nowSec: bigint): bigint | null {
+  const s = runtime.strategy;
+  const payArmed = s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null;
+  const auditArmed = s.preBoundaryAudit && s.offenseEnabled && s.autoAudit;
+  if (!payArmed && !auditArmed) return null;
+  const boundary = boundaryForArmedFire();
+  if (boundary === null) return null;
+  const leadSec = BigInt(Math.ceil(effectiveLeadMs() / 1000));
+  const opens = boundary - leadSec - COLD_START_QUIET_SEC;
   const closes = boundary + RACE_QUIET_AFTER_SEC;
   return nowSec >= opens && nowSec <= closes ? boundary : null;
 }

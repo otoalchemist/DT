@@ -314,10 +314,16 @@ describe("sweepNormalGas — what a mid-epoch audit pays", () => {
   });
 
   it("reverts to race gas inside the pre-boundary quiet window", async () => {
-    // 60s before the boundary that starts epoch 201. A cheap audit signed now could still
+    // 120s before the boundary that starts epoch 201. A cheap audit signed now could still
     // be pending when the boundary payment needs the next nonce from the same wallet, and
     // no tip on that payment can jump a lower nonce — so nothing cheap goes out here.
-    vi.setSystemTime(Number(EPOCH_SECONDS * CURRENT_EPOCH - 60n) * 1000);
+    //
+    // 120 and not 60, because `sweep()` runs its tick through startEngine and a cold start
+    // now DEFERS that tick within lead + 90s of an armed boundary (coldStartMustDeferTick) —
+    // at 60s out there would be no sweep at all to price. 120s still sits inside the 180s
+    // SWEEP_QUIET_WINDOW_SECONDS this test is about, so the property is unchanged; only the
+    // vehicle moved. The bound from the other side is asserted by the next test.
+    vi.setSystemTime(Number(EPOCH_SECONDS * CURRENT_EPOCH - 120n) * 1000);
     await sweep();
     const audits = wireTxs().filter((t) => !t.kill);
     expect(audits.length).toBeGreaterThan(0);
