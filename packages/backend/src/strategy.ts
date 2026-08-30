@@ -1217,7 +1217,11 @@ async function maybeQueueCoinbaseBid(kind: BidKind): Promise<void> {
   const amount = coinbaseBidFor(s, kind);
   if (amount <= 0 || !s.coinbasePayerAddress) return;
   const bidWei = parseEther(String(amount));
-  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei);
+  // The SAME kind that chose the amount also chooses the bid tx's gas profile. An audit-only
+  // bid rides an offense bundle, so pricing it off the payment tip contradicted the config
+  // the operator set — see queueCoinbaseBid. A payment in the bundle makes it a defensive
+  // boundary and keeps the payment profile, which is what the bid is buying position for.
+  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei, kind === "audit");
   if (!queued) return;
   // The bid is real ETH but it does NOT go through act(), so it was invisible to every
   // spend accounting path: "spent this epoch" under-reported it, the cumulative

@@ -354,3 +354,62 @@ describe("crossing into epoch 178", () => {
     expect(sendRawTransaction).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * An audit-only boundary WITH a bid, and separate offense gas.
+ *
+ * Reported by an operator: on nights where nothing is owed and only the audit bid is set,
+ * the bundle looked like it was priced off the PAYMENT gas settings rather than the offense
+ * ones. The audits themselves are fine — act() derives `offense` from the action kind — but
+ * the bid transaction is queued outside act(), and queueCoinbaseBid resolved its own fees
+ * with a hardcoded `computeFees(false, ...)`.
+ *
+ * The bid tx carries `data: "0x"`, so the harness signs it under the "99999999" selector.
+ */
+describe("audit-only boundary with a bid: the bid tx must use offense gas", () => {
+  const BID_TX = "99999999";
+  const auditOnly = () => {
+    // Nothing owed and nothing armed to pay: this is an offense-only night.
+    ownedLep = TARGET_EPOCH; // current, so no payment is due
+    runtime.strategy = {
+      ...runtime.strategy,
+      jitEnabled: false, jitTargetEpoch: null, preBoundaryPay: false, proactivePay: false,
+      combinedBoundaryBundle: false,      // exercise the standalone audit fire
+      coinbaseBidEth: 0,                  // payment bid off — this is the audit-only knob
+      coinbaseBidAuditOnlyEth: 0.01,
+    } as typeof runtime.strategy;
+  };
+
+  it("queues the bid at all, so the assertions below are not vacuous", async () => {
+    auditOnly();
+    await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY_TS });
+    await awaitPendingMirrors();
+    const txs = wireTxs();
+    expect(txs.some((t) => t.sel === AUDIT), "an audit must have gone").toBe(true);
+    expect(txs.some((t) => t.sel === BID_TX), "and the bid must have tailed it").toBe(true);
+  });
+
+  it("prices the bid tx at the AUDIT tip, not the payment tip", async () => {
+    auditOnly();
+    await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY_TS });
+    await awaitPendingMirrors();
+    const bid = wireTxs().find((t) => t.sel === BID_TX)!;
+    // 201 here means the bid tx inherited priorityFeeGwei from the payment profile on a
+    // boundary where the operator asked for 131 — overpaying on every audit-only night,
+    // and ignoring the offense dynamic-tip settings while it does.
+    expect(bid.tipGwei).toBe(AUDIT_TIP);
+  });
+
+  it("still prices the bid tx at the PAYMENT tip when a payment shares the bundle", async () => {
+    // The other side of the bound. A defensive boundary is a payment boundary, and the bid
+    // buying position for it must not be repriced down to the cheap offense tip.
+    ownedLep = TARGET_EPOCH - 2n;
+    runtime.strategy = {
+      ...runtime.strategy, coinbaseBidEth: 0.02, coinbaseBidAuditOnlyEth: 0.01,
+    } as typeof runtime.strategy;
+    await firePreBoundaryPay();
+    await awaitPendingMirrors();
+    const bid = wireTxs().find((t) => t.sel === BID_TX)!;
+    expect(bid.tipGwei).toBe(PAY_TIP);
+  });
+});

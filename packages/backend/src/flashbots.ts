@@ -678,7 +678,26 @@ const COINBASE_BID_GAS = 60_000n;
  * payment), and never mirrored to the mempool (coinbase is only meaningful in the
  * winning block). Returns whether it queued.
  */
-export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<boolean> {
+/**
+ * `offense` selects the gas profile for the bid transaction ITSELF — not the bid amount,
+ * which the caller has already resolved.
+ *
+ * It exists because this was hardcoded to `false`, and that is a real misconfiguration on an
+ * audit-only boundary. The audits in the bundle get offense gas (act() derives it from the
+ * action kind), but the bid is queued outside act(), so it silently kept the PAYMENT tip and
+ * the payment dynamic-tip settings. An operator running the common shape — an expensive
+ * payment tip, a cheap audit tip — paid the payment rate on every audit-only night. At the
+ * observed 201/131 split that is 70 gwei over COINBASE_BID_GAS of a transaction they had
+ * explicitly priced cheaper, and it ignored offenseDynamicTip* entirely on the way past.
+ *
+ * The caller passes the same distinction it already uses to pick the amount, so the bid tx
+ * and the bid value can never disagree about which kind of boundary this is.
+ */
+export async function queueCoinbaseBid(
+  payer: Address,
+  bidWei: bigint,
+  offense = false,
+): Promise<boolean> {
   if (bundleQueue === null || appConfig.mode !== "mainnet" || bidWei <= 0n) return false;
   // One bid buys position for the WHOLE bundle however many wallets contributed txs to
   // it, so it comes from the primary wallet rather than being split or duplicated.
@@ -686,7 +705,7 @@ export async function queueCoinbaseBid(payer: Address, bidWei: bigint): Promise<
   if (!account) return false;
   try {
     const latest = await getLatestBlockCached();
-    const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(false, latest);
+    const { maxFeePerGas, maxPriorityFeePerGas } = computeFees(offense, latest);
     const nonce = nonces.for(account.address).reserve();
     const signed = await signTx(
       account,
