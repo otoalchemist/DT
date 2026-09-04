@@ -169,7 +169,36 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   excludedTokenIds: [],
   preBoundaryPay: true,
   preBoundaryLeadMs: 3000,
-  preBoundaryLeadMainnetMs: 5000,
+  /**
+   * 8s, raised from 5s — the margin between reaching the boundary block and missing it.
+   *
+   * Builders seal well before the slot starts, so what this really buys is time to be
+   * ACCEPTED, not time to be early. Measured on one operator across three boundaries, all
+   * at the same 244 gwei and the same 0.02 ETH bid:
+   *
+   *   epoch 182  submitted boundary-2.4s  bundle intact at idx 12-14  paid
+   *   epoch 184  submitted boundary-0.8s  bundle intact at idx  3-5   paid
+   *   epoch 186  submitted boundary-0.6s  bundle MISSED the block     both payments reverted
+   *
+   * At 186 the bundle was taken for boundary+1 instead, where it got idx 0-1 — perfect
+   * placement, one block too late — while the mempool mirror leaked a single payment into
+   * the boundary block at idx 49, below a rival's 36 gwei/gas bundle at idx 47. The 0.02 ETH
+   * bid bought position in a block where there was nothing left to win.
+   *
+   * The cutoff sits somewhere under a second, and 5s of lead was leaving under 1s of real
+   * margin once signing and submission are paid for. 8s roughly triples that margin.
+   *
+   * Firing earlier does NOT expose us earlier, which is the property that makes this safe:
+   * the public-mempool mirror waits on the pre-boundary BLOCK existing
+   * (preBoundarySlotSettled), not on the clock, so the leak time is unchanged. The bundle
+   * copy is private either way, raceTargetFrom derives its target from the head's timestamp
+   * so the extra 3s still resolves to the same block, and maxFee carries a 2x base-fee
+   * buffer against the staler block this reads.
+   *
+   * Kept well under the 11s zod ceiling: past ~12s the head is a whole slot older and the
+   * arithmetic starts depending on a slot NOT being missed.
+   */
+  preBoundaryLeadMainnetMs: 8000,
   // Away mode is a run-mode choice like `enabled`, so it is NOT a RECOMMENDED_FIELD —
   // a defaults bump must never silently put the engine back on 24/7 polling.
   awayMode: false,
@@ -288,6 +317,19 @@ export function adoptRefreshedLists(previousSkippers: string[]): boolean {
 // Leaving it at 4 means 120 reaches NEW installs only; existing users keep what they set
 // and can opt in themselves.
 export const DEFAULTS_VERSION = 4;
+
+/**
+ * One-off config migrations that must run EXACTLY ONCE, stamped separately from
+ * DEFAULTS_VERSION so they can move a single field without refreshing all of RECOMMENDED_FIELDS.
+ *
+ * A value check alone is not enough and the difference is not cosmetic. "Raise the lead if it
+ * is still 5000" re-fires on every load, so a user who deliberately sets 5000 has it silently
+ * reverted at each restart — the value becomes unsettable. The stamp is what makes a migration
+ * a migration rather than a permanent override.
+ *
+ * 1: mainnet pre-boundary lead 5s -> 8s.
+ */
+export const MIGRATIONS_VERSION = 1;
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
@@ -466,6 +508,7 @@ class Runtime {
       const raw = JSON.parse(fs.readFileSync(p, "utf8"));
       // Meta key, not part of StrategyConfig. Absent => pre-versioning config (0).
       const savedDefaults = typeof raw.defaultsVersion === "number" ? raw.defaultsVersion : 0;
+      const savedMigrations = typeof raw.migrationsVersion === "number" ? raw.migrationsVersion : 0;
       // Keep only keys DEFAULT_STRATEGY still declares, so config.json doesn't carry
       // dead fields from retired settings across upgrades (and `defaultsVersion`
       // itself, which is file meta rather than strategy, is dropped here too).
@@ -486,10 +529,39 @@ class Runtime {
             `Set it separately to bid less on offense-only boundaries.`,
         );
       }
+      /**
+       * Raise the mainnet pre-boundary lead 5s -> 8s, for users still on the old shipped
+       * value. See DEFAULT_STRATEGY.preBoundaryLeadMainnetMs for why 5s was too tight.
+       *
+       * Done here rather than by bumping DEFAULTS_VERSION, and that distinction is the whole
+       * point. preBoundaryLeadMainnetMs is a RECOMMENDED_FIELD, so a version bump would also
+       * overwrite priorityFeeGwei, offensePriorityFeeGwei, both base-fee caps, both dynamic
+       * tip ceilings and the curated target list. Every operator hitting this problem runs a
+       * tip they chose deliberately — 200 to 369 gwei against a shipped 120 — so the bump
+       * would cut their tip to a third on the same boundary it was meant to help. That is
+       * the hazard the v1.3.4 note above records, and it applies here exactly.
+       *
+       * Only 5000 is touched: it was the shipped default, so it reads as "never changed".
+       * Anyone who set their own lead — including someone who deliberately chose 5000 — keeps
+       * it, and this cannot walk back a value already above 8000.
+       */
+      if (savedMigrations < 1 && merged.preBoundaryLeadMainnetMs === 5000) {
+        merged.preBoundaryLeadMainnetMs = 8000;
+        const msg =
+          `Config upgrade: pre-boundary lead raised 5s -> 8s. At 5s the bundle was reaching ` +
+          `builders with under a second of margin, and a boundary block missed by that much ` +
+          `costs the whole race. Change it in the JIT panel if you had a reason for 5s.`;
+        logger.info(msg);
+        activity.add({ kind: "info", status: "info", message: msg });
+      }
       this.strategy = merged as unknown as StrategyConfig;
       if (savedDefaults < DEFAULTS_VERSION) {
         this.strategy = this.applyRecommendedDefaults(this.strategy, savedDefaults);
         this.writeConfig(); // persist the migration + new stamp so it runs once
+      } else if (savedMigrations < MIGRATIONS_VERSION) {
+        // Stamp even when nothing changed, so each migration is attempted once and a value
+        // it moved stays settable afterwards.
+        this.writeConfig();
       }
     } catch (err) {
       logger.warn("Could not load strategy config:", (err as Error).message);
@@ -521,7 +593,7 @@ class Runtime {
       fs.mkdirSync(appConfig.dataDir, { recursive: true });
       fs.writeFileSync(
         this.configPath(),
-        JSON.stringify({ ...this.strategy, defaultsVersion: DEFAULTS_VERSION }, null, 2),
+        JSON.stringify({ ...this.strategy, defaultsVersion: DEFAULTS_VERSION, migrationsVersion: MIGRATIONS_VERSION }, null, 2),
       );
     } catch (err) {
       logger.warn("Could not save strategy config:", (err as Error).message);
