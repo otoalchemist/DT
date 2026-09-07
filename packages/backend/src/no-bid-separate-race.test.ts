@@ -251,6 +251,10 @@ beforeEach(() => {
   runtime.startTime = 0n;
   runtime.strategy = {
     ...DEFAULT_STRATEGY,
+    // These cases cover the MIRRORED, revert-tolerant path, which is no longer the
+    // shipped default (see DEFAULT_STRATEGY). Pinned explicitly so they keep testing
+    // the behaviour rather than whatever the default happens to be.
+    mirrorAudits: true, auditBundleAllOrNothing: false,
     preBoundaryPay: true, preBoundaryAudit: true,
     jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH), jitTokenIds: [],
     offenseEnabled: true, autoAudit: true,

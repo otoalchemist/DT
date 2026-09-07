@@ -240,6 +240,10 @@ beforeEach(() => {
   runtime.citizenSupply = 500n;
   runtime.strategy = {
     ...DEFAULT_STRATEGY,
+    // These cases cover the MIRRORED, revert-tolerant path, which is no longer the
+    // shipped default (see DEFAULT_STRATEGY). Pinned explicitly so they keep testing
+    // the behaviour rather than whatever the default happens to be.
+    mirrorAudits: true, auditBundleAllOrNothing: false,
     enabled: true, jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH),
     jitTokenIds: OWNED.map(String),
     preBoundaryPay: true, preBoundaryAudit: true,
@@ -527,7 +531,15 @@ describe("5 citizens, separate bundles, a bid on each", () => {
  * the wrong transaction.
  */
 describe("auditBundleAllOrNothing", () => {
-  it("defaults to revert-tolerant, naming every audit as allowed to revert", async () => {
+  it("SHIPS on — the audit bundle is all-or-nothing unless an operator turns it off", () => {
+    // This block's fixture pins the setting off (see the note at the top of the file), so
+    // the case below tests the OFF behaviour rather than the default. Assert the default
+    // separately, or the rename would quietly lose the only check on which way it ships.
+    expect(DEFAULT_STRATEGY.auditBundleAllOrNothing).toBe(true);
+    expect(DEFAULT_STRATEGY.mirrorAudits).toBe(false);
+  });
+
+  it("off, every audit is named as allowed to revert", async () => {
     await raceTheBoundary();
     expect(auditBundles().length).toBeGreaterThan(0);
     for (const b of auditBundles()) {

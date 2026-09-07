@@ -167,10 +167,18 @@ const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePr
 describe("combinedBundleActive routing predicate", () => {
   const base = { ...DEFAULT_STRATEGY, coinbasePayerAddress: "0x00000000000000000000000000000000000000b1" };
 
-  it("is false for the shipped default (combine on, no bid) — the safe no-op state", () => {
-    expect(DEFAULT_STRATEGY.combinedBoundaryBundle).toBe(true); // on by default...
-    expect(DEFAULT_STRATEGY.coinbaseBidEth).toBe(0); // ...but inert without a bid
+  it("is false for the shipped default (combine OFF) — now off rather than merely inert", () => {
+    // The default flipped: fusing is off, so the split path is what ships. Previously this
+    // read `combinedBoundaryBundle: true` and relied on a zero bid to keep it inert, which
+    // meant setting a bid silently fused the boundary — and a fused bundle is the one shape
+    // auditBundleAllOrNothing cannot be applied to (one cured target would drop every
+    // payment). Off at the source, the offense default stays reachable with a bid set.
+    expect(DEFAULT_STRATEGY.combinedBoundaryBundle).toBe(false);
+    expect(DEFAULT_STRATEGY.coinbaseBidEth).toBe(0);
     expect(combinedBundleActive(DEFAULT_STRATEGY)).toBe(false);
+    // ...and still false with a bid, which is the part that actually changed.
+    expect(combinedBundleActive({ ...DEFAULT_STRATEGY, coinbaseBidEth: 0.01,
+      coinbasePayerAddress: "0x00000000000000000000000000000000000000b1" })).toBe(false);
   });
 
   it("is true only when combine is on AND a bid is set AND a payer is present", () => {
@@ -1860,7 +1868,15 @@ describe("the audit sweep names its blocker when nothing went out", () => {
   });
 });
 
-describe("pre-boundary audit-only fire: revert-tolerant either way, never bundle-only", () => {
+/**
+ * The MIRRORED, revert-tolerant audit configuration — which used to be the only one.
+ *
+ * The title once read "revert-tolerant either way, never bundle-only", and that was a true
+ * invariant until mirrorAudits and auditBundleAllOrNothing existed to break it deliberately.
+ * Both are now shipped in the breaking direction, so this block pins them back on and covers
+ * the other half of each switch; 1.17.0's own suites cover the off side.
+ */
+describe("pre-boundary audit-only fire, mirrored and revert-tolerant", () => {
   const ADDR = "0x1111111111111111111111111111111111111111" as const;
   const PAYER = "0x00000000000000000000000000000000000000b1";
   const CURRENT = 200n;
@@ -1871,6 +1887,8 @@ describe("pre-boundary audit-only fire: revert-tolerant either way, never bundle
     autoAudit: true,
     preBoundaryAudit: true,
     racePublicMempool: true,
+    mirrorAudits: true,
+    auditBundleAllOrNothing: false,
     minBalanceEth: 0,
     maxBaseFeeGwei: 1000,
     endgameOnlyWithin: null,

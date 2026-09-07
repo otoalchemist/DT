@@ -144,3 +144,70 @@ describe("pre-boundary lead migration, 5s -> 8s", () => {
     expect(activity.add).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Migration 2 — the private, all-or-nothing, split offense defaults.
+ *
+ * Same vehicle as migration 1 and for the same reason: mirrorAudits and
+ * auditBundleAllOrNothing are not RECOMMENDED_FIELDS (a saved config keeps them forever), and
+ * combinedBoundaryBundle IS one, so the only alternative route would be a DEFAULTS_VERSION
+ * bump that also resets every operator's tip.
+ *
+ * Unlike migration 1 these are booleans, so this DOES override a deliberate choice. That is
+ * accepted and one-shot — the stamp is what makes it one-shot, and that is the property most
+ * worth pinning here.
+ */
+describe("offense defaults migration", () => {
+  const OLD = { mirrorAudits: true, auditBundleAllOrNothing: false, combinedBoundaryBundle: true };
+
+  it("ships all four of the requested defaults", () => {
+    expect(DEFAULT_STRATEGY.thorMode).toBe(false);
+    expect(DEFAULT_STRATEGY.mirrorAudits).toBe(false);
+    expect(DEFAULT_STRATEGY.auditBundleAllOrNothing).toBe(true);
+    expect(DEFAULT_STRATEGY.combinedBoundaryBundle).toBe(false);
+  });
+
+  it("moves an existing install off all three old values", () => {
+    saveConfig({ ...OLD, migrationsVersion: 1 });
+    runtime.loadStrategy();
+    expect(runtime.strategy.mirrorAudits).toBe(false);
+    expect(runtime.strategy.auditBundleAllOrNothing).toBe(true);
+    expect(runtime.strategy.combinedBoundaryBundle).toBe(false);
+  });
+
+  it("leaves the PAYMENT mirror alone — this is an offense change only", () => {
+    // The distinction the whole default rests on: a mirrored payment protects a citizen,
+    // a mirrored audit names a target. Thor Mode kills both; this must not.
+    saveConfig({ ...OLD, racePublicMempool: true, migrationsVersion: 1 });
+    runtime.loadStrategy();
+    expect(runtime.strategy.racePublicMempool).toBe(true);
+    expect(runtime.strategy.thorMode).toBe(false);
+  });
+
+  it("does not touch gas tuning, same as migration 1", () => {
+    saveConfig({ ...OLD, migrationsVersion: 1, priorityFeeGwei: 244, offensePriorityFeeGwei: 131 });
+    runtime.loadStrategy();
+    expect(runtime.strategy.priorityFeeGwei).toBe(244);
+    expect(runtime.strategy.offensePriorityFeeGwei).toBe(131);
+  });
+
+  it("runs ONCE — the settings stay settable afterwards", () => {
+    saveConfig({ ...OLD, migrationsVersion: 1 });
+    runtime.loadStrategy();
+    expect(readConfig().migrationsVersion).toBe(MIGRATIONS_VERSION);
+    // An operator who wants the old offense behaviour back must be able to keep it.
+    runtime.saveStrategy(OLD);
+    runtime.loadStrategy();
+    expect(runtime.strategy.mirrorAudits, "a deliberate re-enable must survive").toBe(true);
+    expect(runtime.strategy.auditBundleAllOrNothing).toBe(false);
+    expect(runtime.strategy.combinedBoundaryBundle).toBe(true);
+  });
+
+  it("is quiet when there is nothing left to move", async () => {
+    const { activity } = await import("./activity.js");
+    saveConfig({ mirrorAudits: false, auditBundleAllOrNothing: true,
+                 combinedBoundaryBundle: false, migrationsVersion: 1 });
+    runtime.loadStrategy();
+    expect(activity.add).not.toHaveBeenCalled();
+  });
+});
