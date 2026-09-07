@@ -13,6 +13,9 @@ const PAYMENT_FIELDS: (keyof StrategyConfig)[] = [
   "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
   "maxAutoPayEpochs", "coinbaseBidEth", "coinbaseBidAuditOnlyEth",
   "coinbasePayerAddress", "combinedBoundaryBundle",
+  // Mirrored from the Strategy panel (see the Offense Gas column). Listed here so this
+  // Save lights up for it; the Strategy panel lists it too, so either Save persists it.
+  "offenseEnabled",
 ];
 
 export function JitPanel({
@@ -142,6 +145,7 @@ export function JitPanel({
         coinbaseBidAuditOnlyEth: config.coinbaseBidAuditOnlyEth,
         coinbasePayerAddress: config.coinbasePayerAddress,
         combinedBoundaryBundle: config.combinedBoundaryBundle,
+        offenseEnabled: config.offenseEnabled,
       });
       onConfigSaved(next);
     } catch (e) {
@@ -330,21 +334,62 @@ export function JitPanel({
               <div style={{ color: "var(--green)", fontWeight: 600, fontSize: 12, marginBottom: 4 }}>
                 Offense Gas (audit / kill)
               </div>
+              {/* The SAME `offenseEnabled` field the Strategy panel owns, mirrored here rather
+                  than moved. It is the master switch for everything in this column, and tuning
+                  an audit tip that offense will never spend is the kind of mistake that only
+                  shows up as a boundary where nothing happened.
+
+                  Deliberately OUTSIDE the dimmed wrapper below: it is the one control that has
+                  to stay live when offense is off, or the column would have no way back on.
+
+                  Both panels write the same key, so toggling either updates both, and whichever
+                  Save is pressed persists it — offenseEnabled is in this panel's PAYMENT_FIELDS
+                  and payload as well as the Strategy panel's. */}
+              <label className="check" style={{ marginBottom: 2 }}>
+                <input
+                  type="checkbox"
+                  checked={config.offenseEnabled}
+                  onChange={(e) => gasField("offenseEnabled", e.target.checked)}
+                />
+                <b>Enable offense</b>
+              </label>
+              <div style={{ opacity: config.offenseEnabled ? 1 : 0.45 }}>
+              {!config.offenseEnabled && (
+                <p className="hint" style={{ margin: "0 0 4px 0" }}>
+                  Offense is off, so none of this is spent — no audits or kills are sent at all.
+                </p>
+              )}
               <label className="check" style={{ marginBottom: 2 }}>
                 <input
                   type="checkbox"
                   checked={config.separateOffenseGas}
                   onChange={(e) => gasField("separateOffenseGas", e.target.checked)}
+                  disabled={!config.offenseEnabled}
                 />
                 Price offense separately
               </label>
+              {/* Nested inside the offence dim: these four are exactly what resolveGas swaps
+                  when the split is on, so with it off they are the payment column's numbers
+                  and nothing here is read. They were already disabled; dimming them says the
+                  same thing at a glance instead of only on click.
+
+                  The Audit Coinbase Bid is deliberately NOT dimmed with this. separateOffenseGas
+                  selects tip and base-fee only — the audit bundle still carries
+                  coinbaseBidAuditOnlyEth either way, so greying it here would claim it is inert
+                  when it is still being spent. */}
+              {/* Defers when the offence dim above is already applied: CSS opacity nests
+                  multiplicatively, so 0.45 x 0.5 would put these at ~22% and make "off" read
+                  as "broken". Only one dim is ever in effect. */}
+              <div style={{
+                opacity: !config.offenseEnabled || config.separateOffenseGas ? 1 : 0.5,
+              }}>
               <label className="field" style={{ marginBottom: 4 }}>
                 Priority fee / tip (gwei)
                 <input
                   type="number" min={0} step={0.1}
                   value={config.offensePriorityFeeGwei}
                   onChange={(e) => gasField("offensePriorityFeeGwei", Number(e.target.value))}
-                  disabled={!config.separateOffenseGas}
+                  disabled={!config.separateOffenseGas || !config.offenseEnabled}
                   style={config.separateOffenseGas ? { borderColor: "var(--green)", fontWeight: 600 } : undefined}
                 />
                 {!config.separateOffenseGas && (
@@ -358,7 +403,7 @@ export function JitPanel({
                   type="checkbox"
                   checked={config.offenseDynamicTipEnabled}
                   onChange={(e) => gasField("offenseDynamicTipEnabled", e.target.checked)}
-                  disabled={!config.separateOffenseGas}
+                  disabled={!config.separateOffenseGas || !config.offenseEnabled}
                 />
                 Dynamic tip (scale with block fullness)
               </label>
@@ -368,7 +413,7 @@ export function JitPanel({
                   type="number" min={0} step={1}
                   value={config.offenseDynamicTipMaxGwei}
                   onChange={(e) => gasField("offenseDynamicTipMaxGwei", Number(e.target.value))}
-                  disabled={!config.separateOffenseGas || !config.offenseDynamicTipEnabled}
+                  disabled={!config.separateOffenseGas || !config.offenseDynamicTipEnabled || !config.offenseEnabled}
                 />
                 {config.separateOffenseGas && config.offenseDynamicTipEnabled
                   && config.offenseDynamicTipMaxGwei < config.offensePriorityFeeGwei && (
@@ -384,9 +429,11 @@ export function JitPanel({
                   type="number" min={0}
                   value={config.offenseMaxBaseFeeGwei}
                   onChange={(e) => gasField("offenseMaxBaseFeeGwei", Number(e.target.value))}
-                  disabled={!config.separateOffenseGas}
+                  disabled={!config.separateOffenseGas || !config.offenseEnabled}
                 />
               </label>
+              </div>
+              </div>
             </div>
           </div>
           {/* "Race into the boundary block" (preBoundaryPay + lead times) is
@@ -513,21 +560,41 @@ export function JitPanel({
                   Bid high here.
                 </p>
               </div>
-              <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10 }}>
+              {/* Dimmed with offense, because every path that could spend this bid is gated on
+                  offenseEnabled: firePreBoundaryAudit and firePreBoundaryKill both return early
+                  without it, and the fused fire only selects the audit bid when no payment was
+                  queued — which then requires an audit to have been queued, and none is. So
+                  with offense off this is unspendable, and a funded field that cannot be spent
+                  reads as money at risk. */}
+              <div style={{
+                flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10,
+                opacity: config.offenseEnabled ? 1 : 0.45,
+              }}>
                 <label className="field" style={{ marginBottom: 4 }}>
                   <span style={{ color: "var(--green)", fontWeight: 600 }}>Audit Coinbase Bid</span> (ETH)
                   <input
                     type="number" min={0} step={0.001}
                     value={config.coinbaseBidAuditOnlyEth}
                     onChange={(e) => gasField("coinbaseBidAuditOnlyEth", Math.max(0, Number(e.target.value) || 0))}
-                    style={config.coinbaseBidAuditOnlyEth > 0 ? { borderColor: "var(--green)", fontWeight: 600 } : undefined}
+                    disabled={!config.offenseEnabled}
+                    style={config.coinbaseBidAuditOnlyEth > 0 && config.offenseEnabled
+                      ? { borderColor: "var(--green)", fontWeight: 600 } : undefined}
                   />
                 </label>
                 <p className="muted" style={{ fontSize: 10, margin: 0, lineHeight: 1.45 }}>
-                  Only when <em>nothing is owed</em> and the bundle is audits alone.{" "}
-                  <b>Speculative — losing costs the audit fee only</b>, and the bundle is far
-                  smaller, so a given position is cheaper. Most epochs are these.
-                  0 = don't bid on them.
+                  {!config.offenseEnabled ? (
+                    <>
+                      Offense is off, so this can never be spent — no audit or kill bundle is
+                      built to carry it. Enable offense to use it.
+                    </>
+                  ) : (
+                    <>
+                      Only when <em>nothing is owed</em> and the bundle is audits alone.{" "}
+                      <b>Speculative — losing costs the audit fee only</b>, and the bundle is far
+                      smaller, so a given position is cheaper. Most epochs are these.
+                      0 = don&apos;t bid on them.
+                    </>
+                  )}
                 </p>
               </div>
             </div>
