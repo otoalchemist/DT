@@ -35,6 +35,7 @@ vi.mock("./activity.js", () => ({
   activity: { add: vi.fn(() => ({ id: "e1" })), update: vi.fn(), recent: vi.fn(() => []) },
 }));
 
+const { activity } = await import("./activity.js");
 const { runtime, DEFAULT_STRATEGY, DEFAULTS_VERSION, MIGRATIONS_VERSION } = await import("./runtime.js");
 
 const CONFIG = path.join(DATA_DIR, "config.json");
@@ -209,5 +210,58 @@ describe("offense defaults migration", () => {
                  combinedBoundaryBundle: false, migrationsVersion: 1 });
     runtime.loadStrategy();
     expect(activity.add).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Migration 3 — the payment path goes private and all-or-nothing.
+ *
+ * Kept separate from migration 2 in the code and here for the same reason: 2 changes which
+ * audits you win, 3 changes whether a payment lands at all. This is the only migration in the
+ * file that can cost a citizen, so the assertion that matters most is the LOUD one — an
+ * operator has to be told, because the fallback it removes is invisible until the night it
+ * would have saved them.
+ */
+describe("payment defaults migration", () => {
+  const OLD = { mirrorPayments: true, paymentBundleAllOrNothing: false };
+
+  it("ships both payment defaults in the private, all-or-nothing direction", () => {
+    expect(DEFAULT_STRATEGY.mirrorPayments).toBe(false);
+    expect(DEFAULT_STRATEGY.paymentBundleAllOrNothing).toBe(true);
+  });
+
+  it("moves an existing install off both old values", () => {
+    saveConfig({ ...OLD, migrationsVersion: 2 });
+    runtime.loadStrategy();
+    expect(runtime.strategy.mirrorPayments).toBe(false);
+    expect(runtime.strategy.paymentBundleAllOrNothing).toBe(true);
+  });
+
+  it("says the word CITIZEN, because that is what is being risked", () => {
+    // Not decoration. Every other config-upgrade notice in this file describes a trade between
+    // audits; this one has to distinguish itself from those or it reads as more of the same.
+    saveConfig({ ...OLD, migrationsVersion: 2 });
+    runtime.loadStrategy();
+    expect(activity.add).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("citizen") }),
+    );
+  });
+
+  it("does not touch gas tuning or the audit settings", () => {
+    saveConfig({ ...OLD, migrationsVersion: 2, priorityFeeGwei: 244, mirrorAudits: true });
+    runtime.loadStrategy();
+    expect(runtime.strategy.priorityFeeGwei).toBe(244);
+    // mirrorAudits is migration 2's business; already stamped past it, so it must survive.
+    expect(runtime.strategy.mirrorAudits).toBe(true);
+  });
+
+  it("runs ONCE — an operator can put the mirror back and keep it", () => {
+    saveConfig({ ...OLD, migrationsVersion: 2 });
+    runtime.loadStrategy();
+    expect(readConfig().migrationsVersion).toBe(MIGRATIONS_VERSION);
+    runtime.saveStrategy(OLD); // "I want the fallback, thanks"
+    runtime.loadStrategy();
+    expect(runtime.strategy.mirrorPayments, "a deliberate re-enable must survive").toBe(true);
+    expect(runtime.strategy.paymentBundleAllOrNothing).toBe(false);
   });
 });

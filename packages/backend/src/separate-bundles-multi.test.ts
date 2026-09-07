@@ -240,10 +240,11 @@ beforeEach(() => {
   runtime.citizenSupply = 500n;
   runtime.strategy = {
     ...DEFAULT_STRATEGY,
-    // These cases cover the MIRRORED, revert-tolerant path, which is no longer the
-    // shipped default (see DEFAULT_STRATEGY). Pinned explicitly so they keep testing
-    // the behaviour rather than whatever the default happens to be.
+    // These cases cover the MIRRORED, revert-tolerant path for BOTH halves, which is no
+    // longer the shipped default for either (see DEFAULT_STRATEGY). Pinned explicitly so they
+    // keep testing the behaviour rather than whatever the default happens to be.
     mirrorAudits: true, auditBundleAllOrNothing: false,
+    mirrorPayments: true, paymentBundleAllOrNothing: false,
     enabled: true, jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH),
     jitTokenIds: OWNED.map(String),
     preBoundaryPay: true, preBoundaryAudit: true,
@@ -670,7 +671,7 @@ describe("mirrorAudits", () => {
     expect(wireTxs().filter((t) => kindOf(t.sel) === "audit")).toHaveLength(5);
   });
 
-  it("on, both halves mirror — the behaviour it defaults to", async () => {
+  it("on, both halves mirror — no longer the default, but still the supported config", async () => {
     runtime.strategy = { ...runtime.strategy, mirrorAudits: true };
     await raceTheBoundary();
     const k = mirroredKinds();
@@ -811,9 +812,12 @@ describe("Thor Mode", () => {
 describe("payment privacy and revert economics", () => {
   const payBundles = () => bundles().filter((b) => kindsIn(b).includes("pay"));
 
-  it("defaults leave the payment path exactly as it was", () => {
-    expect(DEFAULT_STRATEGY.mirrorPayments).toBe(true);
-    expect(DEFAULT_STRATEGY.paymentBundleAllOrNothing).toBe(false);
+  it("SHIPS private and all-or-nothing — the payment path is no longer exempt", () => {
+    // Was "defaults leave the payment path exactly as it was". It no longer does: this is the
+    // only default in the bot that can cost a citizen rather than an audit, so it is asserted
+    // here rather than left to be inferred from the fixture pins above.
+    expect(DEFAULT_STRATEGY.mirrorPayments).toBe(false);
+    expect(DEFAULT_STRATEGY.paymentBundleAllOrNothing).toBe(true);
   });
 
   it("mirrors payments and keeps them revert-tolerant by default", async () => {
@@ -867,5 +871,46 @@ describe("payment privacy and revert economics", () => {
     expect(on.mirrorPayments).toBe(false);
     expect(on.paymentBundleAllOrNothing).toBe(true);
     expect(THOR_OVERRIDES.paymentBundleAllOrNothing && !THOR_OVERRIDES.mirrorPayments).toBe(true);
+  });
+});
+
+/**
+ * The incoherent pairing: all-or-nothing while payments are still mirrored.
+ *
+ * Reachable by hand — the Config panel disables the checkbox when mirroring is on but does not
+ * CLEAR the stored value, so turning the mirror back on leaves a `true` behind that the panel
+ * is telling the operator is inert. It is strictly worse than either setting alone: the bundle
+ * is dropped on any revert AND the mirrored copies land and revert anyway, so the atomic
+ * placement is lost and the gas is spent regardless.
+ *
+ * The engine therefore has to enforce what the panel promises rather than trust it.
+ */
+describe("all-or-nothing is inert while payments mirror", () => {
+  it("keeps payments revert-tolerant when the mirror is on, whatever the flag says", async () => {
+    runtime.strategy = {
+      ...runtime.strategy, mirrorPayments: true, paymentBundleAllOrNothing: true,
+    };
+    await raceTheBoundary();
+    const payBundles = bundles().filter((b) => kindsIn(b).includes("pay"));
+    expect(payBundles.length).toBeGreaterThan(0);
+    for (const b of payBundles) {
+      expect(kindsIn(b).filter((k) => k === "pay")).toHaveLength(5); // non-vacuity
+      // Tolerant, because dropping the bundle would save nothing here.
+      expect(b.revertKinds.filter((k) => k === "pay")).toHaveLength(5);
+    }
+    // And the mirror really is on, or the assertion above proves nothing.
+    expect(mirroredKinds().filter((k) => k === "pay")).toHaveLength(5);
+  });
+
+  it("applies it the moment the mirror goes off, with the flag unchanged", async () => {
+    // Same flag, opposite outcome — this is what makes the guard a dependency rather than a
+    // second off-switch that quietly disables the feature.
+    runtime.strategy = {
+      ...runtime.strategy, mirrorPayments: false, paymentBundleAllOrNothing: true,
+    };
+    await raceTheBoundary();
+    const payBundles = bundles().filter((b) => kindsIn(b).includes("pay"));
+    expect(payBundles.length).toBeGreaterThan(0);
+    for (const b of payBundles) expect(b.revertKinds).not.toContain("pay");
   });
 });

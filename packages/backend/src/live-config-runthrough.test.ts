@@ -214,10 +214,11 @@ beforeEach(() => {
   // The live configuration, verbatim.
   runtime.strategy = {
     ...DEFAULT_STRATEGY,
-    // These cases cover the MIRRORED, revert-tolerant path, which is no longer the
-    // shipped default (see DEFAULT_STRATEGY). Pinned explicitly so they keep testing
-    // the behaviour rather than whatever the default happens to be.
+    // These cases cover the MIRRORED, revert-tolerant path for BOTH halves, which is no
+    // longer the shipped default for either (see DEFAULT_STRATEGY). Pinned explicitly so they
+    // keep testing the behaviour rather than whatever the default happens to be.
     mirrorAudits: true, auditBundleAllOrNothing: false,
+    mirrorPayments: true, paymentBundleAllOrNothing: false,
     enabled: true, proactivePay: true, prepayEpochs: 1, maxAutoPayEpochs: 1,
     jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH), jitTokenIds: ["2036"],
     excludedTokenIds: [],

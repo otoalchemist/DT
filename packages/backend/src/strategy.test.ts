@@ -592,6 +592,11 @@ describe("combined boundary bundle with multiple citizens", () => {
     runtime.startTime = 0n;
     runtime.strategy = {
       ...DEFAULT_STRATEGY,
+      // Pinned: revert tolerance for payments is no longer the shipped default (see
+      // DEFAULT_STRATEGY.paymentBundleAllOrNothing). This block is about one bad payment not
+      // dropping its siblings, which IS the tolerant behaviour by definition.
+      mirrorPayments: true,
+      paymentBundleAllOrNothing: false,
       offenseEnabled: true,
       autoAudit: true,
       preBoundaryAudit: true,

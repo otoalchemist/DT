@@ -156,6 +156,10 @@ beforeEach(() => {
   runtime.strategy = {
     ...DEFAULT_STRATEGY,
     preBoundaryPay: true,
+    // Pinned: the mirrored, revert-tolerant payment path is no longer the shipped default
+    // (see DEFAULT_STRATEGY.mirrorPayments). These cases are about that behaviour, not about
+    // whichever way the default currently points.
+    mirrorPayments: true, paymentBundleAllOrNothing: false,
     jitEnabled: true,
     jitTargetEpoch: Number(TARGET_EPOCH),
     jitTokenIds: [],

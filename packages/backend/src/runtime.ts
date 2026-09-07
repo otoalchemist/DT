@@ -243,10 +243,30 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   thorMode: false,
   mirrorAudits: false,
   auditBundleAllOrNothing: true,
-  // Both default to today’s payment behaviour: mirrored, and revert-tolerant with siblings.
-  // Only Thor Mode moves them, because losing a payment costs a citizen rather than a slot.
-  mirrorPayments: true,
-  paymentBundleAllOrNothing: false,
+  /**
+   * The payment path is now private and all-or-nothing too, which makes the shipped default
+   * Thor Mode in everything but `racePublicMempool`.
+   *
+   * READ THIS BEFORE CHANGING IT BACK OR TAKING IT FURTHER. Every other default in this file
+   * trades an audit — an opportunity, recoverable next boundary. These two trade a CITIZEN.
+   * With the mirror off, a boundary whose slot is won by a builder we did not send to lands
+   * no payment at all, the citizen crosses to 2 behind, and it is auditable for a day. The
+   * bot then refuses to auto-pay it (automatic payment after an audit is deliberately off),
+   * so curing it is a manual act at the doubled price.
+   *
+   * The shipped estimate for that is ~9% of boundaries, i.e. roughly one exposure every
+   * eleven days per operator. Measured against it: at the epoch-186 boundary the mirror was
+   * the only reason a payment reached the boundary block at all — though it reverted there
+   * anyway, which is the honest counterweight, since a mirror that lands into a lost race
+   * buys a revert rather than a citizen.
+   *
+   * They ship together because neither is coherent alone. All-or-nothing while the payments
+   * are still broadcast is strictly worse than either setting by itself: the bundle is
+   * dropped AND the mirrored copies land and revert, so the atomic placement is lost and the
+   * gas is spent regardless. `tolerateReverts` enforces that pairing rather than trusting it.
+   */
+  mirrorPayments: false,
+  paymentBundleAllOrNothing: true,
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadRivalSkippers(),
   // The mid-epoch sweep goes wide and cheap; the boundary stays narrow and expensive.
@@ -383,6 +403,8 @@ export const DEFAULTS_VERSION = 4;
  * 1: mainnet pre-boundary lead 5s -> 8s.
  * 2: private, all-or-nothing, split offense — mirrorAudits off, auditBundleAllOrNothing on,
  *    combinedBoundaryBundle off.
+ * 3: the same for PAYMENTS — mirrorPayments off, paymentBundleAllOrNothing on. Unlike 2 this
+ *    one can cost a citizen rather than an audit; see DEFAULT_STRATEGY.mirrorPayments.
  *
  * A caveat that applies to 2 and not to 1, and is worth stating rather than discovering: these
  * are BOOLEANS, so "still the shipped default" and "deliberately chose the shipped default"
@@ -391,7 +413,7 @@ export const DEFAULTS_VERSION = 4;
  * and reversibly in the UI. That is the accepted cost of changing an offense default that is
  * losing audits in the field, not an oversight.
  */
-export const MIGRATIONS_VERSION = 2;
+export const MIGRATIONS_VERSION = 3;
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
@@ -653,6 +675,39 @@ class Runtime {
             `builder that ordered you last. Payments are untouched and still mirror. Split ` +
             `boundaries fund audits from the Audit Coinbase Bid — check it is set. Reverse ` +
             `any of this in Config if your targets are undefended.`;
+          logger.info(msg);
+          activity.add({ kind: "info", status: "info", message: msg });
+        }
+      }
+      /**
+       * Migration 3 — take the payment path private and all-or-nothing.
+       *
+       * Split from migration 2 rather than folded into it so the two are separately legible in
+       * the record: 2 changed which audits you win, 3 changes whether a payment lands at all.
+       * An operator reading their activity log after a bad boundary should be able to tell
+       * which of the two moved it.
+       *
+       * Same one-shot stamp and the same boolean caveat as 2 (see MIGRATIONS_VERSION): this
+       * DOES override someone who deliberately kept the mirror on. Louder about it, because
+       * what is at stake is a citizen rather than an audit.
+       */
+      if (savedMigrations < 3) {
+        const flips: string[] = [];
+        if (merged.mirrorPayments === true) {
+          merged.mirrorPayments = false;
+          flips.push("pre-boundary payments are no longer mirrored to the public mempool");
+        }
+        if (merged.paymentBundleAllOrNothing === false) {
+          merged.paymentBundleAllOrNothing = true;
+          flips.push("the payment bundle is dropped rather than paying for a reverting payment");
+        }
+        if (flips.length > 0) {
+          const msg =
+            `Config upgrade — PAYMENT defaults changed: ${flips.join("; ")}. This is the one ` +
+            `that can cost a citizen: with no mirror, a boundary whose slot is won by a ` +
+            `builder we did not send to lands no payment at all, and that citizen is ` +
+            `auditable for a day. Re-enable the payment mirror in Config if you would rather ` +
+            `keep the fallback than the privacy.`;
           logger.info(msg);
           activity.add({ kind: "info", status: "info", message: msg });
         }

@@ -1100,7 +1100,22 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
    * Payments keep their mempool mirror either way (`bundleOnly` is never set for them): that
    * is what makes this safe rather than a trade of one failure mode for a worse one.
    */
-  const tolerateReverts = !s.paymentBundleAllOrNothing && owing.length >= 2;
+  /**
+   * All-or-nothing only takes effect once payments are PRIVATE, and that guard is load-bearing
+   * rather than tidy.
+   *
+   * With the mirror on, dropping the bundle does not stop the transactions reaching the chain:
+   * the mirrored copies land and revert anyway, so the gas is spent AND the bundle's atomic
+   * placement is lost. That combination is strictly worse than either setting alone, which is
+   * why it must be unreachable rather than merely discouraged.
+   *
+   * The Config panel already disables the checkbox while mirroring is on and says it is
+   * unavailable. It does not CLEAR the stored value though, so a user who turns mirroring back
+   * on carries a `true` the panel is telling them is inert — and without this the engine would
+   * quietly act on it. Enforcing it here is what keeps the panel honest.
+   */
+  const tolerateReverts =
+    (s.mirrorPayments || !s.paymentBundleAllOrNothing) && owing.length >= 2;
 
   for (const { id, key, value } of owing) {
     const guard = await canSpend(value, false, walletForToken(key)); // max-base-fee, floor, max-payment caps
