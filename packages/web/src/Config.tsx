@@ -459,9 +459,13 @@ export function Config({
           Fuse the payment and audit bundles onto one coinbase bid
           <span className="hint" style={{ display: "block" }}>
             Off is two bundles with two independent bids, which is what the two bid fields in
-            the JIT panel imply. On, and with any bid funded, they become one bundle on one bid
-            and the audit bid never fires. The JIT panel's fused/split badge shows which you
-            are actually running.
+            the JIT panel imply. On, and with any bid funded, they become one bundle on one
+            bid — and <b>which</b> bid is decided at fire time by what ends up in the bundle: a
+            payment in it spends the Payment bid, a night where nothing is owed spends the
+            Audit bid. Never both, and never the sum. So both fields still need funding while
+            this is on; a fused bundle that selects the one you left at 0 gets no bid at all,
+            and its audits carry no mempool copy either. The JIT panel's fused/split badge
+            shows which you are actually running.
           </span>
         </label>
       </div>

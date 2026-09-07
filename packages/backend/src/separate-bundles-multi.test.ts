@@ -140,6 +140,7 @@ const contract = await import("./contract.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { awaitPendingMirrors } = await import("./flashbots.js");
 const { nonces } = await import("./nonce.js");
+const { activity } = await import("./activity.js");
 const { applyThorMode, thorModeSettled, THOR_OVERRIDES } = await import("@dat-bot/shared");
 const {
   firePreBoundaryPay, firePreBoundaryAudit, firePreBoundaryBundle,
@@ -1138,5 +1139,84 @@ describe("AUDIT: blast radius of an all-or-nothing, unmirrored boundary", () => 
     );
     await jitPass(OWNED, TARGET_EPOCH, BOUNDARY_TS + 12n);
     expect(bundles().flatMap((b) => b.txs.filter((t) => kindOf(t.sel) === "pay"))).toHaveLength(0);
+  });
+});
+
+/**
+ * Which coinbase bid a FUSED bundle actually spends.
+ *
+ * Not the sum of the two, and not always the payment bid: `firePreBoundaryBundle` picks ONE
+ * kind at fire time from what got queued — a payment in the bundle makes it the payment bid,
+ * an audit-only night makes it the audit bid. Worth pinning because both the Config hint and
+ * bundle-mode.test.ts's own preamble say "the audit bid never fires" when fused, which is true
+ * only for the half of the case they were thinking about.
+ */
+describe("AUDIT: which bid a fused bundle spends", () => {
+  const fused = (over: Record<string, unknown> = {}) => ({
+    ...DEFAULT_STRATEGY,
+    enabled: true, jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH),
+    jitTokenIds: OWNED.map(String), preBoundaryPay: true, preBoundaryAudit: true,
+    offenseEnabled: true, autoAudit: true, offenseTargetTokenIds: RIVALS,
+    minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, offenseMaxBaseFeeGwei: 1000,
+    priorityFeeGwei: PAY_TIP, offensePriorityFeeGwei: AUDIT_TIP, separateOffenseGas: true,
+    endgameOnlyWithin: null, coinbasePayerAddress: PAYER,
+    combinedBoundaryBundle: true,
+    coinbaseBidEth: PAY_BID, coinbaseBidAuditOnlyEth: AUDIT_BID,
+    ...over,
+  });
+  /** Distinct bid transactions on the wire, by ETH value. */
+  const bidValues = () => [...new Set(
+    bundles().flatMap((b) => b.txs.filter((t) => kindOf(t.sel) === "bid").map((t) => t.valueEth)),
+  )];
+
+  it("spends the PAYMENT bid, once, when a payment is in the bundle", async () => {
+    runtime.strategy = fused() as typeof runtime.strategy;
+    await raceTheBoundaryFused();
+    expect(bidValues()).toEqual([PAY_BID]);
+  });
+
+  it("is never the SUM of the two bids", async () => {
+    runtime.strategy = fused() as typeof runtime.strategy;
+    await raceTheBoundaryFused();
+    expect(bidValues()).not.toContain(PAY_BID + AUDIT_BID);
+    // One bid transaction, not two — the fused bundle buys one position.
+    const bidNonces = new Set(bundles().flatMap((b) =>
+      b.txs.filter((t) => kindOf(t.sel) === "bid").map((t) => t.nonce)));
+    expect(bidNonces.size).toBe(1);
+  });
+
+  it("spends the AUDIT bid on an audit-only fused boundary — it does NOT 'never fire'", async () => {
+    // Nothing owed, so paidInBundle is empty and bidKind resolves to "audit". This is the half
+    // the Config hint gets wrong.
+    ownedLep = TARGET_EPOCH; // already current: no payment is due
+    runtime.strategy = fused() as typeof runtime.strategy;
+    await raceTheBoundaryFused();
+    expect(bidValues()).toEqual([AUDIT_BID]);
+  });
+
+  it("HAZARD: audit-only fused with the audit bid zeroed leaves the audits with NEITHER bid nor mirror", async () => {
+    /**
+     * Reachable from the Config hint's own advice. "The audit bid never fires" invites zeroing
+     * it — and combinedBundleActive is satisfied by EITHER bid, so a funded payment bid keeps
+     * the fused fire running on an audit-only night. bidKind is then "audit", the amount is 0,
+     * maybeQueueCoinbaseBid returns early, and the audits are bundle-only by construction in
+     * this path.
+     *
+     * The comment above the bid call claims "the audits always have the bid backing them".
+     * That holds only when the bid that gets SELECTED is the funded one.
+     */
+    ownedLep = TARGET_EPOCH;
+    runtime.strategy = fused({ coinbaseBidAuditOnlyEth: 0 }) as typeof runtime.strategy;
+    await raceTheBoundaryFused();
+
+    const audits = bundles().flatMap((b) => b.txs.filter((t) => kindOf(t.sel) === "audit"));
+    expect(audits.length, "audits were queued").toBeGreaterThan(0);
+    expect(bidValues(), "but no bid backs them").toEqual([]);
+    expect(mirroredKinds(), "and nothing mirrors them either").toEqual([]);
+    // ...which is now SAID, rather than being a silent dead end. The warning is the whole
+    // mitigation: re-routing to the funded bid would spend money nobody configured, and
+    // refusing to fuse would make the dashboard badge depend on fire-time state.
+    const acts = (activity.add as unknown as { mock: { calls: [{ message: string }][] } }).mock.calls;
+    expect(acts.map((c) => c[0].message).join(" ")).toContain("selected the audit coinbase bid, which is 0");
   });
 });

@@ -27,7 +27,14 @@ const { combinedBundleActive } = await import("./strategy.js");
  * This exists because the config's real behaviour surprised an operator twice. A "Payment
  * Coinbase Bid" field beside an "Audit Coinbase Bid" field reads as two bundles with two
  * bids — but with `combinedBoundaryBundle` on and a bid funded, the fires FUSE into one
- * bundle on one bid, and the audit bid never fires at all.
+ * bundle on one bid.
+ *
+ * That last clause used to read "and the audit bid never fires at all", which is wrong and was
+ * repeated in the Config panel's own hint. Which bid fires is decided at fire time by what got
+ * queued: a payment in the bundle spends the payment bid, an audit-only night spends the AUDIT
+ * bid. The mistake mattered — it invited zeroing the audit bid, and a fused audit-only bundle
+ * that selects an unfunded bid gets no bid and no mempool copy. See the fused-bid cases in
+ * separate-bundles-multi.test.ts, and the fire-time warning in firePreBoundaryBundle.
  *
  * So the badge is only worth rendering if it cannot disagree with the engine, which is why
  * both read the same shared function. The last case here is the one that matters: it asserts

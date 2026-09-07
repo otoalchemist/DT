@@ -2102,7 +2102,35 @@ export async function firePreBoundaryBundle(): Promise<void> {
     // a payment in the bundle makes it a must-land defensive boundary, otherwise it is an
     // ordinary offense night on the cheaper bid.
     const bidKind: BidKind = paidInBundle.size > 0 ? "payment" : "audit";
-    if (paidInBundle.size > 0 || auditQueued) await maybeQueueCoinbaseBid(bidKind);
+    if (paidInBundle.size > 0 || auditQueued) {
+      /**
+       * The selected bid can be the UNFUNDED one, and that is a silent dead end.
+       *
+       * `combinedBundleActive` is satisfied by EITHER bid, so a funded payment bid keeps this
+       * fire running on a night where nothing is owed — and then `bidKind` resolves to "audit".
+       * If that one is zero, `maybeQueueCoinbaseBid` returns without queuing, and the audits
+       * above were added with `bundleOnly: true`, so they have neither a bid nor a mempool
+       * copy. Nothing lands and nothing says why.
+       *
+       * The note above this call used to assert the audits "always have the bid backing them".
+       * That holds only when the bid that gets SELECTED is the funded one, which is not what
+       * `combinedBundleActive` checks. Warn rather than silently re-route: picking the other
+       * bid would spend money the operator did not configure, and refusing to fuse here would
+       * make the dashboard's fused/split badge depend on something only known at fire time.
+       */
+      if (coinbaseBidFor(s, bidKind) <= 0) {
+        const other: BidKind = bidKind === "audit" ? "payment" : "audit";
+        const msg =
+          `Fused boundary selected the ${bidKind} coinbase bid, which is 0 — so this bundle ` +
+          `has no bid, and a fused bundle's audits carry no mempool copy either. The ` +
+          `${other} bid is funded but does not apply here: which bid fires is decided by ` +
+          `whether a payment made it into the bundle, not by which one you set. Fund the ` +
+          `${bidKind} bid, or turn off "Fuse the payment and audit bundles".`;
+        logger.warn(msg);
+        activity.add({ kind: "info", status: "skipped", message: msg });
+      }
+      await maybeQueueCoinbaseBid(bidKind);
+    }
   } catch (err) {
     logger.error("pre-boundary bundle error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary bundle error: ${(err as Error).message}` });

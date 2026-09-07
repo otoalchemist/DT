@@ -289,14 +289,11 @@ export function JitPanel({
                   style={{ borderColor: "var(--accent)", fontWeight: 600 }}
                 />
               </label>
-              <label className="field" style={{ marginBottom: 4 }}>
-                Max base fee (gwei)
-                <input
-                  type="number" min={0}
-                  value={config.maxBaseFeeGwei}
-                  onChange={(e) => gasField("maxBaseFeeGwei", Number(e.target.value))}
-                />
-              </label>
+              {/* Dynamic tip sits directly under the static tip it modifies, and above the base
+                  fee cap. The two tip fields are one decision — the static tip is a floor and
+                  the dynamic max is its ceiling — so reading them apart invited setting the max
+                  below the floor, which does nothing (the warning below exists for exactly that
+                  mistake). The base-fee cap is a separate guardrail and now reads as one. */}
               <label className="check" style={{ marginBottom: 2 }}>
                 <input
                   type="checkbox"
@@ -305,7 +302,7 @@ export function JitPanel({
                 />
                 Dynamic tip (scale with block fullness)
               </label>
-              <label className="field" style={{ marginLeft: 24, marginBottom: 0 }}>
+              <label className="field" style={{ marginLeft: 24, marginBottom: 4 }}>
                 Max dynamic tip (gwei)
                 <input
                   type="number" min={0} step={1}
@@ -319,6 +316,14 @@ export function JitPanel({
                     never lowered. Set it above {config.priorityFeeGwei} to have any effect.
                   </span>
                 )}
+              </label>
+              <label className="field" style={{ marginBottom: 0 }}>
+                Max base fee (gwei)
+                <input
+                  type="number" min={0}
+                  value={config.maxBaseFeeGwei}
+                  onChange={(e) => gasField("maxBaseFeeGwei", Number(e.target.value))}
+                />
               </label>
             </div>
             <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10 }}>
@@ -346,15 +351,8 @@ export function JitPanel({
                   <span className="hint">Off: audits and kills use the payment tip on the left.</span>
                 )}
               </label>
-              <label className="field" style={{ marginBottom: 4 }}>
-                Max base fee (gwei)
-                <input
-                  type="number" min={0}
-                  value={config.offenseMaxBaseFeeGwei}
-                  onChange={(e) => gasField("offenseMaxBaseFeeGwei", Number(e.target.value))}
-                  disabled={!config.separateOffenseGas}
-                />
-              </label>
+              {/* Same order as the payment column — the two are read side by side, so a field
+                  in a different row on each side is worse than either arrangement. */}
               <label className="check" style={{ marginBottom: 2 }}>
                 <input
                   type="checkbox"
@@ -364,7 +362,7 @@ export function JitPanel({
                 />
                 Dynamic tip (scale with block fullness)
               </label>
-              <label className="field" style={{ marginLeft: 24, marginBottom: 0 }}>
+              <label className="field" style={{ marginLeft: 24, marginBottom: 4 }}>
                 Max dynamic tip (gwei)
                 <input
                   type="number" min={0} step={1}
@@ -379,6 +377,15 @@ export function JitPanel({
                     {config.offensePriorityFeeGwei} to have any effect.
                   </span>
                 )}
+              </label>
+              <label className="field" style={{ marginBottom: 0 }}>
+                Max base fee (gwei)
+                <input
+                  type="number" min={0}
+                  value={config.offenseMaxBaseFeeGwei}
+                  onChange={(e) => gasField("offenseMaxBaseFeeGwei", Number(e.target.value))}
+                  disabled={!config.separateOffenseGas}
+                />
               </label>
             </div>
           </div>
