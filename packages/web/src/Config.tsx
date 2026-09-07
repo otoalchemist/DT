@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { StrategyConfig } from "@dat-bot/shared";
+import { mempoolPrivacySummary, type StrategyConfig } from "@dat-bot/shared";
 import { api } from "./api.js";
 
 /** Token ids out of free text: newline OR comma separated, blanks dropped. Kept apart
@@ -129,6 +129,12 @@ export function Config({
 }) {
   const [busy, setBusy] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+
+  // `cfg` is the EFFECTIVE config — applyThorMode folds its overrides in on load and on save
+  // — so this summary can never disagree with the engine the way one built from raw toggles
+  // could. Shown whether or not the section is expanded (see mempoolPrivacySummary).
+  const privacySummary = mempoolPrivacySummary(cfg);
 
   // True when any strategy-owned field differs from what's persisted on the backend.
   const dirty =
@@ -350,9 +356,31 @@ export function Config({
           loss. Turning it back off leaves the six settings where it put them.
         </span>
       </label>
+      {/* Collapsed by default — five switches with five paragraphs of hint buried the rest of
+          the panel, and on an ordinary night none of them is touched.
+
+          The one rule this must not break is the panel's own: never hide a value the engine is
+          using. So the summary line below reports the live state of all five whether or not the
+          section is open, and it reads them from `cfg` — which is already the EFFECTIVE config,
+          since applyThorMode folds the overrides in on load and save. Collapsing changes what
+          you have to scroll past, never what you can find out. */}
+      <button
+        type="button"
+        onClick={() => setPrivacyOpen((v) => !v)}
+        className="hint"
+        style={{
+          display: "block", width: "100%", textAlign: "left", background: "none",
+          border: "none", padding: "2px 0 2px 18px", cursor: "pointer", font: "inherit",
+        }}
+        aria-expanded={privacyOpen}
+      >
+        <span style={{ opacity: 0.7 }}>{privacyOpen ? "▾" : "▸"}</span>{" "}
+        {cfg.thorMode ? "Forced by Thor Mode" : "Individual switches"} —{" "}
+        <span style={{ opacity: 0.7 }}>{privacySummary}</span>
+      </button>
       {/* Deliberately still rendered while forced, rather than hidden: an operator needs to
           see WHAT Thor Mode did, and needs the individual switches back when it is off. */}
-      <div style={{ paddingLeft: 18, opacity: cfg.thorMode ? 0.65 : 1 }}>
+      <div hidden={!privacyOpen} style={{ paddingLeft: 18, opacity: cfg.thorMode ? 0.65 : 1 }}>
         <label className="check">
           <input
             type="checkbox"

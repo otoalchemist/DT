@@ -418,6 +418,37 @@ export const THOR_OVERRIDES: Readonly<
   paymentBundleAllOrNothing: true,
 };
 
+/**
+ * One line describing every mempool-privacy switch, for the collapsed Config section.
+ *
+ * Lives here rather than inline in the panel for the same reason `boundaryBundleMode` does:
+ * it is the label on a collapsed control, so if it ever disagrees with the engine the operator
+ * is reading a summary of settings nobody is using — and a wrong summary behind a collapsed
+ * section is worse than no summary, because nothing prompts them to open it and check.
+ *
+ * Takes the EFFECTIVE config (applyThorMode already folded in), and names only what is ON so
+ * the common case stays short. Never returns empty: the fused/split half always contributes,
+ * so a blank line can only mean a broken render, not a quiet default.
+ */
+export function mempoolPrivacySummary(
+  s: Pick<
+    StrategyConfig,
+    | "mirrorAudits"
+    | "mirrorPayments"
+    | "auditBundleAllOrNothing"
+    | "paymentBundleAllOrNothing"
+    | "combinedBoundaryBundle"
+  >,
+): string {
+  const on: string[] = [];
+  if (!s.mirrorAudits) on.push("audits private");
+  if (!s.mirrorPayments) on.push("payments private");
+  if (s.auditBundleAllOrNothing) on.push("audits all-or-nothing");
+  if (s.paymentBundleAllOrNothing) on.push("payments all-or-nothing");
+  on.push(s.combinedBoundaryBundle ? "fused" : "split");
+  return on.join(", ");
+}
+
 /** The fields Thor Mode controls, for rendering them as forced rather than editable. */
 export const THOR_FIELDS = Object.keys(THOR_OVERRIDES) as (keyof typeof THOR_OVERRIDES)[];
 
