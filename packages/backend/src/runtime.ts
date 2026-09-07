@@ -243,6 +243,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   thorMode: false,
   mirrorAudits: false,
   auditBundleAllOrNothing: true,
+  // Both default to today’s payment behaviour: mirrored, and revert-tolerant with siblings.
+  // Only Thor Mode moves them, because losing a payment costs a citizen rather than a slot.
+  mirrorPayments: true,
+  paymentBundleAllOrNothing: false,
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadRivalSkippers(),
   // The mid-epoch sweep goes wide and cheap; the boundary stays narrow and expensive.

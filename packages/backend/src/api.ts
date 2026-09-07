@@ -83,6 +83,8 @@ const strategyPatch = z
     offenseDynamicTipEnabled: z.boolean(),
     offenseDynamicTipMaxGwei: z.number().positive(),
     racePublicMempool: z.boolean(),
+    mirrorPayments: z.boolean(),
+    paymentBundleAllOrNothing: z.boolean(),
     dynamicTipEnabled: z.boolean(),
     dynamicTipMaxGwei: z.number().positive(),
     maxPaymentEth: z.number().min(0),

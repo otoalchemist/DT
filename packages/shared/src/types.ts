@@ -548,15 +548,45 @@ export interface StrategyConfig {
    *  audit is dropped rather than paid for.
    *
    *  Meant for the case it was named after: a defender who watches the mempool and cures the
-   *  exact tokens they see pending. Against an undefended board it is a straight loss — it
-   *  gives up the ~9% of boundaries built by solo validators, for offense only. Payments keep
-   *  their mempool mirror under Thor Mode; this never touches the payment path.
+   *  exact tokens they see pending.
+   *
+   *  It now covers PAYMENTS too, forcing `mirrorPayments` off and `paymentBundleAllOrNothing`
+   *  on. That is a real escalation and the reason it stays opt-in: a payment that only exists
+   *  in a bundle does not land at all on the ~9% of boundaries built by a solo validator, and
+   *  an unpaid citizen is auditable for a day. Offense-only Thor Mode risked an opportunity;
+   *  this risks a citizen.
+   *
+   *  The two go together by necessity rather than taste. Dropping the bundle on a reverting
+   *  payment saves nothing while a mirrored copy is still landing and reverting in the same
+   *  block, so all-or-nothing without privacy is half a feature.
    *
    *  Applied when the config is loaded and on every save, so `runtime.strategy` always holds
    *  the EFFECTIVE values and no reader has to know Thor Mode exists. Turning it back off
-   *  leaves the four flags where it put them — it is a preset, not a suspension. */
+   *  leaves the six flags where it put them — it is a preset, not a suspension. */
   thorMode: boolean;
   mirrorAudits: boolean;
+  /** Mirror pre-boundary PAYMENTS to the public mempool. On by default.
+   *
+   *  Scoped to the boundary race: manual, JIT and proactive payments mirror regardless, since
+   *  none of them is racing anyone and a lost slot there just means waiting a block.
+   *
+   *  Off is a deliberate trade, not an optimisation. The mirror is the only copy that can land
+   *  when no builder we sent to wins the slot, and a payment that fails to land costs a
+   *  CITIZEN rather than an opportunity — which is why this is separate from `mirrorAudits`
+   *  and why it is the one Thor Mode flag with teeth. A pending payment is also not
+   *  meaningfully front-runnable: the delinquency it answers is already on-chain. */
+  mirrorPayments: boolean;
+  /** Make the pre-boundary PAYMENT bundle all-or-nothing: a builder drops it whole rather
+   *  than including payments that revert.
+   *
+   *  Same economics as the audit side — a reverted payment costs gas and raises the block's
+   *  value to the builder that ordered you last — but a strictly worse failure mode, because
+   *  the thing dropped is mandatory. One citizen reverting `AlreadyCurrent`, or audited
+   *  earlier in the same block, takes every healthy sibling payment down with it.
+   *
+   *  Only meaningful with `mirrorPayments` off: while the mirror is on, the dropped bundle's
+   *  transactions still reach the chain and still revert, so the gas is spent either way. */
+  paymentBundleAllOrNothing: boolean;
   /** Make the standalone AUDIT bundle all-or-nothing: a builder drops it whole rather than
    *  including audits that revert.
    *

@@ -1100,7 +1100,7 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
    * Payments keep their mempool mirror either way (`bundleOnly` is never set for them): that
    * is what makes this safe rather than a trade of one failure mode for a worse one.
    */
-  const tolerateReverts = owing.length >= 2;
+  const tolerateReverts = !s.paymentBundleAllOrNothing && owing.length >= 2;
 
   for (const { id, key, value } of owing) {
     const guard = await canSpend(value, false, walletForToken(key)); // max-base-fee, floor, max-payment caps
@@ -2500,7 +2500,13 @@ async function act(
       // Audits riding a payment bundle and the coinbase bid stay bundle-only: mirroring an
       // audit adds a second mempool nonce that can demote the payment, and a bundle-only bid
       // is only meaningful in the block it wins.
-      race: ctx.bundleOnly ? false : offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
+      race: ctx.bundleOnly
+        ? false
+        : offense
+          ? (ctx.race && runtime.strategy.racePublicMempool)
+          // Payments: gated only on the RACE path. Manual, JIT and proactive payments are
+          // not racing anyone, so a lost slot there costs a block, not a citizen.
+          : (!ctx.race || runtime.strategy.mirrorPayments),
       offense,
       simTimestamp: ctx.simTimestamp,
       revertible: ctx.revertible,

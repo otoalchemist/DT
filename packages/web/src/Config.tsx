@@ -110,6 +110,7 @@ const STRATEGY_FIELDS: (keyof StrategyConfig)[] = [
   // Thor Mode and the flags it forces. combinedBoundaryBundle is listed because Thor Mode
   // changes it, so an unsaved-changes indicator that ignored it would under-report.
   "thorMode", "mirrorAudits", "auditBundleAllOrNothing", "combinedBoundaryBundle",
+  "mirrorPayments", "paymentBundleAllOrNothing",
   // NOTE: awayMode/awayLeadMinutes are deliberately absent. They live in the top bar as
   // an instant-apply control (like Start bot), so they persist the moment they're
   // pressed and must never light up this panel's unsaved-changes indicator.
@@ -339,13 +340,14 @@ export function Config({
         />
         <b>Thor Mode</b> — a fully private, fully split boundary
         <span className="hint" style={{ display: "block" }}>
-          One switch for the case where a defender is watching: it forces the three settings
+          One switch for the case where a defender is watching: it forces the five settings
           below, plus the mid-epoch offense mempool race (which has no switch of its own), so
-          nothing about offense is broadcast before a block is built.
-          <b>Payments still mirror</b> — this never touches the payment path.
-          Against an undefended board it is a straight loss, because it gives up the ~9% of
-          boundaries built by solo validators (for offense only). Turning it back off leaves
-          the four settings where it put them.
+          nothing at all is broadcast before a block is built.
+          <b>This now includes payments.</b> That is the part with teeth: a payment that only
+          exists in a bundle does not land on the ~9% of boundaries built by a solo validator,
+          and an unpaid citizen is auditable for a day. Every other flag here risks an
+          opportunity; this one risks a citizen. Against an undefended board it is a straight
+          loss. Turning it back off leaves the six settings where it put them.
         </span>
       </label>
       {/* Deliberately still rendered while forced, rather than hidden: an operator needs to
@@ -381,6 +383,42 @@ export function Config({
             succeeded with it, and a cure inside the block cannot be simulated in advance.
             Only ever applies to a <b>split</b> boundary, where audits have their own bundle —
             fused with a payment they stay revert-tolerant so they can never drop it.
+          </span>
+        </label>
+        {/* The payment pair. Deliberately last and deliberately labelled as the dangerous
+            half: every switch above trades an audit, these two trade a citizen. */}
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.mirrorPayments}
+            onChange={chk("mirrorPayments")}
+            disabled={cfg.thorMode}
+          />
+          Also send pre-boundary payments to the public mempool
+          <span className="hint" style={{ display: "block" }}>
+            <b>Leave this on unless you know why you are turning it off.</b> The mempool copy
+            is the only thing that can land a payment in a boundary block built by a solo
+            validator (~1 in 10), and a payment that does not land leaves that citizen
+            auditable for a day. Unlike an audit, a pending payment gives nothing away — the
+            delinquency it answers is already on-chain. Only the boundary race is affected;
+            manual, JIT and proactive payments mirror either way.
+          </span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.paymentBundleAllOrNothing}
+            onChange={chk("paymentBundleAllOrNothing")}
+            disabled={cfg.thorMode || cfg.mirrorPayments}
+          />
+          Drop the payment bundle rather than pay for a reverting payment
+          <span className="hint" style={{ display: "block" }}>
+            Same economics as the audit version, worse failure mode: the thing dropped is
+            mandatory, so one citizen reverting — already current, or audited earlier in the
+            same block — takes every healthy sibling payment down with it.
+            {cfg.mirrorPayments
+              ? " Unavailable while payments mirror: the dropped bundle's transactions still reach the chain and still revert, so the gas is spent anyway."
+              : " Active, because payments are no longer mirrored."}
           </span>
         </label>
         <label className="check">

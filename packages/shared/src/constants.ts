@@ -5,7 +5,7 @@ import type { StrategyConfig } from "./types.js";
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.17.0" as const;
+export const VERSION = "1.18.0" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
@@ -380,15 +380,30 @@ export function coinbaseBidFundedFor(
  * the override is applied ONCE, to the stored config, and every reader — including the UI —
  * sees the same effective values.
  *
- * The three that go off are the three public-mempool leaks:
+ * The four that go off are the four public-mempool leaks:
  *   mirrorAudits           the pre-boundary audit mirror, which names targets before the block
  *   racePublicMempool      the same broadcast on the mid-epoch/offense race path
  *   combinedBoundaryBundle fusing, so audits ride the payment bundle and its bid
- * and the one that goes on is only safe once fusing is off:
- *   auditBundleAllOrNothing  drop the audit bundle rather than pay for reverting audits
+ *   mirrorPayments         the pre-boundary payment mirror — the one with teeth
+ * and the two that go on are each only safe once something above is off:
+ *   auditBundleAllOrNothing    drop the audit bundle rather than pay for reverting audits
+ *   paymentBundleAllOrNothing  the same for payments, and pointless while they mirror
+ *
+ * PAYMENTS ARE NO LONGER EXEMPT, and that is the one thing to know about this table. Every
+ * other flag here risks an opportunity; `mirrorPayments: false` risks a CITIZEN, because a
+ * payment that exists only in a bundle does not land at all on the ~9% of boundaries built by
+ * a solo validator, and an unpaid citizen is auditable for a day.
  */
 export const THOR_OVERRIDES: Readonly<
-  Pick<StrategyConfig, "mirrorAudits" | "racePublicMempool" | "combinedBoundaryBundle" | "auditBundleAllOrNothing">
+  Pick<
+    StrategyConfig,
+    | "mirrorAudits"
+    | "racePublicMempool"
+    | "combinedBoundaryBundle"
+    | "auditBundleAllOrNothing"
+    | "mirrorPayments"
+    | "paymentBundleAllOrNothing"
+  >
 > = {
   mirrorAudits: false,
   racePublicMempool: false,
@@ -396,6 +411,11 @@ export const THOR_OVERRIDES: Readonly<
   // Safe only because combinedBoundaryBundle is false above: in split mode the audits are
   // alone in their bundle, so all-or-nothing can never drop a payment. Fused it would.
   auditBundleAllOrNothing: true,
+  mirrorPayments: false,
+  // Only meaningful because mirrorPayments is false above. With the mirror on, a dropped
+  // bundle's transactions still reach the chain and still revert, so this would buy nothing
+  // while still costing the whole bundle to one stale citizen.
+  paymentBundleAllOrNothing: true,
 };
 
 /** The fields Thor Mode controls, for rendering them as forced rather than editable. */

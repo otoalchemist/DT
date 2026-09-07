@@ -710,17 +710,22 @@ describe("Thor Mode", () => {
     expect(on.priorityFeeGwei).toBe(base.priorityFeeGwei);
   });
 
-  it("pins the override table itself — exactly four fields, exactly these values", () => {
+  it("pins the override table itself — exactly six fields, exactly these values", () => {
     expect(THOR_OVERRIDES).toEqual({
       mirrorAudits: false,
       racePublicMempool: false,
       combinedBoundaryBundle: false,
       auditBundleAllOrNothing: true,
+      mirrorPayments: false,
+      paymentBundleAllOrNothing: true,
     });
-    // No fifth field can be added silently: Thor Mode writes whatever is in here, so a stray
-    // entry would change a boundary without anything else in the codebase mentioning it.
+    // No seventh field can be added silently: Thor Mode writes whatever is in here, so a stray
+    // entry would change a boundary without anything else in the codebase mentioning it. The
+    // two payment entries are the ones that make this check matter rather than tidy — they are
+    // the only flags in the table that can cost a citizen instead of an audit.
     expect(Object.keys(THOR_OVERRIDES).sort()).toEqual([
-      "auditBundleAllOrNothing", "combinedBoundaryBundle", "mirrorAudits", "racePublicMempool",
+      "auditBundleAllOrNothing", "combinedBoundaryBundle", "mirrorAudits", "mirrorPayments",
+      "paymentBundleAllOrNothing", "racePublicMempool",
     ]);
   });
 
@@ -762,13 +767,23 @@ describe("Thor Mode", () => {
     for (const b of bundles()) {
       expect(kindsIn(b).includes("pay") && kindsIn(b).includes("audit")).toBe(false);
     }
-    // 2. Offense is private; payments are not. This is the leak the mode exists to close.
-    expect(mirroredKinds()).toEqual(["pay", "pay", "pay", "pay", "pay"]);
+    // 2. NOTHING is mirrored — payments included. This is the escalation: the mode used to
+    //    close the offense leak only, and payments kept a fallback that could still land them
+    //    when no builder we sent to won the slot. Now a lost slot means no payment at all.
+    expect(mirroredKinds()).toEqual([]);
     // 3. The audit bundle is all-or-nothing (bid excepted), so a cured target costs nothing.
     expect(auditBundles().length).toBeGreaterThan(0);
     for (const b of auditBundles()) {
       expect(kindsIn(b).filter((k) => k === "audit")).toHaveLength(5);
       expect(b.revertKinds).not.toContain("audit");
+    }
+    // 3b. And so is the PAYMENT bundle, which is only coherent because of (2): while payments
+    //     mirror, dropping the bundle saves nothing because the mirrored copy still reverts.
+    const payBundles = bundles().filter((b) => kindsIn(b).includes("pay"));
+    expect(payBundles.length).toBeGreaterThan(0);
+    for (const b of payBundles) {
+      expect(kindsIn(b).filter((k) => k === "pay")).toHaveLength(5); // non-vacuity
+      expect(b.revertKinds).not.toContain("pay");
     }
     // 4. Still no nonce collision and no gap — the guarantees the rest of this file establishes
     //    have to survive the preset, since it changes which txs are mirrored and that is exactly
@@ -779,5 +794,78 @@ describe("Thor Mode", () => {
     const pay = wireTxs().filter((t) => kindOf(t.sel) === "pay").map((t) => t.nonce);
     const audit = wireTxs().filter((t) => kindOf(t.sel) === "audit").map((t) => t.nonce);
     expect(Math.max(...pay)).toBeLessThan(Math.min(...audit));
+  });
+});
+
+/**
+ * The payment half of Thor Mode.
+ *
+ * These two settings are the only ones in the preset that can cost a CITIZEN rather than an
+ * audit, so they get their own coverage rather than riding on the end-to-end shape test.
+ *
+ * The property that matters most is the DEPENDENCY between them: all-or-nothing on a bundle
+ * whose transactions are also being broadcast is not a safety feature, it is a way to pay the
+ * gas twice over. If a refactor ever lets paymentBundleAllOrNothing take effect while payments
+ * still mirror, the setting silently becomes worse than useless.
+ */
+describe("payment privacy and revert economics", () => {
+  const payBundles = () => bundles().filter((b) => kindsIn(b).includes("pay"));
+
+  it("defaults leave the payment path exactly as it was", () => {
+    expect(DEFAULT_STRATEGY.mirrorPayments).toBe(true);
+    expect(DEFAULT_STRATEGY.paymentBundleAllOrNothing).toBe(false);
+  });
+
+  it("mirrors payments and keeps them revert-tolerant by default", async () => {
+    await raceTheBoundary();
+    expect(mirroredKinds().filter((k) => k === "pay")).toHaveLength(5);
+    for (const b of payBundles()) {
+      expect(b.revertKinds.filter((k) => k === "pay")).toHaveLength(5);
+    }
+  });
+
+  it("mirrorPayments off makes the payment bundle the only copy", async () => {
+    runtime.strategy = { ...runtime.strategy, mirrorPayments: false };
+    await raceTheBoundary();
+    expect(mirroredKinds().filter((k) => k === "pay")).toHaveLength(0);
+    // Non-vacuity: the payments must still be REACHING a builder, or "not mirrored" is
+    // indistinguishable from "never sent".
+    expect(payBundles().length).toBeGreaterThan(0);
+    for (const b of payBundles()) {
+      expect(kindsIn(b).filter((k) => k === "pay")).toHaveLength(5);
+    }
+  });
+
+  it("paymentBundleAllOrNothing drops every payment from the permitted-revert list", async () => {
+    runtime.strategy = {
+      ...runtime.strategy, mirrorPayments: false, paymentBundleAllOrNothing: true,
+    };
+    await raceTheBoundary();
+    expect(payBundles().length).toBeGreaterThan(0);
+    for (const b of payBundles()) {
+      expect(kindsIn(b).filter((k) => k === "pay")).toHaveLength(5); // non-vacuity
+      expect(b.revertKinds).not.toContain("pay");
+    }
+  });
+
+  it("leaves the payment bundle's own coinbase bid revert-tolerant", async () => {
+    // Same carve-out the audit bundle gets: a misconfigured payer must never be able to drop
+    // five healthy payments. The bid is the one tx in the bundle that is allowed to fail.
+    runtime.strategy = {
+      ...runtime.strategy, mirrorPayments: false, paymentBundleAllOrNothing: true,
+    };
+    await raceTheBoundary();
+    const withBid = payBundles().filter((b) => kindsIn(b).includes("bid"));
+    expect(withBid.length).toBeGreaterThan(0);
+    for (const b of withBid) expect(b.revertKinds).toContain("bid");
+  });
+
+  it("Thor Mode turns both on together, never one without the other", () => {
+    // The dependency, asserted on the preset rather than on prose. All-or-nothing while
+    // mirroring is the failure mode this pairing exists to make unreachable.
+    const on = applyThorMode({ ...DEFAULT_STRATEGY, thorMode: true });
+    expect(on.mirrorPayments).toBe(false);
+    expect(on.paymentBundleAllOrNothing).toBe(true);
+    expect(THOR_OVERRIDES.paymentBundleAllOrNothing && !THOR_OVERRIDES.mirrorPayments).toBe(true);
   });
 });
