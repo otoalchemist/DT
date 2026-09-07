@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { PrivateKeyAccount } from "viem/accounts";
-import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
+import { VERSION, applyThorMode, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { activity } from "./activity.js";
@@ -209,6 +209,19 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseEnabled: true,
   autoAudit: true,
   autoKill: false, // opt-in: killing an expired-audit token is free but aggressive
+  // On: the contract allows a behind citizen to audit, and holding its slot back wastes the
+  // slot whenever that citizen survives — which is the common case. Under-audit citizens are
+  // still excluded, so the genuinely dying asset is never committed.
+  auditWhileBehind: true,
+  // Both default to today's behaviour, so syncing does not change anyone's boundary.
+  // Mirroring buys solo-validator reach at the cost of telegraphing targets, and
+  // all-or-nothing trades gas-on-a-failed-audit for no audit at all — which side wins
+  // depends on whether an operator's targets are actively defended, so neither is imposed.
+  // Off by default: it costs solo-validator reach, and most boards are not defended by
+  // someone reading the mempool. It is a response to a specific opponent, not a baseline.
+  thorMode: false,
+  mirrorAudits: true,
+  auditBundleAllOrNothing: false,
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadRivalSkippers(),
   // The mid-epoch sweep goes wide and cheap; the boundary stays narrow and expensive.
@@ -557,6 +570,14 @@ class Runtime {
       this.strategy = merged as unknown as StrategyConfig;
       if (savedDefaults < DEFAULTS_VERSION) {
         this.strategy = this.applyRecommendedDefaults(this.strategy, savedDefaults);
+      }
+      // AFTER the defaults refresh, deliberately: combinedBoundaryBundle is a RECOMMENDED
+      // field, so a refresh would otherwise hand a Thor-Mode operator a fused bundle back.
+      // And BEFORE writeConfig, so the file on disk is the config the engine is running —
+      // writing first would persist the pre-override values and leave the two disagreeing
+      // until the next save.
+      this.strategy = applyThorMode(this.strategy);
+      if (savedDefaults < DEFAULTS_VERSION) {
         this.writeConfig(); // persist the migration + new stamp so it runs once
       } else if (savedMigrations < MIGRATIONS_VERSION) {
         // Stamp even when nothing changed, so each migration is attempted once and a value
@@ -601,7 +622,9 @@ class Runtime {
   }
 
   saveStrategy(next: Partial<StrategyConfig>): StrategyConfig {
-    this.strategy = { ...this.strategy, ...next };
+    // Folded in here rather than at each read site, so runtime.strategy is always the
+    // effective config and what config.json shows is what the engine does.
+    this.strategy = applyThorMode({ ...this.strategy, ...next });
     this.writeConfig();
     this.emitStatus();
     return this.strategy;

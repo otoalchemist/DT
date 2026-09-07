@@ -29,7 +29,12 @@ const sendBundleParams: Record<string, unknown>[] = [];
 
 vi.mock("./chain.js", () => ({
   publicClient: {
-    getBlock: vi.fn(async () => ({ timestamp: BOUNDARY - 12n, baseFeePerGas: 1_000_000_000n })),
+    // Tracks the faked clock, as a real node would. Matters because the mirror gate now holds
+    // until a block at or past the boundary exists, so a hard-coded pre-boundary timestamp
+    // would leave the gate pending forever.
+    getBlock: vi.fn(async () => ({
+      timestamp: BigInt(Math.floor(Date.now() / 1000)), number: 100n, baseFeePerGas: 1_000_000_000n,
+    })),
     getBalance: vi.fn(async () => 100_000_000_000_000_000_000n),
     getBlockNumber: vi.fn(async () => 100n),
     getTransactionCount: vi.fn(async () => 5),
@@ -115,7 +120,7 @@ vi.mock("./nonce.js", () => ({
 
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { firePreBoundaryAudit } = await import("./strategy.js");
-const { awaitPendingMirrors } = await import("./flashbots.js");
+const { resetPendingMirrors } = await import("./flashbots.js");
 
 const ADDR = "0x1111111111111111111111111111111111111111";
 const AUDIT = "22222222";
@@ -181,7 +186,7 @@ describe("a delayed audit fire still races the boundary it was armed for", () =>
     runtime.currentEpoch = TARGET_EPOCH;            // already advanced
 
     await firePreBoundaryAudit({ targetEpoch: TARGET_EPOCH, boundaryTs: BOUNDARY });
-    await awaitPendingMirrors();
+    resetPendingMirrors(); // bundles are the subject here; a pre-boundary gate correctly holds
 
     expect(auditTxs().length).toBeGreaterThan(0);
     for (const b of bundles()) expect(b.minTimestamp).toBe(Number(BOUNDARY));
@@ -196,7 +201,7 @@ describe("a delayed audit fire still races the boundary it was armed for", () =>
     runtime.currentEpoch = TARGET_EPOCH;
 
     await firePreBoundaryAudit();
-    await awaitPendingMirrors();
+    resetPendingMirrors(); // bundles are the subject here; a pre-boundary gate correctly holds
 
     expect(auditTxs().length).toBeGreaterThan(0);
     for (const b of bundles()) expect(b.minTimestamp).toBe(Number(BOUNDARY));
@@ -208,7 +213,7 @@ describe("a delayed audit fire still races the boundary it was armed for", () =>
     runtime.currentEpoch = TARGET_EPOCH - 1n;
 
     await firePreBoundaryAudit();
-    await awaitPendingMirrors();
+    resetPendingMirrors(); // bundles are the subject here; a pre-boundary gate correctly holds
 
     expect(auditTxs().length).toBeGreaterThan(0);
     for (const b of bundles()) expect(b.minTimestamp).toBe(Number(BOUNDARY));

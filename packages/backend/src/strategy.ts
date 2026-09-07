@@ -1,5 +1,5 @@
 import { parseEther, formatEther, type Address } from "viem";
-import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
+import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, boundaryBundleMode, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime, loadAllyTokens, type Wallet } from "./runtime.js";
@@ -1271,7 +1271,9 @@ export function coinbaseBidActive(s: StrategyConfig, kind: BidKind = "payment"):
  * so routing must not depend on guessing that in advance.
  */
 export function combinedBundleActive(s: StrategyConfig): boolean {
-  return s.combinedBoundaryBundle && (coinbaseBidActive(s, "payment") || coinbaseBidActive(s, "audit"));
+  // Delegates to the shared predicate so the dashboard's fused/split badge cannot drift from
+  // what the engine actually does. Two operators have now been surprised by the difference.
+  return boundaryBundleMode(s) === "fused";
 }
 
 // Generous fixed gas for an unsimulated offense pre-submit (real audits used
@@ -1442,6 +1444,9 @@ export interface AuditorState {
   id: bigint;
   lastEpochPaid: bigint;
   auditLimit: bigint;
+  /** 0 when not under audit. Read because auditWhileBehind removes the delinquency clause
+   *  that used to keep an under-audit citizen out of the pool by side effect. */
+  auditDueTimestamp: bigint;
 }
 
 /** The multicall half of the auditor lookup: one round trip, no policy. */
@@ -1452,16 +1457,23 @@ async function readAuditorState(ownedIds: bigint[]): Promise<AuditorState[]> {
     contracts: ownedIds.flatMap((id) => [
       { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
       { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditDueTimestamp" as const, args: [id] as const },
     ]),
   });
   const out: AuditorState[] = [];
   for (let i = 0; i < ownedIds.length; i++) {
-    const lep = results[i * 2];
-    const limit = results[i * 2 + 1];
+    const lep = results[i * 3];
+    const limit = results[i * 3 + 1];
+    const due = results[i * 3 + 2];
     // A partly-failed slice drops the token, exactly as before: an unknown auditor is not
     // an eligible one.
-    if (lep?.status !== "success" || limit?.status !== "success") continue;
-    out.push({ id: ownedIds[i]!, lastEpochPaid: lep.result as bigint, auditLimit: limit.result as bigint });
+    if (lep?.status !== "success" || limit?.status !== "success" || due?.status !== "success") continue;
+    out.push({
+      id: ownedIds[i]!,
+      lastEpochPaid: lep.result as bigint,
+      auditLimit: limit.result as bigint,
+      auditDueTimestamp: due.result as bigint,
+    });
   }
   return out;
 }
@@ -1491,7 +1503,11 @@ function selectAuditors(
     // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet,
     // so remaining capacity == auditLimit. Add one pool entry per available audit
     // so auditor-role tokens (limit > 1) can hit multiple rivals at the boundary.
-    let ok = isEligibleAuditor(entry.lastEpochPaid, targetEpoch, 0n, limitV);
+    const policy = {
+      auditWhileBehind: runtime.strategy.auditWhileBehind,
+      underAudit: entry.auditDueTimestamp !== 0n,
+    };
+    let ok = isEligibleAuditor(entry.lastEpochPaid, targetEpoch, 0n, limitV, policy);
     if (!ok && paidInBundle.has(key)) {
       // Paid one epoch earlier in THIS bundle -> current by the time it audits.
       //
@@ -1510,7 +1526,7 @@ function selectAuditors(
       //
       // +1n rather than targetEpoch is deliberate: the on-chain effect is at least +1, and
       // crediting the smaller advance cannot over-qualify a token.
-      ok = isEligibleAuditor(entry.lastEpochPaid + 1n, targetEpoch, 0n, limitV);
+      ok = isEligibleAuditor(entry.lastEpochPaid + 1n, targetEpoch, 0n, limitV, policy);
       if (ok) needsPayment.add(key);
     }
     if (!ok) continue;
@@ -1750,8 +1766,9 @@ export async function queuePreBoundaryAudits(
     }
     // An auditor that only qualifies via a payment earlier in THIS bundle can't be
     // simulated: the sim runs the audit alone against pre-payment state and would
-    // wrongly revert. Send it unsimulated — it rides allowed-to-revert, so the worst
-    // case is gas on a reverted audit and the payment is never endangered.
+    // wrongly revert. Send it unsimulated — the payment is never endangered either way,
+    // because a revert-tolerant audit reverts harmlessly and an all-or-nothing one only
+    // ever costs its OWN bundle (see the note at the standalone call site).
     const viaBundlePayment = needsPayment.has(from.toString());
     const res = await act(
       { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
@@ -1816,6 +1833,31 @@ export async function firePreBoundaryAudit(
    */
   const entryNow = BigInt(Math.floor(Date.now() / 1000));
   const plannedRace = armed ?? racedBoundary(runtime.startTime ?? 0n, entryNow, runtime.currentEpoch);
+  /**
+   * Refuse a boundary that is already behind us, the same way firePreBoundaryPay does.
+   *
+   * The payment fire has always had this; the audit fire never did, and got away with it
+   * because a stale fire ran out of auditors on its own — the citizen would be 3+ behind by
+   * then, which the old delinquency clause in isEligibleAuditor refused. `auditWhileBehind`
+   * removes that accident, so without an explicit guard a timer armed for a dead epoch would
+   * now spend a fee and an audit slot on a target chosen for an epoch that has passed.
+   *
+   * racedBoundary returns `currentEpoch` itself inside the just-rolled grace window, and
+   * `currentEpoch < currentEpoch` is false, so a boundary landing right now is not refused.
+   *
+   * Gated on a KNOWN chain epoch. armedEpochIsOver falls back to the wall clock when
+   * currentEpoch is null, and that fallback cannot be trusted here: it would refuse a fire
+   * during the boot window before the first snapshot lands, which is exactly when an
+   * away-mode wake fires. Chain truth or nothing — a missing epoch is not evidence of a dead
+   * one.
+   */
+  if (runtime.currentEpoch !== null && armedEpochIsOver(Number(plannedRace.targetEpoch), entryNow)) {
+    logger.debug(
+      `pre-boundary audit: epoch ${plannedRace.targetEpoch} is already over (chain at ` +
+        `${runtime.currentEpoch}) — not firing`,
+    );
+    return;
+  }
   const inputs =
     pending ??
     prefetchAuditInputs(plannedRace.targetEpoch, entryNow).catch((err: unknown) => {
@@ -1862,36 +1904,37 @@ export async function firePreBoundaryAudit(
   setRaceBoundary(boundaryTs);
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
-    // Allowed-to-revert ONLY when a coinbase bid will fire, because `revertible` also
-    // turns off the public-mempool mirror (see act()) and the two failure modes trade
-    // against each other:
-    //
-    //   revertible + bid  — bundle-only, revert-tolerant. A stale target (already
-    //     audited, auditor out of capacity) reverts harmlessly inside the bundle instead
-    //     of invalidating it, so the bundle still lands at the position the bid bought.
-    //   not revertible, no bid — all-or-nothing, but each audit keeps its mempool copy.
-    //     Without a bid the bundle rarely wins top-of-block anyway, so the mirror is the
-    //     only thing likely to land at all.
-    //
-    // Getting this wrong the other way is what cost an epoch of audits: with a 0.022 ETH
-    // bid configured, ONE doomed audit invalidated the whole all-or-nothing bundle, the
-    // builder dropped it, and the bid — which is bundle-only and never mirrored — died
-    // with it. The audits then trickled out through the mempool naked, landed at tx index
-    // 40+ instead of 0, and every one reverted with AuditAlreadyActive because faster
-    // bundles had already taken the targets.
-    const bidding = coinbaseBidActive(s, "audit");
     /**
-     * Standalone audit bundle: revert-tolerant EITHER WAY, and never bundle-only.
+     * Standalone audit bundle: both of these are the operator's call, and both are only safe
+     * to expose HERE, where the audits are alone in their bundle and no payment can be hurt.
      *
      * Revert-tolerance used to be tied to bidding, which left the no-bid config — the one
-     * most people run — with an all-or-nothing bundle: one stale target dropped every audit
-     * from it and they all fell back to their mirrors, losing the placement the tip paid for.
-     * There is no payment in THIS bundle to protect, so tolerating a revert costs nothing.
+     * most people run — with an all-or-nothing bundle for the wrong reason. That coupling is
+     * what cost an epoch of audits once: with a 0.022 ETH bid configured, ONE doomed audit
+     * invalidated the whole bundle, the builder dropped it, and the bid — bundle-only, never
+     * mirrored — died with it. The audits then trickled out through the mempool naked, landed
+     * at tx index 40+ instead of 0, and every one reverted with AuditAlreadyActive.
      *
-     * bundleOnly stays false because the payments are in their own separate bundle here, so a
-     * mirror that lands can only invalidate this one — by which point the audit has landed.
-     * That keeps the mempool copy, which is the only thing that can land in the ~1 boundary
-     * in 10 built by a solo validator.
+     * `auditBundleAllOrNothing` makes it a deliberate choice instead:
+     *
+     *   tolerant (default) — a stale target reverts harmlessly and the rest of the bundle
+     *     still lands at the position the tip and bid bought. Costs gas on the dud, and that
+     *     gas makes the block MORE profitable for the builder that ordered you last.
+     *   all-or-nothing — the builder drops the bundle rather than include a reverting audit,
+     *     so a doomed audit is free. Costs the audits that would have succeeded beside it.
+     *
+     * Neither dominates, because a target curing INSIDE the boundary block is invisible to
+     * simulation: whichever way this is set, some boundaries pay for it. What does NOT vary
+     * is the payment bundle, which is a separate bundle on separate nonces either way.
+     *
+     * A coinbase bid tailing this bundle stays revert-tolerant on its own (see
+     * queueCoinbaseBid), so all-or-nothing never lets a payer problem drop healthy audits.
+     *
+     * `mirrorAudits` off makes each audit bundle-only. The mirror is the only thing that can
+     * land in the ~1 boundary in 10 built by a solo validator, but it also announces the
+     * target list before the block is built — and four consecutive boundaries where the
+     * contested target cured inside the block, one at index 0 on a 10 gwei tip, are what that
+     * announcement looks like from the receiving end. Payments mirror either way.
      */
     /**
      * Credit citizens the payment fire just queued for this same boundary. They still read as
@@ -1913,8 +1956,8 @@ export async function firePreBoundaryAudit(
     // Usually already resolved: it has been running since before we took the lock.
     const prefetched = await inputs;
     const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
-      revertible: true,
-      bundleOnly: false,
+      revertible: !s.auditBundleAllOrNothing,
+      bundleOnly: !s.mirrorAudits,
       paidInBundle,
       prefetched: prefetched ?? undefined,
     });
@@ -2023,6 +2066,10 @@ export async function firePreBoundaryBundle(): Promise<void> {
       !(s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin))
     ) {
       auditQueued = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
+        // Deliberately NOT wired to auditBundleAllOrNothing. Here the audits SHARE a bundle
+        // with the payments, so making them mandatory would let one cured target drop every
+        // payment — gas on a failed audit traded for citizens going unpaid, at the one block
+        // where that matters most. The setting exists only for the standalone bundle above.
         revertible: paidInBundle.size > 0 || coinbaseBidActive(s, "audit"),
         // MUST stay true here: payments share this bundle on sequential nonces, so a mirrored
         // audit that lands would consume its nonce, invalidate the bundle, and take the
@@ -2978,18 +3025,24 @@ async function findEligibleAuditors(ownedIds: bigint[], currentEpoch: bigint): P
       { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
       { ...gameContract, functionName: "auditsUsedInEpoch" as const, args: [id, currentEpoch] as const },
       { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditDueTimestamp" as const, args: [id] as const },
     ]),
   });
   const eligible: bigint[] = [];
   for (let i = 0; i < ownedIds.length; i++) {
-    const lep = results[i * 3];
-    const used = results[i * 3 + 1];
-    const limit = results[i * 3 + 2];
-    if (lep?.status !== "success" || used?.status !== "success" || limit?.status !== "success") continue;
+    const lep = results[i * 4];
+    const used = results[i * 4 + 1];
+    const limit = results[i * 4 + 2];
+    const due = results[i * 4 + 3];
+    if (lep?.status !== "success" || used?.status !== "success" || limit?.status !== "success"
+      || due?.status !== "success") continue;
     const lepV = lep.result as bigint;
     const usedV = used.result as bigint;
     const limitV = limit.result as bigint;
-    if (!isEligibleAuditor(lepV, currentEpoch, usedV, limitV)) continue;
+    if (!isEligibleAuditor(lepV, currentEpoch, usedV, limitV, {
+      auditWhileBehind: runtime.strategy.auditWhileBehind,
+      underAudit: (due.result as bigint) !== 0n,
+    })) continue;
     // Remaining capacity this epoch (>= 1 given isEligibleAuditor); one pool entry each.
     for (let k = usedV; k < limitV; k++) eligible.push(ownedIds[i]!);
   }

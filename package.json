@@ -1,6 +1,6 @@
 {
   "name": "death-and-taxes-bot",
-  "version": "1.16.4",
+  "version": "1.17.0",
   "private": true,
   "description": "Self-hosted automation bot for the DeathAndTaxes on-chain game (defense + game-strategy, Flashbots inclusion).",
   "license": "MIT",
@@ -24,7 +24,8 @@
     "rival-builder-bids": "node scripts/rival-builder-bids.mjs",
     "target-scores": "node scripts/target-scores.mjs",
     "race-timing": "node scripts/race-timing.mjs",
-    "token-moves": "node scripts/token-moves.mjs"
+    "token-moves": "node scripts/token-moves.mjs",
+    "dry-run-boundary": "node scripts/dry-run-boundary.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

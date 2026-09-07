@@ -387,7 +387,7 @@ export async function awaitPendingMirrors(): Promise<void> {
 const SLOT_SECONDS = 12n;
 
 /**
- * Hold a race mirror until the slot BEFORE the boundary has produced a block.
+ * Hold a race mirror until a block AT OR PAST the boundary exists.
  *
  * `minTimestamp` protects the bundle copy, but a public-mempool transaction carries no such
  * field — nothing stops a builder putting it in a pre-boundary block, where the epoch has not
@@ -395,25 +395,49 @@ const SLOT_SECONDS = 12n;
  * 0x44ce0008…b496 reverted at index 5 of the pre-boundary block with `NotDelinquent()`,
  * burning 0.024 ETH and its nonce, which killed the copy aimed at the boundary block.
  *
- * Once the pre-boundary block EXISTS it is sealed, so the next block must be the boundary
- * block — and a transaction broadcast after that point cannot be mined too early. Waiting on
- * the block rather than on the clock is what makes this robust to the actual failure: that
- * slot was published ~8 seconds LATE, so any wall-clock lead would still have been swept in.
+ * This used to release one slot earlier, on `timestamp >= boundaryTs - SLOT_SECONDS`, reasoning
+ * that once the pre-boundary block EXISTS it is sealed, so the next block must be the boundary
+ * block. **That reasoning is wrong, and it cost a payment at the epoch-184 boundary.**
  *
- * Normally this makes the mirror go out EARLIER than before, not later: the pre-boundary slot
- * starts a full 12s ahead of the boundary, so its block usually exists by boundary-11s,
- * against the old fixed boundary-5s. It only delays when the slot is late, which is exactly
- * when delay is the point.
+ * Seeing a block does not mean every builder has finished competing for its slot. Payment
+ * 0xcdbc4cf6…8177 was aimed correctly at the boundary block 25885876 — the bundle fan-out never
+ * offered anything lower — yet it landed in 25885875, stamped boundary-12s, and reverted. Only
+ * the mirror can do that, because only the mirror is unconstrained by block number. The
+ * pre-boundary block's own timestamp SATISFIED the old threshold, so the gate opened while that
+ * slot was still winnable and Eureka swept the broadcast into it.
  *
- * Deliberately gives up after the boundary passes: from then on every new block is at or past
- * it, so broadcasting is safe regardless.
+ * Waiting for `timestamp >= boundaryTs` removes the ambiguity: a block at or past the boundary
+ * is proof the epoch has advanced, so no later inclusion can be too early. The cost is that the
+ * mirror now goes out AFTER the boundary block rather than racing into it — which is the right
+ * trade. The mirror never existed to win the boundary block (the bundle does that); it exists so
+ * a solo-validator boundary, which accepts no bundles at all, is still reachable. Those land in
+ * the block after regardless.
+ *
+ * Still gives up at the deadline, so an unusually long gap between blocks cannot strand the
+ * mirror entirely.
  */
 async function preBoundarySlotSettled(boundaryTs: bigint): Promise<void> {
-  const deadlineMs = Number(boundaryTs) * 1000 + 2_000;
+  /**
+   * Backstop, raised from boundaryTs + 2s to boundaryTs + 2 slots.
+   *
+   * The deadline exists so a stalled chain cannot strand the mirror forever, but it must not
+   * itself reopen the hole this gate closes. At boundaryTs + 2s the pre-boundary slot can still,
+   * rarely, be unpublished and winnable — releasing then is the same sweep that reverted the
+   * epoch-184 payment. Two slots past the boundary the pre-boundary slot is resolved either way:
+   * published, or missed and skipped forever.
+   *
+   * Costs nothing that matters. The mirror is the fallback for a solo-validator boundary that
+   * accepts no bundles, and that lands in a later block regardless — the bundle is what races
+   * for the boundary block itself.
+   */
+  const deadlineMs = Number(boundaryTs + 2n * SLOT_SECONDS) * 1000;
   for (;;) {
     try {
       const b = await publicClient.getBlock({ blockTag: "latest" });
-      if (b.timestamp >= boundaryTs - SLOT_SECONDS) return;
+      // At or past the boundary — proof the epoch has advanced, so nothing broadcast from here
+      // can execute an epoch early. NOT `boundaryTs - SLOT_SECONDS`: that admitted the
+      // pre-boundary block's own timestamp and opened the gate while its slot was still live.
+      if (b.timestamp >= boundaryTs) return;
     } catch {
       // Transient read failure: fall through to the wait and try again.
     }
@@ -530,11 +554,32 @@ export async function flushBundle(): Promise<Map<number, BundleTxResult>> {
    * is decided (a look-back bundle spans three blocks, not two).
    */
   const lastTargetBlock = targetBlocks[targetBlocks.length - 1]!;
+  /**
+   * `mirrored` means BROADCAST, not "will be broadcast" — and on a race it is not broadcast yet.
+   *
+   * The nonce manager treats a mirrored tx the node has never heard of as DEAD, on the sound
+   * reasoning that a broadcast tx would be in the mempool if it still existed. That inference is
+   * only valid once the broadcast has actually happened. On a race the mirror is held behind
+   * preBoundarySlotSettled and fired detached, so for up to a couple of slots the tx is private,
+   * absent from the node, and completely alive.
+   *
+   * Claiming `mirrored: true` there cost a real audit at the epoch-184 boundary. The payment fire
+   * reserved nonce 11969 and its mirror was still gated; 1.8s later the audit fire synced, could
+   * not find the payment via getTransaction, read `mirrored` and concluded the nonce was free —
+   * so the audit was signed at 11969 too. One of them had to die, and the audit did
+   * (0x56bf216e…, reported by the dead-tx check as "nonce 11969 was consumed by a different
+   * transaction").
+   *
+   * A gated race tx is therefore recorded as NOT mirrored, which routes it to the bundle-only
+   * rule: dead only once its last target block has passed. That is the correct question for a
+   * private tx, and it holds the nonce for exactly as long as the bundle can still land.
+   */
+  const mirrorGated = raceBoundaryTs !== null;
   for (const q of queue) {
     nonces.for(q.from).markSigned(q.nonce, {
       hash: keccak256(q.signed),
       lastTargetBlock,
-      mirrored: q.race,
+      mirrored: q.race && !mirrorGated,
     });
   }
 
@@ -911,17 +956,48 @@ export async function submitTx(
     }),
   );
 
-  // Public-mempool copy (identical tx: same nonce/sig, so only one can ever land
-  // and the loser is dropped as a duplicate). Fire it CONCURRENTLY with the
-  // bundles — awaiting relay round-trips first would delay the broadcast by
-  // 100-200ms+ per builder, which is exactly the margin a boundary race runs on.
-  const broadcast: Promise<Hex | undefined> = opts.race
-    ? publicClient.sendRawTransaction({ serializedTransaction: signed }).catch((err) => {
+  /**
+   * Public-mempool copy (identical tx: same nonce/sig, so only one can ever land and the loser
+   * is dropped as a duplicate).
+   *
+   * Off a race it goes out CONCURRENTLY with the bundles — awaiting relay round-trips first
+   * would delay the broadcast by 100-200ms+ per builder, which is exactly the margin a race
+   * runs on.
+   *
+   * On a pre-boundary race it must be gated, for the same reason as the batched path: the
+   * mirror carries no `minTimestamp`, so nothing stops a builder putting it in a pre-boundary
+   * block where a payment priced for the next epoch reverts with IncorrectPayment() and burns
+   * its nonce. That is what happened at the epoch-184 boundary through the batched path.
+   *
+   * This path was NOT gated, which was a latent hole rather than an observed loss: every
+   * pre-boundary fire opens a batch, so payments normally take the queued path above. It is
+   * closed anyway — the guard belongs with the broadcast, not with whichever caller happens to
+   * reach it, and "no batch was open" is not a reason for a payment to execute an epoch early.
+   *
+   * Detached like the batched version so the gate cannot hold the caller (and with it the
+   * engine lock) across the wait.
+   */
+  let txHashFromMirror: Hex | undefined;
+  const sendMirror = () =>
+    publicClient
+      .sendRawTransaction({ serializedTransaction: signed })
+      .then((h) => { txHashFromMirror = h as Hex; return h as Hex | undefined; })
+      .catch((err) => {
         // "nonce too low"/"already known" just means a bundle landed first — not fatal.
         logger.warn("public broadcast failed:", (err as Error).message);
         return undefined;
-      })
-    : Promise.resolve(undefined);
+      });
+  let broadcast: Promise<Hex | undefined> = Promise.resolve(undefined);
+  let mirrorPending = false;
+  if (opts.race) {
+    if (opts.simTimestamp !== undefined) {
+      // A pre-boundary race: hold it behind the same gate the batched path uses.
+      mirrorPending = true;
+      pendingMirrors.push(preBoundarySlotSettled(opts.simTimestamp).then(sendMirror).then(() => undefined));
+    } else {
+      broadcast = sendMirror();
+    }
+  }
 
   const [txHash, settled] = await Promise.all([broadcast, Promise.allSettled(attempts)]);
   for (const s of settled) {
@@ -938,9 +1014,11 @@ export async function submitTx(
 
   return {
     ...base,
-    ok: bundleHashes.length > 0 || txHash !== undefined,
+    // A gated mirror counts as a live path: the caller must not treat this as a failure and
+    // retry, which would sign a second tx for the same action.
+    ok: bundleHashes.length > 0 || txHash !== undefined || mirrorPending,
     bundleHash: bundleHashes[0],
-    txHash,
+    txHash: txHash ?? txHashFromMirror,
     predictedTxHash: keccak256(signed),
     targetBlock,
     error: bundleHashes.length === 0 && txHash === undefined ? "no bundle accepted" : undefined,

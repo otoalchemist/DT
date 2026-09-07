@@ -315,12 +315,17 @@ describe("minTimestamp: a race can never execute before its boundary", () => {
  * builder is free to put a mirrored payment or audit in a PRE-boundary block, where the epoch
  * has not advanced and it reverts. Audit 0x44ce0008…b496 died exactly that way.
  *
- * So a race mirror is held until the slot before the boundary has produced a block. Once that
- * block exists it is sealed, so the next one must be the boundary block. Waiting on the BLOCK
- * rather than the clock is the point: that slot was published ~8s late, and any wall-clock
- * lead would still have been swept into it.
+ * So a race mirror is held until a block AT OR PAST the boundary exists. Waiting on the BLOCK
+ * rather than the clock is the point: a late slot would sweep in any wall-clock lead.
+ *
+ * The threshold used to be one slot lower — release as soon as the PRE-boundary block appeared,
+ * on the reasoning that a published block is sealed so the next must be the boundary block. The
+ * epoch-184 boundary disproved it: payment 0xcdbc4cf6…8177 was aimed correctly at boundary block
+ * 25885876 (the fan-out offered nothing lower) and still landed in 25885875 at boundary-12s,
+ * where it reverted. Only the mirror is unconstrained by block number. Seeing a block does not
+ * mean every builder has stopped competing for its slot.
  */
-describe("mirror gate: a race mirror waits for the pre-boundary block", () => {
+describe("mirror gate: a race mirror waits for a block at or past the boundary", () => {
   const BOUNDARY = 1787011175n; // 2026-08-17T23:59:35Z
 
   beforeEach(() => {
@@ -342,16 +347,101 @@ describe("mirror gate: a race mirror waits for the pre-boundary block", () => {
     expect(sendRawTransaction).not.toHaveBeenCalled();
   });
 
-  it("broadcasts once the pre-boundary block exists", async () => {
-    // The pre-boundary block is sealed, so the next block must be the boundary block and the
-    // mirror can no longer be mined too early.
+  it("does NOT broadcast once the PRE-BOUNDARY block exists — it used to, and that cost a payment", async () => {
+    /**
+     * This case is inverted from what it originally asserted, and the inversion is the fix.
+     *
+     * The gate used to release here, reasoning that a published pre-boundary block is sealed so
+     * the next block must be the boundary block. Payment 0xcdbc4cf6…8177 disproved it at the
+     * epoch-184 boundary: the bundle fan-out correctly offered only 25885876 and up, yet the
+     * transaction landed in 25885875 — stamped boundary-12s — and reverted. Only the mirror is
+     * unconstrained by block number, so only the mirror could put it there. Seeing a block does
+     * not mean every builder has stopped competing for that slot.
+     */
     headTs = BOUNDARY - 12n;
     beginBundle();
     setRaceBoundary(BOUNDARY);
     await queue({ race: true });
     await flushBundle();
-    await awaitPendingMirrors();
+    expect(sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("holds through the whole pre-boundary slot — the epoch-184 regression", async () => {
+    /**
+     * Walks the head forward one slot at a time across the boundary, asserting the mirror stays
+     * held for every pre-boundary state and goes out exactly once a block at or past the
+     * boundary exists.
+     *
+     * A single-point check would not have caught the original bug: boundary-24s was already
+     * asserted and passed, while boundary-12s — the state that actually cost the payment — was
+     * asserted to broadcast.
+     */
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+
+    for (const offset of [-24n, -12n]) {
+      headTs = BOUNDARY + offset;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(sendRawTransaction, `must stay held at boundary${offset}s`).not.toHaveBeenCalled();
+    }
+    // The boundary block appears: now it is provably safe.
+    headTs = BOUNDARY;
+    await vi.advanceTimersByTimeAsync(500);
     expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up two slots past the boundary rather than stranding the mirror", async () => {
+    // The backstop, raised from boundary+2s. It must not fire while the pre-boundary slot could
+    // still be won — that is the same sweep the gate exists to prevent — but it must eventually
+    // release so a stalled chain cannot hold the mirror forever.
+    headTs = BOUNDARY - 12n; // boundary block never appears
+    beginBundle();
+    setRaceBoundary(BOUNDARY);
+    await queue({ race: true });
+    await flushBundle();
+
+    vi.setSystemTime(Number(BOUNDARY + 12n) * 1000); // one slot past: still held
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sendRawTransaction).not.toHaveBeenCalled();
+
+    vi.setSystemTime(Number(BOUNDARY + 24n) * 1000); // two slots: the deadline
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("gates the SINGLE-TX path too, not just the batched one", async () => {
+    /**
+     * Same guard, other code path. A pre-boundary race outside an open batch used to broadcast
+     * its mirror immediately, so nothing stopped a builder taking the payment into a
+     * pre-boundary block where it reverts with IncorrectPayment() and burns its nonce.
+     *
+     * A latent hole rather than an observed loss — every pre-boundary fire opens a batch, so
+     * payments normally take the queued path — but the guard belongs with the broadcast, not
+     * with whichever caller happens to reach it.
+     *
+     * No beginBundle() here: that is what routes submitTx down the single-tx path.
+     */
+    headTs = BOUNDARY - 12n; // pre-boundary: must stay held
+    const r = await submitTx(INTENT, { account, skipSim: true, race: true, simTimestamp: BOUNDARY });
+    expect(sendRawTransaction).not.toHaveBeenCalled();
+    // ...and the caller must still see a live path, or it would retry and sign a second tx.
+    expect(r.ok).toBe(true);
+
+    headTs = BOUNDARY; // boundary block appears
+    // The gate polls on a timer, and this describe runs on fake timers — step them rather
+    // than awaiting, or the poll never fires and the test hangs instead of failing.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("still broadcasts the single-tx path immediately when it is NOT a boundary race", async () => {
+    // Bounds the change: an ordinary race with no boundary to satisfy keeps its concurrent
+    // broadcast, since delaying it buys nothing and costs latency.
+    const r = await submitTx(INTENT, { account, skipSim: true, race: true });
+    expect(sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(r.ok).toBe(true);
   });
 
   it("broadcasts when the boundary itself has already arrived", async () => {

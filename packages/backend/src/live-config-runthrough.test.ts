@@ -413,3 +413,75 @@ describe("audit-only boundary with a bid: the bid tx must use offense gas", () =
     expect(bid.tipGwei).toBe(PAY_TIP);
   });
 });
+
+/**
+ * auditWhileBehind must not reach the PAYMENT pathway.
+ *
+ * This is the highest-impact question about the change, so it is asserted end to end rather
+ * than argued from the call graph. The relaxation widens who may AUDIT; a payment that stops
+ * landing kills a citizen, so the two must stay disjoint.
+ *
+ * The structural reasons it is disjoint, each pinned by a case below:
+ *   - the payment fire queues FIRST, so payments take the lower nonces and claim the spend
+ *     budget before any audit is considered;
+ *   - isEligibleAuditor is consumed only by the auditor-pool builders, never by
+ *     queuePreBoundaryPayments / jitPass / proactivePayPass, which read lastEpochPaid
+ *     themselves;
+ *   - audits ride allowed-to-revert, so a doomed audit can never drop the payment.
+ */
+describe("auditWhileBehind leaves the payment pathway untouched", () => {
+  /** #2036 is 2 behind at the target epoch, so it is eligible ONLY with the setting on. */
+  const twoBehind = () => { ownedLep = TARGET_EPOCH - 2n; };
+
+  it("pays exactly the same transaction whether the setting is on or off", async () => {
+    twoBehind();
+    runtime.strategy = { ...runtime.strategy, auditWhileBehind: false } as typeof runtime.strategy;
+    await raceTheBoundary();
+    const payOff = wireTxs().filter((t) => t.sel === PAY);
+
+    // Reset the wire and re-run with the setting ON.
+    chainNonce += 50;
+    resetPaidForBoundary();
+    vi.mocked(globalThis.fetch).mockClear();
+    sendRawTransaction.mockClear();
+    twoBehind();
+    runtime.strategy = { ...runtime.strategy, auditWhileBehind: true } as typeof runtime.strategy;
+    await raceTheBoundary();
+    const payOn = wireTxs().filter((t) => t.sel === PAY);
+
+    // Same count, same tip. Only the audit half may differ.
+    // NON-VACUITY: the setting must actually change the audit half, or "payments identical"
+    // proves nothing. Off, #2036 is 2 behind and refused as an auditor; on, it audits.
+    expect(wireTxs().filter((t) => t.sel === AUDIT).length).toBeGreaterThan(0);
+    expect(payOff).toHaveLength(1);
+    expect(payOn).toHaveLength(1);
+    expect(payOn[0]!.tipGwei).toBe(payOff[0]!.tipGwei);
+    expect(payOn[0]!.tipGwei).toBe(PAY_TIP);
+  });
+
+  it("keeps the payment on the LOWER nonce even when the extra auditor is the payer itself", async () => {
+    // The citizen paying is also the citizen auditing. If the relaxation let the audit be
+    // queued first, the payment would sit behind it and could not be mined until the audit
+    // was — inverting the safety ordering.
+    twoBehind();
+    runtime.strategy = { ...runtime.strategy, auditWhileBehind: true } as typeof runtime.strategy;
+    await raceTheBoundary();
+    const pay = wireTxs().filter((t) => t.sel === PAY);
+    const audit = wireTxs().filter((t) => t.sel === AUDIT);
+    expect(pay).toHaveLength(1);
+    expect(audit.length).toBeGreaterThan(0);
+    expect(Math.max(...pay.map((t) => t.nonce))).toBeLessThan(Math.min(...audit.map((t) => t.nonce)));
+  });
+
+  it("still pays when the setting is on and NO audit is possible", async () => {
+    // Guards the reverse direction: widening the auditor pool must not make the payment
+    // conditional on an audit being found.
+    twoBehind();
+    // This fixture hardcodes auditable: true, so suppress it at the source for this case.
+    const { batchGetTargetStatuses } = await import("./contract.js");
+    vi.mocked(batchGetTargetStatuses).mockResolvedValueOnce([] as never);
+    runtime.strategy = { ...runtime.strategy, auditWhileBehind: true } as typeof runtime.strategy;
+    await raceTheBoundary();
+    expect(wireTxs().filter((t) => t.sel === PAY)).toHaveLength(1);
+  });
+});

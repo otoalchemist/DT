@@ -523,6 +523,52 @@ export interface StrategyConfig {
   autoAudit: boolean;
   /** Automatically kill tokens whose audit has expired. */
   autoKill: boolean;
+  /** Let a citizen that is itself 2+ epochs behind still be used as an audit "from" token.
+   *  The contract permits this — verified in production at the epoch-176 boundary, where
+   *  #2036 audited while two behind with its own payment dead — so refusing it is a strategy
+   *  choice, not a requirement. Off means a single-citizen holder's audits silently alternate
+   *  on and off with its payment cadence. A citizen UNDER AUDIT is excluded either way. */
+  auditWhileBehind: boolean;
+  /** Mirror pre-boundary audits to the public mempool as well as bundling them.
+   *
+   *  ON is the historical behaviour and buys reach: the ~9% of boundaries built by a solo
+   *  validator accept no bundles at all, so the mempool copy is the only thing that can land
+   *  there. The cost is that it BROADCASTS which rivals are about to be audited, seconds
+   *  before the block is built, so a defender reading the mempool can cure exactly those
+   *  tokens. Across four consecutive boundaries every contested target cured inside the
+   *  boundary block — one at tx index 0 on a 10 gwei tip — which is what that leak looks like.
+   *
+   *  Payments are mirrored either way. This is offense only, and only applies where audits
+   *  have their own bundle: fused with a payment they are already bundle-only. */
+  /** "Thor Mode" in the UI — one switch for a fully private, fully split boundary.
+   *
+   *  Forces `mirrorAudits`, `racePublicMempool` and `combinedBoundaryBundle` off and
+   *  `auditBundleAllOrNothing` on (see THOR_OVERRIDES). Together those mean nothing about
+   *  offense reaches the public mempool before the boundary block is built, and a doomed
+   *  audit is dropped rather than paid for.
+   *
+   *  Meant for the case it was named after: a defender who watches the mempool and cures the
+   *  exact tokens they see pending. Against an undefended board it is a straight loss — it
+   *  gives up the ~9% of boundaries built by solo validators, for offense only. Payments keep
+   *  their mempool mirror under Thor Mode; this never touches the payment path.
+   *
+   *  Applied when the config is loaded and on every save, so `runtime.strategy` always holds
+   *  the EFFECTIVE values and no reader has to know Thor Mode exists. Turning it back off
+   *  leaves the four flags where it put them — it is a preset, not a suspension. */
+  thorMode: boolean;
+  mirrorAudits: boolean;
+  /** Make the standalone AUDIT bundle all-or-nothing: a builder drops it whole rather than
+   *  including audits that revert.
+   *
+   *  A reverted audit costs gas AND makes the block more profitable for the builder, so you
+   *  end up paying for the ordering that beat you. All-or-nothing makes a doomed audit free.
+   *  The cost is coarseness — one target curing inside the boundary block drops the audits
+   *  that would have succeeded alongside it, and a cure inside the block is invisible to
+   *  simulation, so it cannot be filtered out in advance.
+   *
+   *  Scoped to the standalone bundle by construction. Fused with payments the same setting
+   *  would let one cured target drop every payment, which is the opposite of the trade. */
+  auditBundleAllOrNothing: boolean;
   /** Only run offense once citizen supply is within this many of WINNERS. */
   endgameOnlyWithin: number | null;
   /** Specific rival token IDs to target. Empty array = target any delinquent rival. */

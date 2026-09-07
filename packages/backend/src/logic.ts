@@ -65,7 +65,7 @@ export function isKillable(auditDueTimestamp: bigint, nowSec: bigint): boolean {
 /**
  * Whether an owned token SHOULD be used as an audit "from" token right now.
  *
- * The `!isAuditable` half is OUR policy, not a contract rule. The contract places no
+ * The delinquency half is OUR policy, not a contract rule. The contract places no
  * delinquency condition on the from-token at all — probed by simulation against mainnet
  * state (2026-08), every case succeeding or failing only on a TARGET-side error:
  *
@@ -76,12 +76,27 @@ export function isKillable(auditDueTimestamp: bigint, nowSec: bigint): boolean {
  * So the contract enforces exactly three things: you own the from-token, it has audit
  * capacity left this epoch, and the target is actually auditable.
  *
- * We stay stricter on purpose. A citizen 2+ behind is itself auditable — and if it is
- * under audit, roughly a day from being killable — so spending its slot means committing
- * an asset that may not survive the epoch, while the audit fee is spent either way. In the
- * normal case this costs nothing: citizens sit 1 behind at a boundary, which passes. It
- * only bites when one has already fallen further, which is also when slots are scarcest —
- * so if that trade ever looks wrong, relax THIS line, not the contract's.
+ * Confirmed in production, not just simulation: at the epoch-176 boundary #2036 audited
+ * #1612 successfully (block 25828481, index 66) while sitting at lastEpochPaid 174 against
+ * currentEpoch 176 — two behind, itself auditable, and with its own payment killed by a
+ * nonce collision so it never landed. A delinquent auditor audits fine.
+ *
+ * `auditWhileBehind` therefore governs a STRATEGY choice, not a mechanical constraint:
+ *
+ *   false — the historical behaviour. A citizen 2+ behind is refused, on the grounds that
+ *           spending its slot commits an asset that may not survive the epoch. The cost is
+ *           real and was measured: a single-citizen holder sits 2 behind at every other
+ *           boundary, so its audits silently alternate on/off ("1 auditable target(s),
+ *           0 auditor slot(s), queued 0").
+ *   true  — let it audit. The fee is spent either way, and a slot held back by a citizen
+ *           that then survives was simply wasted.
+ *
+ * `underAudit` is excluded under BOTH settings, and that exclusion is why this function had
+ * to grow a parameter. A citizen under audit is roughly a day from killable — the actual
+ * dying-asset case — and until now it was kept out of the pool only INCIDENTALLY, because
+ * being under audit almost always means 2+ behind, which the delinquency clause caught.
+ * Relaxing that clause without this one would have quietly started spending the slots of
+ * the citizens least likely to live.
  *
  * `auditsUsedThisEpoch < auditLimit` IS a contract rule: 1 for a normal token, higher for
  * auditor-role tokens.
@@ -91,8 +106,12 @@ export function isEligibleAuditor(
   currentEpoch: bigint,
   auditsUsedThisEpoch: bigint,
   auditLimit: bigint,
+  opts: { auditWhileBehind?: boolean; underAudit?: boolean } = {},
 ): boolean {
-  return !isAuditable(lastEpochPaid, currentEpoch) && auditsUsedThisEpoch < auditLimit;
+  if (auditsUsedThisEpoch >= auditLimit) return false; // contract rule
+  if (opts.underAudit) return false; // never commit a citizen that is ~a day from killable
+  if (opts.auditWhileBehind) return true;
+  return !isAuditable(lastEpochPaid, currentEpoch);
 }
 
 export interface RiskResult {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { BotStatus, OwnedTokenStatus, StrategyConfig } from "@dat-bot/shared";
-import { EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI } from "@dat-bot/shared";
+import { EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, boundaryBundleMode, boundaryDensitiesGwei } from "@dat-bot/shared";
 import { api } from "./api.js";
 import { countdown, weiToEth } from "./util.js";
 
@@ -8,6 +8,8 @@ import { countdown, weiToEth } from "./util.js";
 // when one of these has unsaved edits (independent of the Strategy panel's fields).
 const PAYMENT_FIELDS: (keyof StrategyConfig)[] = [
   "maxBaseFeeGwei", "priorityFeeGwei", "dynamicTipEnabled", "dynamicTipMaxGwei",
+  "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
+  "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
   "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
   "maxAutoPayEpochs", "coinbaseBidEth", "coinbaseBidAuditOnlyEth",
   "coinbasePayerAddress", "combinedBoundaryBundle",
@@ -127,6 +129,11 @@ export function JitPanel({
         priorityFeeGwei: config.priorityFeeGwei,
         dynamicTipEnabled: config.dynamicTipEnabled,
         dynamicTipMaxGwei: config.dynamicTipMaxGwei,
+        separateOffenseGas: config.separateOffenseGas,
+        offenseMaxBaseFeeGwei: config.offenseMaxBaseFeeGwei,
+        offensePriorityFeeGwei: config.offensePriorityFeeGwei,
+        offenseDynamicTipEnabled: config.offenseDynamicTipEnabled,
+        offenseDynamicTipMaxGwei: config.offenseDynamicTipMaxGwei,
         preBoundaryPay: config.preBoundaryPay,
         preBoundaryLeadMs: config.preBoundaryLeadMs,
         preBoundaryLeadMainnetMs: config.preBoundaryLeadMainnetMs,
@@ -255,47 +262,126 @@ export function JitPanel({
               every delinquent epoch, so a citizen 2 behind is quoted 2x even for a
               1-epoch request). It still applies and stays editable in data/config.json. */}
 
-          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>PAYMENT GAS</div>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>GAS</div>
           <p className="muted" style={{ fontSize: 11, margin: "0 0 10px 0", lineHeight: 1.5 }}>
-            Applied to every tax payment, including the boundary-timed pay above. Raise the priority tip
-            (or enable the dynamic tip) so your payment out-orders a batch-audit tx landing in the same
-            first-of-epoch block.
+            Payment and offense priced side by side, for the same reason the coinbase bids are:
+            they compete for the same boundary block but are not the same decision. A payment
+            <b> must land</b> — missing it can cost a citizen. An audit is speculative, and
+            losing one costs gas only, since a revert refunds both the fee and the audit slot.
           </p>
-          <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
-            <label className="field" style={{ flex: "1 1 120px" }}>
-              Priority fee / tip (gwei)
-              <input
-                type="number" min={0} step={0.1}
-                value={config.priorityFeeGwei}
-                onChange={(e) => gasField("priorityFeeGwei", Number(e.target.value))}
-              />
-            </label>
-            <label className="field" style={{ flex: "1 1 120px" }}>
-              Max base fee (gwei)
-              <input
-                type="number" min={0}
-                value={config.maxBaseFeeGwei}
-                onChange={(e) => gasField("maxBaseFeeGwei", Number(e.target.value))}
-              />
-            </label>
+          {/* Two columns, colour-matched to the bid split below, so each side reads as one
+              decision rather than a list of four numbers. Worth keeping visually adjacent:
+              when both halves ride ONE bundle (a coinbase bid is set), builders rank it on the
+              BLENDED density, so a far-lower audit tip drags the payment's placement down with
+              it — measured at the epoch-182 boundary, where a 10 gwei audit cut a 201 gwei
+              payment's bundle from 263 to 160 gwei/gas. */}
+          <div className="row wrap" style={{ gap: 12, alignItems: "stretch", marginBottom: 6 }}>
+            <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--accent)", paddingLeft: 10 }}>
+              <div style={{ color: "var(--accent)", fontWeight: 600, fontSize: 12, marginBottom: 4 }}>
+                Payment Gas
+              </div>
+              <label className="field" style={{ marginBottom: 4 }}>
+                Priority fee / tip (gwei)
+                <input
+                  type="number" min={0} step={0.1}
+                  value={config.priorityFeeGwei}
+                  onChange={(e) => gasField("priorityFeeGwei", Number(e.target.value))}
+                  style={{ borderColor: "var(--accent)", fontWeight: 600 }}
+                />
+              </label>
+              <label className="field" style={{ marginBottom: 4 }}>
+                Max base fee (gwei)
+                <input
+                  type="number" min={0}
+                  value={config.maxBaseFeeGwei}
+                  onChange={(e) => gasField("maxBaseFeeGwei", Number(e.target.value))}
+                />
+              </label>
+              <label className="check" style={{ marginBottom: 2 }}>
+                <input
+                  type="checkbox"
+                  checked={config.dynamicTipEnabled}
+                  onChange={(e) => gasField("dynamicTipEnabled", e.target.checked)}
+                />
+                Dynamic tip (scale with block fullness)
+              </label>
+              <label className="field" style={{ marginLeft: 24, marginBottom: 0 }}>
+                Max dynamic tip (gwei)
+                <input
+                  type="number" min={0} step={1}
+                  value={config.dynamicTipMaxGwei}
+                  onChange={(e) => gasField("dynamicTipMaxGwei", Number(e.target.value))}
+                  disabled={!config.dynamicTipEnabled}
+                />
+                {config.dynamicTipEnabled && config.dynamicTipMaxGwei < config.priorityFeeGwei && (
+                  <span className="hint">
+                    Below the static tip, so it does nothing — the static tip is a floor and is
+                    never lowered. Set it above {config.priorityFeeGwei} to have any effect.
+                  </span>
+                )}
+              </label>
+            </div>
+            <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10 }}>
+              <div style={{ color: "var(--green)", fontWeight: 600, fontSize: 12, marginBottom: 4 }}>
+                Offense Gas (audit / kill)
+              </div>
+              <label className="check" style={{ marginBottom: 2 }}>
+                <input
+                  type="checkbox"
+                  checked={config.separateOffenseGas}
+                  onChange={(e) => gasField("separateOffenseGas", e.target.checked)}
+                />
+                Price offense separately
+              </label>
+              <label className="field" style={{ marginBottom: 4 }}>
+                Priority fee / tip (gwei)
+                <input
+                  type="number" min={0} step={0.1}
+                  value={config.offensePriorityFeeGwei}
+                  onChange={(e) => gasField("offensePriorityFeeGwei", Number(e.target.value))}
+                  disabled={!config.separateOffenseGas}
+                  style={config.separateOffenseGas ? { borderColor: "var(--green)", fontWeight: 600 } : undefined}
+                />
+                {!config.separateOffenseGas && (
+                  <span className="hint">Off: audits and kills use the payment tip on the left.</span>
+                )}
+              </label>
+              <label className="field" style={{ marginBottom: 4 }}>
+                Max base fee (gwei)
+                <input
+                  type="number" min={0}
+                  value={config.offenseMaxBaseFeeGwei}
+                  onChange={(e) => gasField("offenseMaxBaseFeeGwei", Number(e.target.value))}
+                  disabled={!config.separateOffenseGas}
+                />
+              </label>
+              <label className="check" style={{ marginBottom: 2 }}>
+                <input
+                  type="checkbox"
+                  checked={config.offenseDynamicTipEnabled}
+                  onChange={(e) => gasField("offenseDynamicTipEnabled", e.target.checked)}
+                  disabled={!config.separateOffenseGas}
+                />
+                Dynamic tip (scale with block fullness)
+              </label>
+              <label className="field" style={{ marginLeft: 24, marginBottom: 0 }}>
+                Max dynamic tip (gwei)
+                <input
+                  type="number" min={0} step={1}
+                  value={config.offenseDynamicTipMaxGwei}
+                  onChange={(e) => gasField("offenseDynamicTipMaxGwei", Number(e.target.value))}
+                  disabled={!config.separateOffenseGas || !config.offenseDynamicTipEnabled}
+                />
+                {config.separateOffenseGas && config.offenseDynamicTipEnabled
+                  && config.offenseDynamicTipMaxGwei < config.offensePriorityFeeGwei && (
+                  <span className="hint">
+                    Below the static tip, so it does nothing. Set it above{" "}
+                    {config.offensePriorityFeeGwei} to have any effect.
+                  </span>
+                )}
+              </label>
+            </div>
           </div>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={config.dynamicTipEnabled}
-              onChange={(e) => gasField("dynamicTipEnabled", e.target.checked)}
-            />
-            Dynamic priority tip (scale up as the block fills)
-          </label>
-          <label className="field" style={{ marginLeft: 24 }}>
-            Max dynamic tip (gwei)
-            <input
-              type="number" min={0} step={1}
-              value={config.dynamicTipMaxGwei}
-              onChange={(e) => gasField("dynamicTipMaxGwei", Number(e.target.value))}
-              disabled={!config.dynamicTipEnabled}
-            />
-          </label>
           {/* "Race into the boundary block" (preBoundaryPay + lead times) is
               intentionally not rendered — it's ON by default so the armed JIT payment can
               land in the first block of the epoch ahead of a batch-auditor, and we don't
@@ -323,10 +409,73 @@ export function JitPanel({
               )}
               {config.coinbaseBidAuditOnlyEth > 0 && (
                 <span className="badge" style={{ marginLeft: 6, background: "var(--green)", color: "#04231a", fontSize: 10 }}>
-                  AUDIT-ONLY · {config.coinbaseBidAuditOnlyEth} ETH
+                  AUDIT · {config.coinbaseBidAuditOnlyEth} ETH
                 </span>
               )}
+              {/* Which shape the boundary fire will ACTUALLY take.
+                  Rendered because the two settings that decide it — combinedBoundaryBundle and
+                  a funded bid — are not adjacent, and reading the mode off them has caught
+                  operators out twice. A "Payment" bid field beside an "Audit" bid field implies
+                  two bundles; with fusion on there is ONE bundle and the audit bid never fires.
+                  Derived from the SHARED predicate the engine itself uses, so the badge cannot
+                  drift from the behaviour. */}
+              <span
+                className="badge"
+                title={
+                  boundaryBundleMode(config) === "fused"
+                    ? "One atomic bundle: payments, audits and a single Payment bid go out together. The audit is valid immediately because its nonces sit inside the same bundle. Cost: builders rank a bundle on BLENDED density, so a cheaper audit tip — and the audit's ~130k gas — drag the payment's placement down with them."
+                    : "Two independent bundles, each with its own tip and its own bid. No dilution. The audit bundle holds nonces above the still-unmined payment, so it lands only if the builder also took the payment bundle and placed it first — which is what a value-sorting builder does anyway, since the payment bundle is the denser one."
+                }
+                style={{
+                  marginLeft: 8,
+                  background: "transparent",
+                  border: "1px solid",
+                  borderColor: boundaryBundleMode(config) === "fused" ? "var(--accent)" : "var(--green)",
+                  color: boundaryBundleMode(config) === "fused" ? "var(--accent)" : "var(--green)",
+                  fontSize: 10,
+                  cursor: "help",
+                }}
+              >
+                {boundaryBundleMode(config) === "fused"
+                  ? "FUSED · 1 bundle, 1 bid"
+                  : "SPLIT · 2 bundles, 2 bids"}
+              </span>
             </div>
+            {/* Density inversion warning — SPLIT mode only.
+                In split mode the audit bundle holds nonces above the still-unmined payment, so a
+                builder can only include it after the payment bundle. Builders try candidates in
+                value order, so the arrangement works while the PAYMENT bundle is the denser one.
+                Inverted, the builder reaches for the audit first, finds its nonce two above the
+                account and discards it as unexecutable.
+
+                Sized on the operator's ACTUAL shape: each extra payment adds 82,875 gas to the
+                payment bundle and thins its bid, so a five-citizen holder can be inverted where a
+                one-citizen holder is not. */}
+            {(() => {
+              if (boundaryBundleMode(config) !== "split") return null;
+              const behind = tokens.filter(
+                (t) => BigInt(t.lastEpochPaid) < BigInt(t.currentEpoch),
+              ).length;
+              const capacity = tokens.reduce((n, t) => n + (t.auditLimit ?? 1), 0);
+              const d = boundaryDensitiesGwei(config, {
+                payments: Math.max(1, behind),
+                audits: Math.max(1, capacity),
+              });
+              if (d.paymentDenser) return null;
+              return (
+                <p
+                  className="err"
+                  style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5, fontWeight: 600 }}
+                >
+                  Audit bundle is denser than the payment bundle ({d.audit.toFixed(0)} vs{" "}
+                  {d.payment.toFixed(0)} gwei/gas). In split mode the audit sits on nonces above
+                  the unmined payment, so builders must take the payment bundle first — and they
+                  order by value. Inverted like this, a builder reaches for the audit bundle,
+                  finds a nonce gap and drops it. Lower the Audit Coinbase Bid or the audit tip,
+                  or raise the payment side, until the payment is denser.
+                </p>
+              );
+            })()}
             <p className="muted" style={{ fontSize: 11, margin: "0 0 8px 0", lineHeight: 1.5 }}>
               A <b>flat payment straight to the block builder</b> added to the pre-boundary payment bundle,
               to bid it to the <b>top of the boundary block</b> — independent of tip. This is the lever
@@ -340,10 +489,8 @@ export function JitPanel({
             <div className="row wrap" style={{ gap: 12, alignItems: "stretch", marginBottom: 10 }}>
               <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--accent)", paddingLeft: 10 }}>
                 <label className="field" style={{ marginBottom: 4 }}>
-                  {/* Named for the EPOCH, not the transaction: this bid covers the whole
-                      bundle on a boundary that carries a payment, audits included. */}
-                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>Payment + Audit Epoch</span>{" "}
-                  Bid (ETH)
+                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>Payment Coinbase Bid</span>{" "}
+                  (ETH)
                   <input
                     type="number" min={0} step={0.001}
                     value={config.coinbaseBidEth}
@@ -361,7 +508,7 @@ export function JitPanel({
               </div>
               <div style={{ flex: "1 1 220px", borderLeft: "3px solid var(--green)", paddingLeft: 10 }}>
                 <label className="field" style={{ marginBottom: 4 }}>
-                  <span style={{ color: "var(--green)", fontWeight: 600 }}>Audit Only Epoch</span> Bid (ETH)
+                  <span style={{ color: "var(--green)", fontWeight: 600 }}>Audit Coinbase Bid</span> (ETH)
                   <input
                     type="number" min={0} step={0.001}
                     value={config.coinbaseBidAuditOnlyEth}
@@ -405,9 +552,9 @@ export function JitPanel({
               <p className="muted" style={{ fontSize: 10, margin: "4px 0 0 0", lineHeight: 1.5 }}>
                 While away mode is on, the engine notices a citizen would be auditable at the
                 coming boundary, arms itself, and the bundle pays and audits together on the{" "}
-                <span style={{ color: "var(--accent)" }}>Payment + Audit Epoch</span> bid. JIT then
+                <span style={{ color: "var(--accent)" }}>Payment Coinbase Bid</span>. JIT then
                 disarms itself as it always has, so quiet epochs fall back to offense on the{" "}
-                <span style={{ color: "var(--green)" }}>Audit Only Epoch</span> bid.
+                <span style={{ color: "var(--green)" }}>Audit Coinbase Bid</span>.
                 <br />
                 <b>That spends ETH with no keypress</b>, so the bids above are the ceiling you
                 are agreeing to each time you go away. It never arms for a citizen that is

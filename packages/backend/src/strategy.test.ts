@@ -29,7 +29,14 @@ vi.mock("./chain.js", () => ({
     multicall: vi.fn(async ({ contracts }: { contracts: { functionName: string }[] }) =>
       contracts.map((c) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n, // lastEpochPaid huge (current), auditLimit=1
+        // auditDueTimestamp MUST be 0 (not under audit) rather than falling through to the
+        // lastEpochPaid default: auditWhileBehind drops the delinquency clause, so
+        // isEligibleAuditor now excludes on this field instead, and a non-zero default here
+        // makes every owned citizen read as under audit and empties the auditor pool.
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n
+          : 1_000_000n, // lastEpochPaid huge (current)
       })),
     ),
   },
@@ -642,7 +649,10 @@ describe("combined boundary bundle with multiple citizens", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -1356,7 +1366,10 @@ describe("bundle-only txs still resolve submitted -> included", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -1510,7 +1523,10 @@ describe("multi-wallet: actions are signed by the wallet that owns the citizen",
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -1682,7 +1698,9 @@ describe("the audit sweep uses a prefetch taken outside the lock", () => {
   const inputsFor = (epoch: bigint) => ({
     targetEpoch: epoch,
     ownedIds: [10n],
-    auditorState: [{ id: 10n, lastEpochPaid: 1_000_000n, auditLimit: 1n }],
+    // auditDueTimestamp 0n is REQUIRED, not decorative: isEligibleAuditor excludes an
+    // under-audit citizen, and an absent field reads as non-zero, which empties the pool.
+    auditorState: [{ id: 10n, lastEpochPaid: 1_000_000n, auditLimit: 1n, auditDueTimestamp: 0n }],
     candidates: [{ id: 501n, owner: "0x00000000000000000000000000000000000000dd" as const }],
     emigrated: new Set<string>(),
     statuses: [{
@@ -1751,7 +1769,10 @@ describe("the auditor pool spreads audits across distinct auditors", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: { contracts: { functionName: string }[] }) =>
       contracts.map((c) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 3n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 3n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       }))) as never);
     runtime.strategy = {
       ...DEFAULT_STRATEGY,
@@ -1895,7 +1916,10 @@ describe("pre-boundary audit-only fire: revert-tolerant either way, never bundle
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -2658,7 +2682,10 @@ describe("boundary pathways: payment, audit, and both", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
