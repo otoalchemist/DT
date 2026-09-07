@@ -139,10 +139,11 @@ vi.mock("./emigration.js", () => ({ emigratedTokenIdSet: vi.fn(async () => new S
 const contract = await import("./contract.js");
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
 const { awaitPendingMirrors } = await import("./flashbots.js");
+const { nonces } = await import("./nonce.js");
 const { applyThorMode, thorModeSettled, THOR_OVERRIDES } = await import("@dat-bot/shared");
 const {
   firePreBoundaryPay, firePreBoundaryAudit, firePreBoundaryBundle,
-  combinedBundleActive, resetPaidForBoundary,
+  combinedBundleActive, resetPaidForBoundary, jitPass,
 } = await import("./strategy.js");
 
 const PAY = "11111111", AUDIT = "22222222", BID = "";
@@ -912,5 +913,230 @@ describe("all-or-nothing is inert while payments mirror", () => {
     const payBundles = bundles().filter((b) => kindsIn(b).includes("pay"));
     expect(payBundles.length).toBeGreaterThan(0);
     for (const b of payBundles) expect(b.revertKinds).not.toContain("pay");
+  });
+});
+
+/**
+ * AUDIT of the two boundary pathways that actually ship, under the 1.19.0 defaults, with and
+ * without Thor Mode.
+ *
+ * Written after the defaults moved twice in one day (offense private in 1.18.0, payments in
+ * 1.19.0), because at that point nobody had run the shipped configuration end to end — every
+ * other suite in this file pins the settings it is testing, which is correct for those cases
+ * and useless for this one.
+ *
+ * The pathways:
+ *   A. payment only     — nothing auditable, so one bundle carries the payments and the bid
+ *   B. payment + audit  — two independent bundles, two bids, which is now the shipped shape
+ *
+ * The Thor Mode half of this is the interesting part: under these defaults the preset should
+ * change NOTHING at a boundary, because five of its six overrides are already the default and
+ * the sixth (racePublicMempool) only gates offense txs that mirrorAudits: false has already
+ * made bundle-only. Asserted as wire equality rather than argued, so if a later default drifts
+ * apart from the preset this fails instead of the two silently diverging.
+ */
+describe("AUDIT: shipped boundary pathways, defaults vs Thor Mode", () => {
+  /** The wire, reduced to what a builder and the mempool actually receive. */
+  const wire = () => ({
+    bundles: bundles().map((b) => ({
+      kinds: kindsIn(b), revert: b.revertKinds, block: b.blockNumber, minTs: b.minTimestamp,
+    })),
+    mirrored: mirroredKinds(),
+  });
+
+  const shipped = () => ({ ...DEFAULT_STRATEGY, ...baseOverrides() });
+
+  /** Everything the fixture needs that is NOT a privacy/revert setting, so these cases run the
+   *  SHIPPED values for the settings under audit rather than this file's pins. */
+  function baseOverrides() {
+    const s = runtime.strategy;
+    return {
+      enabled: s.enabled, jitEnabled: s.jitEnabled, jitTargetEpoch: s.jitTargetEpoch,
+      jitTokenIds: s.jitTokenIds, preBoundaryPay: s.preBoundaryPay,
+      preBoundaryAudit: s.preBoundaryAudit, offenseEnabled: s.offenseEnabled,
+      autoAudit: s.autoAudit, offenseTargetTokenIds: s.offenseTargetTokenIds,
+      minBalanceEth: s.minBalanceEth, maxPaymentEth: s.maxPaymentEth,
+      maxBaseFeeGwei: s.maxBaseFeeGwei, offenseMaxBaseFeeGwei: s.offenseMaxBaseFeeGwei,
+      priorityFeeGwei: s.priorityFeeGwei, offensePriorityFeeGwei: s.offensePriorityFeeGwei,
+      separateOffenseGas: s.separateOffenseGas, endgameOnlyWithin: s.endgameOnlyWithin,
+      coinbasePayerAddress: PAYER, coinbaseBidEth: PAY_BID, coinbaseBidAuditOnlyEth: AUDIT_BID,
+      sweepUnpinned: s.sweepUnpinned,
+    };
+  }
+
+  // ---- A. payment only -------------------------------------------------------------------
+
+  it("A: payment-only — one private bundle, no payment may revert, bid may", async () => {
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    vi.mocked(contract.batchGetTargetStatuses).mockResolvedValue([]); // nothing auditable
+    await raceTheBoundary();
+
+    expect(auditBundles()).toHaveLength(0);
+    expect(payBundles().length).toBeGreaterThan(0);
+    for (const b of payBundles()) {
+      expect(kindsIn(b).filter((k) => k === "pay")).toHaveLength(5); // non-vacuity
+      // The whole point of the 1.19.0 default: a doomed payment costs nothing.
+      expect(b.revertKinds).not.toContain("pay");
+      // ...but a misconfigured payer must never drop five healthy payments.
+      if (kindsIn(b).includes("bid")) expect(b.revertKinds).toContain("bid");
+    }
+    // Private: no fallback copy exists. This is the trade, stated on the wire.
+    expect(mirroredKinds()).toEqual([]);
+  });
+
+  it("A-thor: Thor Mode changes nothing about a payment-only boundary", async () => {
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    vi.mocked(contract.batchGetTargetStatuses).mockResolvedValue([]);
+    await raceTheBoundary();
+    const asShipped = wire();
+
+    resetWire();
+    runtime.strategy = applyThorMode({ ...shipped(), thorMode: true }) as typeof runtime.strategy;
+    await raceTheBoundary();
+    expect(wire()).toEqual(asShipped);
+  });
+
+  // ---- B. payment bundle + audit bundle, sent separately ----------------------------------
+
+  it("B: split — two bundles, neither tolerant, nothing mirrored, nonces unbroken", async () => {
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    await raceTheBoundary();
+
+    expect(payBundles().length).toBeGreaterThan(0);
+    expect(auditBundles().length).toBeGreaterThan(0);
+    // No blended density: the reason for splitting at all.
+    for (const b of bundles()) {
+      expect(kindsIn(b).includes("pay") && kindsIn(b).includes("audit")).toBe(false);
+    }
+    for (const b of payBundles()) expect(b.revertKinds).not.toContain("pay");
+    for (const b of auditBundles()) expect(b.revertKinds).not.toContain("audit");
+    expect(mirroredKinds()).toEqual([]);
+
+    // Nonce safety survives BOTH halves going bundle-only — the property this file exists for.
+    const all = bundles().flatMap((b) => b.txs.map((t) => t.nonce));
+    const uniq = [...new Set(all)].sort((a, b) => a - b);
+    expect(uniq).toHaveLength(new Set(all).size);
+    for (let i = 1; i < uniq.length; i++) expect(uniq[i]).toBe(uniq[i - 1]! + 1);
+  });
+
+  it("B-thor: Thor Mode changes nothing about a split boundary either", async () => {
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    await raceTheBoundary();
+    const asShipped = wire();
+
+    resetWire();
+    runtime.strategy = applyThorMode({ ...shipped(), thorMode: true }) as typeof runtime.strategy;
+    await raceTheBoundary();
+    expect(wire()).toEqual(asShipped);
+  });
+
+  it("Thor Mode is a boundary no-op ONLY because the defaults caught up to it", () => {
+    // The reason A-thor and B-thor pass, made explicit so their passing cannot be mistaken for
+    // Thor Mode being inert by design. Exactly one override still differs from the shipped
+    // default, and it does not reach the boundary: racePublicMempool gates offense mirroring,
+    // which mirrorAudits: false has already suppressed via bundleOnly.
+    const differing = (Object.keys(THOR_OVERRIDES) as (keyof typeof THOR_OVERRIDES)[])
+      .filter((k) => DEFAULT_STRATEGY[k] !== THOR_OVERRIDES[k]);
+    expect(differing).toEqual(["racePublicMempool"]);
+  });
+});
+
+/**
+ * FAILURE MODES the 1.19.0 defaults introduce, and the recovery that bounds them.
+ *
+ * Neither of these is a bug — they are the cost side of the trade, and the point of writing
+ * them down as tests is that the cost was argued for in prose and never asserted. If a later
+ * change makes the blast radius smaller, these fail and someone gets to notice it was an
+ * improvement rather than a regression.
+ */
+describe("AUDIT: blast radius of an all-or-nothing, unmirrored boundary", () => {
+  const shipped = () => ({
+    ...DEFAULT_STRATEGY,
+    enabled: true, jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH),
+    jitTokenIds: OWNED.map(String), preBoundaryPay: true, preBoundaryAudit: true,
+    offenseEnabled: true, autoAudit: true, offenseTargetTokenIds: RIVALS,
+    minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000, offenseMaxBaseFeeGwei: 1000,
+    priorityFeeGwei: PAY_TIP, offensePriorityFeeGwei: AUDIT_TIP, separateOffenseGas: true,
+    endgameOnlyWithin: null, coinbasePayerAddress: PAYER,
+    coinbaseBidEth: PAY_BID, coinbaseBidAuditOnlyEth: AUDIT_BID,
+  });
+
+  it("couples the audits to the payments: audit nonces sit ABOVE every payment", async () => {
+    /**
+     * The cascade, stated structurally. Payments occupy the lower nonces and audits the ones
+     * directly above, with no gap. A builder that drops the payment bundle — which is now what
+     * all-or-nothing ASKS it to do on any revert — leaves every audit sitting behind a nonce
+     * that will never be consumed, so the audit bundle cannot be mined either.
+     *
+     * Before 1.19.0 a stale citizen cost one payment. It now costs the whole boundary, both
+     * halves. That is the trade, and this is where it is visible.
+     */
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    await raceTheBoundary();
+    // Deduped: bundles() yields one entry per (builder x target block), so every tx repeats.
+    const nonces = (kind: string) => [...new Set(
+      bundles().flatMap((b) => b.txs.filter((t) => kindOf(t.sel) === kind).map((t) => t.nonce)),
+    )].sort((a, b) => a - b);
+    const pays = nonces("pay");
+    const audits = nonces("audit");
+    expect(pays.length).toBeGreaterThan(0);
+    expect(audits.length).toBeGreaterThan(0);
+    expect(Math.max(...pays)).toBeLessThan(Math.min(...audits));
+    // Unbroken across EVERY tx including the two bids, which is what makes the dependency
+    // total: there is no nonce an audit could be mined on without the payments going first.
+    const all = [...new Set(bundles().flatMap((b) => b.txs.map((t) => t.nonce)))].sort((a, b) => a - b);
+    for (let i = 1; i < all.length; i++) expect(all[i]).toBe(all[i - 1]! + 1);
+  });
+
+  it("still has a post-boundary fallback: JIT pays anything the bundle failed to land", async () => {
+    /**
+     * What bounds the risk. A dropped payment bundle is NOT the end of the epoch — scheduleJit
+     * Boundary fires a tick at boundary+500ms and jitPass pays whatever still owes, a block or
+     * two late. The race is lost; the citizen is not.
+     *
+     * The gap this does not cover is the one that actually killed citizens this week: if a
+     * rival audits inside the boundary block, jitPass refuses (automatic payment after an audit
+     * is deliberately off) and curing becomes manual at the doubled price.
+     */
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    // Run the real pre-boundary fire first. Not decoration: fetchOwnedAcrossWallets fills the
+    // token -> wallet map that act() signs from, so a jitPass called cold cannot pay anything
+    // and the test would pass for the wrong reason. It also models the actual sequence — the
+    // bundle WAS sent, and is being treated here as having been dropped.
+    await raceTheBoundary();
+    resetWire();
+    // Nothing landed: still behind, chain now in the target epoch.
+    ownedLep = TARGET_EPOCH - 1n;
+    // The fire’s finally block calls nonces.resetAll(), and in production the post-boundary
+    // tick re-syncs before reaching jitPass. Doing the same here rather than reaching into the
+    // nonce manager’s internals, so this exercises the real sequence.
+    await nonces.syncAll([ADDR], "mainnet");
+    await jitPass(OWNED, TARGET_EPOCH, BOUNDARY_TS + 12n);
+    // Distinct nonces, not kind counts: each tx is posted once per target block.
+    const paid = new Set(bundles().flatMap((b) =>
+      b.txs.filter((t) => kindOf(t.sel) === "pay").map((t) => t.nonce)));
+    expect(paid.size, "JIT must still pay after a dropped pre-boundary bundle").toBe(OWNED.length);
+  });
+
+  it("does NOT auto-pay a citizen a rival audited inside the boundary block", async () => {
+    // The uncovered half of the fallback, asserted so it reads as a known limit rather than an
+    // oversight. This is exactly what happened to #4355 and #6699 at the epoch-186 boundary.
+    runtime.strategy = shipped() as typeof runtime.strategy;
+    await raceTheBoundary(); // fills the token -> wallet map, as above
+    resetWire();
+    ownedLep = TARGET_EPOCH - 1n;
+    await nonces.syncAll([ADDR], "mainnet");
+    vi.mocked(contract.batchGetOwnedStatuses).mockResolvedValueOnce(
+      OWNED.map((id) => ({
+        tokenId: id.toString(), lastEpochPaid: ownedLep.toString(),
+        currentEpoch: TARGET_EPOCH.toString(),
+        auditDueTimestamp: String(Number(BOUNDARY_TS) + 86_400), // audited in the boundary block
+        secondsUntilKillable: null, bribeBalance: "0", hasLifeInsurance: false,
+        risk: "audited" as const, estimatedPayWei: "120000000000000000", auditLimit: 1,
+        walletAddress: ADDR, walletLabel: "t",
+      })) as never,
+    );
+    await jitPass(OWNED, TARGET_EPOCH, BOUNDARY_TS + 12n);
+    expect(bundles().flatMap((b) => b.txs.filter((t) => kindOf(t.sel) === "pay"))).toHaveLength(0);
   });
 });
