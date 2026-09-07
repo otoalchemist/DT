@@ -269,6 +269,80 @@ export function Config({
       <h2>Strategy</h2>
       <div style={{ marginBottom: 16 }}>{saveBar}</div>
 
+      {/* Rival targets lead the panel: this is the list every offense setting below acts
+          ON, so choosing it first and then deciding how hard to pursue it reads in the
+          order the decisions are actually made. It sat under the offense switches, which
+          put the WHO after the HOW.
+
+          Every control here still gates on cfg.offenseEnabled, whose checkbox is now BELOW
+          it — deliberate rather than overlooked. The list is worth curating before offense
+          is ever switched on, and the disabled state plus the note under the box say why
+          they are inert, so nothing here is a dead end. */}
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>RIVAL TARGETS</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, marginBottom: 4, flexWrap: "wrap" }}>
+        <button
+          type="button"
+          onClick={() => set("offenseTargetTokenIds", [...defaultRivals])}
+          disabled={!cfg.offenseEnabled || defaultRivals.length === 0 || targetsEqual(defaultRivals)}
+          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
+          title="Restore the curated rival list that ships with the bot"
+        >
+          Reset to default list
+        </button>
+        {/* Groups TOGGLE and combine — lit when every id in the group is selected.
+            Each is additive, so "skippers + non-skippers" is two clicks instead of
+            re-typing a list by hand. The roster is split per operator because they are
+            not one decision: they defend differently and only one of them attacks. */}
+        <GroupToggle label="Rival Skippers" ids={skippers} on={groupOn(skippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
+          title="Rivals that pay on a ~2-epoch cadence, so they are delinquent at every second boundary." />
+        <GroupToggle label="Non-skippers" ids={nonSkippers} on={groupOn(nonSkippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
+          title="The curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)." />
+        {Object.keys(bigBoysByOperator).sort().map((op) => (
+          <GroupToggle
+            key={op}
+            label={op}
+            ids={bigBoysByOperator[op]!}
+            on={groupOn(bigBoysByOperator[op]!)}
+            onClick={toggleGroup}
+            disabled={!cfg.offenseEnabled}
+            title={`Big-boy operator "${op}" (data/big-boys.json). Pins every citizen they run, for a coordinated push against that operator specifically. Several defend at the top of the boundary block — check Analyze targets for what beating them costs.`}
+          />
+        ))}
+        <button
+          type="button"
+          onClick={() => set("offenseTargetTokenIds", [])}
+          disabled={!cfg.offenseEnabled || cfg.offenseTargetTokenIds.length === 0}
+          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
+          title="Clear the list. Blank = target every delinquent rival the bot discovers."
+        >
+          Clear
+        </button>
+        {defaultRivals.length > 0 && (
+          <span className="muted" style={{ fontSize: 11 }}>
+            {defaultRivals.length} default{skippers.length > 0 ? ` · ${skippers.length} skippers` : ""}
+            {nonSkippers.length > 0 ? ` · ${nonSkippers.length} non-skippers` : ""}
+            {bigBoys.length > 0 ? ` · ${bigBoys.length} big boys` : ""}
+          </span>
+        )}
+      </div>
+      <label className="field">
+        Rival token IDs to target (one per line or comma-separated — blank = all delinquent rivals)
+        <textarea
+          rows={5}
+          style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, resize: "vertical" }}
+          value={targetsDraft}
+          onChange={(e) => {
+            setTargetsDraft(e.target.value);
+            set("offenseTargetTokenIds", parseTokenIds(e.target.value));
+          }}
+          disabled={!cfg.offenseEnabled}
+          placeholder={"42\n137\n501"}
+        />
+        <span className="muted" style={{ fontSize: 11 }}>
+          {cfg.offenseTargetTokenIds.length} token{cfg.offenseTargetTokenIds.length !== 1 ? "s" : ""}
+        </span>
+      </label>
+      <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
       <label className="check">
         <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />
@@ -328,6 +402,13 @@ export function Config({
           the offense tip, as does the last few minutes before a boundary.
         </span>
       </label>
+      {/* Race audits/kills into the boundary block (preBoundaryAudit / preBoundaryKill)
+          are intentionally not rendered — we always want them ON so offense competes in
+          the first eligible block instead of the block after. They stay on and remain
+          editable in data/config.json. preBoundaryKill is a no-op unless Auto-kill above
+          is enabled. The "Only run offense when supply is within N of 69" gate
+          (endgameOnlyWithin) is likewise hidden so its "always run" default can't be
+          changed by accident. */}
       {/* Thor Mode and the two flags it subsumes.
           Rendered together because they answer one question — how much of your offense the
           public mempool gets to see before the boundary block is built — and because Thor
@@ -469,77 +550,6 @@ export function Config({
           </span>
         </label>
       </div>
-      {/* Race audits/kills into the boundary block (preBoundaryAudit / preBoundaryKill)
-          are intentionally not rendered — we always want them ON so offense competes in
-          the first eligible block instead of the block after. They stay on and remain
-          editable in data/config.json. preBoundaryKill is a no-op unless Auto-kill above
-          is enabled. The "Only run offense when supply is within N of 69" gate
-          (endgameOnlyWithin) is likewise hidden so its "always run" default can't be
-          changed by accident. */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, marginBottom: 4, flexWrap: "wrap" }}>
-        <button
-          type="button"
-          onClick={() => set("offenseTargetTokenIds", [...defaultRivals])}
-          disabled={!cfg.offenseEnabled || defaultRivals.length === 0 || targetsEqual(defaultRivals)}
-          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
-          title="Restore the curated rival list that ships with the bot"
-        >
-          Reset to default list
-        </button>
-        {/* Groups TOGGLE and combine — lit when every id in the group is selected.
-            Each is additive, so "skippers + non-skippers" is two clicks instead of
-            re-typing a list by hand. The roster is split per operator because they are
-            not one decision: they defend differently and only one of them attacks. */}
-        <GroupToggle label="Rival Skippers" ids={skippers} on={groupOn(skippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
-          title="Rivals that pay on a ~2-epoch cadence, so they are delinquent at every second boundary." />
-        <GroupToggle label="Non-skippers" ids={nonSkippers} on={groupOn(nonSkippers)} onClick={toggleGroup} disabled={!cfg.offenseEnabled}
-          title="The curated rivals that are NOT ~2-epoch skippers (the default list minus Rival Skippers)." />
-        {Object.keys(bigBoysByOperator).sort().map((op) => (
-          <GroupToggle
-            key={op}
-            label={op}
-            ids={bigBoysByOperator[op]!}
-            on={groupOn(bigBoysByOperator[op]!)}
-            onClick={toggleGroup}
-            disabled={!cfg.offenseEnabled}
-            title={`Big-boy operator "${op}" (data/big-boys.json). Pins every citizen they run, for a coordinated push against that operator specifically. Several defend at the top of the boundary block — check Analyze targets for what beating them costs.`}
-          />
-        ))}
-        <button
-          type="button"
-          onClick={() => set("offenseTargetTokenIds", [])}
-          disabled={!cfg.offenseEnabled || cfg.offenseTargetTokenIds.length === 0}
-          style={{ padding: "3px 12px", borderRadius: 6, border: "1px solid #555", fontSize: 12 }}
-          title="Clear the list. Blank = target every delinquent rival the bot discovers."
-        >
-          Clear
-        </button>
-        {defaultRivals.length > 0 && (
-          <span className="muted" style={{ fontSize: 11 }}>
-            {defaultRivals.length} default{skippers.length > 0 ? ` · ${skippers.length} skippers` : ""}
-            {nonSkippers.length > 0 ? ` · ${nonSkippers.length} non-skippers` : ""}
-            {bigBoys.length > 0 ? ` · ${bigBoys.length} big boys` : ""}
-          </span>
-        )}
-      </div>
-      <label className="field">
-        Rival token IDs to target (one per line or comma-separated — blank = all delinquent rivals)
-        <textarea
-          rows={5}
-          style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, resize: "vertical" }}
-          value={targetsDraft}
-          onChange={(e) => {
-            setTargetsDraft(e.target.value);
-            set("offenseTargetTokenIds", parseTokenIds(e.target.value));
-          }}
-          disabled={!cfg.offenseEnabled}
-          placeholder={"42\n137\n501"}
-        />
-        <span className="muted" style={{ fontSize: 11 }}>
-          {cfg.offenseTargetTokenIds.length} token{cfg.offenseTargetTokenIds.length !== 1 ? "s" : ""}
-        </span>
-      </label>
-
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>BENJI (DEFENSE) MODE — POST-AUDIT</div>
       <label className="check">
