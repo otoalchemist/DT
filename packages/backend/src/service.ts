@@ -28,21 +28,45 @@ export async function readOwnedStatuses(): Promise<OwnedTokenStatus[]> {
   if (!runtime.unlocked) return [];
   const snap = await getGameSnapshot(SNAPSHOT_TTL_MS);
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  // Union across every unlocked wallet, tagged with the one holding each citizen so the
-  // dashboard can group them and the user can see which wallet needs funding.
+  /**
+   * Where to look for citizens we control.
+   *
+   * The vault has to be in here, not just in the engine's own enumeration
+   * (fetchOwnedAcrossWallets). A vault-held citizen is owned by the CONTRACT on-chain, so
+   * wallet-only enumeration returns nothing and the dashboard shows an empty holdings list —
+   * which then greys out the JIT Arm button, because it is disabled on `nSelected === 0`. The
+   * engine would happily have paid that citizen; the UI simply offered no way to ask it to.
+   *
+   * Ordered with the vault LAST for the same reason the engine does: if the NFT index is
+   * momentarily stale mid-transfer and reports a citizen in both places, the wallet entry wins,
+   * and nothing claims a citizen is vaulted before it really is.
+   *
+   * Deliberately NOT gated on the vault preflight. A mis-wired vault still HOLDS these citizens
+   * and the operator still needs to see them; the red "VAULT NOT USABLE" banner is what reports
+   * the wiring problem.
+   */
+  const vaultAddress = (runtime.strategy.vaultAddress ?? "").trim();
+  const sources: { address: `0x${string}`; label: string }[] = [
+    ...runtime.wallets.map((w) => ({ address: w.account.address as `0x${string}`, label: w.label })),
+    ...(/^0x[a-fA-F0-9]{40}$/.test(vaultAddress)
+      ? [{ address: vaultAddress as `0x${string}`, label: "vault" }]
+      : []),
+  ];
+  // Union across every source, tagged with the one holding each citizen so the dashboard can
+  // group them and the user can see which wallet needs funding.
   const per = await Promise.all(
-    runtime.wallets.map(async (w) => ({
-      w,
-      ids: await fetchOwnedTokenIds(snap.citizensAddress, w.account.address as `0x${string}`),
+    sources.map(async (s) => ({
+      source: s,
+      ids: await fetchOwnedTokenIds(snap.citizensAddress, s.address),
     })),
   );
   const holder = new Map<string, { address: string; label: string }>();
   const ids: bigint[] = [];
-  for (const { w, ids: list } of per) {
+  for (const { source, ids: list } of per) {
     for (const id of list) {
       const key = id.toString();
       if (holder.has(key)) continue;
-      holder.set(key, { address: w.account.address, label: w.label });
+      holder.set(key, { address: source.address, label: source.label });
       ids.push(id);
     }
   }
@@ -165,11 +189,20 @@ export async function readTargets(outputLimit = 250): Promise<TargetTokenStatus[
   // Every wallet we hold, so a citizen in ANY of them is filtered out of the rival list.
   // Falls back to the keystore's addresses when locked — they're stored in plaintext
   // there (only the keys are encrypted), so the panel doesn't change shape on unlock.
+  //
+  // The VAULT is one of ours too. Without it a migrated citizen is owned on-chain by a
+  // contract this set does not recognise, so it stops reading as "ours" and turns up in the
+  // dashboard's RIVAL list — your own citizen offered as a target. Offense itself is safe
+  // either way, because it excludes by ally-roster token id rather than by owner, but a board
+  // that lists your own holdings as rivals is exactly the kind of thing an operator acts on.
+  const vaultSelf = (runtime.strategy.vaultAddress ?? "").trim();
   const selfSet = new Set(
-    (runtime.unlocked
-      ? runtime.addresses
-      : loadWallets(appConfig.dataDir).map((w) => w.address)
-    ).map((a) => a.toLowerCase()),
+    [
+      ...(runtime.unlocked
+        ? runtime.addresses
+        : loadWallets(appConfig.dataDir).map((w) => w.address)),
+      ...(/^0x[a-fA-F0-9]{40}$/.test(vaultSelf) ? [vaultSelf] : []),
+    ].map((a) => a.toLowerCase()),
   );
   const isOurs = (t: TargetTokenStatus) => selfSet.has(t.owner.toLowerCase());
 

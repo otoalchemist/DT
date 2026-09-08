@@ -383,21 +383,36 @@ export async function buildServer(): Promise<FastifyInstance> {
        * leaves the runtime exactly as locked as it was — no half-open state where the engine
        * could be started against a wallet the gate just rejected.
        *
+       * The VAULT counts as one of "your" addresses. A migrated citizen is owned on-chain by
+       * the CitizenVault, so a wallet-only check reads a fully paid-up team member as a
+       * stranger and locks them out of their own bot — which happened: moving the last citizen
+       * into the vault made the next unlock fail, minutes before a boundary. The vault is only
+       * reachable by its operator, so a rostered citizen inside it is exactly as much proof of
+       * membership as one held directly.
+       *
        * checkAllyHolding never throws and fails open on any indeterminate reading; see
        * ally-gate.ts for why a wrong deny is far more expensive than a wrong allow.
        */
-      const allyVerdict = await checkAllyHolding(wallets.map((w) => w.account.address));
+      const vaultForGate = (runtime.strategy.vaultAddress ?? "").trim();
+      const gateAddresses = [
+        ...wallets.map((w) => w.account.address as string),
+        ...(/^0x[a-fA-F0-9]{40}$/.test(vaultForGate) ? [vaultForGate] : []),
+      ];
+      const allyVerdict = await checkAllyHolding(gateAddresses);
       if (!allyVerdict.ok) {
         logger.warn(
-          `Unlock denied by the ally gate: none of ${wallets.length} wallet(s) holds a rostered ` +
-            `citizen (${allyVerdict.checked} live roster entries checked)`,
+          `Unlock denied by the ally gate: none of ${gateAddresses.length} address(es) holds a ` +
+            `rostered citizen (${allyVerdict.checked} live roster entries checked)`,
         );
         return reply.code(403).send({
           error:
             "No allied Citizen found in this wallet. This build is gated to the team: the " +
             "wallet you unlock must hold at least one Citizen on the shared ally roster. If " +
             "you have just joined, ask for your token id to be added to the roster, then " +
-            "restart the bot so it syncs the new list.",
+            "restart the bot so it syncs the new list." +
+            (/^0x[a-fA-F0-9]{40}$/.test(vaultForGate)
+              ? ` Your configured vault (${vaultForGate}) was checked too and holds none either.`
+              : ""),
         });
       }
       if (allyVerdict.reason === "indeterminate") {

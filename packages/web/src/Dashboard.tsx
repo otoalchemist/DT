@@ -752,12 +752,20 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
                       className="muted"
                       style={{ fontSize: 11 }}
                       title={
-                        t.walletAddress
-                          ? `Held by ${t.walletLabel} (${t.walletAddress}). Paying or auditing this citizen is owner-only on-chain, so it is signed by — and spends gas from — this wallet.`
-                          : undefined
+                        /* The vault is a CONTRACT, so the usual wording would be wrong twice
+                           over: it does not sign and it does not hold the gas. The whole point
+                           of the owner/operator split is that the signer and the holder are
+                           different, so say which is which. */
+                        !t.walletAddress
+                          ? undefined
+                          : t.walletLabel === "vault"
+                            ? `Held by the CitizenVault (${t.walletAddress}). The contract is the on-chain owner, so payments and audits are made BY it — signed by the bot wallet as its operator, and funded from that wallet. Only the vault's cold owner key can move this citizen out.`
+                            : `Held by ${t.walletLabel} (${t.walletAddress}). Paying or auditing this citizen is owner-only on-chain, so it is signed by — and spends gas from — this wallet.`
                       }
                     >
-                      {t.walletLabel ?? "—"}
+                      {t.walletLabel === "vault"
+                        ? <span className="badge" title="Batched: the whole boundary goes out as one transaction.">vault</span>
+                        : (t.walletLabel ?? "—")}
                     </td>
                     <td>{current
                       ? <span className="badge on">current</span>
