@@ -271,15 +271,29 @@ function beginVaultBatch(): void {
   vaultBidWei = 0n;
 }
 
-// Gas for the vault wrapper itself: calldata dispatch, the loop, the value check, the
-// refund and the coinbase transfer. Sized generously and deliberately — unused gas is
-// refunded, while under-providing loses the boundary. Same asymmetry as
-// GAS_COINBASE_BID_TX.
+/**
+ * These two set the SIGNED GAS LIMIT, which is a different quantity from what a bundle COSTS.
+ *
+ * Do not "correct" them to the measured execution figures. A signed limit has to cover
+ * intrinsic (21,000) + calldata + execution; the measurements in VAULT-STATUS and in
+ * citizen-vault.test.ts are execution only, because neither a fork replay nor evm.runCall
+ * charges the first two. Setting the limit to those numbers puts it BELOW real usage and every
+ * vault transaction runs out of gas — a boundary lost nightly, from a change that reads like a
+ * tidy-up. GAS_VAULT_OVERHEAD in shared/constants.ts is the one that wanted the real figure,
+ * because it prices density; these want an upper bound.
+ *
+ * Unused gas is refunded, so over-providing is safe on cost. It is NOT free on headroom: the
+ * limit times maxFee is what canSpend must see spare before it will send. At 20 actions and
+ * 300 gwei the current numbers demand ~0.89 ETH of balance to sign a boundary that will
+ * actually burn ~1.6M gas. Worth tightening once an audit's marginal cost inside the vault is
+ * measured against the REAL game rather than the mock — the harness measures the wrapper
+ * (~3,500/call), and MockGame.payTaxes is empty, so the game's own work is not in that figure.
+ */
 const VAULT_CALL_OVERHEAD_GAS = 60_000n;
-// Per collected action. The largest game action is an audit at ~130,409; the rest is the
-// internal CALL and event. Not eth_estimateGas'd: at a boundary the batch is invalid
-// against current state (it pays an epoch that has not begun), which is exactly why
-// PRE_BOUNDARY_GAS exists too.
+// Per collected action. The largest game action is an audit at ~130,409 standalone; inside the
+// batch that is the game's own execution plus ~3,500 of wrapper (measured). Not
+// eth_estimateGas'd: at a boundary the batch is invalid against current state (it pays an epoch
+// that has not begun), which is exactly why PRE_BOUNDARY_GAS exists too.
 const VAULT_PER_CALL_GAS = 145_000n;
 
 /**

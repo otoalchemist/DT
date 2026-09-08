@@ -155,15 +155,22 @@ export const GAS_PER_AUDIT = 130_409;
 export const GAS_COINBASE_BID_TX = 30_550;
 
 /**
- * Fixed overhead of a CitizenVault.run() call: calldata dispatch, the value check, the
- * loop, the per-call CallResult logs, the refund and the inline coinbase transfer.
+ * Fixed cost of the one transaction a vault boundary sends: the 21,000 intrinsic every
+ * transaction pays, plus the run() wrapper itself — dispatch, the value check, the loop, the
+ * per-call CallResult logs, the refund and the inline coinbase transfer.
  *
- * Batching replaces N transactions with one, so the per-transaction 21,000 intrinsic gas is
- * paid once instead of N times — but the wrapper itself is not free, and pricing a bid
- * against a bundle that ignores it under-provides on the one number where under-providing
- * loses the boundary. Sized from the measured VAULT_CALL_OVERHEAD_GAS the bot signs with.
+ * MEASURED, twice, by different methods that agree:
+ *   - mainnet fork (VAULT-STATUS, block 25780106): 10,100 execution for bid-only, 0 calls
+ *   - the EVM harness in citizen-vault.test.ts: 35,100, of which 25,000 is cold-account
+ *     creation for a block.coinbase this EVM has never seen and mainnet always has
+ * So ~10,100 of wrapper, + 21,000 intrinsic = 31,100.
+ *
+ * Was 60,000, sized off the gas LIMIT the bot signs with — which is a different quantity and
+ * deliberately generous (see VAULT_CALL_OVERHEAD_GAS in strategy.ts). Using it here inflated
+ * every batched density figure by ~29,000 gas of transaction that does not exist, which makes
+ * a batched bundle look denser to price and therefore under-bids it.
  */
-export const GAS_VAULT_OVERHEAD = 60_000;
+export const GAS_VAULT_OVERHEAD = 31_100;
 
 /**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.

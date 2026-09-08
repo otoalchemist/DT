@@ -305,3 +305,93 @@ describe("CitizenVault: deployment guards", () => {
     await expect(deploy(vaultBytecode + ctorArgs)).rejects.toThrow();
   });
 });
+
+/**
+ * What the wrapper actually costs, measured rather than assumed.
+ *
+ * The branch note recorded fork numbers and concluded "both should be brought to the measured
+ * numbers". That is right for ONE of the three constants and wrong for the other two, which is
+ * why this block exists instead of a straight edit:
+ *
+ *   GAS_VAULT_OVERHEAD (shared)      prices a bundle for the DENSITY math. Wants real gas.
+ *   VAULT_CALL_OVERHEAD_GAS (bot)    sets the SIGNED GAS LIMIT.
+ *   VAULT_PER_CALL_GAS (bot)         same.
+ *
+ * A signed gas limit must cover intrinsic (21,000) + calldata + execution. Setting it to the
+ * measured EXECUTION figures would put the limit BELOW actual usage and every vault transaction
+ * would run out of gas — a boundary lost every night, from a change that reads like a tidy-up.
+ *
+ * Note these numbers are execution only: evm.runCall charges no intrinsic and no calldata.
+ */
+describe("CitizenVault: measured gas", () => {
+  const gasOf = async (calls: Call[], bidWei = 0n): Promise<bigint> => {
+    const data = encodeFunctionData({ abi: vaultAbi, functionName: "run", args: [calls, bidWei] });
+    const value = calls.reduce((s, c) => s + c.value, bidWei);
+    const r = await evm.runCall({
+      caller: OPERATOR, to: vault, data: hexToBytes(data), value, gasLimit: 5_000_000n,
+    });
+    if (r.execResult.exceptionError) throw new Error(String(r.execResult.exceptionError.error));
+    return r.execResult.executionGasUsed;
+  };
+  // Reuses the file’s own encoders, so these measure the exact calldata the other cases send.
+  const pay = (id: number): Call => ({ data: payData(BigInt(id)), value: 0n, tolerate: false });
+  const audit = (from: number, target: number): Call =>
+    ({ data: auditData(BigInt(from), BigInt(target)), value: 0n, tolerate: true });
+
+  it("reports the shape the constants have to cover", async () => {
+    const wrapper = await gasOf([], 10n ** 15n);
+    const p1 = await gasOf([pay(1)]);
+    const p2 = await gasOf([pay(1), pay(2)]);
+    const p5 = await gasOf([pay(1), pay(2), pay(3), pay(4), pay(5)]);
+    const a1 = await gasOf([audit(1, 100)]);
+    const a2 = await gasOf([audit(1, 100), audit(2, 101)]);
+    const marginalPay = p2 - p1;
+    const marginalAudit = a2 - a1;
+
+    // eslint-disable-next-line no-console
+    console.log(`
+  wrapper only (bid, 0 calls) : ${wrapper}
+  1 payment                   : ${p1}
+  2 payments                  : ${p2}   marginal ${marginalPay}
+  5 payments                  : ${p5}
+  1 audit                     : ${a1}
+  2 audits                    : ${a2}   marginal ${marginalAudit}
+  + intrinsic per TX          : 21000  (charged on chain, not by runCall)`);
+
+    /**
+     * The wrapper is cheap — the whole basis for batching — but read this number carefully.
+     *
+     * It includes ~25,000 of COLD-ACCOUNT creation for block.coinbase, which this EVM has
+     * never seen and mainnet always has. Subtract that and it lands on ~10,100, which is
+     * exactly what the mainnet fork measured independently (VAULT-STATUS). Two different
+     * methods agreeing on the wrapper cost is worth more than either alone.
+     */
+    const COLD_COINBASE = 25_000;
+    expect(Number(wrapper) - COLD_COINBASE).toBeLessThan(15_000);
+    // And the per-call figures here are the WRAPPER cost only: MockGame.payTaxes is an empty
+    // function, so the real game action is not in these numbers.
+    expect(Number(marginalPay)).toBeLessThan(10_000);
+    expect(Number(marginalAudit)).toBeLessThan(10_000);
+  });
+
+  it("the SIGNED limit the bot uses covers real usage with margin, for a big holder", async () => {
+    // The property that matters: 9 payments + 11 audits — the shape a nine-citizen holder
+    // actually sends — must fit inside what strategy.ts signs, with the on-chain intrinsic and
+    // a calldata allowance added on top of what runCall charges.
+    const calls = [
+      ...Array.from({ length: 9 }, (_, i) => pay(i + 1)),
+      ...Array.from({ length: 11 }, (_, i) => audit(i + 1, 200 + i)),
+    ];
+    const execution = await gasOf(calls, 10n ** 16n);
+    const CALLDATA_ALLOWANCE = 20n * 320n; // ~320 gas per 100-byte Call struct, generous
+    const realistic = execution + 21_000n + CALLDATA_ALLOWANCE;
+
+    const VAULT_CALL_OVERHEAD_GAS = 60_000n; // mirrored from strategy.ts
+    const VAULT_PER_CALL_GAS = 145_000n;
+    const signed = VAULT_CALL_OVERHEAD_GAS + BigInt(calls.length) * VAULT_PER_CALL_GAS;
+
+    // eslint-disable-next-line no-console
+    console.log(`  20-action batch: execution ${execution}, realistic ${realistic}, signed ${signed}`);
+    expect(signed).toBeGreaterThan(realistic);
+  });
+});
