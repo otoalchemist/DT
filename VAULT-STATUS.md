@@ -16,7 +16,8 @@ passing unchanged is there to prove.
 | `packages/shared/src/abi/citizenVault.ts` | minimal ABI — deliberately omits the owner-only functions so the hot key cannot encode them |
 | tests | 26 across `citizen-vault` (compiles + executes the real contract), `vault-bundle`, `vault-mixed`, `vault-receipt` |
 
-378 tests pass, build clean.
+676 tests across 45 files pass, both typechecks clean, build clean — master (1.19.0) merged in
+2026-09-08. That is master's 650 plus this branch's 26, so nothing was lost either side.
 
 ## Verified on a mainnet fork (block 25780106)
 
@@ -57,7 +58,7 @@ brought to the measured numbers, with the fork script as their provenance.
 Going through the vault costs **+6,741 execution gas** over a direct payment for one call,
 and saves a whole 21,000-gas intrinsic per additional action after the first.
 
-## OPEN — audits are reverting, and it is NOT the vault
+## RESOLVED 2026-09-08 — the reverting audits were BURNED citizens, not insurance
 
 Found while simulating, unfinished. Every audit the bot would currently queue reverts:
 
@@ -74,23 +75,33 @@ audits did succeed on-chain 6.3h earlier at the epoch-169 boundary. Game `state`
 ABI**, so `packages/shared/src/abi/deathAndTaxes.ts` is missing at least one error the
 deployed contract can throw.
 
-Leading hypothesis: **life insurance blocks auditing.** All six rejected targets have
-`hasLifeInsurance = 1`. The bot treats insurance as cosmetic (see the comment on
-`LIFE_INSURANCE_COST_WEI`, and the unlock screen text) and `TargetTokenStatus` does not even
-carry the field, so `isAuditable()` never consults it — meaning the bot would keep queueing
-audits that cannot land.
+The leading hypothesis was **life insurance blocks auditing**, flagged unproven because all
+six rejected targets were insured and there was no counter-example.
 
-**Not yet proven.** All six auditable targets happened to be insured, so there is no
-counter-example. The next step is to find an auditable *uninsured* citizen and check whether
-`audit()` is accepted; a scan of ids 1..7000 for `auditDue == 0 && lastEpochPaid + 2 <= epoch
-&& hasLifeInsurance == 0` was written but not run. If it confirms, the fix is to fetch
-insurance in `batchGetTargetStatuses` and exclude insured targets in `isAuditable` — which
-would matter to production offense today, entirely independently of this branch.
+**There are seven, and the hypothesis is wrong.** Every target audited SUCCESSFULLY on chain
+the week of 2026-09-07 — #6953, #358, #6699, #4355, #5688, #4140, #382 — also carries
+`hasLifeInsurance = 1`. Insurance does not separate the two groups.
+
+**Liveness does.** All six that reverted are BURNED (`ownerOf` reverts); all seven that worked
+are alive. And `0x7e273289` is `ERC721NonexistentToken(uint256)` — inherited from the ERC721
+base and thrown by the Citizens contract, not declared by the game. `lastEpochPaid` is a
+mapping that survives the burn, so a dead citizen still reads as N epochs behind while
+`ownerOf` reverts. Same root cause as the earlier 3+-behind finding.
+
+**No production change was needed, and the proposed fix would have been harmful.** Excluding
+insured targets would have disabled essentially all offense, since apparently every citizen is
+insured. `filterLiveTokenIds` already drops burned ids from the offense pipeline. The ABI entry
+this note said was missing is present on master — true at 1.5.5, fixed since. What landed on
+master is a regression pin only (`abi-errors.test.ts`), verified to fail if the inherited error
+is ever dropped in a regeneration.
 
 ## Remaining before mainnet
 
-1. Finish the insurance question above (affects production, not just the vault).
-2. Correct the three gas constants to the measured values.
+1. ~~Finish the insurance question~~ — CLOSED, see above. No production change needed.
+2. Correct the three gas constants to the measured values. Still outstanding: after the merge
+   `GAS_VAULT_OVERHEAD` is still 60_000 against a measured 10,100, and strategy.ts still carries
+   `VAULT_CALL_OVERHEAD_GAS = 60_000` / `VAULT_PER_CALL_GAS = 145_000` against 10,100 and
+   ~39,476. Over-providing is safe, but every beat/lead figure is quoted off the wrong number.
 3. External review of the contract — my own adversarial pass found one real bug (a non-contract
    `game` address made every call silently "succeed" while sending the ETH to a dead address;
    fixed with constructor code checks, pinned as a test). Two other suspicions did not hold: a
@@ -105,9 +116,13 @@ endgame payout would need citizens withdrawn first (pinned as a failing-by-desig
 ## Picking this up elsewhere
 
 ```bash
-git fetch origin && git checkout vault && npm install && npm test
+git fetch origin && git checkout vault && npm install && npm test   # 676 tests
 ```
 
-The branch is invisible to other operators by construction: `version-check.ts`,
-`update.mjs` and `list-sync.ts` all hardcode `master`, and `VERSION` is untouched at 1.5.5.
-Do not bump `VERSION` on master while this is in flight.
+The branch is invisible to other operators by construction: `version-check.ts`, `update.mjs`
+and `list-sync.ts` all hardcode `master`.
+
+**The "do not bump VERSION on master" rule is now moot and should not be reinstated.** Master
+has shipped up to 1.19.0 while this branch sat still, and nothing broke, because the isolation
+comes from the three hardcoded `master` refs rather than from the version number. The branch
+carries master's 1.19.0 after the merge.
