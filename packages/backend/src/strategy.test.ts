@@ -29,7 +29,14 @@ vi.mock("./chain.js", () => ({
     multicall: vi.fn(async ({ contracts }: { contracts: { functionName: string }[] }) =>
       contracts.map((c) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n, // lastEpochPaid huge (current), auditLimit=1
+        // auditDueTimestamp MUST be 0 (not under audit) rather than falling through to the
+        // lastEpochPaid default: auditWhileBehind drops the delinquency clause, so
+        // isEligibleAuditor now excludes on this field instead, and a non-zero default here
+        // makes every owned citizen read as under audit and empties the auditor pool.
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n
+          : 1_000_000n, // lastEpochPaid huge (current)
       })),
     ),
   },
@@ -70,7 +77,7 @@ vi.mock("./nonce.js", () => ({
   // Per-address registry. The real one hands each wallet its own counter; the tests
   // only need the calls to be inert.
   nonces: {
-    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0) })),
+    for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0), markSigned: vi.fn() })),
     syncAll: vi.fn(async () => {}),
     resetAll: vi.fn(),
     retain: vi.fn(),
@@ -97,7 +104,7 @@ vi.mock("./flashbots.js", () => ({
   queueCoinbaseBid: vi.fn(async () => false),
   // Telemetry hook (race-timing.ts) — a no-op here, but it must exist on the mock or every
   // pre-boundary fire throws before doing any work.
-  setRaceBoundary: vi.fn(),
+  setRaceBoundary: vi.fn(), setRaceLookBack: vi.fn(),
 }));
 
 vi.mock("./contract.js", () => ({
@@ -148,7 +155,7 @@ function useWallet(account: unknown, balanceWei: bigint | null = null): void {
 function setTestBalance(wei: bigint | null): void {
   for (const w of runtime.wallets) w.balanceWei = wei;
 }
-const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
+const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePreBoundaryAudit, fetchOffenseCandidates, fetchOffenseCandidatesWithSkips, queuePreBoundaryAudits, prefetchAuditInputs, firePreBoundaryBundle, firePreBoundaryPay, maybeAutoArmPayment, maybeAutoDefendAudit, resetDefenseState, resetTickBudget, jitPass, fetchOwnedAcrossWallets, schedulePreBoundaryBundle, manualPayToCurrent, resetJitState, scheduleAwayWake, clearAwayTimers } =
   await import("./strategy.js");
 
 // combinedBundleActive is the single predicate that routes every pre-boundary
@@ -160,10 +167,18 @@ const { startEngine, stopEngine, combinedBundleActive, coinbaseBidActive, firePr
 describe("combinedBundleActive routing predicate", () => {
   const base = { ...DEFAULT_STRATEGY, coinbasePayerAddress: "0x00000000000000000000000000000000000000b1" };
 
-  it("is false for the shipped default (combine on, no bid) — the safe no-op state", () => {
-    expect(DEFAULT_STRATEGY.combinedBoundaryBundle).toBe(true); // on by default...
-    expect(DEFAULT_STRATEGY.coinbaseBidEth).toBe(0); // ...but inert without a bid
+  it("is false for the shipped default (combine OFF) — now off rather than merely inert", () => {
+    // The default flipped: fusing is off, so the split path is what ships. Previously this
+    // read `combinedBoundaryBundle: true` and relied on a zero bid to keep it inert, which
+    // meant setting a bid silently fused the boundary — and a fused bundle is the one shape
+    // auditBundleAllOrNothing cannot be applied to (one cured target would drop every
+    // payment). Off at the source, the offense default stays reachable with a bid set.
+    expect(DEFAULT_STRATEGY.combinedBoundaryBundle).toBe(false);
+    expect(DEFAULT_STRATEGY.coinbaseBidEth).toBe(0);
     expect(combinedBundleActive(DEFAULT_STRATEGY)).toBe(false);
+    // ...and still false with a bid, which is the part that actually changed.
+    expect(combinedBundleActive({ ...DEFAULT_STRATEGY, coinbaseBidEth: 0.01,
+      coinbasePayerAddress: "0x00000000000000000000000000000000000000b1" })).toBe(false);
   });
 
   it("is true only when combine is on AND a bid is set AND a payer is present", () => {
@@ -420,7 +435,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
   });
 
   it("queues exactly one audit of #1612 from our owned auditor token", async () => {
-    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     expect(queued).toBe(true);
     // The audit tx was actually submitted (encodeAudit calldata), value == AUDIT_COST_WEI.
     const auditCalls = vi.mocked(submitTx).mock.calls.filter(([intent]) => intent.data === "0xAUDIT");
@@ -434,7 +449,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
     // because the contract forbids an auditable token from auditing — but that's the
     // game's rule, not an exclusion effect.)
     runtime.strategy = { ...runtime.strategy, excludedTokenIds: ["1"] };
-    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     expect(queued).toBe(true);
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(1);
     // ...and it audited FROM the excluded token #1.
@@ -454,7 +469,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
         killable: false,
       },
     ]);
-    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     expect(queued).toBe(false);
     expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
   });
@@ -505,7 +520,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
         })),
       );
 
-      const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+      const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
       expect(queued).toBe(false);
       // Nothing submitted (the point of the cap) ...
       expect(vi.mocked(submitTx).mock.calls.filter(([i]) => i.data === "0xAUDIT")).toHaveLength(0);
@@ -535,7 +550,7 @@ describe("queuePreBoundaryAudits: pinned high-ID delinquent rival gets an audit 
           killable: false,
         })),
       );
-      await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+      await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
       // Both candidates were considered — the loop continued rather than breaking out.
       expect(vi.mocked(getLatestBlockCached).mock.calls.length).toBe(2);
     });
@@ -577,6 +592,11 @@ describe("combined boundary bundle with multiple citizens", () => {
     runtime.startTime = 0n;
     runtime.strategy = {
       ...DEFAULT_STRATEGY,
+      // Pinned: revert tolerance for payments is no longer the shipped default (see
+      // DEFAULT_STRATEGY.paymentBundleAllOrNothing). This block is about one bad payment not
+      // dropping its siblings, which IS the tolerant behaviour by definition.
+      mirrorPayments: true,
+      paymentBundleAllOrNothing: false,
       offenseEnabled: true,
       autoAudit: true,
       preBoundaryAudit: true,
@@ -642,7 +662,10 @@ describe("combined boundary bundle with multiple citizens", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -675,7 +698,7 @@ describe("combined boundary bundle with multiple citizens", () => {
     const opts = (data: string) =>
       vi.mocked(submitTx).mock.calls
         .filter(([i]) => (i as { data: string }).data === data)
-        .map(([, o]) => o as { revertible?: boolean; race?: boolean });
+        .map(([, o]) => o as { revertible?: boolean; race?: boolean; bundleOnly?: boolean });
 
     const pays = opts("0xPAYTAXES");
     const audits = opts("0xAUDIT");
@@ -1356,7 +1379,10 @@ describe("bundle-only txs still resolve submitted -> included", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -1510,7 +1536,10 @@ describe("multi-wallet: actions are signed by the wallet that owns the citizen",
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -1538,7 +1567,7 @@ describe("multi-wallet: actions are signed by the wallet that owns the citizen",
     vi.mocked(fetchOwnedTokenIds).mockImplementation(async (_c: unknown, addr: string) =>
       addr.toLowerCase() === B.toLowerCase() ? [20n] : [],
     );
-    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false });
+    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: false, bundleOnly: false });
     const audits = signersByData().filter((c) => c.data === "0xAUDIT");
     expect(audits.length).toBeGreaterThan(0);
     for (const a of audits) expect(a.signer).toBe(B);
@@ -1649,7 +1678,210 @@ describe("multi-wallet: manual actions resolve the owning wallet before signing"
 // bundle, the builder dropped it, the bundle-only coinbase bid died with it, and the
 // audits trickled out through the mempool naked — landing at tx index 40 instead of 0 and
 // every one reverting with AuditAlreadyActive.
-describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bid", () => {
+/**
+ * A sweep that sends nothing has to say why.
+ *
+ * It always reported the COUNT, so a zero was never invisible — but with targets and slots
+ * available "queued 0" reads as a broken bot. The realistic trigger is the SEPARATE offense
+ * base-fee cap: payments and audits carry independent ceilings, so a base fee between them
+ * sends every payment and stops every audit, and the reason only went to logger.debug.
+ */
+/**
+ * Audit slots are dealt round-robin, not token by token.
+ *
+ * At the epoch-178 boundary an ally held 15 slots across 9 citizens and spent all three of
+ * its audits on #358 — the first eligible citizen, which carries auditLimit 3. The three
+ * audits were separate transactions with separate outcomes, yet shared one auditor, so
+ * anything invalidating that citizen took all three with it. Nothing is bought by that
+ * coupling.
+ */
+/**
+ * The sweep's reads happen OUTSIDE the engine lock.
+ *
+ * At epoch 178 an ally's payment fire held the lock through its own builder fan-out, so the
+ * audit fire could not begin reading until that finished and ran three seconds past the
+ * boundary — its targets already taken. The reads touch nothing the lock guards, so the fire
+ * now starts them before acquiring it and hands the result to the sweep.
+ *
+ * What has to hold: a prefetch for THIS epoch is used as-is, and one for a different epoch is
+ * discarded rather than trusted, because statuses are classified against a target epoch.
+ */
+describe("the audit sweep uses a prefetch taken outside the lock", () => {
+  const TARGET_EPOCH = 200n;
+  const inputsFor = (epoch: bigint) => ({
+    targetEpoch: epoch,
+    ownedIds: [10n],
+    // auditDueTimestamp 0n is REQUIRED, not decorative: isEligibleAuditor excludes an
+    // under-audit citizen, and an absent field reads as non-zero, which empties the pool.
+    auditorState: [{ id: 10n, lastEpochPaid: 1_000_000n, auditLimit: 1n, auditDueTimestamp: 0n }],
+    candidates: [{ id: 501n, owner: "0x00000000000000000000000000000000000000dd" as const }],
+    emigrated: new Set<string>(),
+    statuses: [{
+      tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+      lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+      auditable: true, auditDueTimestamp: "0", killable: false,
+    }],
+  });
+
+  beforeEach(() => {
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount, 10n ** 19n);
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0, offenseTargetTokenIds: ["501"],
+    } as typeof runtime.strategy;
+    resetTickBudget();
+  });
+
+  it("reuses a prefetch instead of reading again", async () => {
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(inputsFor(TARGET_EPOCH).statuses as never);
+    // Built through the REAL prefetch, because fetchOwnedAcrossWallets also fills the
+    // token -> wallet map that act() signs from; a hand-made object skips that and the
+    // sweep then refuses every audit for want of a holder.
+    const pre = await prefetchAuditInputs(TARGET_EPOCH, 0n);
+    vi.mocked(batchGetTargetStatuses).mockClear();
+    vi.mocked(fetchOwnedTokenIds).mockClear();
+    const queued = await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, {
+      revertible: true, bundleOnly: false, prefetched: pre,
+    });
+    expect(queued).toBe(true);
+    // The whole point: no round trip under the lock.
+    expect(batchGetTargetStatuses).not.toHaveBeenCalled();
+    expect(fetchOwnedTokenIds).not.toHaveBeenCalled();
+  });
+
+  it("discards a prefetch taken for a different epoch and reads fresh", async () => {
+    // Statuses are classified against a target epoch, so one fetched for another epoch
+    // would mislabel every rival. Cheaper to re-read than to be wrong.
+    vi.mocked(batchGetTargetStatuses).mockClear();
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([] as never);
+    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, {
+      revertible: true, bundleOnly: false, prefetched: { ...inputsFor(TARGET_EPOCH + 1n), targetEpoch: TARGET_EPOCH + 1n } as never,
+    });
+    expect(batchGetTargetStatuses).toHaveBeenCalled();
+  });
+});
+
+describe("the auditor pool spreads audits across distinct auditors", () => {
+  const OWNED_MULTI = [10n, 20n, 30n];
+
+  beforeEach(() => {
+    runtime.currentEpoch = 199n;
+    runtime.startTime = 0n;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount, 10n ** 19n);
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue(OWNED_MULTI);
+    // auditLimit THREE per citizen. The harness default is 1, and with one slot each the
+    // round-robin and token-by-token deals produce the identical list — the assertion below
+    // would pass against the bug it exists to catch.
+    vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: { contracts: { functionName: string }[] }) =>
+      contracts.map((c) => ({
+        status: "success" as const,
+        result:
+          c.functionName === "auditLimit" ? 3n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
+      }))) as never);
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true,
+      minBalanceEth: 0, maxPaymentEth: 0,
+      offenseTargetTokenIds: ["501", "502", "503"],
+    } as typeof runtime.strategy;
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue(
+      ["501", "502", "503"].map((tokenId) => ({
+        tokenId, owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: "198", delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      })) as never,
+    );
+    resetTickBudget();
+  });
+
+  it("uses a different auditor per audit when several are eligible", async () => {
+    // Nine slots across three citizens (3 each). Dealt token-by-token all three audits land
+    // on #10 — the epoch-178 shape; dealt round-robin they land on #10, #20, #30.
+    vi.mocked(encodeAudit).mockClear();
+    await queuePreBoundaryAudits(200n, 0n, 0n, { revertible: true, bundleOnly: false });
+    const auditors = vi.mocked(encodeAudit).mock.calls.map((c) => String(c[0]));
+    expect(auditors).toHaveLength(3);
+    expect(new Set(auditors).size).toBe(3);
+    expect(auditors).toEqual(["10", "20", "30"]);
+  });
+
+  it("still fills from one auditor when it is the only eligible citizen", async () => {
+    // Degenerate case: the deal must not lose capacity a single multi-slot citizen has.
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    vi.mocked(encodeAudit).mockClear();
+    await queuePreBoundaryAudits(200n, 0n, 0n, { revertible: true, bundleOnly: false });
+    const auditors = vi.mocked(encodeAudit).mock.calls.map((c) => String(c[0]));
+    expect(auditors).toEqual(["10", "10", "10"]);
+  });
+});
+
+describe("the audit sweep names its blocker when nothing went out", () => {
+  it("says the base-fee cap stopped it, instead of just reporting zero", async () => {
+    const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
+    const { activity } = await import("./activity.js");
+    const { queuePreBoundaryAudits, resetTickBudget } = await import("./strategy.js");
+    const { batchGetTargetStatuses } = await import("./contract.js");
+    const { fetchOwnedTokenIds } = await import("./index-tokens.js");
+
+    const TARGET_EPOCH = 200n;
+    runtime.currentEpoch = TARGET_EPOCH - 1n;
+    runtime.startTime = 0n;
+    runtime.gameState = 1;
+    runtime.citizensAddress = "0x00000000000000000000000000000000000000cc";
+    vi.mocked(fetchOwnedTokenIds).mockResolvedValue([10n]);
+    // An unlocked wallet holding #10, or the auditor pool is empty and the sweep breaks at
+    // "0 auditor slot(s)" before it ever reaches the spend guard this test is about.
+    useWallet({ address: "0x1111111111111111111111111111111111111111" } as unknown as PrivateKeyAccount, 10n ** 19n);
+    vi.mocked(batchGetTargetStatuses).mockResolvedValue([
+      {
+        tokenId: "501", owner: "0x00000000000000000000000000000000000000dd",
+        lastEpochPaid: (TARGET_EPOCH - 2n).toString(), delinquent: true, epochsBehind: 2,
+        auditable: true, auditDueTimestamp: "0", killable: false,
+      },
+    ] as never);
+    // Offense capped BELOW the block's base fee while payments stay generous — the exact
+    // asymmetry that sends every payment and stops every audit.
+    runtime.strategy = {
+      ...DEFAULT_STRATEGY,
+      offenseEnabled: true, autoAudit: true, preBoundaryAudit: true,
+      separateOffenseGas: true,
+      maxBaseFeeGwei: 500,
+      offenseMaxBaseFeeGwei: 1, // block base fee in this harness is 10 gwei
+      offenseTargetTokenIds: ["501"],
+      minBalanceEth: 0, maxPaymentEth: 0,
+    } as typeof runtime.strategy;
+    resetTickBudget();
+    vi.mocked(activity.add).mockClear();
+
+    await queuePreBoundaryAudits(TARGET_EPOCH, 0n, 0n, { revertible: true, bundleOnly: false });
+
+    const msgs = vi.mocked(activity.add).mock.calls.map((c) => String(c[0]?.message ?? ""));
+    const summary = msgs.find((m) => m.includes("Pre-boundary audit (epoch"));
+    expect(summary).toBeDefined();
+    expect(summary).toContain("queued 0");
+    // The point: the reason is in the feed, not only in logger.debug.
+    expect(summary).toMatch(/none sent: .*over cap/i);
+  });
+});
+
+/**
+ * The MIRRORED, revert-tolerant audit configuration — which used to be the only one.
+ *
+ * The title once read "revert-tolerant either way, never bundle-only", and that was a true
+ * invariant until mirrorAudits and auditBundleAllOrNothing existed to break it deliberately.
+ * Both are now shipped in the breaking direction, so this block pins them back on and covers
+ * the other half of each switch; 1.17.0's own suites cover the off side.
+ */
+describe("pre-boundary audit-only fire, mirrored and revert-tolerant", () => {
   const ADDR = "0x1111111111111111111111111111111111111111" as const;
   const PAYER = "0x00000000000000000000000000000000000000b1";
   const CURRENT = 200n;
@@ -1660,6 +1892,8 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
     autoAudit: true,
     preBoundaryAudit: true,
     racePublicMempool: true,
+    mirrorAudits: true,
+    auditBundleAllOrNothing: false,
     minBalanceEth: 0,
     maxBaseFeeGwei: 1000,
     endgameOnlyWithin: null,
@@ -1705,7 +1939,10 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 
@@ -1732,22 +1969,38 @@ describe("pre-boundary audit-only fire: revert-tolerance follows the coinbase bi
     for (const o of opts) expect(o.revertible).toBe(true);
   });
 
-  it("WITHOUT a bid: audits stay all-or-nothing and keep the mempool mirror", async () => {
-    // No bid means the bundle is unlikely to win top-of-block at all, so the mirror is
-    // the only copy that will realistically land — losing it would be strictly worse.
+  it("WITHOUT a bid: audits are revert-tolerant TOO, and still keep the mempool mirror", async () => {
+    // This used to be all-or-nothing, which meant the config most people run lost every
+    // audit from its bundle to one stale target. Nothing shares this bundle — the payments
+    // are in their own — so tolerating a revert costs nothing, and the mirror is kept
+    // because it is the only copy that can land in a solo-built boundary block.
     runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0, coinbasePayerAddress: PAYER };
     await firePreBoundaryAudit();
     const opts = auditOpts();
     expect(opts.length).toBeGreaterThan(0);
-    for (const o of opts) expect(o.revertible).toBe(false);
+    for (const o of opts) {
+      expect(o.revertible).toBe(true);
+      // act() consumes bundleOnly to derive `race`, so race:true IS the mirror surviving.
+      expect(o.race).toBe(true);
+    }
   });
 
-  it("a bid amount with no payer configured does NOT switch to bundle-only", async () => {
-    // maybeQueueCoinbaseBid is a no-op without a payer, so treating this as "bidding"
-    // would drop the mempool mirror while buying no position whatsoever.
-    runtime.strategy = { ...base, coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: "" };
-    await firePreBoundaryAudit();
-    for (const o of auditOpts()) expect(o.revertible).toBe(false);
+  it("never goes bundle-only on the standalone path, whatever the bid settings say", async () => {
+    // The standalone fire has no payment sharing its bundle, so there is nothing for
+    // bundle-only to protect — and dropping the mirror would forfeit the solo-builder case.
+    // Checked with a bid amount but no payer (where maybeQueueCoinbaseBid is a no-op) and
+    // with a fully configured bid.
+    for (const bid of [
+      { coinbaseBidAuditOnlyEth: 0.05, coinbasePayerAddress: "" },
+      { coinbaseBidAuditOnlyEth: 0.022, coinbasePayerAddress: PAYER },
+    ]) {
+      vi.mocked(submitTx).mockClear();
+      runtime.strategy = { ...base, ...bid };
+      await firePreBoundaryAudit();
+      const opts = auditOpts();
+      expect(opts.length).toBeGreaterThan(0);
+      for (const o of opts) expect(o.race).toBe(true); // mirror kept in both bid shapes
+    }
   });
 });
 
@@ -2452,7 +2705,10 @@ describe("boundary pathways: payment, audit, and both", () => {
     vi.mocked(publicClient.multicall).mockImplementation((async ({ contracts }: any) =>
       contracts.map((c: any) => ({
         status: "success" as const,
-        result: c.functionName === "auditLimit" ? 1n : 1_000_000n,
+        result:
+          c.functionName === "auditLimit" ? 1n
+          : c.functionName === "auditDueTimestamp" ? 0n // not under audit
+          : 1_000_000n,
       })) ) as never);
   });
 

@@ -1,10 +1,11 @@
+import type { StrategyConfig } from "./types.js";
 // The bot's release version. SINGLE SOURCE OF TRUTH — the backend logs it at
 // startup and returns it in /api/status, the dashboard shows it in the header,
 // and `npm run package` names the release zip after it
 // (death-and-taxes-bot-v<VERSION>.zip). Bump this on every release so a user can
 // tell at a glance whether they're running the current build. Keep the
 // package.json `version` fields in sync (npm run package verifies they match).
-export const VERSION = "1.5.5" as const;
+export const VERSION = "1.19.0" as const;
 
 // Game parameters from the verified DeathAndTaxes GameParams.sol.
 // These are compile-time constants on-chain; the backend still reads the live
@@ -234,4 +235,308 @@ export function tipOnlyBundleGas(payments: number, audits: number): number {
  */
 export function tipCostEth(tipGwei: number, payments: number, audits: number): number {
   return (tipGwei * tipOnlyBundleGas(payments, audits)) / 1e9;
+}
+
+/**
+ * The single tip a bundle behaves as, when its payments and its audits carry DIFFERENT tips.
+ *
+ * The bot really does price them apart — `resolveGas` hands audits `offensePriorityFeeGwei`
+ * whenever `separateOffenseGas` is on — so a panel that priced everything at one tip was
+ * answering a question nobody had configured.
+ *
+ * A builder sorts on total priority value over total gas, so the honest single number is the
+ * GAS-weighted mean, not the arithmetic one: audits burn ~130k gas each against ~83k for a
+ * payment, so an audit tip pulls the blend harder than a payment tip does, per action.
+ *
+ * Weighted this way the blend is exact rather than an approximation — every existing formula
+ * keeps working untouched, because `blend * totalGas` is identically
+ * `payTip * payGas + auditTip * auditGas`. So `tipCostEth(blend, ...)` is the true cost of
+ * both tips together, and `bidToBeat(density, blend, ...)` is the true bid still needed.
+ *
+ * Degenerate cases fall out correctly: no payments blends to the audit tip, no audits to the
+ * payment tip, and an empty bundle to the payment tip rather than dividing by zero.
+ *
+ * One caveat this cannot express: with no coinbase bid the bot sends payments and audits as
+ * SEPARATE bundles, so on that path each has its own density and neither is the blend. The
+ * blend is exact for one fused bundle and an average for two.
+ */
+export function blendedTipGwei(
+  payments: number,
+  audits: number,
+  payTipGwei: number,
+  auditTipGwei: number,
+): number {
+  const payGas = payments * GAS_PER_PAYMENT;
+  const auditGas = audits * GAS_PER_AUDIT;
+  const total = payGas + auditGas;
+  if (total <= 0) return payTipGwei;
+  return (payTipGwei * payGas + auditTipGwei * auditGas) / total;
+}
+
+/** One epoch's observed defense density for a rival. */
+export interface DensityPoint {
+  epoch: number;
+  /** Peak (coinbase bid + priority tips) / gas that epoch, in gwei per gas. */
+  density: number;
+}
+
+export interface DensityTrend {
+  direction: "rising" | "falling" | "flat";
+  /** Least-squares slope in gwei/gas per epoch — the number `direction` is derived from. */
+  slopePerEpoch: number;
+  /** Change from the first observed epoch to the last, as a percentage of the first. */
+  changePct: number;
+  first: number;
+  last: number;
+  /** Epochs actually observed. Fewer than the window means the rival skipped some. */
+  points: number;
+}
+
+/**
+ * Which way a rival's defense is moving across the epochs it was observed defending.
+ *
+ * Uses a THEIL-SEN slope — the median of all pairwise slopes — not least squares. Rivals
+ * routinely pay 0.6 gwei mid-epoch when nothing is at risk, and a least-squares fit lets one
+ * such point dominate: a flat 364-gwei defender with a single cheap epoch measured a +12.5%
+ * slope and reported "rising", which is the opposite of the truth. The median of pairwise
+ * slopes is unmoved by a minority of outliers.
+ *
+ * The slope is judged relative to the mean so one threshold serves every scale — a rival at
+ * 2 gwei/gas and one at 450 are held to the same standard of "has this really moved".
+ *
+ * Division of labour worth keeping straight: this answers "is the general LEVEL moving", which
+ * is what decides whether to price the next boundary off the peak or off recent behaviour. It
+ * deliberately does not answer "what did they do last time" — the -2/-1/max columns do that,
+ * and `changePct` carries the raw first-to-last move for anyone who wants the endpoints.
+ *
+ * Returns null below two points: one observation is not a trend, and reporting "flat" for it
+ * would be a claim the data cannot support.
+ */
+export function densityTrend(series: DensityPoint[]): DensityTrend | null {
+  const pts = [...series].filter((p) => Number.isFinite(p.density)).sort((a, b) => a.epoch - b.epoch);
+  if (pts.length < 2) return null;
+  const n = pts.length;
+  // Median of pairwise slopes. n is at most the scan window (~10-20), so O(n^2) is nothing.
+  const slopes: number[] = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const dx = pts[j]!.epoch - pts[i]!.epoch;
+      if (dx !== 0) slopes.push((pts[j]!.density - pts[i]!.density) / dx);
+    }
+  }
+  slopes.sort((x, y) => x - y);
+  const mid = Math.floor(slopes.length / 2);
+  const slopePerEpoch =
+    slopes.length === 0 ? 0 : slopes.length % 2 === 1 ? slopes[mid]! : (slopes[mid - 1]! + slopes[mid]!) / 2;
+  const meanY = pts.reduce((s, p) => s + p.density, 0) / n;
+  const first = pts[0]!.density;
+  const last = pts[n - 1]!.density;
+  const rel = meanY === 0 ? 0 : slopePerEpoch / meanY;
+  const direction = Math.abs(rel) < 0.05 ? "flat" : rel > 0 ? "rising" : "falling";
+  const changePct = first === 0 ? (last === 0 ? 0 : 100) : ((last - first) / first) * 100;
+  return { direction, slopePerEpoch, changePct, first, last, points: n };
+}
+
+/**
+ * Pull the bare Alchemy API key out of whatever the user actually pasted.
+ *
+ * The key is interpolated straight into three URLs, so anything unexpected in it produces a
+ * malformed URL and viem's transport throws — which surfaced as an unexplained HTTP 500 the
+ * moment someone saved their key, with the real cause only in the server log. The likely
+ * culprits are all paste artefacts rather than user error:
+ *
+ *  - Alchemy's dashboard shows the FULL https URL with a copy button, so pasting it yields
+ *    `https://eth-mainnet.g.alchemy.com/v2/https://eth-mainnet.g.alchemy.com/v2/KEY`;
+ *  - copying from a terminal, notes app or email drags in whitespace or a trailing newline;
+ *  - quotes get added by a shell or a smart-quoting editor.
+ *
+ * Returns null when what is left cannot be a key, so the caller can answer 400 with something
+ * actionable instead of 500 with a stack trace.
+ */
+export function normalizeAlchemyKey(input: string): string | null {
+  let k = input.trim().replace(/^["'\s]+|["'\s]+$/g, "");
+  // A pasted endpoint: take the last path segment of any alchemy.com URL form (v2 or nft/v3).
+  const m = k.match(/alchemy\.com\/(?:nft\/)?v\d\/([^/?#\s]+)/i);
+  if (m) k = m[1]!;
+  // Strip a stray trailing slash left by a copied URL.
+  k = k.replace(/\/+$/, "");
+  // Keys are URL path segments: letters, digits, - and _ only. Anything else would corrupt
+  // every derived URL, and a silent pass-through is what turned this into a 500.
+  if (k.length === 0 || !/^[A-Za-z0-9_-]+$/.test(k)) return null;
+  return k;
+}
+
+/**
+ * Which shape a boundary fire will actually take.
+ *
+ * "fused" — payment and audits go out as ONE atomic bundle sharing ONE coinbase bid. The
+ *   audit's nonces sit directly after the payment's inside the same bundle, so the audit is
+ *   valid the moment the bundle simulates. The cost is BLENDED density: builders rank the
+ *   bundle by total value over total gas, so a cheaper audit tip drags the payment's
+ *   placement down, and the bid is spread over the audit's ~130k gas as well.
+ *
+ * "split" — two independent bundles, each with its own tip and its own bid
+ *   (coinbaseBidEth vs coinbaseBidAuditOnlyEth). No dilution. The catch is that the audit
+ *   bundle holds nonces ABOVE the still-unmined payment, so simulated on its own it has a
+ *   nonce gap; it lands only if the builder also took the payment bundle and placed it first.
+ *   That ordering is what a value-sorting builder does anyway, since the payment bundle is
+ *   the denser one — but it is not guaranteed by the protocol.
+ *
+ * Fusing requires a bid to fund: with no bid there is nothing to share, so the toggle is
+ * inert and the fires split regardless of how it is set.
+ */
+export type BoundaryBundleMode = "fused" | "split";
+
+export function coinbaseBidFundedFor(
+  s: Pick<StrategyConfig, "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress">,
+  kind: "payment" | "audit",
+): boolean {
+  const amount = kind === "payment" ? s.coinbaseBidEth : s.coinbaseBidAuditOnlyEth;
+  return amount > 0 && !!s.coinbasePayerAddress;
+}
+
+/**
+ * What Thor Mode forces, in one place.
+ *
+ * A table rather than branches at each read site, for the same reason `boundaryBundleMode`
+ * exists: the dashboard renders these toggles and the engine acts on them, and a switch that
+ * silently overrides a checkbox the operator can still see ticked is worse than no switch. So
+ * the override is applied ONCE, to the stored config, and every reader — including the UI —
+ * sees the same effective values.
+ *
+ * The four that go off are the four public-mempool leaks:
+ *   mirrorAudits           the pre-boundary audit mirror, which names targets before the block
+ *   racePublicMempool      the same broadcast on the mid-epoch/offense race path
+ *   combinedBoundaryBundle fusing, so audits ride the payment bundle and its bid
+ *   mirrorPayments         the pre-boundary payment mirror — the one with teeth
+ * and the two that go on are each only safe once something above is off:
+ *   auditBundleAllOrNothing    drop the audit bundle rather than pay for reverting audits
+ *   paymentBundleAllOrNothing  the same for payments, and pointless while they mirror
+ *
+ * PAYMENTS ARE NO LONGER EXEMPT, and that is the one thing to know about this table. Every
+ * other flag here risks an opportunity; `mirrorPayments: false` risks a CITIZEN, because a
+ * payment that exists only in a bundle does not land at all on the ~9% of boundaries built by
+ * a solo validator, and an unpaid citizen is auditable for a day.
+ */
+export const THOR_OVERRIDES: Readonly<
+  Pick<
+    StrategyConfig,
+    | "mirrorAudits"
+    | "racePublicMempool"
+    | "combinedBoundaryBundle"
+    | "auditBundleAllOrNothing"
+    | "mirrorPayments"
+    | "paymentBundleAllOrNothing"
+  >
+> = {
+  mirrorAudits: false,
+  racePublicMempool: false,
+  combinedBoundaryBundle: false,
+  // Safe only because combinedBoundaryBundle is false above: in split mode the audits are
+  // alone in their bundle, so all-or-nothing can never drop a payment. Fused it would.
+  auditBundleAllOrNothing: true,
+  mirrorPayments: false,
+  // Only meaningful because mirrorPayments is false above. With the mirror on, a dropped
+  // bundle's transactions still reach the chain and still revert, so this would buy nothing
+  // while still costing the whole bundle to one stale citizen.
+  paymentBundleAllOrNothing: true,
+};
+
+/**
+ * One line describing every mempool-privacy switch, for the collapsed Config section.
+ *
+ * Lives here rather than inline in the panel for the same reason `boundaryBundleMode` does:
+ * it is the label on a collapsed control, so if it ever disagrees with the engine the operator
+ * is reading a summary of settings nobody is using — and a wrong summary behind a collapsed
+ * section is worse than no summary, because nothing prompts them to open it and check.
+ *
+ * Takes the EFFECTIVE config (applyThorMode already folded in), and names only what is ON so
+ * the common case stays short. Never returns empty: the fused/split half always contributes,
+ * so a blank line can only mean a broken render, not a quiet default.
+ */
+export function mempoolPrivacySummary(
+  s: Pick<
+    StrategyConfig,
+    | "mirrorAudits"
+    | "mirrorPayments"
+    | "auditBundleAllOrNothing"
+    | "paymentBundleAllOrNothing"
+    | "combinedBoundaryBundle"
+  >,
+): string {
+  const on: string[] = [];
+  if (!s.mirrorAudits) on.push("audits private");
+  if (!s.mirrorPayments) on.push("payments private");
+  if (s.auditBundleAllOrNothing) on.push("audits all-or-nothing");
+  if (s.paymentBundleAllOrNothing) on.push("payments all-or-nothing");
+  on.push(s.combinedBoundaryBundle ? "fused" : "split");
+  return on.join(", ");
+}
+
+/** The fields Thor Mode controls, for rendering them as forced rather than editable. */
+export const THOR_FIELDS = Object.keys(THOR_OVERRIDES) as (keyof typeof THOR_OVERRIDES)[];
+
+/** Fold the overrides into a config. Identity when Thor Mode is off, so it is safe to call
+ *  on every load and save. */
+export function applyThorMode<T extends StrategyConfig>(s: T): T {
+  return s.thorMode ? { ...s, ...THOR_OVERRIDES } : s;
+}
+
+/** True when the stored config already matches every override — i.e. Thor Mode is not just
+ *  on but actually in effect. Used by the UI to prove the switch did what it says. */
+export function thorModeSettled(s: StrategyConfig): boolean {
+  return THOR_FIELDS.every((k) => s[k] === THOR_OVERRIDES[k]);
+}
+
+export function boundaryBundleMode(
+  s: Pick<
+    StrategyConfig,
+    "combinedBoundaryBundle" | "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress"
+  >,
+): BoundaryBundleMode {
+  const anyBid = coinbaseBidFundedFor(s, "payment") || coinbaseBidFundedFor(s, "audit");
+  return s.combinedBoundaryBundle && anyBid ? "fused" : "split";
+}
+
+/**
+ * Density of each boundary bundle in SPLIT mode, in gwei per gas: tip plus the bid spread over
+ * the bundle's own gas. Reuses bundleGas, so the bid transaction's own ~30,550 gas is counted —
+ * it is part of what the bid has to cover.
+ *
+ * Why this is worth surfacing rather than leaving as arithmetic: in split mode the audit bundle
+ * holds nonces ABOVE the still-unmined payment, so it is only includable after the payment
+ * bundle has been applied. Builders try candidates in value order, so the arrangement works
+ * precisely while the PAYMENT bundle is the denser of the two — the builder's own profit motive
+ * then puts them in the only order that can succeed.
+ *
+ * Invert that and the builder reaches for the audit bundle first, finds its first nonce two
+ * above the account, and discards it as unexecutable. Whether the audit ever lands then depends
+ * on the builder revisiting rejected bundles, which nothing guarantees.
+ *
+ * Counts matter and are not symmetric: every extra payment adds 82,875 gas to the payment
+ * bundle and thins its bid, so a multi-citizen holder's payment density falls while the audit
+ * side is untouched. Passing the real shape avoids a warning that is right for one citizen and
+ * wrong for five.
+ */
+export function boundaryDensitiesGwei(
+  s: Pick<
+    StrategyConfig,
+    "priorityFeeGwei" | "offensePriorityFeeGwei" | "separateOffenseGas"
+    | "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress"
+  >,
+  shape: { payments: number; audits: number } = { payments: 1, audits: 1 },
+): { payment: number; audit: number; paymentDenser: boolean } {
+  const payments = Math.max(1, shape.payments);
+  const audits = Math.max(1, shape.audits);
+  // Offense inherits the payment tip unless priced apart — same rule as resolveGas.
+  const auditTip = s.separateOffenseGas ? s.offensePriorityFeeGwei : s.priorityFeeGwei;
+  const bidPart = (eth: number, gas: number) =>
+    coinbaseBidFundedFor(s, "payment") || coinbaseBidFundedFor(s, "audit")
+      ? (eth * 1e18) / gas / 1e9
+      : 0;
+  const payGas = bundleGas(payments, 0);
+  const auditGas = bundleGas(0, audits);
+  const payment = s.priorityFeeGwei + bidPart(s.coinbaseBidEth, payGas);
+  const audit = auditTip + bidPart(s.coinbaseBidAuditOnlyEth, auditGas);
+  return { payment, audit, paymentDenser: payment > audit };
 }

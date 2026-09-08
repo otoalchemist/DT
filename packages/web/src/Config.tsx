@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { StrategyConfig } from "@dat-bot/shared";
+import { mempoolPrivacySummary, type StrategyConfig } from "@dat-bot/shared";
 import { api } from "./api.js";
 
 /** Token ids out of free text: newline OR comma separated, blanks dropped. Kept apart
@@ -105,9 +105,12 @@ function AlchemyKeySection() {
 const STRATEGY_FIELDS: (keyof StrategyConfig)[] = [
   "offenseEnabled", "autoAudit", "autoKill", "preBoundaryAudit", "preBoundaryKill",
   "endgameOnlyWithin", "offenseTargetTokenIds",
-  "separateOffenseGas", "offenseMaxBaseFeeGwei", "offensePriorityFeeGwei",
-  "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
+  "sweepUnpinned", "sweepNormalGas", "auditWhileBehind",
   "racePublicMempool", "minBalanceEth", "maxPaymentEth", "autoDefendAudit",
+  // Thor Mode and the flags it forces. combinedBoundaryBundle is listed because Thor Mode
+  // changes it, so an unsaved-changes indicator that ignored it would under-report.
+  "thorMode", "mirrorAudits", "auditBundleAllOrNothing", "combinedBoundaryBundle",
+  "mirrorPayments", "paymentBundleAllOrNothing",
   // NOTE: awayMode/awayLeadMinutes are deliberately absent. They live in the top bar as
   // an instant-apply control (like Start bot), so they persist the moment they're
   // pressed and must never light up this panel's unsaved-changes indicator.
@@ -126,6 +129,12 @@ export function Config({
 }) {
   const [busy, setBusy] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+
+  // `cfg` is the EFFECTIVE config — applyThorMode folds its overrides in on load and on save
+  // — so this summary can never disagree with the engine the way one built from raw toggles
+  // could. Shown whether or not the section is expanded (see mempoolPrivacySummary).
+  const privacySummary = mempoolPrivacySummary(cfg);
 
   // True when any strategy-owned field differs from what's persisted on the backend.
   const dirty =
@@ -149,7 +158,7 @@ export function Config({
   // segments, so the moment you typed the "," or Enter that starts a second id, the value
   // round-tripped back without it and the separator vanished as you typed. There was no
   // way to reach a second line by hand. Editing the text and deriving the ids from it —
-  // the same split PostMortem uses for tx hashes — keeps separators alive while typing.
+  // the same split the postmortem CLI uses for tx hashes — keeps separators alive while typing.
   const [targetsDraft, setTargetsDraft] = useState<string>(cfg.offenseTargetTokenIds.join("\n"));
   const targetsKey = cfg.offenseTargetTokenIds.join(",");
   // Re-seed only when the list changed from OUTSIDE this box — a template button, a reset,
@@ -260,26 +269,16 @@ export function Config({
       <h2>Strategy</h2>
       <div style={{ marginBottom: 16 }}>{saveBar}</div>
 
-      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
-      <label className="check">
-        <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />
-        Enable offense
-      </label>
-      <label className="check">
-        <input type="checkbox" checked={cfg.autoAudit} onChange={chk("autoAudit")} disabled={!cfg.offenseEnabled} />
-        Auto-audit delinquent rivals ({(0.00069).toString()} ETH each)
-      </label>
-      <label className="check">
-        <input type="checkbox" checked={cfg.autoKill} onChange={chk("autoKill")} disabled={!cfg.offenseEnabled} />
-        Auto-kill expired-audit tokens (free, gas only)
-      </label>
-      {/* Race audits/kills into the boundary block (preBoundaryAudit / preBoundaryKill)
-          are intentionally not rendered — we always want them ON so offense competes in
-          the first eligible block instead of the block after. They stay on and remain
-          editable in data/config.json. preBoundaryKill is a no-op unless Auto-kill above
-          is enabled. The "Only run offense when supply is within N of 69" gate
-          (endgameOnlyWithin) is likewise hidden so its "always run" default can't be
-          changed by accident. */}
+      {/* Rival targets lead the panel: this is the list every offense setting below acts
+          ON, so choosing it first and then deciding how hard to pursue it reads in the
+          order the decisions are actually made. It sat under the offense switches, which
+          put the WHO after the HOW.
+
+          Every control here still gates on cfg.offenseEnabled, whose checkbox is now BELOW
+          it — deliberate rather than overlooked. The list is worth curating before offense
+          is ever switched on, and the disabled state plus the note under the box say why
+          they are inert, so nothing here is a dead end. */}
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>RIVAL TARGETS</div>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, marginBottom: 4, flexWrap: "wrap" }}>
         <button
           type="button"
@@ -343,79 +342,214 @@ export function Config({
           {cfg.offenseTargetTokenIds.length} token{cfg.offenseTargetTokenIds.length !== 1 ? "s" : ""}
         </span>
       </label>
-
       <div className="spacer" />
-      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE GAS (audit / kill)</div>
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>OFFENSE (optional)</div>
       <label className="check">
-        <input
-          type="checkbox"
-          checked={cfg.separateOffenseGas}
-          onChange={chk("separateOffenseGas")}
-        />
-        Separate gas for audit / kill
+        <input type="checkbox" checked={cfg.offenseEnabled} onChange={chk("offenseEnabled")} />
+        Enable offense
       </label>
-      <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 8px 24px", lineHeight: 1.5 }}>
-        Audit and kill are races; tax payments are not. Turn this on to bid gas independently for
-        offense. When off, audit/kill use the same payment gas (set in the JIT payment panel).
-      </p>
-      <label className="field">
-        Max base fee — offense (gwei)
-        <input
-          type="number"
-          min={0}
-          value={cfg.offenseMaxBaseFeeGwei}
-          onChange={num("offenseMaxBaseFeeGwei")}
-          disabled={!cfg.separateOffenseGas}
-        />
+      <label className="check">
+        <input type="checkbox" checked={cfg.autoAudit} onChange={chk("autoAudit")} disabled={!cfg.offenseEnabled} />
+        Auto-audit delinquent rivals ({(0.00069).toString()} ETH each)
       </label>
-      <label className="field">
-        Priority fee / bundle tip — offense (gwei)
-        <input
-          type="number"
-          min={0}
-          step={0.1}
-          value={cfg.offensePriorityFeeGwei}
-          onChange={num("offensePriorityFeeGwei")}
-          disabled={!cfg.separateOffenseGas}
-        />
+      <label className="check">
+        <input type="checkbox" checked={cfg.autoKill} onChange={chk("autoKill")} disabled={!cfg.offenseEnabled} />
+        Auto-kill expired-audit tokens (free, gas only)
       </label>
       <label className="check">
         <input
           type="checkbox"
-          checked={cfg.offenseDynamicTipEnabled}
-          onChange={chk("offenseDynamicTipEnabled")}
-          disabled={!cfg.separateOffenseGas}
+          checked={cfg.auditWhileBehind}
+          onChange={chk("auditWhileBehind")}
+          disabled={!cfg.offenseEnabled || !cfg.autoAudit}
         />
-        Dynamic priority tip — offense
+        Let a citizen that is behind still audit
+        <span className="hint" style={{ display: "block" }}>
+          The contract allows it — verified on chain, where a citizen two epochs behind with its
+          own payment dead still audited successfully. Off, a single-citizen holder loses its
+          audit on every epoch it owes a payment. A citizen already <b>under audit</b> is
+          excluded either way.
+        </span>
       </label>
-      <label className="field" style={{ marginLeft: 24 }}>
-        Max dynamic tip — offense (gwei)
+      {/* The two mid-epoch sweep settings. Both are about spending audit capacity that
+          would otherwise expire unused at the next boundary — capacity resets per epoch,
+          and a rival can only become LESS auditable as an epoch runs, so a slot held back
+          is a slot spent on nobody. Boundary audits and kills are unaffected by either. */}
+      <label className="check">
         <input
-          type="number"
-          min={0}
-          step={1}
-          value={cfg.offenseDynamicTipMaxGwei}
-          onChange={num("offenseDynamicTipMaxGwei")}
-          disabled={!cfg.separateOffenseGas || !cfg.offenseDynamicTipEnabled}
+          type="checkbox"
+          checked={cfg.sweepUnpinned}
+          onChange={chk("sweepUnpinned")}
+          disabled={!cfg.offenseEnabled || !cfg.autoAudit}
         />
+        Sweep beyond the target list — audit any auditable rival
+        <span className="hint" style={{ display: "block" }}>
+          Mid-epoch only, and only after every pinned target has been served. Allies and
+          emigrants are still excluded, and kills stay limited to the list below.
+        </span>
       </label>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.sweepNormalGas}
+          onChange={chk("sweepNormalGas")}
+          disabled={!cfg.offenseEnabled || !cfg.autoAudit}
+        />
+        Mid-epoch audits at normal gas (~17x cheaper)
+        <span className="hint" style={{ display: "block" }}>
+          A mid-epoch audit races nobody, and if a rival does cure first the revert refunds
+          both the fee and the audit slot — so a lost one costs only gas. Boundary audits keep
+          the offense tip, as does the last few minutes before a boundary.
+        </span>
+      </label>
+      {/* Race audits/kills into the boundary block (preBoundaryAudit / preBoundaryKill)
+          are intentionally not rendered — we always want them ON so offense competes in
+          the first eligible block instead of the block after. They stay on and remain
+          editable in data/config.json. preBoundaryKill is a no-op unless Auto-kill above
+          is enabled. The "Only run offense when supply is within N of 69" gate
+          (endgameOnlyWithin) is likewise hidden so its "always run" default can't be
+          changed by accident. */}
+      {/* Thor Mode and the two flags it subsumes.
+          Rendered together because they answer one question — how much of your offense the
+          public mempool gets to see before the boundary block is built — and because Thor
+          Mode WRITES the others. The three it forces are shown ticked-off and disabled, so
+          the panel never displays a value the engine is not using (the same rule the
+          fused/split badge follows). */}
+      <div className="muted" style={{ fontSize: 11, marginTop: 10, marginBottom: 6 }}>
+        MEMPOOL PRIVACY
+      </div>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={cfg.thorMode}
+          onChange={chk("thorMode")}
+          disabled={!cfg.offenseEnabled}
+        />
+        <b>Thor Mode</b> — a fully private, fully split boundary
+        <span className="hint" style={{ display: "block" }}>
+          One switch for the case where a defender is watching: it forces the five settings
+          below, plus the mid-epoch offense mempool race (which has no switch of its own), so
+          nothing at all is broadcast before a block is built.
+          <b>This now includes payments.</b> That is the part with teeth: a payment that only
+          exists in a bundle does not land on the ~9% of boundaries built by a solo validator,
+          and an unpaid citizen is auditable for a day. Every other flag here risks an
+          opportunity; this one risks a citizen. Against an undefended board it is a straight
+          loss. Turning it back off leaves the six settings where it put them.
+        </span>
+      </label>
+      {/* Collapsed by default — five switches with five paragraphs of hint buried the rest of
+          the panel, and on an ordinary night none of them is touched.
 
-      {/* LATENCY (offense) — racePublicMempool — is intentionally not rendered. It's ON
-          by default (mirror time-critical offense txs to the public mempool alongside the
-          bundle so any builder can include them next block) and stays that way; still
-          editable in data/config.json. */}
-
-      {/* The rest of DEFENSE is intentionally not rendered — rarely touched, and arming a
-          JIT payment enables it automatically. Those values stay editable in
-          data/config.json (enabled, proactivePay, prepayEpochs) and cover PRE-AUDIT
-          protection only. Per-citizen opt-out and the per-payment epoch cap live in the
-          Just-in-time panel.
-
-          autoDefendAudit IS rendered, because it is the one setting that spends an
-          unbounded amount by itself — a thing a user must be able to see is on. It sits
-          down here, after offense gas rather than up with the payment controls, because
-          almost nobody should want it: letting an audited citizen go is usually correct,
-          and this is the deliberate exception. */}
+          The one rule this must not break is the panel's own: never hide a value the engine is
+          using. So the summary line below reports the live state of all five whether or not the
+          section is open, and it reads them from `cfg` — which is already the EFFECTIVE config,
+          since applyThorMode folds the overrides in on load and save. Collapsing changes what
+          you have to scroll past, never what you can find out. */}
+      <button
+        type="button"
+        onClick={() => setPrivacyOpen((v) => !v)}
+        className="hint"
+        style={{
+          display: "block", width: "100%", textAlign: "left", background: "none",
+          border: "none", padding: "2px 0 2px 18px", cursor: "pointer", font: "inherit",
+        }}
+        aria-expanded={privacyOpen}
+      >
+        <span style={{ opacity: 0.7 }}>{privacyOpen ? "▾" : "▸"}</span>{" "}
+        {cfg.thorMode ? "Forced by Thor Mode" : "Individual switches"} —{" "}
+        <span style={{ opacity: 0.7 }}>{privacySummary}</span>
+      </button>
+      {/* Deliberately still rendered while forced, rather than hidden: an operator needs to
+          see WHAT Thor Mode did, and needs the individual switches back when it is off. */}
+      <div hidden={!privacyOpen} style={{ paddingLeft: 18, opacity: cfg.thorMode ? 0.65 : 1 }}>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.mirrorAudits}
+            onChange={chk("mirrorAudits")}
+            disabled={!cfg.offenseEnabled || !cfg.autoAudit || cfg.thorMode}
+          />
+          Also send pre-boundary audits to the public mempool
+          <span className="hint" style={{ display: "block" }}>
+            On, the mempool copy is the only thing that can land in a boundary block built by a
+            solo validator (~1 in 10). It also announces which rivals you are about to audit,
+            seconds before the block is built — four boundaries running, the contested target
+            cured inside the block, once at tx index 0 on a 10 gwei tip.
+          </span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.auditBundleAllOrNothing}
+            onChange={chk("auditBundleAllOrNothing")}
+            disabled={!cfg.offenseEnabled || !cfg.autoAudit || cfg.thorMode}
+          />
+          Drop the audit bundle rather than pay for a reverting audit
+          <span className="hint" style={{ display: "block" }}>
+            A reverted audit costs gas <i>and</i> makes the block more profitable for the
+            builder that ordered you last. On, a doomed audit is free. The cost is coarseness:
+            one target curing inside the boundary block takes the audits that would have
+            succeeded with it, and a cure inside the block cannot be simulated in advance.
+            Only ever applies to a <b>split</b> boundary, where audits have their own bundle —
+            fused with a payment they stay revert-tolerant so they can never drop it.
+          </span>
+        </label>
+        {/* The payment pair. Deliberately last and deliberately labelled as the dangerous
+            half: every switch above trades an audit, these two trade a citizen. */}
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.mirrorPayments}
+            onChange={chk("mirrorPayments")}
+            disabled={cfg.thorMode}
+          />
+          Also send pre-boundary payments to the public mempool
+          <span className="hint" style={{ display: "block" }}>
+            <b>Leave this on unless you know why you are turning it off.</b> The mempool copy
+            is the only thing that can land a payment in a boundary block built by a solo
+            validator (~1 in 10), and a payment that does not land leaves that citizen
+            auditable for a day. Unlike an audit, a pending payment gives nothing away — the
+            delinquency it answers is already on-chain. Only the boundary race is affected;
+            manual, JIT and proactive payments mirror either way.
+          </span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.paymentBundleAllOrNothing}
+            onChange={chk("paymentBundleAllOrNothing")}
+            disabled={cfg.thorMode || cfg.mirrorPayments}
+          />
+          Drop the payment bundle rather than pay for a reverting payment
+          <span className="hint" style={{ display: "block" }}>
+            Same economics as the audit version, worse failure mode: the thing dropped is
+            mandatory, so one citizen reverting — already current, or audited earlier in the
+            same block — takes every healthy sibling payment down with it.
+            {cfg.mirrorPayments
+              ? " Unavailable while payments mirror: the dropped bundle's transactions still reach the chain and still revert, so the gas is spent anyway."
+              : " Active, because payments are no longer mirrored."}
+          </span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={cfg.combinedBoundaryBundle}
+            onChange={chk("combinedBoundaryBundle")}
+            disabled={!cfg.offenseEnabled || cfg.thorMode}
+          />
+          Fuse the payment and audit bundles onto one coinbase bid
+          <span className="hint" style={{ display: "block" }}>
+            Off is two bundles with two independent bids, which is what the two bid fields in
+            the JIT panel imply. On, and with any bid funded, they become one bundle on one
+            bid — and <b>which</b> bid is decided at fire time by what ends up in the bundle: a
+            payment in it spends the Payment bid, a night where nothing is owed spends the
+            Audit bid. Never both, and never the sum. So both fields still need funding while
+            this is on; a fused bundle that selects the one you left at 0 gets no bid at all,
+            and its audits carry no mempool copy either. The JIT panel's fused/split badge
+            shows which you are actually running.
+          </span>
+        </label>
+      </div>
       <div className="spacer" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>BENJI (DEFENSE) MODE — POST-AUDIT</div>
       <label className="check">

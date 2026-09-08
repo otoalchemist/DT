@@ -136,6 +136,102 @@ export interface TargetScoreRow {
    */
   bidEth: number | null;
   bidPays: number | null;
+  /**
+   * The rival's BIGGEST single coinbase bid over the whole window, and whether that peak is
+   * still inside the recent 2 epochs.
+   *
+   * `bidEth` above is a recent-only sum, which meant a rival that bid hard four epochs ago and
+   * coasted since displayed no bid at all — while the Beat columns quoted a figure built from
+   * exactly that bid. #2711 is the case: tips 90 gwei, shows no recent bid, and costs 448 gwei
+   * to out-rank, because a 0.042 ETH bid over its small 110,820-gas group is 379 gwei/gas on
+   * its own. That reads as a broken tool rather than a lull in their defense.
+   *
+   * Optional: absent on rows cached before this field existed.
+   */
+  bidPeakEth?: number | null;
+  bidPeakRecent?: boolean | null;
+  /**
+   * The same bid bucketed by boundary, rendered with the peak as -2/-1/max, because one number
+   * cannot distinguish a steady bidder you must price for every time from one that has stopped.
+   *
+   * "-1" is the LATEST boundary, which is the CURRENT epoch — the boundary for epoch N happens
+   * when epoch N begins — and "-2" is the one before it. `epochE1`/`epochE2` carry the actual
+   * numbers so nothing has to infer the offset.
+   *
+   * A rival that pays every OTHER epoch always leaves one slot empty; that is its cadence, not
+   * missing data about a boundary it contested.
+   */
+  bidE2Eth?: number | null;
+  bidE1Eth?: number | null;
+  /**
+   * Their own PRIORITY TIP two / one epoch(s) ago, paired with maxTip as -2/-1/max. Same
+   * reason as the bid triple: a lone peak cannot distinguish a rival still defending at that
+   * level from one that defended once and has coasted since.
+   */
+  tipE2?: number | null;
+  tipE1?: number | null;
+  /**
+   * The DENSITY they mounted in each of those epochs — payment bundle or audit bundle, whichever
+   * was denser — and the beat price for each. A block does not care which side a bundle was on,
+   * so pricing these off payments alone left them blank at exactly the boundaries where a rival
+   * owed nothing and audited instead.
+   * The visible Beat columns are priced from these three windows — two epochs ago, one epoch
+   * ago, and peak — which replaced the old recent-2-epoch / peak / boundary-only trio.
+   *
+   * defenseBoundaryGwei and beatBoundaryEth are still populated for anything that wants
+   * boundary-block-only defense; they just no longer have a column of their own.
+   */
+  /**
+   * Defense density per epoch, oldest first — the series behind the trend sparkline.
+   *
+   * Free to produce: the scan already walks every payment block in the window to trace
+   * coinbase bids, so this is a read-out of work already done. Widening the window costs
+   * provider calls; this does not.
+   */
+  densitySeries?: { epoch: number; density: number }[];
+  /**
+   * What this citizen's operator mounted while ATTACKING — density in gwei/gas per boundary, the
+   * bid inside it, its tip, and the beat price for the latest one.
+   *
+   * A different question from the defense columns. Those price "out-rank their cure so my audit
+   * lands"; these price "out-rank whatever they put in the block on an epoch when they owe
+   * nothing". For an ally whose payment schedule is opposite a rival's, this is the only bar that
+   * exists on those boundaries: Hedo at epoch 170 paid no tax and ran ten audits behind 0.03 ETH
+   * at 31 gwei/gas, so pricing off their 0.093 ETH payment bundle overpays roughly 3x.
+   *
+   * Attributed to the AUDITOR token, so one bundle lands on every row that rode it. When audits
+   * shared a bundle with payments the density is that whole bundle's — which is the right bar,
+   * since that is what a block actually sorted.
+   */
+  atkE2Gwei?: number | null;
+  atkE1Gwei?: number | null;
+  atkMaxGwei?: number | null;
+  atkBidE2Eth?: number | null;
+  atkBidE1Eth?: number | null;
+  atkTipE1?: number | null;
+  atkTipE2?: number | null;
+  beatBidAtkE1Eth?: number | null;
+  beatTipAtkE1Gwei?: number | null;
+  /** How many distinct boundaries this citizen was observed auditing in. */
+  atkAudits?: number;
+  /**
+   * Which side each bid slot backed: "payment", "audit", or "both" when a single boundary had
+   * both. The bid column counts a bid whichever it backed — position is position — so this is
+   * how a reader can still tell what they were doing with it.
+   */
+  bidKindE2?: "payment" | "audit" | "both" | null;
+  bidKindE1?: "payment" | "audit" | "both" | null;
+  bidKindPeak?: "payment" | "audit" | "both" | null;
+  /** Which epochs the -1 and -2 columns are. Carried so the UI can name them rather than leave
+   *  a reader to work out whether the offset counts from the current epoch or the previous one. */
+  epochE1?: number;
+  epochE2?: number;
+  defenseE2Gwei?: number | null;
+  defenseE1Gwei?: number | null;
+  beatBidE2Eth?: number | null;
+  beatBidE1Eth?: number | null;
+  beatTipE2Gwei?: number | null;
+  beatTipE1Gwei?: number | null;
   /** Same, over the WHOLE window — the bidding `beatBidEth` is actually priced against. */
   bidWindowEth?: number | null;
   bidWindowPays?: number | null;
@@ -253,6 +349,31 @@ export interface VaultStatus {
 }
 
 /** State of the on-demand rival scan behind the dashboard's "Analyze targets" button. */
+/** One epoch's contribution to the prize pool. */
+export interface TreasuryEpochRow {
+  epoch: number;
+  /** First block of this epoch — the boundary block, where most of its tax lands. */
+  boundaryBlock: string;
+  /** Wei the treasury gained during this epoch. Decimal string: JSON has no bigint. */
+  treasuryWei: string;
+  projectWei: string;
+  /** True for the epoch still running, whose figure is only the part banked so far. */
+  live: boolean;
+}
+
+export interface TreasuryState {
+  treasuryAddress: string;
+  projectAddress: string;
+  /** Current balances, not the sum of the rows — the pool predates the window shown. */
+  treasuryTotalWei: string;
+  projectTotalWei: string;
+  /** Citizens that survive to split the pool. Mirrors the contract's WINNERS. */
+  winners: number;
+  rows: TreasuryEpochRow[];
+  computedAt: number;
+  error: string | null;
+}
+
 export interface TargetScoresState {
   running: boolean;
   /** Epoch the scan was computed against; null until one completes. */
@@ -413,10 +534,97 @@ export interface StrategyConfig {
   autoAudit: boolean;
   /** Automatically kill tokens whose audit has expired. */
   autoKill: boolean;
+  /** Let a citizen that is itself 2+ epochs behind still be used as an audit "from" token.
+   *  The contract permits this — verified in production at the epoch-176 boundary, where
+   *  #2036 audited while two behind with its own payment dead — so refusing it is a strategy
+   *  choice, not a requirement. Off means a single-citizen holder's audits silently alternate
+   *  on and off with its payment cadence. A citizen UNDER AUDIT is excluded either way. */
+  auditWhileBehind: boolean;
+  /** Mirror pre-boundary audits to the public mempool as well as bundling them.
+   *
+   *  ON is the historical behaviour and buys reach: the ~9% of boundaries built by a solo
+   *  validator accept no bundles at all, so the mempool copy is the only thing that can land
+   *  there. The cost is that it BROADCASTS which rivals are about to be audited, seconds
+   *  before the block is built, so a defender reading the mempool can cure exactly those
+   *  tokens. Across four consecutive boundaries every contested target cured inside the
+   *  boundary block — one at tx index 0 on a 10 gwei tip — which is what that leak looks like.
+   *
+   *  Payments are mirrored either way. This is offense only, and only applies where audits
+   *  have their own bundle: fused with a payment they are already bundle-only. */
+  /** "Thor Mode" in the UI — one switch for a fully private, fully split boundary.
+   *
+   *  Forces `mirrorAudits`, `racePublicMempool` and `combinedBoundaryBundle` off and
+   *  `auditBundleAllOrNothing` on (see THOR_OVERRIDES). Together those mean nothing about
+   *  offense reaches the public mempool before the boundary block is built, and a doomed
+   *  audit is dropped rather than paid for.
+   *
+   *  Meant for the case it was named after: a defender who watches the mempool and cures the
+   *  exact tokens they see pending.
+   *
+   *  It now covers PAYMENTS too, forcing `mirrorPayments` off and `paymentBundleAllOrNothing`
+   *  on. That is a real escalation and the reason it stays opt-in: a payment that only exists
+   *  in a bundle does not land at all on the ~9% of boundaries built by a solo validator, and
+   *  an unpaid citizen is auditable for a day. Offense-only Thor Mode risked an opportunity;
+   *  this risks a citizen.
+   *
+   *  The two go together by necessity rather than taste. Dropping the bundle on a reverting
+   *  payment saves nothing while a mirrored copy is still landing and reverting in the same
+   *  block, so all-or-nothing without privacy is half a feature.
+   *
+   *  Applied when the config is loaded and on every save, so `runtime.strategy` always holds
+   *  the EFFECTIVE values and no reader has to know Thor Mode exists. Turning it back off
+   *  leaves the six flags where it put them — it is a preset, not a suspension. */
+  thorMode: boolean;
+  mirrorAudits: boolean;
+  /** Mirror pre-boundary PAYMENTS to the public mempool. On by default.
+   *
+   *  Scoped to the boundary race: manual, JIT and proactive payments mirror regardless, since
+   *  none of them is racing anyone and a lost slot there just means waiting a block.
+   *
+   *  Off is a deliberate trade, not an optimisation. The mirror is the only copy that can land
+   *  when no builder we sent to wins the slot, and a payment that fails to land costs a
+   *  CITIZEN rather than an opportunity — which is why this is separate from `mirrorAudits`
+   *  and why it is the one Thor Mode flag with teeth. A pending payment is also not
+   *  meaningfully front-runnable: the delinquency it answers is already on-chain. */
+  mirrorPayments: boolean;
+  /** Make the pre-boundary PAYMENT bundle all-or-nothing: a builder drops it whole rather
+   *  than including payments that revert.
+   *
+   *  Same economics as the audit side — a reverted payment costs gas and raises the block's
+   *  value to the builder that ordered you last — but a strictly worse failure mode, because
+   *  the thing dropped is mandatory. One citizen reverting `AlreadyCurrent`, or audited
+   *  earlier in the same block, takes every healthy sibling payment down with it.
+   *
+   *  Only meaningful with `mirrorPayments` off: while the mirror is on, the dropped bundle's
+   *  transactions still reach the chain and still revert, so the gas is spent either way. */
+  paymentBundleAllOrNothing: boolean;
+  /** Make the standalone AUDIT bundle all-or-nothing: a builder drops it whole rather than
+   *  including audits that revert.
+   *
+   *  A reverted audit costs gas AND makes the block more profitable for the builder, so you
+   *  end up paying for the ordering that beat you. All-or-nothing makes a doomed audit free.
+   *  The cost is coarseness — one target curing inside the boundary block drops the audits
+   *  that would have succeeded alongside it, and a cure inside the block is invisible to
+   *  simulation, so it cannot be filtered out in advance.
+   *
+   *  Scoped to the standalone bundle by construction. Fused with payments the same setting
+   *  would let one cured target drop every payment, which is the opposite of the trade. */
+  auditBundleAllOrNothing: boolean;
   /** Only run offense once citizen supply is within this many of WINNERS. */
   endgameOnlyWithin: number | null;
   /** Specific rival token IDs to target. Empty array = target any delinquent rival. */
   offenseTargetTokenIds: string[];
+  /** Widen the MID-EPOCH audit sweep past `offenseTargetTokenIds` to every auditable
+   *  rival (allies and emigrants still excluded). Pinned targets are still served
+   *  FIRST, so scarce auditor slots go to them before anyone discovered this way.
+   *  Boundary audits and kills stay pinned-only regardless — this only spends the
+   *  capacity that would otherwise sit unused for the rest of the epoch. */
+  sweepUnpinned: boolean;
+  /** Price MID-EPOCH sweep audits at the network's normal gas (+1 gwei) instead of the
+   *  offense race tip. A mid-epoch audit is contesting nobody: the rivals who meant to
+   *  cure did so at the boundary, and a revert refunds both the fee and the audit slot,
+   *  so a lost race costs only gas. Boundary audits keep the race tip. */
+  sweepNormalGas: boolean;
   /** ADVANCED: pre-submit audits ~preBoundaryLeadMs before the epoch boundary so
    *  they land in the FIRST block of the epoch (auditing rivals the instant they
    *  become delinquent, like a batch-auditor) instead of the block after.

@@ -1,5 +1,5 @@
 import { parseEther, formatEther, type Address } from "viem";
-import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, type StrategyConfig } from "@dat-bot/shared";
+import { AUDIT_COST_WEI, WINNERS, EPOCH_DURATION_SECONDS, BASE_TAX_RATE_WEI, isEmigrated, boundaryBundleMode, type StrategyConfig } from "@dat-bot/shared";
 import { publicClient, wsClient, getLatestBlockCached, primeBlockCache, getBalanceCached, invalidateBalanceCache } from "./chain.js";
 import { appConfig } from "./config.js";
 import { runtime, loadAllyTokens, type Wallet } from "./runtime.js";
@@ -28,7 +28,7 @@ import {
   ownershipIndexingAvailable,
 } from "./index-tokens.js";
 import { emigratedTokenIdSet } from "./emigration.js";
-import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, setRaceBoundary, type TxIntent, type SubmitResult } from "./flashbots.js";
+import { submitTx, beginBundle, flushBundle, queueCoinbaseBid, setRaceBoundary, setRaceLookBack, type TxIntent, type SubmitResult } from "./flashbots.js";
 import { resolveGas, canAffordSpend, isEligibleAuditor, isAuditable, preBoundaryTaxWei, cappedAutoPayEpochs, autoPayCapWei, withinAutoPayCap, excludedTokenSet, orderBySalt } from "./logic.js";
 import { logger } from "./logger.js";
 import { recordRaceOutcome } from "./race-timing.js";
@@ -53,6 +53,17 @@ let awayStartedEngine = false;
 let preBoundaryBundleTimer: NodeJS.Timeout | null = null;
 let unwatchBlocks: (() => void) | null = null;
 let ticking = false;
+/**
+ * WHICH work holds `ticking`, in words fit for an activity entry.
+ *
+ * Exists because the delay warning was blaming the wrong thing. The audit fire ALWAYS waits
+ * behind the payment fire on a boundary where a payment is due — that is the architecture,
+ * not a fault: the audit needs the paid-in-bundle credit the payment fire produces, and a
+ * lower nonce is what makes crediting it safe. Reporting that expected wait as "a routine
+ * tick held the engine" sent an operator hunting for tick duration when nothing was wrong
+ * with the tick at all.
+ */
+let tickingOwner: string | null = null;
 // Randomized once per engine start (see startEngine) and used to reorder the
 // rival sweep (offensePass, firePreBoundaryAudit, firePreBoundaryKill) so every
 // bot instance doesn't audit/kill candidates in the same identical order — the
@@ -223,7 +234,7 @@ export function resetOwnedEmigrantNotice(): void {
 // Activity entries whose tx was queued into the current bundle batch (mainnet).
 // flushBatch fills in each one's txHash/bundleHash and starts receipt tracking
 // once the whole tick's txs are sent together as one atomic bundle.
-let batchEntries: { entryId: string; nonce: number }[] = [];
+let batchEntries: { entryId: string; nonce: number; address: Address }[] = [];
 
 /**
  * Actions collected for a single CitizenVault.run() call, and the bid riding with them.
@@ -340,7 +351,12 @@ async function flushVaultBatch(): Promise<void> {
     runtime.recordSpend(result.gasWei);
     invalidateBalanceCache();
     commitFor(signer.account.address, result.gasWei);
-    if (result.queued) batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+    // address, because master made nonce fate-tracking per-wallet: a multi-wallet bundle has
+    // to reach the right NonceManager, not the primary’s. A vault batch is one tx signed by
+    // one wallet, so it is simply that signer.
+    if (result.queued) {
+      batchEntries.push({ entryId: entry.id, nonce: result.nonce, address: signer.account.address });
+    }
     runtime.emitStatus();
     // Per-action outcomes come from the receipt: a call that reverted inside the batch
     // emits no game event, so only the vault's own CallResult log can say which failed.
@@ -381,7 +397,7 @@ async function flushBatch(): Promise<void> {
     logger.error("bundle flush error:", (err as Error).message);
     return;
   }
-  for (const { entryId, nonce } of entries) {
+  for (const { entryId, nonce, address } of entries) {
     const r = results.get(nonce);
     if (!r) continue;
     activity.update(entryId, {
@@ -392,8 +408,9 @@ async function flushBatch(): Promise<void> {
     // Flip submitted -> included/reverted once it lands. A bundle-only tx (a revertible
     // audit riding a payment bundle) was never broadcast so it has no `txHash`, but its
     // hash is derivable from the signed tx — poll that instead of leaving it stuck.
-    if (r.txHash) void trackReceipt(entryId, r.txHash);
-    else if (r.predictedTxHash) void trackReceipt(entryId, r.predictedTxHash, false);
+    const dead = { address, nonce };
+    if (r.txHash) void trackReceipt(entryId, r.txHash, true, dead);
+    else if (r.predictedTxHash) void trackReceipt(entryId, r.predictedTxHash, false, dead);
   }
 }
 
@@ -495,17 +512,64 @@ export function startEngine(): void {
     unwatchBlocks = wsClient.watchBlocks({
       onBlock: (block) => {
         primeBlockCache(block);
-        void tick();
+        void tick(false, true);
       },
       onError: (err) => logger.warn("Block subscription error:", (err as Error).message),
     });
     activity.add({ kind: "info", status: "info", message: "Block subscription active (WebSocket)" });
   } else {
     // Fallback: poll every 12s if no WebSocket URL is configured.
-    timer = setInterval(() => void tick(), TICK_MS);
+    timer = setInterval(() => void tick(false, true), TICK_MS);
     activity.add({ kind: "info", status: "info", message: "Polling every 12s (no WebSocket configured)" });
   }
-  void tick();
+
+  /**
+   * The opening tick is a COLD one, and a cold tick is not a routine tick.
+   *
+   * It reads everything uncached — snapshot, per-wallet balances, owned tokens, emigration
+   * rosters, target statuses — and holds the engine lock for the whole of it.
+   * routineTickMustYield cannot stop it, and is not what guards this: that window opens at
+   * `boundary - lead - 12s`, sized for a tick that starts at most one block early, while a
+   * restart can begin well before it and run straight through the fire. The wider
+   * coldStartMustDeferTick budget is the one that covers this.
+   *
+   * Measured at the epoch-180 boundary. An ally's engine threw a tick error (the poisoned
+   * block cache primeBlockCache now rejects), so they paused at boundary-57s and restarted at
+   * boundary-38s — 21 seconds before the quiet window even opens. The opening tick still held
+   * the lock when the fire came due, so the payments queued at boundary-0.9s instead of
+   * boundary-5s. By flush the boundary block already existed, raceTargetFrom correctly aimed
+   * at the block AFTER it, and both payments reverted against a rival audit that had landed in
+   * the block they were meant to be in. They were index 1 and 2 at 369 gwei — first in the
+   * wrong block.
+   *
+   * When a race is already armed the schedulers are all this start actually owes. Every fire
+   * re-syncs its own nonces and reads its own inputs (firePreBoundaryPay calls nonces.syncAll
+   * itself), and a pause/restart leaves in memory the chain state a refresh would rewrite. So
+   * arm the timers and let the first BLOCK tick do the refresh once the boundary is past.
+   *
+   * Fails open in the case that actually needs a tick: routineTickMustYield returns null when
+   * startTime is unknown — a genuinely cold process that has never read the chain — because
+   * ticking is what reads it, and going quiet there would be self-sustaining. It also returns
+   * null when nothing is armed, and an unarmed boundary has no race to protect.
+   */
+  const quiet = coldStartMustDeferTick(BigInt(Math.floor(Date.now() / 1000)));
+  if (quiet === null) {
+    void tick();
+    return;
+  }
+  activity.add({
+    kind: "info",
+    status: "info",
+    message:
+      `Engine started inside the epoch boundary window — holding back the opening refresh so ` +
+      `it cannot own the engine while the pre-boundary race fires. The armed timers are set ` +
+      `and will fire normally; routine ticking resumes once the boundary has passed.`,
+  });
+  scheduleJitBoundary();
+  schedulePreBoundaryPay();
+  schedulePreBoundaryAudit();
+  schedulePreBoundaryBundle();
+  scheduleDefenseBoundary();
 }
 
 export function stopEngine(): void {
@@ -551,6 +615,62 @@ function nextBoundarySec(startTime: bigint, nowSec: bigint): bigint {
   const elapsed = nowSec - startTime;
   return startTime + (elapsed / EPOCH_DURATION_SECONDS + 1n) * EPOCH_DURATION_SECONDS;
 }
+
+/**
+ * How long before a boundary the mid-epoch sweep stops using cheap gas.
+ *
+ * Not about the sweep's own inclusion — it's about the nonce. Sweep audits sign from the
+ * same wallets the boundary payment does, and nonces are consumed in order: a cheap audit
+ * still pending when the boundary fires holds a nonce the payment sits behind, and no tip
+ * on the payment can jump it. Three minutes is ~15 blocks, far more than a
+ * suggestion-plus-1-gwei tx needs, and costs at most a handful of race-priced audits per
+ * epoch (the boundary path is what audits at a boundary anyway).
+ */
+const SWEEP_QUIET_WINDOW_SECONDS = 180n;
+
+/**
+ * How late a fire may be and still be racing the boundary it was armed for.
+ *
+ * The pre-boundary fires contend for one tick lock and retry every 150ms, so an audit fire
+ * routinely starts after the payment fire has finished — and sometimes after the boundary has
+ * passed. Two minutes is generous: past that the race is lost regardless, and what matters is
+ * that we do not silently switch to racing TOMORROW's boundary.
+ */
+const RACE_GRACE_SECONDS = 120n;
+
+/**
+ * The boundary this fire is racing, derived from the CLOCK rather than from runtime.currentEpoch.
+ *
+ * currentEpoch is refreshed by ticks, so reading it after a delay gives the epoch we are now IN
+ * rather than the one we were armed for — and `currentEpoch + 1` then points a full day ahead.
+ * That was survivable until minTimestamp: a bundle stamped with tomorrow's boundary cannot be
+ * included in any block of this window, so every audit died silently while payments (which pin
+ * the armed epoch) landed. This is the same class of bug fixed for the combined fire in 5c92ffc;
+ * the standalone audit path was left re-deriving.
+ *
+ * Just past a boundary we are still racing THAT boundary, not the next one — hence the grace.
+ */
+function racedBoundary(startTime: bigint, nowSec: bigint, currentEpoch: bigint | null): { targetEpoch: bigint; boundaryTs: bigint } {
+  // No epoch known yet (pre-first-snapshot): fall back to the clock grid alone.
+  if (currentEpoch === null) {
+    const next = nextBoundarySec(startTime, nowSec);
+    const previous = next - EPOCH_DURATION_SECONDS;
+    const boundaryTs = nowSec >= previous && nowSec - previous <= RACE_GRACE_SECONDS ? previous : next;
+    return { targetEpoch: (boundaryTs - startTime) / EPOCH_DURATION_SECONDS + 1n, boundaryTs };
+  }
+  // Epoch N begins at startTime + (N-1)*EPOCH, so this is the boundary that STARTED the epoch
+  // we are in, and the next one is a day later.
+  const startedThisEpoch = startTime + (currentEpoch - 1n) * EPOCH_DURATION_SECONDS;
+  const nextBoundary = startTime + currentEpoch * EPOCH_DURATION_SECONDS;
+  // Just past the boundary that started this epoch? Then that is the race we are in — the fire
+  // was armed before it and only ran after, which is the normal consequence of waiting behind
+  // the payment fire's tick lock. Anything else is racing the next one.
+  const justRolled = nowSec >= startedThisEpoch && nowSec - startedThisEpoch <= RACE_GRACE_SECONDS;
+  return justRolled
+    ? { targetEpoch: currentEpoch, boundaryTs: startedThisEpoch }
+    : { targetEpoch: currentEpoch + 1n, boundaryTs: nextBoundary };
+}
+
 
 /**
  * Is the epoch a JIT arm names already OVER? Answered from the CLOCK when it can be,
@@ -827,23 +947,192 @@ function boundaryForArmedFire(): bigint | null {
   return runtime.startTime + (epoch - 1n) * EPOCH_DURATION_SECONDS;
 }
 
+/**
+ * How long before an armed pre-boundary fire routine ticks stop taking the lock, and how
+ * long after the boundary they stay out.
+ *
+ * BEFORE is a full slot, not a token margin, and that sizing is the whole point. The tick
+ * that costs a race does not START inside the lead — it starts on the block BEFORE and runs
+ * into it. Measured on the epoch-174 boundary: the fire was due at :30 against a :35
+ * boundary, and the tick that held the lock had begun at :23. A window that opened at :30
+ * would not have touched it. Opening a slot earlier means at most one tick is ever in
+ * flight when the window opens, and it has a whole block to drain.
+ *
+ * AFTER is short: the post-boundary JIT tick is a BOUNDARY tick and exempt anyway, so this
+ * only stops a routine tick grabbing the lock in the same second the boundary lands.
+ */
+const RACE_QUIET_BEFORE_SEC = 12n;
+const RACE_QUIET_AFTER_SEC = 2n;
+
+/**
+ * The boundary a routine tick must keep out of the way of, or null when there is none.
+ *
+ * Only suppresses when a fire is actually ARMED — with offense off and nothing owed there is
+ * no race to protect, and going quiet then would just stop work for no reason.
+ *
+ * What a skipped tick costs is nothing that cannot wait ~15s: proactive pay, auto-defend
+ * (a 24h clock), the kill sweep and mid-epoch offense all resume on the next block. What it
+ * BUYS is the boundary race itself, plus a second effect worth having — a routine tick is
+ * what advances currentEpoch mid-window, which is the root the epoch-shift bugs grew from.
+ */
+// Exported for tests: the window SIZING is the fix, and getting it wrong is silent — a
+// window that opens too late looks identical to one that works until a boundary is lost.
+export function routineTickMustYield(nowSec: bigint): bigint | null {
+  const s = runtime.strategy;
+  const payArmed = s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null;
+  const auditArmed = s.preBoundaryAudit && s.offenseEnabled && s.autoAudit;
+  if (!payArmed && !auditArmed) return null;
+  const boundary = boundaryForArmedFire();
+  if (boundary === null) return null;
+  const leadSec = BigInt(Math.ceil(effectiveLeadMs() / 1000));
+  const opens = boundary - leadSec - RACE_QUIET_BEFORE_SEC;
+  const closes = boundary + RACE_QUIET_AFTER_SEC;
+  return nowSec >= opens && nowSec <= closes ? boundary : null;
+}
+
+/**
+ * How close to an armed boundary a COLD start must not run its opening tick.
+ *
+ * Deliberately far wider than RACE_QUIET_BEFORE_SEC, because it answers a different question.
+ * The routine window is sized for a tick with ONE BLOCK of work ahead of it. The opening tick
+ * has all of it — snapshot, per-wallet balances, owned tokens, emigration rosters, target
+ * statuses, every one uncached — and holds the engine lock for the whole of it.
+ *
+ * Reusing the routine window here would be worse than useless: it opens at `boundary - lead -
+ * 12s`, and the restart that actually lost epoch 180 happened at boundary-38s, TWENTY-ONE
+ * SECONDS before that window opens. A guard that cannot see the case it was written for is
+ * the kind that looks correct in review and changes nothing on the night.
+ *
+ * 90s is the measured floor rounded up hard: a restart 38s out was still holding the lock when
+ * the fire came due 33s later, so anything under ~40s is demonstrably too small. Erring large
+ * is close to free — the only thing a deferred opening tick delays is a refresh the armed
+ * fires do not read (each re-syncs its own nonces and re-reads its own inputs), and the next
+ * block tick performs it anyway once the boundary is past.
+ */
+const COLD_START_QUIET_SEC = 90n;
+
+/**
+ * The boundary a cold start must not tick into, or null when it is safe to open with a tick.
+ *
+ * Fails open in the two cases that genuinely need the tick, matching routineTickMustYield:
+ * nothing armed (no race to protect), and an unknown startTime (a process that has never read
+ * the chain — the tick is what reads it, so deferring would be self-sustaining).
+ */
+// Exported for tests: like the routine window, getting this SIZING wrong is silent. A budget
+// that is too small looks identical to one that works, right up until a boundary is lost.
+export function coldStartMustDeferTick(nowSec: bigint): bigint | null {
+  const s = runtime.strategy;
+  const payArmed = s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null;
+  const auditArmed = s.preBoundaryAudit && s.offenseEnabled && s.autoAudit;
+  if (!payArmed && !auditArmed) return null;
+  const boundary = boundaryForArmedFire();
+  if (boundary === null) return null;
+  const leadSec = BigInt(Math.ceil(effectiveLeadMs() / 1000));
+  const opens = boundary - leadSec - COLD_START_QUIET_SEC;
+  const closes = boundary + RACE_QUIET_AFTER_SEC;
+  return nowSec >= opens && nowSec <= closes ? boundary : null;
+}
+
 /** A pre-boundary fire was ready but blocked by an in-flight tick until the boundary had
  *  already passed. Distinct from warnRaceMissed (armed too late): here the timer fired ON
  *  TIME and the engine's own tick is what cost the race, which is actionable — it points at
  *  tick duration, not at a sleeping machine. Reported once per boundary. */
 const tickLostRaceFor = new Map<string, bigint>();
+
+/**
+ * How late a fire has to be before it is worth reporting.
+ *
+ * Two seconds, because that is what it actually costs. The old threshold was "the boundary
+ * has already passed", which is ~12s of slip — and MISSING THE BOUNDARY BLOCK only needs a
+ * couple. That gap swallowed a real failure: on the epoch-174 boundary four payments fired
+ * at :33 against a :35 boundary, missed the block by one, and every one of them reverted
+ * with IncorrectPayment once a rival's audits landed first. The boundary had not passed, so
+ * nothing was logged at all and the operator saw only the reverts.
+ */
+const RACE_DELAY_WARN_SEC = 2n;
+
+/** Report a pre-boundary fire that was ready on time but is being held off by a routine
+ *  tick. Distinct from warnRaceMissed (armed too late): here the timer fired ON TIME and the
+ *  engine's own tick is what is costing the race, which points at tick duration rather than
+ *  at a sleeping machine. Reported once per boundary per kind. */
 function warnRaceLostToTick(kind: string, boundarySec: bigint): void {
   if (tickLostRaceFor.get(kind) === boundarySec) return;
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  /**
+   * The audit fire waiting on the PAYMENT fire is the design — but only while the race is
+   * still winnable.
+   *
+   * They are scheduled for the same instant and share one lock, so on any boundary where a
+   * payment is due the audit ALWAYS queues behind it, and must: it needs the paid-in-bundle
+   * credit the payment produces, and the payment's lower nonce is what makes crediting it
+   * safe. Reporting a two-second wait as a fault fired on healthy boundaries and pointed at
+   * tick duration, which was never the problem.
+   *
+   * Suppressing it UNCONDITIONALLY was too much, and cost a boundary. At epoch 178 an ally's
+   * payment fire held the lock through its own builder fan-out; the audit fire got in at
+   * :38 against a :35 boundary, by which time a rival had taken both its targets inside the
+   * boundary block. The sweep reported "0 auditable target(s)" and nothing said why — the one
+   * warning built for this was silenced because the holder was a sibling. Its payments sat at
+   * index 35-38 of that block and the rival's audits at 60, so the race was there to win.
+   *
+   * So: quiet while there is still time, loud once the boundary has passed. A sibling holding
+   * the lock past the boundary has cost the block, whatever its reason for holding it.
+   */
+  if (
+    kind === "audit" &&
+    nowSec < boundarySec &&
+    (tickingOwner === "the payment fire" || tickingOwner === "the combined pay+audit fire")
+  ) {
+    return;
+  }
+  // Due when the scheduler armed it, which is one lead before the boundary — NOT at the
+  // boundary itself. Measuring against the boundary is what made this silent.
+  const dueSec = boundarySec - BigInt(Math.ceil(effectiveLeadMs() / 1000));
+  const lateSec = nowSec - dueSec;
+  if (lateSec < RACE_DELAY_WARN_SEC) return;
   tickLostRaceFor.set(kind, boundarySec);
-  const lateSec = Number(BigInt(Math.floor(Date.now() / 1000)) - boundarySec);
+  const past = nowSec >= boundarySec;
   const msg =
-    `Pre-boundary ${kind} race was ready on time but a routine tick was still running, and ` +
-    `the boundary has now passed (${lateSec}s ago). The payment/audit will still go out on ` +
-    `the next tick, a block late. If this repeats, the tick is taking too long — consider ` +
-    `pinning fewer offense targets or raising the pre-boundary lead.`;
+    `Pre-boundary ${kind} race was ready on time but ${tickingOwner ?? "other work"} held the engine ` +
+    `for ${lateSec}s` +
+    (past
+      ? `, and the boundary has now passed. It will go out on the next tick, a block late.`
+      : `. It still went out before the boundary, but late enough to risk missing the ` +
+        `boundary BLOCK — which is what decides the race, not the second on the clock.`) +
+    ` Routine ticks are supposed to stay out of this window (see routineTickMustYield); if ` +
+    `this repeats, a tick is overrunning a full slot — pin fewer offense targets, or raise ` +
+    `the pre-boundary lead so the window opens earlier.`;
   logger.warn(msg);
   activity.add({ kind: "info", status: "info", message: msg });
 }
+
+/**
+ * Say when the endgame gate is what stopped an offense sweep. Once per boundary: the audit
+ * fire can be re-entered by its own retry loop, and a line per retry would bury the point.
+ */
+const endgameSkipFor = new Map<string, bigint>();
+function noteEndgameGateSkip(boundarySec: bigint | null): void {
+  const key = "audit";
+  if (boundarySec !== null && endgameSkipFor.get(key) === boundarySec) return;
+  if (boundarySec !== null) endgameSkipFor.set(key, boundarySec);
+  const s = runtime.strategy;
+  const left = (runtime.citizenSupply ?? 0n) - WINNERS;
+  const msg =
+    `Pre-boundary audit skipped: endgame-only mode is set to ${s.endgameOnlyWithin} and ` +
+    `${left} citizen(s) are still above the ${WINNERS} that win, so offense stays off until ` +
+    `the field is closer. Payments are unaffected. Clear "Endgame only within" to audit now.`;
+  logger.info(msg);
+  activity.add({ kind: "info", status: "skipped", message: msg });
+}
+
+// Exported for tests ONLY: the suppression rule is a behaviour ("do not blame a tick for a
+// wait that is architectural") with no other observable, and driving it through two real
+// fires would test the scheduler rather than the rule.
+export function __setTickingOwnerForTest(o: string | null): void { tickingOwner = o; }
+export function __warnRaceLostToTickForTest(kind: string, boundarySec: bigint): void {
+  warnRaceLostToTick(kind, boundarySec);
+}
+export function __resetRaceWarnForTest(): void { tickLostRaceFor.clear(); endgameSkipFor.clear(); }
 
 /** Fire an extra tick precisely at the armed epoch's boundary (near-instant JIT pay). */
 export function scheduleJitBoundary(): void {
@@ -903,6 +1192,32 @@ export function schedulePreBoundaryPay(): void {
   }
   noteRaceArmed("payment", BigInt(s.jitTargetEpoch ?? 0));
   preBoundaryTimer = setTimeout(() => void firePreBoundaryPay(), Math.min(deltaMs, 2_000_000_000));
+}
+
+/**
+ * Tokens the payment fire queued for THIS boundary, so the audit fire that follows can count
+ * them as current.
+ *
+ * Without this a single-citizen holder on the no-bid path can pay OR audit at a boundary, never
+ * both: the chain still reads the citizen as behind when the audit sweep runs, so it is not an
+ * eligible auditor and the sweep reports "0 auditor slot(s)". Observed alternating exactly with
+ * whether a payment was due — epoch 169 audited, 170 did not, 171 audited, 172 did not.
+ *
+ * Safe across two separate bundles for one reason: both come from the SAME wallet on sequential
+ * nonces (payTaxes is owner-only, so the payer IS the auditor token's owner, which is the wallet
+ * that signs the audit). A block must order a sender's transactions by ascending nonce, so the
+ * audit can only ever execute AFTER that wallet's payment executes. If the payment does not land,
+ * the audit cannot land either — there is a nonce gap — so crediting it can never produce an
+ * audit running against an unpaid auditor. Same guarantee the combined bundle relies on, just
+ * spanning two bundles instead of one.
+ *
+ * Keyed by epoch so a stale set from an earlier boundary is ignored rather than trusted.
+ */
+let paidForBoundary: { epoch: string; tokens: Set<string> } | null = null;
+
+/** Forget the paid-this-boundary set. For tests. */
+export function resetPaidForBoundary(): void {
+  paidForBoundary = null;
 }
 
 // Fixed gas for a pre-boundary payTaxes — we can't eth_estimateGas it (the value
@@ -988,7 +1303,22 @@ async function queuePreBoundaryPayments(targetEpoch: bigint, boundaryTs: bigint)
    * Payments keep their mempool mirror either way (`bundleOnly` is never set for them): that
    * is what makes this safe rather than a trade of one failure mode for a worse one.
    */
-  const tolerateReverts = owing.length >= 2;
+  /**
+   * All-or-nothing only takes effect once payments are PRIVATE, and that guard is load-bearing
+   * rather than tidy.
+   *
+   * With the mirror on, dropping the bundle does not stop the transactions reaching the chain:
+   * the mirrored copies land and revert anyway, so the gas is spent AND the bundle's atomic
+   * placement is lost. That combination is strictly worse than either setting alone, which is
+   * why it must be unreachable rather than merely discouraged.
+   *
+   * The Config panel already disables the checkbox while mirroring is on and says it is
+   * unavailable. It does not CLEAR the stored value though, so a user who turns mirroring back
+   * on carries a `true` the panel is telling them is inert — and without this the engine would
+   * quietly act on it. Enforcing it here is what keeps the panel honest.
+   */
+  const tolerateReverts =
+    (s.mirrorPayments || !s.paymentBundleAllOrNothing) && owing.length >= 2;
 
   for (const { id, key, value } of owing) {
     const guard = await canSpend(value, false, walletForToken(key)); // max-base-fee, floor, max-payment caps
@@ -1045,11 +1375,12 @@ export async function firePreBoundaryPay(): Promise<void> {
   // Same tick-contention report as the combined fire — see warnRaceLostToTick.
   if (ticking) {
     const b = boundaryForArmedFire();
-    if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("payment", b);
+    if (b !== null) warnRaceLostToTick("payment", b);
     setTimeout(() => void firePreBoundaryPay(), 150);
     return;
   }
   ticking = true;
+  tickingOwner = "the payment fire";
   committedThisTickWei = new Map();
   beginBatch();
   const targetEpoch = BigInt(s.jitTargetEpoch);
@@ -1059,6 +1390,8 @@ export async function firePreBoundaryPay(): Promise<void> {
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
     const paid = await queuePreBoundaryPayments(targetEpoch, boundaryTs);
+    // Hand these to the audit fire, which runs next and would otherwise see them as behind.
+    paidForBoundary = { epoch: targetEpoch.toString(), tokens: paid };
     if (paid.size > 0) await maybeQueueCoinbaseBid("payment");
   } catch (err) {
     logger.error("pre-boundary pay error:", (err as Error).message);
@@ -1067,6 +1400,7 @@ export async function firePreBoundaryPay(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1106,6 +1440,9 @@ async function maybeQueueCoinbaseBid(kind: BidKind): Promise<void> {
   // transaction of its own. That is not just tidier: the forwarder tx costs ~30,550 gas
   // that the bid is then spread across, so paying inline buys a higher value-per-gas for
   // the same ETH. No payer address is needed on this path.
+  //
+  // It also takes no gas profile: there is no separate bid transaction to price, so the
+  // payment/offense split below simply does not arise here.
   if (vaultBatch) {
     vaultBidWei += bidWei;
     runtime.recordSpend(bidWei);
@@ -1115,7 +1452,11 @@ async function maybeQueueCoinbaseBid(kind: BidKind): Promise<void> {
   }
 
   if (!s.coinbasePayerAddress) return;
-  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei);
+  // The SAME kind that chose the amount also chooses the bid tx's gas profile. An audit-only
+  // bid rides an offense bundle, so pricing it off the payment tip contradicted the config
+  // the operator set — see queueCoinbaseBid. A payment in the bundle makes it a defensive
+  // boundary and keeps the payment profile, which is what the bid is buying position for.
+  const queued = await queueCoinbaseBid(s.coinbasePayerAddress as Address, bidWei, kind === "audit");
   if (!queued) return;
   // The bid is real ETH but it does NOT go through act(), so it was invisible to every
   // spend accounting path: "spent this epoch" under-reported it, the cumulative
@@ -1168,7 +1509,9 @@ export function coinbaseBidActive(s: StrategyConfig, kind: BidKind = "payment"):
  * so routing must not depend on guessing that in advance.
  */
 export function combinedBundleActive(s: StrategyConfig): boolean {
-  return s.combinedBoundaryBundle && (coinbaseBidActive(s, "payment") || coinbaseBidActive(s, "audit"));
+  // Delegates to the shared predicate so the dashboard's fused/split badge cannot drift from
+  // what the engine actually does. Two operators have now been surprised by the difference.
+  return boundaryBundleMode(s) === "fused";
 }
 
 // Generous fixed gas for an unsimulated offense pre-submit (real audits used
@@ -1225,8 +1568,16 @@ export async function fetchOffenseCandidates(): Promise<{ id: bigint; owner: Add
 
 /** `fetchOffenseCandidates` plus the IDs it dropped as emigrated, so a caller can
  *  tell "this pin left the game" apart from "this pin was burned/killed" when
- *  explaining a skip. Same work, one return value richer. */
-export async function fetchOffenseCandidatesWithSkips(): Promise<{
+ *  explaining a skip. Same work, one return value richer.
+ *
+ *  `includeUnpinned` unions the pins with the capped enumeration instead of scanning
+ *  only the pins, for the mid-epoch sweep (see sweepUnpinned). Pins stay FIRST in the
+ *  returned order so a caller handing out scarce auditor slots serves them before
+ *  anything discovered this way. Opt-in per call site on purpose: the boundary paths
+ *  spend race gas and must stay narrow. */
+export async function fetchOffenseCandidatesWithSkips(
+  opts: { includeUnpinned?: boolean } = {},
+): Promise<{
   candidates: { id: bigint; owner: Address }[];
   emigrated: Set<string>;
 }> {
@@ -1241,11 +1592,21 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
       logger.warn(`offense target #${raw} is not a valid token ID; ignoring it`);
     }
   }
-  // Pinned mode: the pins ARE the candidate set (bypass the enumeration cap).
-  const ids =
-    pinnedIds.length > 0
-      ? pinnedIds
-      : await fetchCandidateTokenIds(citizens);
+  // Pinned mode: the pins ARE the candidate set (bypass the enumeration cap). Widened
+  // mode unions both — the pins still bypass the cap (that's why they're listed first
+  // and deduped, rather than trusting the enumeration to contain them).
+  let ids: bigint[];
+  if (pinnedIds.length === 0) {
+    ids = await fetchCandidateTokenIds(citizens);
+  } else if (opts.includeUnpinned) {
+    const seen = new Set(pinnedIds.map((x) => x.toString()));
+    ids = [...pinnedIds];
+    for (const id of await fetchCandidateTokenIds(citizens)) {
+      if (!seen.has(id.toString())) ids.push(id);
+    }
+  } else {
+    ids = pinnedIds;
+  }
   const liveRaw = await filterLiveTokenIds(citizens, ids);
   // Allies are never offense candidates. The rival lists shouldn't contain one, but this
   // is the last line of defence: a stale pin, a hand-edited target list or a regenerated
@@ -1258,73 +1619,184 @@ export async function fetchOffenseCandidatesWithSkips(): Promise<{
   const pinnedSet = new Set(pinnedIds.map((x) => x.toString()));
   const emigrated = new Set<string>();
   const inGame: { id: bigint; owner: Address }[] = [];
-  let allySkipped = 0;
+  /**
+   * Allies are counted in TWO buckets, because only one of them is a problem.
+   *
+   * A PINNED ally is a real config error: someone put a teammate on the target list, and the
+   * only reason nothing bad happened is this filter. That deserves a warning naming the ids.
+   *
+   * An ENUMERATED ally is completely normal once the sweep is widened past the pins
+   * (sweepUnpinned) — the candidate set is then the whole live field, which of course
+   * contains every teammate. Warning about it fired ~7,000 times a day telling operators to
+   * "check your target list" when their list was fine, which is worse than saying nothing:
+   * it trains people to ignore a message that does mean something when it names pins.
+   */
+  const pinnedAllies: string[] = [];
+  let enumeratedAllies = 0;
   for (const t of liveRaw) {
     const key = t.id.toString();
     if (isEmigrated(t.owner)) emigrated.add(key);
-    else if (allySet.has(key)) allySkipped++;
-    else inGame.push(t);
+    else if (allySet.has(key)) {
+      if (pinnedSet.has(key)) pinnedAllies.push(key);
+      else enumeratedAllies++;
+    } else inGame.push(t);
   }
   if (emigrated.size > 0) {
     logger.debug(
       `offense candidates: skipped ${emigrated.size} emigrated citizen(s) — out of the main game`,
     );
   }
-  if (allySkipped > 0) {
-    logger.warn(`offense candidates: skipped ${allySkipped} ALLIED citizen(s) — check your target list`);
+  if (pinnedAllies.length > 0) {
+    logger.warn(
+      `offense candidates: your target list contains ${pinnedAllies.length} ALLIED citizen(s) ` +
+        `— #${pinnedAllies.join(", #")}. They were skipped; remove them from the list.`,
+    );
   }
-  return { candidates: orderBySalt(inGame, (t) => t.id.toString(), engineSalt), emigrated };
+  if (enumeratedAllies > 0) {
+    logger.debug(
+      `offense candidates: skipped ${enumeratedAllies} allied citizen(s) found by enumeration ` +
+        `(expected when the sweep is widened past the pins)`,
+    );
+  }
+  // Salt-order within each group, but keep pins ahead of everything discovered by
+  // enumeration. Auditor slots are finite and handed out in list order, so without this
+  // a widened sweep could spend the last slot on a random rival and skip a pinned one.
+  // Two separate orderBySalt calls rather than one plus a sort: the salt ordering is the
+  // anti-collision mechanism (it staggers which target each ally hits first), and a
+  // stable sort over one shuffled list would preserve it inside each group anyway — this
+  // just makes the grouping explicit instead of implicit in sort stability.
+  const ordered = orderBySalt(inGame, (t) => t.id.toString(), engineSalt);
+  if (pinnedSet.size === 0) return { candidates: ordered, emigrated };
+  const pins: { id: bigint; owner: Address }[] = [];
+  const rest: { id: bigint; owner: Address }[] = [];
+  for (const t of ordered) (pinnedSet.has(t.id.toString()) ? pins : rest).push(t);
+  return { candidates: [...pins, ...rest], emigrated };
 }
 
 /** Owned tokens usable as audit "from" tokens AT the upcoming epoch: not
  *  auditable at `targetEpoch` (so still current now) and with full capacity
  *  (the new epoch has 0 audits used). One audit per token. */
-async function findPreBoundaryAuditors(
-  ownedIds: bigint[],
-  targetEpoch: bigint,
-  paidInBundle: Set<string> = new Set(),
-): Promise<{ auditors: bigint[]; needsPayment: Set<string> }> {
-  if (ownedIds.length === 0) return { auditors: [], needsPayment: new Set() };
+/** What the chain says about each owned citizen's auditor potential. A pure read, so it can
+ *  be fetched before the engine lock is held — see prefetchAuditInputs. */
+export interface AuditorState {
+  id: bigint;
+  lastEpochPaid: bigint;
+  auditLimit: bigint;
+  /** 0 when not under audit. Read because auditWhileBehind removes the delinquency clause
+   *  that used to keep an under-audit citizen out of the pool by side effect. */
+  auditDueTimestamp: bigint;
+}
+
+/** The multicall half of the auditor lookup: one round trip, no policy. */
+async function readAuditorState(ownedIds: bigint[]): Promise<AuditorState[]> {
+  if (ownedIds.length === 0) return [];
   const results = await publicClient.multicall({
     allowFailure: true,
     contracts: ownedIds.flatMap((id) => [
       { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
       { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditDueTimestamp" as const, args: [id] as const },
     ]),
   });
-  const eligible: bigint[] = [];
+  const out: AuditorState[] = [];
+  for (let i = 0; i < ownedIds.length; i++) {
+    const lep = results[i * 3];
+    const limit = results[i * 3 + 1];
+    const due = results[i * 3 + 2];
+    // A partly-failed slice drops the token, exactly as before: an unknown auditor is not
+    // an eligible one.
+    if (lep?.status !== "success" || limit?.status !== "success" || due?.status !== "success") continue;
+    out.push({
+      id: ownedIds[i]!,
+      lastEpochPaid: lep.result as bigint,
+      auditLimit: limit.result as bigint,
+      auditDueTimestamp: due.result as bigint,
+    });
+  }
+  return out;
+}
+
+/**
+ * The policy half: which of those citizens may audit at `targetEpoch`, and in what order.
+ *
+ * Split from the read so the round trip can happen outside the engine lock while a sibling
+ * fire still holds it. This half stays inside, because it needs `paidInBundle` — the set the
+ * payment fire produces, which does not exist until that fire has run.
+ */
+function selectAuditors(
+  state: AuditorState[],
+  targetEpoch: bigint,
+  paidInBundle: Set<string> = new Set(),
+): { auditors: bigint[]; needsPayment: Set<string> } {
+  /** One entry per eligible citizen with its remaining capacity, dealt out below. */
+  const perToken: { id: bigint; slots: number }[] = [];
   // Auditors that only qualify BECAUSE a payment precedes them in this bundle. The
   // chain still reads them as behind, so their audit can't be simulated (the sim
   // can't see the queued payment) — the caller sends those unsimulated, riding
   // allowed-to-revert so they can never drop the payment.
   const needsPayment = new Set<string>();
-  for (let i = 0; i < ownedIds.length; i++) {
-    const lep = results[i * 2];
-    const limit = results[i * 2 + 1];
-    if (lep?.status !== "success" || limit?.status !== "success") continue;
-    const limitV = limit.result as bigint;
-    const key = ownedIds[i]!.toString();
+  for (const entry of state) {
+    const limitV = entry.auditLimit;
+    const key = entry.id.toString();
     // 0n audits used because targetEpoch is a fresh epoch we haven't acted in yet,
     // so remaining capacity == auditLimit. Add one pool entry per available audit
     // so auditor-role tokens (limit > 1) can hit multiple rivals at the boundary.
-    let ok = isEligibleAuditor(lep.result as bigint, targetEpoch, 0n, limitV);
+    const policy = {
+      auditWhileBehind: runtime.strategy.auditWhileBehind,
+      underAudit: entry.auditDueTimestamp !== 0n,
+    };
+    let ok = isEligibleAuditor(entry.lastEpochPaid, targetEpoch, 0n, limitV, policy);
     if (!ok && paidInBundle.has(key)) {
       // Paid one epoch earlier in THIS bundle -> current by the time it audits.
       //
-      // NOTE: unreachable while JIT sends the flat one-epoch amount. Rescuing a token
-      // into eligibility requires it to be 2+ behind at targetEpoch, but on-chain
-      // payTaxes(id,1) then costs epochsBehind * epoch * base (verified: a 2-behind
-      // token quotes 2x), so preBoundaryTaxWei's 1x underpays and the boundary sim
-      // rejects it — such a token never lands in paidInBundle. A token that IS paid
-      // successfully was exactly 1 behind, which already passes the check above.
-      // Kept because it is the correct rule and activates the moment the pre-boundary
-      // payment learns to quote catch-up amounts (which costs 2x, so it is gated on
-      // maxAutoPayEpochs by design).
-      ok = isEligibleAuditor((lep.result as bigint) + 1n, targetEpoch, 0n, limitV);
+      // REACHABLE, and load-bearing — an earlier note here claimed the opposite, that a
+      // 2-behind token could never land in paidInBundle because payTaxes(id,1) would underpay
+      // and the sim would reject it. Measured on mainnet across three consecutive boundaries
+      // (#2036 at blocks 25771071 / 25785422 / 25799777), that is wrong twice over: the flat
+      // one-epoch amount at the CURRENT rate is accepted, and it advances lastEpochPaid by TWO
+      // epochs (170 -> 172), i.e. it makes the citizen fully current rather than one epoch
+      // less behind.
+      //
+      // This is exactly the case that silently cost audits: a single-citizen holder sits 2
+      // behind at every other boundary, isEligibleAuditor refuses it, and the sweep logs
+      // "1 auditable target(s), 0 auditor slot(s), queued 0" — alternating with whether a
+      // payment was due (epoch 169 audited, 170 did not, 171 audited, 172 did not).
+      //
+      // +1n rather than targetEpoch is deliberate: the on-chain effect is at least +1, and
+      // crediting the smaller advance cannot over-qualify a token.
+      ok = isEligibleAuditor(entry.lastEpochPaid + 1n, targetEpoch, 0n, limitV, policy);
       if (ok) needsPayment.add(key);
     }
     if (!ok) continue;
-    for (let k = 0n; k < limitV; k++) eligible.push(ownedIds[i]!);
+    perToken.push({ id: entry.id, slots: Number(limitV) });
+  }
+
+  /**
+   * Deal the slots round-robin, not token by token.
+   *
+   * Pushing each token `auditLimit` times in a row put every audit of a sweep on the FIRST
+   * eligible citizen: at the epoch-178 boundary an ally held 15 slots across 9 citizens and
+   * spent all three of its audits on #358, because #358 sits first and carries a limit of 3.
+   *
+   * That concentrates a risk that has no reason to be concentrated. The audits are separate
+   * transactions with separate outcomes, but they shared one auditor, so anything that
+   * invalidated that citizen would have taken all three down together — and at that very
+   * boundary #358 WAS invalidated, audited by a rival twenty indices before its own payment
+   * could land. The three audits failed on their targets first, so the concentration did not
+   * decide it that night; it is simply a coupling we get nothing for.
+   *
+   * Round-robin makes the failures independent wherever capacity allows, and costs nothing
+   * when there is only one eligible auditor — the deal degenerates to the old order.
+   */
+  const eligible: bigint[] = [];
+  for (let round = 0; ; round++) {
+    let dealt = false;
+    for (const t of perToken) {
+      if (round >= t.slots) continue;
+      eligible.push(t.id);
+      dealt = true;
+    }
+    if (!dealt) break;
   }
   return { auditors: eligible, needsPayment };
 }
@@ -1350,7 +1822,10 @@ export function schedulePreBoundaryAudit(): void {
     return;
   }
   noteRaceArmed("audit", auditTarget);
-  preBoundaryAuditTimer = setTimeout(() => void firePreBoundaryAudit(), Math.min(deltaMs, 2_000_000_000));
+  preBoundaryAuditTimer = setTimeout(
+    () => void firePreBoundaryAudit({ targetEpoch: auditTarget, boundaryTs: boundary }),
+    Math.min(deltaMs, 2_000_000_000),
+  );
 }
 
 /** Pre-submit audits (skip-sim) for rivals that will be auditable in the FIRST
@@ -1361,30 +1836,99 @@ export function schedulePreBoundaryAudit(): void {
  * and synced the nonce). Targets rivals auditable in the first block of `targetEpoch`,
  * one per eligible auditor token.
  *
- * `opts.revertible` marks each audit allowed-to-revert AND bundle-only (never mirrored —
- * see act()). Set it when a coinbase bid will fire: the bid buys the bundle its position,
- * and revert-tolerance stops one stale target (already audited, auditor out of capacity)
- * from invalidating the whole bundle and taking the bid down with it. Leave it off when
- * no bid fires — the bundle is then unlikely to win top-of-block, so the mempool mirror
- * is the only copy likely to land at all. In combined mode it is also what stops a
- * defended target from dropping the payment. Returns whether any queued.
+ * `opts.revertible` marks each audit allowed-to-revert, so one stale target (already audited,
+ * auditor out of capacity) cannot invalidate the whole bundle and take its siblings with it.
+ *
+ * `opts.bundleOnly` separately decides whether each audit is withheld from the public mempool,
+ * and the two are NOT the same question — conflating them is what made the useful combination
+ * unrepresentable. It matters which caller is asking:
+ *
+ *   COMBINED bundle (payments + audits share one bundle) -> bundleOnly MUST be true. Payments
+ *     and audits there hold sequential nonces of the same wallet, so if a mirrored audit
+ *     landed it would consume its nonce and make the bundle containing that nonce invalid —
+ *     the builder drops it and the PAYMENTS go down with the audit. That is the "mirroring an
+ *     audit demotes the payment" hazard, and it is specific to sharing a bundle.
+ *   STANDALONE audit bundle (no bid, payments in their OWN bundle) -> bundleOnly false is
+ *     safe and strictly better. A mirror landing can only invalidate the audit bundle, and by
+ *     then the audit has landed; nothing else rides with it. That buys revert-tolerance AND
+ *     keeps the only copy that can land in the ~1 boundary in 10 built by a solo validator,
+ *     which accepts no bundles at all.
+ *
+ * The cost of mirroring an audit is strategic, not mechanical: a visible pending audit lets
+ * the target cure first. That is the same exposure payments already carry, and it stays gated
+ * behind `racePublicMempool` (see act()).
+ *
+ * Returns whether any queued.
  */
+/**
+ * Everything the audit sweep reads before it decides anything.
+ *
+ * All four are pure reads that touch none of the state the engine lock guards
+ * (committedThisTickWei, batchEntries, bundleQueue, the nonce sequence), so they can run
+ * while a sibling fire still holds it — which is the entire point.
+ *
+ * At the epoch-178 boundary an ally's payment fire held the lock for about four seconds
+ * after its last transaction was queued, spending it inside its own builder fan-out. The
+ * audit fire could not even BEGIN these reads until that finished, so it ran three seconds
+ * past the boundary, by which time a rival had taken both of its targets inside the boundary
+ * block. It reported "0 auditable target(s)" and queued nothing.
+ *
+ * Reading early means acting on state up to a few seconds old, and that is the right trade
+ * for a race: a target taken between the read and the submit costs one reverted audit, which
+ * is revert-tolerant on this path and a few tenths of a milli-ETH. Reading late costs the
+ * whole boundary, which is what actually happened.
+ *
+ * `targetEpoch` is carried so a consumer can tell whether the prefetch still answers its
+ * question — see the guard in queuePreBoundaryAudits.
+ */
+export interface AuditInputs {
+  targetEpoch: bigint;
+  ownedIds: bigint[];
+  auditorState: AuditorState[];
+  candidates: Awaited<ReturnType<typeof fetchOffenseCandidatesWithSkips>>["candidates"];
+  emigrated: Set<string>;
+  statuses: Awaited<ReturnType<typeof batchGetTargetStatuses>>;
+}
+
+/** Fetch those reads, overlapping the independent ones. Exported so the fire can start it
+ *  before taking the lock, and for tests. */
+export async function prefetchAuditInputs(targetEpoch: bigint, nowSec: bigint): Promise<AuditInputs> {
+  const [ownedIds, offense] = await Promise.all([
+    fetchOwnedAcrossWallets(runtime.citizensAddress as Address),
+    fetchOffenseCandidatesWithSkips(),
+  ]);
+  const [auditorState, statuses] = await Promise.all([
+    readAuditorState(ownedIds),
+    batchGetTargetStatuses(offense.candidates, targetEpoch, nowSec),
+  ]);
+  return { targetEpoch, ownedIds, auditorState, candidates: offense.candidates, emigrated: offense.emigrated, statuses };
+}
+
 // Exported for tests: this is the audit-queue unit that a boundary miss like
 // token 1612 flows through, so an integration test drives it directly.
 export async function queuePreBoundaryAudits(
   targetEpoch: bigint,
   nowSec: bigint,
   boundaryTs: bigint,
-  opts: { revertible: boolean; paidInBundle?: Set<string> },
+  opts: { revertible: boolean; bundleOnly: boolean; paidInBundle?: Set<string>; prefetched?: AuditInputs },
 ): Promise<boolean> {
   const s = runtime.strategy;
-  const ownedIds = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
-  const { auditors, needsPayment } = await findPreBoundaryAuditors(ownedIds, targetEpoch, opts.paidInBundle);
-
-  const { candidates: live, emigrated } = await fetchOffenseCandidatesWithSkips();
+  /**
+   * Use the caller's prefetch only if it answers THIS question.
+   *
+   * The epoch is the whole of it: statuses are computed against a target epoch, so a
+   * prefetch taken for a different one would classify every rival wrongly. A mismatch can
+   * only happen on the fallback path where the race is re-derived from the clock, and the
+   * cost of not trusting it is one extra set of reads — cheap next to a wrong answer.
+   */
+  const input =
+    opts.prefetched && opts.prefetched.targetEpoch === targetEpoch
+      ? opts.prefetched
+      : await prefetchAuditInputs(targetEpoch, nowSec);
+  const { ownedIds, candidates: live, emigrated, statuses } = input;
+  const { auditors, needsPayment } = selectAuditors(input.auditorState, targetEpoch, opts.paidInBundle);
   const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = pinnedTargetSet(s);
-  const statuses = await batchGetTargetStatuses(live, targetEpoch, nowSec);
   // Rivals that will be auditable AT the target epoch (2+ behind) and aren't already
   // under audit — the full set, independent of how many auditor slots we have.
   const auditable = statuses.filter(
@@ -1425,6 +1969,21 @@ export async function queuePreBoundaryAudits(
 
   let idx = 0;
   let queued = 0;
+  /**
+   * Why nothing was sent, when nothing was sent.
+   *
+   * The sweep already reports the COUNT unconditionally, so a zero is never invisible — but
+   * it never said the reason, and "queued 0" with targets and slots available reads as a
+   * broken bot. The payment path names its blocker; this one dropped it to logger.debug,
+   * which is not in the activity feed the operator actually reads.
+   *
+   * The realistic trigger is the SEPARATE offense base-fee cap: payments and audits carry
+   * independent ceilings, so a base fee between them sends every payment and silently stops
+   * every audit. Boundary blocks run at ~0.05 gwei against a 69.1 default, so it is rare —
+   * but rare and silent is the combination that costs a whole boundary before anyone looks.
+   */
+  let blockedBy: string | null = null;
+  let deferred = 0;
   for (const t of auditable) {
     if (idx >= auditors.length) break; // out of auditor capacity this epoch
     // Pick the auditor first: the audit is signed by whichever wallet holds it, so the
@@ -1433,12 +1992,21 @@ export async function queuePreBoundaryAudits(
     const guard = await canSpend(AUDIT_COST_WEI, true, walletForToken(from));
     // Fee over cap fails for every remaining target too, and here the wasted awaits eat
     // the pre-boundary lead window itself — stop rather than scan on.
-    if (guard.fatal) { logger.debug(`pre-boundary audit stopped early: ${guard.reason}`); break; }
-    if (!guard.ok) continue;
+    if (guard.fatal) {
+      blockedBy = guard.reason ?? "spend guard";
+      logger.debug(`pre-boundary audit stopped early: ${blockedBy}`);
+      break;
+    }
+    if (!guard.ok) {
+      deferred++;
+      blockedBy ??= guard.reason ?? null;
+      continue;
+    }
     // An auditor that only qualifies via a payment earlier in THIS bundle can't be
     // simulated: the sim runs the audit alone against pre-payment state and would
-    // wrongly revert. Send it unsimulated — it rides allowed-to-revert, so the worst
-    // case is gas on a reverted audit and the payment is never endangered.
+    // wrongly revert. Send it unsimulated — the payment is never endangered either way,
+    // because a revert-tolerant audit reverts harmlessly and an all-or-nothing one only
+    // ever costs its OWN bundle (see the note at the standalone call site).
     const viaBundlePayment = needsPayment.has(from.toString());
     const res = await act(
       { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI, gas: PRE_BOUNDARY_OFFENSE_GAS },
@@ -1448,15 +2016,16 @@ export async function queuePreBoundaryAudits(
         targetTokenId: t.tokenId,
         message:
           `Pre-boundary audit #${t.tokenId} from #${from} for epoch ${targetEpoch}` +
-          (viaBundlePayment ? " (auditor paid in this bundle, unsimulated)" : opts.revertible ? " (in payment bundle)" : " (boundary race)"),
+          (viaBundlePayment ? " (auditor paid in this bundle, unsimulated)" : opts.bundleOnly ? " (in payment bundle)" : " (boundary race)"),
         race: true,
         simTimestamp: boundaryTs,
         skipSim: viaBundlePayment,
         revertible: opts.revertible,
-        // Preserves the previous behaviour now that the mirror is no longer derived from
-        // `revertible`: a revert-tolerant audit stays bundle-only, because mirroring it adds
-        // a second mempool nonce that can demote the payment sharing its bundle.
-        bundleOnly: opts.revertible,
+        // The caller decides, because only the caller knows whether a payment shares this
+        // bundle — see the note on this function. Deriving it from `revertible` forced
+        // revert-tolerance and the mempool mirror to be the same choice, which cost the
+        // no-bid path one of them for no reason.
+        bundleOnly: opts.bundleOnly,
       },
     );
     if (res?.ok) { idx++; queued++; }
@@ -1468,53 +2037,168 @@ export async function queuePreBoundaryAudits(
   activity.add({
     kind: "info",
     status: "info",
-    message: `Pre-boundary audit (epoch ${targetEpoch}): ${auditable.length} auditable target(s), ${auditors.length} auditor slot(s), queued ${queued}`,
+    message:
+      `Pre-boundary audit (epoch ${targetEpoch}): ${auditable.length} auditable target(s), ` +
+      `${auditors.length} auditor slot(s), queued ${queued}` +
+      (deferred > 0 ? `, ${deferred} deferred` : "") +
+      // Only when nothing went out: with something queued the blocker cost an opportunity,
+      // not the boundary, and naming it every time would bury the counts that matter.
+      (queued === 0 && blockedBy ? ` — none sent: ${blockedBy}` : ""),
   });
   return queued > 0;
 }
 
 /** Standalone pre-boundary audit bundle. Used when combinedBoundaryBundle is OFF. */
-export async function firePreBoundaryAudit(): Promise<void> {
+export async function firePreBoundaryAudit(
+  armed?: { targetEpoch: bigint; boundaryTs: bigint },
+  pending?: Promise<AuditInputs | null>,
+): Promise<void> {
   const s = runtime.strategy;
   if (!s.preBoundaryAudit || !s.offenseEnabled || !s.autoAudit) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
   if (runtime.gameState !== 1) return; // only act while the game is LIVE
-  if (ticking) {
-    const b = boundaryForArmedFire();
-    if (b !== null && BigInt(Math.floor(Date.now() / 1000)) >= b) warnRaceLostToTick("audit", b);
-    setTimeout(() => void firePreBoundaryAudit(), 150);
+  /**
+   * Start the sweep's reads NOW, before the lock, and carry the same promise across every
+   * retry so they happen once rather than per attempt.
+   *
+   * This is the fix for a boundary lost at epoch 178: the payment fire held the lock through
+   * its own builder fan-out, and the audit fire could not begin reading until that finished,
+   * so it ran three seconds past the boundary and found its targets already taken. The reads
+   * touch nothing the lock guards, so there is no reason for them to wait on it.
+   *
+   * A failed prefetch resolves to null rather than rejecting, and the sweep then reads for
+   * itself — losing the overlap but never the audit.
+   */
+  const entryNow = BigInt(Math.floor(Date.now() / 1000));
+  const plannedRace = armed ?? racedBoundary(runtime.startTime ?? 0n, entryNow, runtime.currentEpoch);
+  /**
+   * Refuse a boundary that is already behind us, the same way firePreBoundaryPay does.
+   *
+   * The payment fire has always had this; the audit fire never did, and got away with it
+   * because a stale fire ran out of auditors on its own — the citizen would be 3+ behind by
+   * then, which the old delinquency clause in isEligibleAuditor refused. `auditWhileBehind`
+   * removes that accident, so without an explicit guard a timer armed for a dead epoch would
+   * now spend a fee and an audit slot on a target chosen for an epoch that has passed.
+   *
+   * racedBoundary returns `currentEpoch` itself inside the just-rolled grace window, and
+   * `currentEpoch < currentEpoch` is false, so a boundary landing right now is not refused.
+   *
+   * Gated on a KNOWN chain epoch. armedEpochIsOver falls back to the wall clock when
+   * currentEpoch is null, and that fallback cannot be trusted here: it would refuse a fire
+   * during the boot window before the first snapshot lands, which is exactly when an
+   * away-mode wake fires. Chain truth or nothing — a missing epoch is not evidence of a dead
+   * one.
+   */
+  if (runtime.currentEpoch !== null && armedEpochIsOver(Number(plannedRace.targetEpoch), entryNow)) {
+    logger.debug(
+      `pre-boundary audit: epoch ${plannedRace.targetEpoch} is already over (chain at ` +
+        `${runtime.currentEpoch}) — not firing`,
+    );
     return;
   }
-  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
+  const inputs =
+    pending ??
+    prefetchAuditInputs(plannedRace.targetEpoch, entryNow).catch((err: unknown) => {
+      logger.debug(`audit prefetch failed, falling back to reading under the lock: ${(err as Error).message}`);
+      return null;
+    });
+  if (ticking) {
+    const b = boundaryForArmedFire();
+    if (b !== null) warnRaceLostToTick("audit", b);
+    // Carry the armed boundary through the retry, or a delayed fire re-derives it and lands
+    // on the wrong day — which is the bug this whole path exists to avoid.
+    setTimeout(() => void firePreBoundaryAudit(armed, inputs), 150);
+    return;
+  }
+  /**
+   * The endgame gate, which used to return in total silence.
+   *
+   * That silence cost a diagnosis: an operator saw the delay warning above, then nothing at
+   * all, and no audits — indistinguishable from "the sweep ran and found no targets". Supply
+   * is what decides this, so with 78 citizens and 69 winners any endgameOnlyWithin under 9
+   * switches every pre-boundary audit off while payments carry on normally.
+   */
+  if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) {
+    noteEndgameGateSkip(boundaryForArmedFire());
+    return;
+  }
   ticking = true;
+  tickingOwner = "the audit fire";
   committedThisTickWei = new Map();
   beginBatch();
-  const targetEpoch = (runtime.currentEpoch ?? 0n) + 1n;
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const boundaryTs = (runtime.startTime ?? 0n) + (runtime.currentEpoch ?? 0n) * EPOCH_DURATION_SECONDS;
-  // Telemetry only: lets the flush record how early this race was sent (race-timing.ts).
+  /**
+   * Pinned to the boundary passed in by the scheduler, or derived from the clock — never from
+   * currentEpoch + 1. See racedBoundary: this fire waits behind the payment fire's tick lock, so
+   * by the time it runs currentEpoch may already have advanced, and the old derivation then
+   * stamped the bundle with TOMORROW's boundary. minTimestamp made that fatal rather than merely
+   * late: no block in the window can satisfy it, so every audit vanished without an error while
+   * payments landed normally.
+   */
+  const armedRace = armed ?? racedBoundary(runtime.startTime ?? 0n, nowSec, runtime.currentEpoch);
+  const targetEpoch = armedRace.targetEpoch;
+  const boundaryTs = armedRace.boundaryTs;
+  // Bounds the bundle (minTimestamp) and measures the lead in race telemetry.
   setRaceBoundary(boundaryTs);
   try {
     await nonces.syncAll(runtime.addresses as Address[], appConfig.mode);
-    // Allowed-to-revert ONLY when a coinbase bid will fire, because `revertible` also
-    // turns off the public-mempool mirror (see act()) and the two failure modes trade
-    // against each other:
-    //
-    //   revertible + bid  — bundle-only, revert-tolerant. A stale target (already
-    //     audited, auditor out of capacity) reverts harmlessly inside the bundle instead
-    //     of invalidating it, so the bundle still lands at the position the bid bought.
-    //   not revertible, no bid — all-or-nothing, but each audit keeps its mempool copy.
-    //     Without a bid the bundle rarely wins top-of-block anyway, so the mirror is the
-    //     only thing likely to land at all.
-    //
-    // Getting this wrong the other way is what cost an epoch of audits: with a 0.022 ETH
-    // bid configured, ONE doomed audit invalidated the whole all-or-nothing bundle, the
-    // builder dropped it, and the bid — which is bundle-only and never mirrored — died
-    // with it. The audits then trickled out through the mempool naked, landed at tx index
-    // 40+ instead of 0, and every one reverted with AuditAlreadyActive because faster
-    // bundles had already taken the targets.
-    const bidding = coinbaseBidActive(s, "audit");
-    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, { revertible: bidding });
+    /**
+     * Standalone audit bundle: both of these are the operator's call, and both are only safe
+     * to expose HERE, where the audits are alone in their bundle and no payment can be hurt.
+     *
+     * Revert-tolerance used to be tied to bidding, which left the no-bid config — the one
+     * most people run — with an all-or-nothing bundle for the wrong reason. That coupling is
+     * what cost an epoch of audits once: with a 0.022 ETH bid configured, ONE doomed audit
+     * invalidated the whole bundle, the builder dropped it, and the bid — bundle-only, never
+     * mirrored — died with it. The audits then trickled out through the mempool naked, landed
+     * at tx index 40+ instead of 0, and every one reverted with AuditAlreadyActive.
+     *
+     * `auditBundleAllOrNothing` makes it a deliberate choice instead:
+     *
+     *   tolerant (default) — a stale target reverts harmlessly and the rest of the bundle
+     *     still lands at the position the tip and bid bought. Costs gas on the dud, and that
+     *     gas makes the block MORE profitable for the builder that ordered you last.
+     *   all-or-nothing — the builder drops the bundle rather than include a reverting audit,
+     *     so a doomed audit is free. Costs the audits that would have succeeded beside it.
+     *
+     * Neither dominates, because a target curing INSIDE the boundary block is invisible to
+     * simulation: whichever way this is set, some boundaries pay for it. What does NOT vary
+     * is the payment bundle, which is a separate bundle on separate nonces either way.
+     *
+     * A coinbase bid tailing this bundle stays revert-tolerant on its own (see
+     * queueCoinbaseBid), so all-or-nothing never lets a payer problem drop healthy audits.
+     *
+     * `mirrorAudits` off makes each audit bundle-only. The mirror is the only thing that can
+     * land in the ~1 boundary in 10 built by a solo validator, but it also announces the
+     * target list before the block is built — and four consecutive boundaries where the
+     * contested target cured inside the block, one at index 0 on a 10 gwei tip, are what that
+     * announcement looks like from the receiving end. Payments mirror either way.
+     */
+    /**
+     * Credit citizens the payment fire just queued for this same boundary. They still read as
+     * behind on-chain, but their payment carries a LOWER nonce from the same wallet, so the audit
+     * cannot execute before it (see paidForBoundary). Those auditors go out unsimulated and
+     * revert-tolerant, because simulating one against pre-payment state would wrongly fail.
+     */
+    const paidInBundle =
+      paidForBoundary?.epoch === targetEpoch.toString() ? paidForBoundary.tokens : new Set<string>();
+    /**
+     * Aim one block earlier as well, but ONLY when a payment shared this boundary.
+     *
+     * The payment fire flushed first and read its own head; if a block landed between that
+     * flush and this one, it is aimed a block ahead of us and we cannot reach the block it
+     * took. Looking back covers that. On an audit-only boundary there is no earlier fire to
+     * catch up to, so the extra post per builder would buy nothing.
+     */
+    setRaceLookBack(paidInBundle.size > 0);
+    // Usually already resolved: it has been running since before we took the lock.
+    const prefetched = await inputs;
+    const queuedAudit = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
+      revertible: !s.auditBundleAllOrNothing,
+      bundleOnly: !s.mirrorAudits,
+      paidInBundle,
+      prefetched: prefetched ?? undefined,
+    });
     // Tail a coinbase bid so the audit bundle wins the slot (no-op unless configured).
     if (queuedAudit) await maybeQueueCoinbaseBid("audit");
   } catch (err) {
@@ -1524,6 +2208,7 @@ export async function firePreBoundaryAudit(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1550,13 +2235,12 @@ export async function firePreBoundaryBundle(): Promise<void> {
   // that turned up a block late (the epoch-162 miss), with nothing in the log to say why.
   if (ticking) {
     const boundarySec = boundaryForArmedFire();
-    if (boundarySec !== null && BigInt(Math.floor(Date.now() / 1000)) >= boundarySec) {
-      warnRaceLostToTick("bundle", boundarySec);
-    }
+    if (boundarySec !== null) warnRaceLostToTick("bundle", boundarySec);
     setTimeout(() => void firePreBoundaryBundle(), 150);
     return;
   }
   ticking = true;
+  tickingOwner = "the combined pay+audit fire";
   committedThisTickWei = new Map();
   beginBatch();
   /**
@@ -1620,7 +2304,15 @@ export async function firePreBoundaryBundle(): Promise<void> {
       !(s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin))
     ) {
       auditQueued = await queuePreBoundaryAudits(targetEpoch, nowSec, boundaryTs, {
+        // Deliberately NOT wired to auditBundleAllOrNothing. Here the audits SHARE a bundle
+        // with the payments, so making them mandatory would let one cured target drop every
+        // payment — gas on a failed audit traded for citizens going unpaid, at the one block
+        // where that matters most. The setting exists only for the standalone bundle above.
         revertible: paidInBundle.size > 0 || coinbaseBidActive(s, "audit"),
+        // MUST stay true here: payments share this bundle on sequential nonces, so a mirrored
+        // audit that lands would consume its nonce, invalidate the bundle, and take the
+        // payments with it. Unchanged from before — only the standalone path moved.
+        bundleOnly: true,
         // Tokens paid above are current by the time the audit executes, so they can
         // serve as audit "from" tokens even though the chain still reads them behind.
         paidInBundle,
@@ -1633,7 +2325,35 @@ export async function firePreBoundaryBundle(): Promise<void> {
     // a payment in the bundle makes it a must-land defensive boundary, otherwise it is an
     // ordinary offense night on the cheaper bid.
     const bidKind: BidKind = paidInBundle.size > 0 ? "payment" : "audit";
-    if (paidInBundle.size > 0 || auditQueued) await maybeQueueCoinbaseBid(bidKind);
+    if (paidInBundle.size > 0 || auditQueued) {
+      /**
+       * The selected bid can be the UNFUNDED one, and that is a silent dead end.
+       *
+       * `combinedBundleActive` is satisfied by EITHER bid, so a funded payment bid keeps this
+       * fire running on a night where nothing is owed — and then `bidKind` resolves to "audit".
+       * If that one is zero, `maybeQueueCoinbaseBid` returns without queuing, and the audits
+       * above were added with `bundleOnly: true`, so they have neither a bid nor a mempool
+       * copy. Nothing lands and nothing says why.
+       *
+       * The note above this call used to assert the audits "always have the bid backing them".
+       * That holds only when the bid that gets SELECTED is the funded one, which is not what
+       * `combinedBundleActive` checks. Warn rather than silently re-route: picking the other
+       * bid would spend money the operator did not configure, and refusing to fuse here would
+       * make the dashboard's fused/split badge depend on something only known at fire time.
+       */
+      if (coinbaseBidFor(s, bidKind) <= 0) {
+        const other: BidKind = bidKind === "audit" ? "payment" : "audit";
+        const msg =
+          `Fused boundary selected the ${bidKind} coinbase bid, which is 0 — so this bundle ` +
+          `has no bid, and a fused bundle's audits carry no mempool copy either. The ` +
+          `${other} bid is funded but does not apply here: which bid fires is decided by ` +
+          `whether a payment made it into the bundle, not by which one you set. Fund the ` +
+          `${bidKind} bid, or turn off "Fuse the payment and audit bundles".`;
+        logger.warn(msg);
+        activity.add({ kind: "info", status: "skipped", message: msg });
+      }
+      await maybeQueueCoinbaseBid(bidKind);
+    }
   } catch (err) {
     logger.error("pre-boundary bundle error:", (err as Error).message);
     activity.add({ kind: "error", status: "skipped", message: `Pre-boundary bundle error: ${(err as Error).message}` });
@@ -1641,6 +2361,7 @@ export async function firePreBoundaryBundle(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1691,6 +2412,7 @@ async function firePreBoundaryKill(): Promise<void> {
   if (ticking) { setTimeout(() => void firePreBoundaryKill(), 150); return; }
   if (s.endgameOnlyWithin !== null && (runtime.citizenSupply ?? 0n) - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   ticking = true;
+  tickingOwner = "the kill fire";
   committedThisTickWei = new Map();
   beginBatch();
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
@@ -1731,6 +2453,7 @@ async function firePreBoundaryKill(): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -1754,6 +2477,42 @@ export function scheduleDefenseBoundary(): void {
   const s = runtime.strategy;
   if (!runtime.running || !s.enabled || !s.proactivePay) return;
   if (runtime.startTime === null || runtime.currentEpoch === null) return;
+  /**
+   * Stand down when a pre-boundary payment fire already owns this boundary.
+   *
+   * The two pay the SAME citizens. maybeAutoArmPayment arms exactly those with
+   * `lastEpochPaid < currentEpoch` — the ones that go 2 behind when the boundary lands — and
+   * queuePreBoundaryPayments pays that armed set. By the time this tick would run, the
+   * payment fire has already covered them 3.5s earlier, at the race tip, aimed at the
+   * boundary block. There is nothing left for it to find.
+   *
+   * What it does instead is take the engine lock at boundary - 1.5s and run a FULL tick —
+   * snapshot, nonce sync, owned tokens, auto-arm, auto-defend, jitPass, offensePass, flush —
+   * squarely inside the window the audit fire is retrying in. It is a boundary tick, so
+   * routineTickMustYield deliberately exempts it, and if proactivePayPass finds nothing it
+   * logs nothing, so the delay it causes is invisible.
+   *
+   * That is the shape of the epoch-178 loss: an ally's payments landed at index 35-38 of the
+   * boundary block, its audit fire did not run until three seconds PAST the boundary, and by
+   * then a rival had taken both of its targets inside that block.
+   *
+   * Unarmed boundaries are untouched: proactive pay is the only defense there, and with no
+   * payment fire there is nothing to collide with.
+   *
+   * The cost, stated plainly: if the payment fire is armed but its guards trip (min-balance
+   * floor, fee cap), proactive pay no longer runs as a second attempt that boundary. It would
+   * hit the same guards, so the loss is small — but it is not nothing.
+   */
+  const paymentFireOwnsThisBoundary =
+    s.preBoundaryPay && s.jitEnabled && s.jitTargetEpoch !== null &&
+    BigInt(s.jitTargetEpoch) === runtime.currentEpoch + 1n &&
+    !armedEpochIsOver(s.jitTargetEpoch);
+  if (paymentFireOwnsThisBoundary) {
+    logger.debug(
+      `defense boundary tick stood down for epoch ${s.jitTargetEpoch}: the pre-boundary payment fire covers it`,
+    );
+    return;
+  }
 
   // Epoch boundary that starts epoch (current+1) is startTime + current*DURATION.
   const nextEpochBoundary = runtime.startTime + runtime.currentEpoch * EPOCH_DURATION_SECONDS;
@@ -1889,6 +2648,10 @@ async function trackReceipt(
   entryId: string,
   txHash: `0x${string}`,
   broadcast = true,
+  // Who signed it and at what nonce. Optional only because older callers predate the
+  // check below; supply it wherever you can — it is what turns "no receipt" from a
+  // shrug into a verdict.
+  signer?: { address: Address; nonce: number },
 ): Promise<void> {
   try {
     const receipt = await publicClient.waitForTransactionReceipt({
@@ -1910,7 +2673,49 @@ async function trackReceipt(
       ...(broadcast ? {} : { txHash }),
     });
   } catch (err) {
-    // Timed out or RPC error — leave the entry as "submitted".
+    /**
+     * No receipt inside the window. "Lost the race" and "this transaction can never land"
+     * look identical here, and the difference is the whole story — so ask the chain which
+     * one it is instead of leaving the row at "submitted" forever.
+     *
+     * The test is the nonce. If the chain has moved PAST our nonce and our hash still has no
+     * receipt, then something else consumed that nonce and this transaction is permanently
+     * dead. That is the exact signature of the epoch-176 collision, where a payment sat at
+     * "submitted" while the citizen it was meant to save went unpaid, fell 2 epochs behind,
+     * and got audited — and nothing in the feed said so. A dropped bundle, by contrast,
+     * leaves the nonce unconsumed and is genuinely just a lost race.
+     *
+     * Deliberately an ERROR, not info: a payment that can never land is the most expensive
+     * silent failure this bot has, and it needs to survive a glance at the feed.
+     */
+    if (signer) {
+      try {
+        const chainNonce = await publicClient.getTransactionCount({
+          address: signer.address,
+          blockTag: "latest",
+        });
+        if (chainNonce > signer.nonce) {
+          activity.update(entryId, { status: "skipped" });
+          activity.add({
+            kind: "error",
+            status: "skipped",
+            message:
+              `Transaction ${txHash.slice(0, 10)}… can never land: nonce ${signer.nonce} was ` +
+              `consumed by a different transaction (wallet is now at ${chainNonce}). ` +
+              `Whatever this was meant to do did NOT happen — check the citizen it covered.`,
+          });
+          logger.error(
+            `dead tx ${txHash.slice(0, 10)}…: nonce ${signer.nonce} consumed by another tx ` +
+              `(chain at ${chainNonce})`,
+          );
+          return;
+        }
+      } catch (probeErr) {
+        logger.warn(`could not classify stuck tx ${txHash.slice(0, 10)}…: ${(probeErr as Error).message}`);
+      }
+    }
+    // Nonce not yet consumed: a dropped bundle or a slow chain. Leave it as "submitted" —
+    // it may still land, and force-marking it either way would be a guess.
     logger.warn(`receipt tracking for ${txHash.slice(0, 10)}… failed: ${(err as Error).message}`);
   }
 }
@@ -2028,7 +2833,13 @@ async function act(
       // Audits riding a payment bundle and the coinbase bid stay bundle-only: mirroring an
       // audit adds a second mempool nonce that can demote the payment, and a bundle-only bid
       // is only meaningful in the block it wins.
-      race: ctx.bundleOnly ? false : offense ? (ctx.race && runtime.strategy.racePublicMempool) : true,
+      race: ctx.bundleOnly
+        ? false
+        : offense
+          ? (ctx.race && runtime.strategy.racePublicMempool)
+          // Payments: gated only on the RACE path. Manual, JIT and proactive payments are
+          // not racing anyone, so a lost slot there costs a block, not a citizen.
+          : (!ctx.race || runtime.strategy.mirrorPayments),
       offense,
       simTimestamp: ctx.simTimestamp,
       revertible: ctx.revertible,
@@ -2069,14 +2880,15 @@ async function act(
     // Queued into a bundle batch (mainnet): the tx isn't sent yet, so its hashes
     // and receipt tracking are reconciled by flushBatch at end of tick.
     if (result.queued) {
-      batchEntries.push({ entryId: entry.id, nonce: result.nonce });
+      batchEntries.push({ entryId: entry.id, nonce: result.nonce, address: signer.account.address });
       return result;
     }
     // Watch for the receipt so the entry flips submitted -> included/reverted. A pure
     // Flashbots submission has no broadcast txHash, but the hash it will have if it lands
     // is just keccak of the signed tx — poll that so bundle-only sends resolve too.
-    if (result.txHash) void trackReceipt(entry.id, result.txHash);
-    else if (result.predictedTxHash) void trackReceipt(entry.id, result.predictedTxHash, false);
+    const dead = { address: signer.account.address, nonce: result.nonce };
+    if (result.txHash) void trackReceipt(entry.id, result.txHash, true, dead);
+    else if (result.predictedTxHash) void trackReceipt(entry.id, result.predictedTxHash, false, dead);
     return result;
   } catch (err) {
     activity.add({
@@ -2325,6 +3137,11 @@ export async function maybeAutoArmPayment(
   schedulePreBoundaryPay();
   schedulePreBoundaryAudit();
   schedulePreBoundaryBundle();
+  // The defense tick reads the arm too: it stands down when a payment fire owns the boundary,
+  // and it is otherwise scheduled ONLY from refreshSnapshot, which runs BEFORE this function
+  // in the same tick. Without this line the stand-down misses the tick that arms and waits for
+  // the next one — self-correcting within a block, but only because a tick happens to follow.
+  scheduleDefenseBoundary();
   // Always in away mode to reach here, and the wake window is picked from what is armed —
   // so it has to be recomputed now that a payment is due.
   scheduleAwayWake();
@@ -2547,18 +3364,24 @@ async function findEligibleAuditors(ownedIds: bigint[], currentEpoch: bigint): P
       { ...gameContract, functionName: "lastEpochPaid" as const, args: [id] as const },
       { ...gameContract, functionName: "auditsUsedInEpoch" as const, args: [id, currentEpoch] as const },
       { ...gameContract, functionName: "auditLimit" as const, args: [id] as const },
+      { ...gameContract, functionName: "auditDueTimestamp" as const, args: [id] as const },
     ]),
   });
   const eligible: bigint[] = [];
   for (let i = 0; i < ownedIds.length; i++) {
-    const lep = results[i * 3];
-    const used = results[i * 3 + 1];
-    const limit = results[i * 3 + 2];
-    if (lep?.status !== "success" || used?.status !== "success" || limit?.status !== "success") continue;
+    const lep = results[i * 4];
+    const used = results[i * 4 + 1];
+    const limit = results[i * 4 + 2];
+    const due = results[i * 4 + 3];
+    if (lep?.status !== "success" || used?.status !== "success" || limit?.status !== "success"
+      || due?.status !== "success") continue;
     const lepV = lep.result as bigint;
     const usedV = used.result as bigint;
     const limitV = limit.result as bigint;
-    if (!isEligibleAuditor(lepV, currentEpoch, usedV, limitV)) continue;
+    if (!isEligibleAuditor(lepV, currentEpoch, usedV, limitV, {
+      auditWhileBehind: runtime.strategy.auditWhileBehind,
+      underAudit: (due.result as bigint) !== 0n,
+    })) continue;
     // Remaining capacity this epoch (>= 1 given isEligibleAuditor); one pool entry each.
     for (let k = usedV; k < limitV; k++) eligible.push(ownedIds[i]!);
   }
@@ -2579,9 +3402,60 @@ async function offensePass(
     if (supply - WINNERS > BigInt(s.endgameOnlyWithin)) return;
   }
 
-  const live = await fetchOffenseCandidates();
-  const owned = new Set(ownedIds.map((x) => x.toString()));
   const pinned = pinnedTargetSet(s);
+  // Widen the AUDIT half of the sweep past the pins when asked. Kills are deliberately
+  // left narrow (see the kill branch below), and the boundary paths call
+  // fetchOffenseCandidates() without the flag, so this affects the mid-epoch sweep only.
+  const wide = pinned !== null && s.sweepUnpinned && s.autoAudit;
+
+  /**
+   * Read the auditor pool FIRST, and bail before touching the candidate set if there is
+   * nothing it could do with one.
+   *
+   * Audit capacity is per-epoch, so the sweep spends it in the first tick or two after a
+   * boundary and then has none for the remaining ~7,000 ticks of the epoch. Those ticks
+   * used to enumerate the field, multicall ownerOf over it, and multicall a status for
+   * every rival — all to discover the pool was empty. That was already wasteful at pinned
+   * width; with sweepUnpinned it is the whole live field, twice per tick.
+   *
+   * Costs one round-trip of concurrency on the ticks that DO have capacity (auditors and
+   * statuses used to be fetched together). Worth it: the sweep is mid-epoch work with no
+   * deadline — the boundary paths are what race — and the trade is one extra round-trip on
+   * a handful of ticks against two large multicalls on thousands of them.
+   *
+   * Only safe to skip when autoKill is off, since a kill needs no auditor. With it on,
+   * nextKillDeadlineSec also has to stay fresh for schedulePreBoundaryKill.
+   */
+  const auditors = s.autoAudit ? await findEligibleAuditors(ownedIds, currentEpoch) : [];
+  if (auditors.length === 0 && !s.autoKill) {
+    logger.debug("offense sweep: no audit capacity left this epoch and autoKill is off — skipping");
+    return;
+  }
+
+  const live = (await fetchOffenseCandidatesWithSkips({ includeUnpinned: wide })).candidates;
+  const owned = new Set(ownedIds.map((x) => x.toString()));
+
+  /**
+   * Price mid-epoch sweep audits at normal gas rather than the offense race tip.
+   *
+   * A mid-epoch audit contests nobody: the rivals who intended to cure did it at the
+   * boundary, and if one does front-run us the revert refunds BOTH the 0.00069 fee and
+   * the audit slot, so a lost cheap audit costs only gas. At a 131 gwei offense tip an
+   * audit is ~0.0178 ETH against ~0.0010 at normal gas — 17x for a race that isn't
+   * happening.
+   *
+   * The exception is the quiet window before a boundary. These txs come from the same
+   * wallets the boundary fires use, so a cheap one still pending when the boundary
+   * arrives holds a nonce the payment queues behind — and a higher nonce cannot be mined
+   * before a lower one no matter what it pays. Inside the window we pay race gas so
+   * nothing lingers. (The +1 gwei bump in normalFees is the other half of this: priced
+   * exactly AT the node's suggestion, a tx is a coin-flip per block.)
+   */
+  const untilBoundary =
+    runtime.startTime === null ? null : nextBoundarySec(runtime.startTime, nowSec) - nowSec;
+  const inBoundaryQuietWindow =
+    untilBoundary !== null && untilBoundary <= SWEEP_QUIET_WINDOW_SECONDS;
+  const sweepNormalGas = s.sweepNormalGas && !inBoundaryQuietWindow;
 
   // Narrow to tokens we could actually act on BEFORE reading their status, then
   // fetch all their statuses in ONE multicall — a serial getTargetStatus per
@@ -2590,21 +3464,21 @@ async function offensePass(
   const candidates = live.filter(({ id }) => {
     const key = id.toString();
     if (owned.has(key)) return false; // never audit our own
-    if (pinned && !pinned.has(key)) return false; // not on the target list
+    // Unpinned tokens are in the set only when `wide`, and then only the audit branch
+    // may act on them — the kill branch re-checks the pin itself.
+    if (pinned && !pinned.has(key) && !wide) return false; // not on the target list
     return true;
   });
+  const statuses = await batchGetTargetStatuses(candidates, currentEpoch, nowSec);
 
-  // The auditor pool (owned tokens usable as an audit "from" this tick — each
-  // backs one audit, since a token audits at most `auditLimit` times/epoch) and
-  // the target statuses are independent reads, so fetch them concurrently. We hand
-  // auditors out one per target so multiple rivals can be audited in a single
-  // epoch instead of reusing one token and reverting with AuditLimitReached.
-  const [auditors, statuses] = await Promise.all([
-    findEligibleAuditors(ownedIds, currentEpoch),
-    batchGetTargetStatuses(candidates, currentEpoch, nowSec),
-  ]);
+  // Auditors are handed out one per target so multiple rivals can be audited in a single
+  // epoch instead of reusing one token and reverting with AuditLimitReached. The pool was
+  // read above, before the candidate set, so an epoch with no capacity left costs nothing.
   let auditorIdx = 0;
   let noAuditorSkips = 0;
+  // How many of this sweep's audits hit a rival that is NOT on the pinned list, so the
+  // activity line can say the widening is what found them.
+  let unpinnedAudits = 0;
   // Set when the sweep stopped early because the guardrail failed for a reason that
   // applies to the whole block (base fee over cap). Reported below so an offense pass
   // that did nothing is never silent about why.
@@ -2624,6 +3498,11 @@ async function offensePass(
     }
 
     if (s.autoKill && t.killable) {
+      // Kills stay PINNED-ONLY even when the audit sweep is widened. A kill is a race
+      // against every other killer for the same reward, so it needs race gas — and
+      // widening a race-gas action is a spend increase the sweep widening deliberately
+      // isn't. `wide` is the only way an unpinned token reaches this loop.
+      if (pinned && !pinned.has(t.tokenId)) continue;
       const guard = await canSpend(0n, true);
       // A fee spike fails identically for every remaining target — stop the sweep
       // instead of re-awaiting the same verdict once per rival.
@@ -2647,9 +3526,20 @@ async function offensePass(
       const res = await act(
         { to: appConfig.gameAddress, data: encodeAudit(auditFrom, tokenId), value: AUDIT_COST_WEI },
         "audit",
-        { tokenId: auditFrom.toString(), targetTokenId: t.tokenId, message: `Audit delinquent #${t.tokenId} from #${auditFrom}`, race: true },
+        {
+          tokenId: auditFrom.toString(),
+          targetTokenId: t.tokenId,
+          message: `Audit delinquent #${t.tokenId} from #${auditFrom}`,
+          // `race` is the mempool mirror, not the tip — keep it either way so the audit
+          // lands without depending on a builder. Only the PRICE changes below.
+          race: true,
+          normalGas: sweepNormalGas,
+        },
       );
-      if (res?.ok) auditorIdx++; // consume this auditor only if the audit actually went out
+      if (res?.ok) {
+        auditorIdx++; // consume this auditor only if the audit actually went out
+        if (pinned && !pinned.has(t.tokenId)) unpinnedAudits++;
+      }
     }
   }
 
@@ -2659,6 +3549,22 @@ async function offensePass(
       status: "info",
       message: `Audited ${auditorIdx} rival(s) this sweep; ${noAuditorSkips} more auditable but no eligible auditor token left (each audits up to its per-epoch limit).`,
     });
+  }
+
+  // Debug, not activity: the sweep runs every block, so an entry per sweep would flood
+  // the feed. What's worth recording is that the widening spent slots on rivals the pin
+  // list wouldn't have reached — otherwise those audits read as pins the user forgot.
+  if (unpinnedAudits > 0) {
+    logger.debug(
+      `offense sweep: ${unpinnedAudits} of ${auditorIdx} audit(s) went to unpinned rivals ` +
+        `(sweepUnpinned) at ${sweepNormalGas ? "normal" : "race"} gas`,
+    );
+  }
+  if (inBoundaryQuietWindow && s.sweepNormalGas) {
+    logger.debug(
+      `offense sweep: within ${SWEEP_QUIET_WINDOW_SECONDS}s of the boundary — using race gas ` +
+        `so no cheap tx is left holding a nonce the boundary payment would queue behind`,
+    );
   }
 
   // Debug, not activity: a fee spike lasts many blocks and the sweep runs every block, so
@@ -2703,14 +3609,22 @@ async function waitForIdle(timeoutMs = 5_000): Promise<boolean> {
  */
 async function runManualAction(
   tokenId: bigint,
-  kind: "pay-taxes" | "use-bribe",
-  build: () => Promise<{ intent: TxIntent; message: string } | { error: string }>,
+  kind: "pay-taxes" | "use-bribe" | "audit",
+  /**
+   * May return an `actingTokenId` when the token that must SIGN differs from the token the
+   * action is about. An audit is the case: it is owner-only on the AUDITOR, while the id the
+   * user clicked is the rival being audited. Without this the holder lookup would run against a
+   * token we do not own, and the call would be signed by the wrong wallet and revert on-chain
+   * after paying gas.
+   */
+  build: () => Promise<{ intent: TxIntent; message: string; actingTokenId?: bigint } | { error: string }>,
 ): Promise<ManualActionResult> {
   if (!runtime.unlocked || !runtime.account) return { ok: false, message: "Unlock the wallet first" };
   if (runtime.gameState !== 1) return { ok: false, message: "Game is not live" };
   if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment" };
 
   ticking = true;
+  tickingOwner = "a manual action from the dashboard";
   committedThisTickWei = new Map();
   beginBatch();
   try {
@@ -2726,9 +3640,10 @@ async function runManualAction(
     const built = await build();
     if ("error" in built) return { ok: false, message: built.error };
 
-    const holder = walletForToken(tokenId);
+    const acting = built.actingTokenId ?? tokenId;
+    const holder = walletForToken(acting);
     if (!holder) {
-      return { ok: false, message: `No unlocked wallet holds #${tokenId} — add its key to act on it` };
+      return { ok: false, message: `No unlocked wallet holds #${acting} — add its key to act on it` };
     }
     // Min-balance floor applies to the wallet that will actually pay, not the total
     // across wallets: a funded wallet must not let an empty one send a tx it cannot
@@ -2766,6 +3681,7 @@ async function runManualAction(
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 
@@ -2810,13 +3726,196 @@ export async function manualUseBribe(tokenId: bigint): Promise<ManualActionResul
   });
 }
 
+/**
+ * Audit ONE rival now, on the network's normal gas — the manual counterpart to the boundary
+ * race.
+ *
+ * Deliberately not a race: there is no bid, no boundary timestamp and no dynamic tip, just
+ * `estimateMaxPriorityFeePerGas` like every other manual action. Pressing a button mid-epoch is
+ * not competing for a slot, and inheriting the configured race tip would spend several hundred
+ * gwei to do something nobody is contesting.
+ *
+ * The auditor is chosen for the user, because it is not a meaningful choice: any owned citizen
+ * that is itself current and has an audit left this epoch does the same job. It is picked fresh
+ * from `findEligibleAuditors`, which reads `auditsUsedInEpoch` on-chain, so a slot already spent
+ * by an automatic sweep earlier in the epoch cannot be double-booked into `AuditLimitReached`.
+ */
+export async function manualAudit(targetTokenId: bigint): Promise<ManualActionResult> {
+  return runManualAction(targetTokenId, "audit", async () => {
+    const epoch = runtime.currentEpoch ?? 0n;
+    /**
+     * Through filterLiveTokenIds first, for two reasons: batchGetTargetStatuses needs the owner,
+     * and a BURNED token still answers lastEpochPaid from a surviving mapping. Auditing one of
+     * those reverts with ERC721NonexistentToken after paying gas, so a dead id must be refused
+     * here rather than diagnosed from a failed transaction.
+     */
+    const live = await filterLiveTokenIds(runtime.citizensAddress as Address, [targetTokenId]);
+    if (live.length === 0) return { error: `#${targetTokenId} no longer exists (killed and burned)` };
+    const [target] = await batchGetTargetStatuses(live, epoch, BigInt(Math.floor(Date.now() / 1000)));
+    if (!target) return { error: `Could not read #${targetTokenId}` };
+    if (!target.auditable) {
+      return {
+        error:
+          `#${targetTokenId} is not auditable right now (${target.epochsBehind} epoch(s) behind — ` +
+          `needs 2). Nothing was sent.`,
+      };
+    }
+    if (target.auditDueTimestamp !== "0") {
+      return { error: `#${targetTokenId} is already under audit — a second audit would revert` };
+    }
+    const owned = await fetchOwnedAcrossWallets(runtime.citizensAddress as Address);
+    const auditors = await findEligibleAuditors(owned, epoch);
+    const from = auditors[0];
+    if (from === undefined) {
+      return {
+        error:
+          "No audit capacity left: every citizen you hold is either behind on taxes or has " +
+          "already used its audits this epoch.",
+      };
+    }
+    return {
+      intent: { to: appConfig.gameAddress, data: encodeAudit(from, targetTokenId), value: AUDIT_COST_WEI },
+      message: `Manual audit #${targetTokenId} from #${from} (normal gas)`,
+      actingTokenId: from,
+    };
+  });
+}
+
+/** What a mass audit did, per target, so the UI can report partial success honestly. */
+export interface MassAuditResult {
+  ok: boolean;
+  message: string;
+  audited: { target: string; from: string; txHash?: string }[];
+  skipped: { target: string; reason: string }[];
+  /** Audit slots still unused after this run. */
+  capacityLeft: number;
+}
+
+/**
+ * Audit every auditable rival, up to the audit slots currently available.
+ *
+ * One batch, so on mainnet they go out as a single bundle and share one nonce run rather than
+ * racing each other. Normal gas throughout, same reasoning as the single audit.
+ *
+ * Capacity is the binding constraint and it is reported rather than silently hit: a user with 3
+ * slots and 8 auditable rivals should be told 5 were left alone, not left wondering. Targets are
+ * taken in the order the panel shows them, so the result matches what was on screen.
+ */
+export async function manualAuditAll(): Promise<MassAuditResult> {
+  const empty = { audited: [], skipped: [], capacityLeft: 0 };
+  if (!runtime.unlocked || !runtime.account) return { ok: false, message: "Unlock the wallet first", ...empty };
+  if (runtime.gameState !== 1) return { ok: false, message: "Game is not live", ...empty };
+  if (!(await waitForIdle())) return { ok: false, message: "Bot is busy submitting; try again in a moment", ...empty };
+
+  ticking = true;
+  tickingOwner = "a manual audit-all";
+  committedThisTickWei = new Map();
+  beginBatch();
+  const audited: { target: string; from: string; txHash?: string }[] = [];
+  const skipped: { target: string; reason: string }[] = [];
+  let capacityLeft = 0;
+  try {
+    const [owned] = await Promise.all([
+      fetchOwnedAcrossWallets(runtime.citizensAddress as Address),
+      refreshSnapshot(),
+      nonces.syncAll(runtime.addresses as Address[], appConfig.mode),
+    ]);
+    const epoch = runtime.currentEpoch ?? 0n;
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    const auditors = await findEligibleAuditors(owned, epoch);
+    capacityLeft = auditors.length;
+    if (auditors.length === 0) {
+      return {
+        ok: false,
+        message:
+          "No audit capacity: every citizen you hold is either behind on taxes or has already " +
+          "used its audits this epoch.",
+        audited, skipped, capacityLeft: 0,
+      };
+    }
+
+    // Same candidate set the offense sweep uses, so allies and emigrants are already excluded
+    // and this cannot audit a teammate.
+    const { candidates } = await fetchOffenseCandidatesWithSkips();
+    const statuses = await batchGetTargetStatuses(candidates, epoch, nowSec);
+    const auditable = statuses.filter((t) => t.auditable && t.auditDueTimestamp === "0");
+    if (auditable.length === 0) {
+      return { ok: false, message: "No rival is auditable right now", audited, skipped, capacityLeft };
+    }
+
+    let slot = 0;
+    for (const t of auditable) {
+      const from = auditors[slot];
+      if (from === undefined) {
+        skipped.push({ target: t.tokenId, reason: "no audit slots left" });
+        continue;
+      }
+      const holder = walletForToken(from);
+      if (!holder) {
+        skipped.push({ target: t.tokenId, reason: `no unlocked wallet holds auditor #${from}` });
+        continue;
+      }
+      const res = await act(
+        { to: appConfig.gameAddress, data: encodeAudit(from, BigInt(t.tokenId)), value: AUDIT_COST_WEI },
+        "audit",
+        {
+          tokenId: t.tokenId,
+          wallet: holder,
+          message: `Mass audit #${t.tokenId} from #${from} (normal gas)`,
+          race: true,
+          normalGas: true,
+        },
+      );
+      if (res?.ok) {
+        audited.push({ target: t.tokenId, from: from.toString(), txHash: res.txHash });
+        slot++;
+      } else {
+        skipped.push({ target: t.tokenId, reason: res?.error ?? "failed to submit" });
+      }
+    }
+    capacityLeft = Math.max(0, auditors.length - slot);
+    const tail = skipped.length > 0 ? `, ${skipped.length} skipped` : "";
+    return {
+      ok: audited.length > 0,
+      message:
+        audited.length > 0
+          ? `Audited ${audited.length} rival(s)${tail}. ${capacityLeft} audit slot(s) left this epoch.`
+          : `Nothing audited${tail}`,
+      audited, skipped, capacityLeft,
+    };
+  } catch (err) {
+    const message = (err as Error).message;
+    activity.add({ kind: "error", status: "skipped", message: `Mass audit failed: ${message}` });
+    return { ok: false, message, audited, skipped, capacityLeft };
+  } finally {
+    await flushBatch();
+    nonces.resetAll();
+    ticking = false;
+    tickingOwner = null;
+  }
+}
+
 // `fireProactivePay` is true only for the tick armed by scheduleDefenseBoundary
 // at the next epoch boundary — every other tick (block watch, poll, JIT/offense
 // boundary ticks) leaves already-delinquent citizens alone.
-async function tick(fireProactivePay = false): Promise<void> {
+async function tick(fireProactivePay = false, routine = false): Promise<void> {
   if (ticking) return;
   if (!runtime.running || !runtime.unlocked || !runtime.account) return;
+  /**
+   * Stay out of an armed boundary race.
+   *
+   * `routine` defaults to FALSE so this fails safe: a boundary-timed tick that forgot to
+   * identify itself still runs. Only the block subscription and the poll opt in.
+   */
+  if (routine) {
+    const boundary = routineTickMustYield(BigInt(Math.floor(Date.now() / 1000)));
+    if (boundary !== null) {
+      logger.debug(`routine tick skipped: inside the armed boundary window for ${boundary}`);
+      return;
+    }
+  }
   ticking = true;
+  tickingOwner = routine ? "a routine tick" : "a boundary tick";
   committedThisTickWei = new Map(); // fresh spend budget for this tick
   beginBatch();
   try {
@@ -2861,6 +3960,7 @@ async function tick(fireProactivePay = false): Promise<void> {
     await flushBatch();
     nonces.resetAll();
     ticking = false;
+    tickingOwner = null;
   }
 }
 

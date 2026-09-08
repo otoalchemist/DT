@@ -93,9 +93,100 @@ npm run dev                 # starts backend (:8787) + dashboard (:5173)
 
 **One-click launch:** double-click **`start.bat`** on Windows or **`start.command`**
 on macOS. Either one installs dependencies on first run, starts the dev server, and
-opens the dashboard. On macOS the first launch may need a right-click → **Open** to
-clear Gatekeeper, and if double-click doesn't run it, mark it executable once with
-`chmod +x start.command`.
+opens the dashboard.
+
+**macOS: "`start.command` Not Opened — Apple could not verify…"**
+
+This is Gatekeeper, and it is about where the file came from rather than what is in
+it: a browser stamps `com.apple.quarantine` on the ZIP, and everything extracted
+from it inherits the flag. On macOS 15 (Sequoia) the old right-click → **Open**
+bypass no longer clears it. Pick whichever suits you:
+
+```bash
+# 1. Just run it from Terminal — nothing to bypass. Gatekeeper gates double-click
+#    launching a quarantined file, not `bash` reading one.
+cd ~/Downloads/DT-master && bash start.command
+
+# 2. Or strip the flag once for the whole folder, and double-click works after.
+xattr -cr ~/Downloads/DT-master
+chmod +x ~/Downloads/DT-master/start.command
+```
+
+Or: **System Settings → Privacy & Security**, scroll to Security, and click
+**Open Anyway** on the line naming `start.command` (it only appears after the
+launch has been blocked once), then open it again.
+
+**Cloning avoids this entirely** — git-created files are never quarantined, so
+there is no dialog to clear:
+
+```bash
+git clone https://github.com/otoalchemist/DT.git
+cd DT && bash start.command
+```
+
+Notarizing the launcher would not help: a bare `.command` cannot be notarized on
+its own, so it would mean shipping a signed app bundle and an Apple Developer
+account to wrap a script that runs `npm`.
+
+**Endless `ECONNREFUSED 127.0.0.1:8787` / every action returns HTTP 500**
+
+The dashboard is up but the backend is not, so Vite's proxy fails every `/api` call —
+including saving your Alchemy key, which makes it look like the key was rejected. It
+was not: nothing reached the backend.
+
+The real error is in the SAME terminal, scrolled up above the repeated `[web]` lines,
+prefixed `[backend]`. To see it on its own:
+
+```bash
+npm run dev:backend
+```
+
+The usual causes, in order:
+
+- **Node older than 20.** `node -v` — Vite runs on 18, the backend does not. The
+  launcher now refuses to start on anything older instead of half-working.
+- **A `node_modules` copied from another machine.** esbuild and other packages ship
+  platform-specific binaries, so a folder moved from Windows (or restored from a
+  backup) breaks `tsx`. Copy `data/` across between machines, never `node_modules`.
+  Fix: `rm -rf node_modules package-lock.json && npm install`
+- **A half-finished `npm install`** (dropped network). Same fix as above.
+- **Port 8787 already in use** by an earlier run: `lsof -ti tcp:8787 | xargs kill -9`.
+
+**Team access code.** Released builds ask for a shared code at unlock, alongside your wallet
+passphrase. It is a separate field and a separate thing: it does **not** unlock your key, it
+only gates this build. Ask whoever gave you the bot for the code.
+
+> This is a members-only sign, not a lock. The repository is public and the check runs on your
+> own machine, so anyone determined can remove it and rebuild — do not mistake it for security.
+> The shipped constant is a SHA-256 hash rather than the code itself, so the code is not
+> published along with the source.
+
+Running your own fork and don't want the gate: set `BOT_ACCESS_CODE_OFF=1`. Building for a
+different group: set `BOT_ACCESS_CODE_SHA256` to the hash of your own code —
+
+```bash
+node -e 'console.log(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' YOURCODE
+```
+
+**Allied-Citizen check.** Released builds also check the chain at unlock: the wallet you open
+must hold at least one Citizen on the shared ally roster (`data/ally-tokens.json`, refreshed
+from master at every start). There is nothing to type — if your wallet holds a rostered token
+the unlock proceeds, and if it does not you get a message saying so.
+
+This is the same members-only sign as the code above, with one difference worth knowing: a
+code can be forwarded to anyone and the leak is invisible, while roster membership cannot be
+pasted and is revoked by taking an id off the list. Two gates that fail differently, so a leak
+of either one alone still leaves a stranger outside.
+
+If you have just joined, ask for your token id to be added to the roster, then **restart the
+bot** so it picks up the new list.
+
+The check **fails open**: if the RPC is unreachable, or the roster is missing or unreadable,
+the unlock is allowed and the reason is logged. A wrong denial would lock you out of your own
+wallet, and a bot that cannot unlock cannot pay taxes — that costs far more than a wrong
+allow on a gate that is advisory anyway. Only a clean roster read that finds no match denies.
+
+Running your own fork, or locked out by a stale roster: set `BOT_ALLY_GATE_OFF=1`.
 
 Open the dashboard at **`http://localhost:5173`** and:
 

@@ -115,11 +115,12 @@ vi.mock("./nonce.js", () => ({
   nonces: {
     syncAll: vi.fn(async () => {}),
     resetAll: vi.fn(),
-    for: () => ({ reserve: () => nonceCounter++, peek: () => nonceCounter }),
+    for: () => ({ reserve: () => nonceCounter++, peek: () => nonceCounter, markSigned: () => {} }),
   },
 }));
 
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
+const { awaitPendingMirrors } = await import("./flashbots.js");
 const { firePreBoundaryBundle } = await import("./strategy.js");
 
 /** The single eth_sendBundle payload (first target block). */
@@ -166,6 +167,10 @@ beforeEach(() => {
   runtime.strategy = {
     ...DEFAULT_STRATEGY,
     preBoundaryPay: true, preBoundaryAudit: true,
+    // Pinned: the mirrored, revert-tolerant payment path is no longer the shipped default
+    // (see DEFAULT_STRATEGY.mirrorPayments). These cases are about that behaviour, not about
+    // whichever way the default currently points.
+    mirrorPayments: true, paymentBundleAllOrNothing: false,
     jitEnabled: true, jitTargetEpoch: Number(TARGET_EPOCH), jitTokenIds: [],
     offenseEnabled: true, autoAudit: true,
     minBalanceEth: 0, maxPaymentEth: 0, maxBaseFeeGwei: 1000,
@@ -224,6 +229,7 @@ describe("multi-citizen boundary bundle: nothing can drop it", () => {
     await firePreBoundaryBundle();
     // 5 payments mirrored. Audits are bundle-only here (a bid backs them), and the bid is
     // only meaningful in the block it wins.
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(5);
   });
 });
@@ -265,6 +271,7 @@ describe("one failed payment does not stop the others", () => {
 
     const b = bundle();
     expect(b.revertingTxHashes ?? []).toHaveLength(b.txs.length); // still all-tolerant
+    await awaitPendingMirrors();
     expect(sendRawTransaction).toHaveBeenCalledTimes(4);          // 4 surviving payments mirrored
   });
 });

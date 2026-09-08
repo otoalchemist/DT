@@ -5,8 +5,8 @@ import type {
   OwnedTokenStatus,
   TargetTokenStatus,
   EmigratedTokenStatus,
-  PostMortemResult,
   TargetScoresState,
+  TreasuryState,
   BigBoyStatus,
 } from "@dat-bot/shared";
 
@@ -42,8 +42,22 @@ export const api = {
     }),
   createKeystore: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string }) =>
     req<{ address: string }>("/api/keystore", { method: "POST", body: JSON.stringify(body) }),
-  unlock: (passphrase: string) =>
-    req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase }) }),
+  unlock: (passphrase: string, accessCode?: string) =>
+    req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase, accessCode }) }),
+  /** Whether this build gates unlock behind a team access code. */
+  accessGate: () => req<{ required: boolean; allyGate: boolean }>("/api/access-gate"),
+  /** Audit one rival now, at normal network gas (not a race — no bid, no race tip). */
+  auditRival: (tokenId: string) =>
+    req<{ ok: boolean; message: string; txHash?: string }>("/api/rival/audit", {
+      method: "POST", body: JSON.stringify({ tokenId }),
+    }),
+  /** Audit every auditable rival, bounded by the audit slots left this epoch. */
+  auditAll: () =>
+    req<{
+      ok: boolean; message: string; capacityLeft: number;
+      audited: { target: string; from: string; txHash?: string }[];
+      skipped: { target: string; reason: string }[];
+    }>("/api/rival/audit-all", { method: "POST" }),
   lock: () => req<{ ok: boolean }>("/api/lock", { method: "POST" }),
   getConfig: () => req<StrategyConfig>("/api/config"),
   defaultRivalTargets: () => req<{ tokenIds: string[] }>("/api/default-rival-targets"),
@@ -56,6 +70,8 @@ export const api = {
     req<BotStatus>("/api/jit", { method: "POST", body: JSON.stringify(body) }),
   tokens: () => req<OwnedTokenStatus[]>("/api/tokens"),
   // On-demand rival scoring. POST starts a background scan; GET polls for the result.
+  treasury: () => req<TreasuryState>("/api/treasury"),
+  refreshTreasury: () => req<TreasuryState>("/api/treasury/refresh", { method: "POST" }),
   targetScores: () => req<TargetScoresState>("/api/target-scores"),
   runTargetScores: () => req<TargetScoresState>("/api/target-scores", { method: "POST" }),
   // Manual per-token actions — normal network gas at press time, not the race tips.
@@ -96,6 +112,4 @@ export const api = {
     req<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify({ alchemyApiKey }) }),
   saveMode: (mode: "mainnet" | "public") =>
     req<{ ok: boolean; mode: string }>("/api/settings", { method: "POST", body: JSON.stringify({ mode }) }),
-  postMortem: (ours: string[], rivals: string[]) =>
-    req<PostMortemResult>("/api/postmortem", { method: "POST", body: JSON.stringify({ ours, rivals }) }),
 };

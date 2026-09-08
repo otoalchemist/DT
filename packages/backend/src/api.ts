@@ -23,11 +23,14 @@ import { getGameSnapshot } from "./contract.js";
 import { invalidateTokenCaches } from "./index-tokens.js";
 import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
-import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
+import { normalizeAlchemyKey } from "@dat-bot/shared";
+import { accessCodeMatches, accessCodeRequired } from "./access-code.js";
+import { allyGateRequired, checkAllyHolding } from "./ally-gate.js";
+import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, manualAudit, manualAuditAll, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
 import { getTargetScores, startTargetScores } from "./target-scores.js";
-import { runPostMortem } from "./postmortem.js";
+import { getTreasuryHistory, invalidateTreasuryCache } from "./treasury.js";
 import { syncDefaultLists } from "./list-sync.js";
 
 const strategyPatch = z
@@ -60,8 +63,14 @@ const strategyPatch = z
     offenseEnabled: z.boolean(),
     autoAudit: z.boolean(),
     autoKill: z.boolean(),
+    auditWhileBehind: z.boolean(),
+    thorMode: z.boolean(),
+    mirrorAudits: z.boolean(),
+    auditBundleAllOrNothing: z.boolean(),
     endgameOnlyWithin: z.number().int().min(0).nullable(),
     offenseTargetTokenIds: z.array(z.string()),
+    sweepUnpinned: z.boolean(),
+    sweepNormalGas: z.boolean(),
     preBoundaryAudit: z.boolean(),
     preBoundaryKill: z.boolean(),
     combinedBoundaryBundle: z.boolean(),
@@ -74,6 +83,8 @@ const strategyPatch = z
     offenseDynamicTipEnabled: z.boolean(),
     offenseDynamicTipMaxGwei: z.number().positive(),
     racePublicMempool: z.boolean(),
+    mirrorPayments: z.boolean(),
+    paymentBundleAllOrNothing: z.boolean(),
     dynamicTipEnabled: z.boolean(),
     dynamicTipMaxGwei: z.number().positive(),
     maxPaymentEth: z.number().min(0),
@@ -150,6 +161,10 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   // --- on-demand rival scoring (dashboard "Analyze targets") ---
   // The scan takes minutes, so POST starts it in the background and the UI polls GET.
+  // Prize-pool growth. Read-only and heavily cached, so it is safe to poll and safe to call
+  // while locked - it reads public chain state and touches no wallet.
+  app.get("/api/treasury", async () => getTreasuryHistory());
+  app.post("/api/treasury/refresh", async () => { invalidateTreasuryCache(); return getTreasuryHistory(); });
   app.get("/api/target-scores", async () => getTargetScores());
   app.post("/api/target-scores", async () => startTargetScores());
 
@@ -175,6 +190,13 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   // --- keystore lifecycle ---
+  /** Whether this build gates unlock behind a team access code, so the UI can show the field
+   *  only when it applies (a fork with BOT_ACCESS_CODE_OFF=1 should not prompt for one). */
+  app.get("/api/access-gate", async () => ({
+    required: accessCodeRequired(),
+    allyGate: allyGateRequired(),
+  }));
+
   app.get("/api/keystore", async () => {
     const files = loadWallets(appConfig.dataDir);
     return {
@@ -326,9 +348,22 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post("/api/unlock", async (req, reply) => {
-    const schema = z.object({ passphrase: z.string() });
+    const schema = z.object({ passphrase: z.string(), accessCode: z.string().optional() });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    /**
+     * Team access gate, checked BEFORE the keystore is touched so a wrong code cannot be used
+     * to probe passphrases. Deliberately a distinct message from a bad passphrase: conflating
+     * "you are not on the team" with "you typed your own passphrase wrong" would send users
+     * hunting for the wrong problem.
+     */
+    if (!accessCodeMatches(parsed.data.accessCode ?? "")) {
+      return reply.code(403).send({
+        error:
+          "Access code required. This build is gated to the team — enter the code you were " +
+          "given alongside your wallet passphrase.",
+      });
+    }
     const files = loadWallets(appConfig.dataDir);
     if (files.length === 0) return reply.code(400).send({ error: "No keystore found" });
     try {
@@ -340,6 +375,38 @@ export async function buildServer(): Promise<FastifyInstance> {
         const account = accountFromPrivateKey(decryptPrivateKey(f, parsed.data.passphrase));
         return { account, label: f.label ?? (i === 0 ? "primary" : `wallet-${i + 1}`), balanceWei: null };
       });
+      /**
+       * Second gate: the unlocked wallets must hold a Citizen on the shared ally roster.
+       *
+       * Placed HERE for two reasons. It runs after decryption because it needs the addresses,
+       * which only exist once the keystore is open. And it runs before setWallets so a denial
+       * leaves the runtime exactly as locked as it was — no half-open state where the engine
+       * could be started against a wallet the gate just rejected.
+       *
+       * checkAllyHolding never throws and fails open on any indeterminate reading; see
+       * ally-gate.ts for why a wrong deny is far more expensive than a wrong allow.
+       */
+      const allyVerdict = await checkAllyHolding(wallets.map((w) => w.account.address));
+      if (!allyVerdict.ok) {
+        logger.warn(
+          `Unlock denied by the ally gate: none of ${wallets.length} wallet(s) holds a rostered ` +
+            `citizen (${allyVerdict.checked} live roster entries checked)`,
+        );
+        return reply.code(403).send({
+          error:
+            "No allied Citizen found in this wallet. This build is gated to the team: the " +
+            "wallet you unlock must hold at least one Citizen on the shared ally roster. If " +
+            "you have just joined, ask for your token id to be added to the roster, then " +
+            "restart the bot so it syncs the new list.",
+        });
+      }
+      if (allyVerdict.reason === "indeterminate") {
+        // Loud on purpose: this is the branch that lets an unlock through WITHOUT proof, so
+        // the reason has to be in the log rather than inferred from a silent success.
+        logger.warn(`Ally gate not evaluated (${allyVerdict.detail}) - allowing the unlock`);
+      } else if (allyVerdict.reason === "held") {
+        logger.info(`Ally gate satisfied: citizen #${allyVerdict.tokenId} held by ${allyVerdict.address}`);
+      }
       runtime.setWallets(wallets);
       nonces.retain(runtime.addresses as `0x${string}`[]);
       runtime.chainId = await getChainId();
@@ -426,6 +493,36 @@ export async function buildServer(): Promise<FastifyInstance> {
     try { id = BigInt(parsed.data.tokenId); } catch { return reply.code(400).send({ error: "Invalid token ID" }); }
     const res = await manualUseBribe(id);
     if (!res.ok) return reply.code(400).send({ error: res.message });
+    return res;
+  });
+
+  /**
+   * Audit one rival now, on normal network gas. The manual counterpart to the boundary race:
+   * no bid, no boundary timestamp, no race tip — pressing a button mid-epoch is not competing
+   * for a slot. The auditor is chosen for the user from whatever has an audit left this epoch.
+   */
+  app.post("/api/rival/audit", async (req, reply) => {
+    const parsed = tokenAction.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+    let id: bigint;
+    try { id = BigInt(parsed.data.tokenId); } catch { return reply.code(400).send({ error: "Invalid token ID" }); }
+    const res = await manualAudit(id);
+    if (!res.ok) return reply.code(400).send({ error: res.message });
+    return res;
+  });
+
+  /**
+   * Audit every auditable rival, bounded by the audit slots left this epoch.
+   *
+   * Returns 200 with the per-target breakdown even when it audited nothing, because "no capacity"
+   * and "nobody is auditable" are ordinary answers the panel should display rather than errors to
+   * swallow. Only a genuine failure (locked, game not live, busy) is a 4xx.
+   */
+  app.post("/api/rival/audit-all", async (_req, reply) => {
+    const res = await manualAuditAll();
+    if (!res.ok && res.audited.length === 0 && /Unlock|not live|busy/i.test(res.message)) {
+      return reply.code(400).send({ error: res.message });
+    }
     return res;
   });
 
@@ -518,10 +615,36 @@ export async function buildServer(): Promise<FastifyInstance> {
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    const { alchemyApiKey, mode } = parsed.data;
+    const { alchemyApiKey: rawKey, mode } = parsed.data;
+
+    /**
+     * Normalise before anything touches it. The key is interpolated into three URLs, so a
+     * paste artefact produced a malformed URL, viem's transport threw, and this handler —
+     * which had no try/catch — answered a bare HTTP 500 with the cause only in the server
+     * log. Alchemy's dashboard offers the FULL https endpoint with a copy button, so pasting
+     * that is the likely path, and it is indistinguishable from a broken install to whoever
+     * hit it.
+     */
+    let alchemyApiKey: string | undefined;
+    if (rawKey !== undefined) {
+      const clean = normalizeAlchemyKey(rawKey);
+      if (clean === null) {
+        return reply.code(400).send({
+          error:
+            "That does not look like an Alchemy API key. Paste just the key — the part after " +
+            "/v2/ in your endpoint URL — not the whole https:// address, and without quotes.",
+        });
+      }
+      alchemyApiKey = clean;
+    }
 
     const existing = loadSettings();
 
+    // Everything below writes a file and rebuilds the RPC clients, either of which can throw
+    // (an unwritable data/ directory, a URL viem rejects). Reported rather than raised: a 500
+    // with no body told the user nothing, and this is the first thing anyone does after
+    // installing, so it is the worst possible place to be unhelpful.
+    try {
     if (alchemyApiKey) {
       saveSettings({ ...existing, alchemyApiKey, ...(mode ? { mode } : {}) });
       process.env.ALCHEMY_API_KEY = alchemyApiKey;
@@ -553,7 +676,22 @@ export async function buildServer(): Promise<FastifyInstance> {
       logger.info(`Submission mode switched to: ${mode}`);
     }
 
-    return { ok: true, mode: appConfig.mode };
+      return { ok: true, mode: appConfig.mode };
+    } catch (err) {
+      const msg = (err as Error).message;
+      logger.error("Saving settings failed:", msg);
+      activity.add({
+        kind: "error",
+        status: "skipped",
+        message: `Could not save settings: ${msg}`,
+      });
+      return reply.code(500).send({
+        error:
+          `Could not save settings: ${msg}. ` +
+          `If this mentions permission or a path, the bot cannot write its data folder — ` +
+          `move it out of a read-only or synced location and try again.`,
+      });
+    }
   });
 
   // --- reads for the dashboard ---
@@ -646,29 +784,6 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get("/api/activity", async (req) => {
     const limit = Number((req.query as { limit?: string }).limit ?? 200);
     return activity.recent(limit);
-  });
-
-  // --- race post-mortem: compare our tx(s) vs rival tx(s) on-chain ---
-  app.post("/api/postmortem", async (req, reply) => {
-    const hash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "invalid tx hash");
-    const schema = z.object({
-      ours: z.array(hash).min(1).max(20),
-      rivals: z.array(hash).max(20).default([]),
-    });
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
-    if (!appConfig.httpUrl) {
-      return reply.code(400).send({ error: "No RPC configured — set the Alchemy key first." });
-    }
-    try {
-      const result = await runPostMortem(
-        parsed.data.ours as `0x${string}`[],
-        parsed.data.rivals as `0x${string}`[],
-      );
-      return result;
-    } catch (err) {
-      return reply.code(500).send({ error: (err as Error).message });
-    }
   });
 
   // --- websocket: push status + activity ---

@@ -34,12 +34,12 @@ vi.mock("./activity.js", () => {
 });
 
 vi.mock("./nonce.js", () => ({
-  nonces: { for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0) })), syncAll: vi.fn(async () => {}), resetAll: vi.fn(), retain: vi.fn() },
+  nonces: { for: vi.fn(() => ({ sync: vi.fn(async () => {}), reset: vi.fn(), peek: vi.fn(() => 0), reserve: vi.fn(() => 0), markSigned: vi.fn() })), syncAll: vi.fn(async () => {}), resetAll: vi.fn(), retain: vi.fn() },
 }));
 
 vi.mock("./flashbots.js", () => ({
   submitTx: vi.fn(async () => ({ ok: true, simulated: false, txHash: "0xhash", nonce: 0, valueWei: 0n, gasWei: 0n })),
-  beginBundle: vi.fn(), flushBundle: vi.fn(async () => new Map()), queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(),
+  beginBundle: vi.fn(), flushBundle: vi.fn(async () => new Map()), queueCoinbaseBid: vi.fn(async () => false), setRaceBoundary: vi.fn(), setRaceLookBack: vi.fn(),
 }));
 
 vi.mock("./contract.js", () => ({

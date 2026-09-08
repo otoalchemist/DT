@@ -1,4 +1,4 @@
-import type { Address } from "viem";
+import type { Address, Hex } from "viem";
 import { publicClient } from "./chain.js";
 
 // Nonce state for the single hot wallet, held across engine ticks.
@@ -13,35 +13,130 @@ import { publicClient } from "./chain.js";
 
 export type SubmitMode = "public" | "mainnet" | "local";
 
+/** What we signed at a given nonce, so its fate can be looked up instead of guessed. */
+interface SignedTx {
+  hash: Hex;
+  /** Highest block a bundle copy could still be included in. Meaningless for a mirrored
+   *  tx, which sits in the mempool with no expiry. */
+  lastTargetBlock: bigint;
+  /** Also broadcast to the public mempool. A mirrored tx can land in ANY later block, so
+   *  block expiry proves nothing about it — only its absence from the mempool does. */
+  mirrored: boolean;
+}
+
 export class NonceManager {
   private next: number | null = null;
   private reservedCeil: number | null = null; // one past the highest nonce reserved this session
-  private lastOnchain = -1;
-  private lastOnchainChangeMs = 0;
-  // If pending hasn't advanced past our held reservation for this long, an
-  // un-mined bundle has almost certainly been dropped (bundles expire after ~2
-  // blocks), so we release the nonce rather than stick behind a permanent gap.
+  /**
+   * When we last reserved a nonce the chain has not caught up to yet.
+   *
+   * This — NOT the last time the chain's nonce moved — is what the staleness check below has
+   * to measure, and getting it wrong cost a real payment at the epoch-176 boundary. Two fires
+   * 2.4s apart both signed nonce 11946: the audit mined, the payment was permanently
+   * invalidated, the citizen stayed 2 behind, a rival audited it in the same block, and
+   * catching up cost double the taxes.
+   *
+   * The reason chain movement is the wrong clock: in away mode the engine sleeps between
+   * boundaries, so when it wakes the wallet's nonce has been unchanged for hours. Judging our
+   * reservation by that made every FIRST reservation of a session instantly "stale", and the
+   * second fire of the same boundary reused its nonce. Reservation age has no such coupling —
+   * a 2.4s-old reservation reads as 2.4s old no matter how long the wallet sat idle.
+   *
+   * Still only a BACKSTOP. `evidence()` below decides first, and this catches the cases it
+   * cannot speak to: an untracked nonce, or an RPC that will not answer.
+   */
+  private reservedAtMs = 0;
+  // If the chain hasn't advanced past our held reservation for this long, an un-mined bundle
+  // has almost certainly been dropped (bundles expire after ~2 blocks), so we release the
+  // nonce rather than stick behind a permanent gap. Only consulted when evidence is
+  // unavailable — a wall clock cannot tell a dropped bundle from a slow one.
   private static readonly STALE_MS = 90_000;
+
+  /** nonce -> what we signed there. Pruned as the chain advances past each entry. */
+  private signed = new Map<number, SignedTx>();
+
+  /**
+   * Record what was signed at `nonce`, so a later sync can ask the chain about its fate
+   * rather than time it out. Called from flashbots at signing time.
+   */
+  markSigned(nonce: number, info: SignedTx): void {
+    this.signed.set(nonce, info);
+  }
+
+  /**
+   * Is the transaction the chain is WAITING for still alive?
+   *
+   * The only nonce that can block us is `onchain` — the next one the account will execute.
+   * Everything we hold above it is unreachable until that one resolves, so its fate decides
+   * whether the whole held ceiling is real or a permanent gap.
+   *
+   *   still pending  -> ALIVE. Holding is mandatory: handing this nonce out again is exactly
+   *                     the epoch-176 collision, where the second signature invalidated the
+   *                     first and a citizen went unpaid.
+   *   mined          -> ALIVE. The chain is about to advance past it on its own.
+   *   unknown to the node:
+   *     mirrored     -> DEAD. It was broadcast, so the node would know it if it existed;
+   *                     absence means dropped.
+   *     bundle-only  -> DEAD only once its last target block has passed. Before that the
+   *                     bundle is simply private — the node has never seen it and never will.
+   *
+   * Returns null when it cannot tell (untracked nonce, RPC failure), which hands the
+   * decision back to the STALE_MS backstop rather than guessing in either direction.
+   */
+  private async evidence(onchain: number): Promise<"alive" | "dead" | null> {
+    const rec = this.signed.get(onchain);
+    if (!rec) return null; // nothing signed here by us — nothing to reason about
+    let tx: { blockNumber: bigint | null } | null;
+    try {
+      tx = await publicClient.getTransaction({ hash: rec.hash });
+    } catch (err) {
+      // viem throws TransactionNotFoundError rather than returning null. That IS the answer
+      // we want, but an RPC outage throws too and must not be read as "dead" — so only a
+      // not-found is treated as absence, and anything else defers to the backstop.
+      if (!/not.*found|could not be found/i.test((err as Error).message)) return null;
+      tx = null;
+    }
+    if (tx) return "alive"; // pending or mined; either way this nonce is genuinely taken
+    if (rec.mirrored) return "dead";
+    try {
+      const head = await publicClient.getBlockNumber({ cacheTime: 0 });
+      return head > rec.lastTargetBlock ? "dead" : "alive";
+    } catch {
+      return null;
+    }
+  }
 
   /** Re-sync at the start of a tick. `mode` decides whether to trust the mempool
    *  (public/local) or hold our own reserved ceiling (mainnet). */
   async sync(address: Address, mode: SubmitMode): Promise<void> {
     const onchain = await publicClient.getTransactionCount({ address, blockTag: "pending" });
     const nowMs = Date.now();
-    if (onchain !== this.lastOnchain) {
-      this.lastOnchain = onchain;
-      this.lastOnchainChangeMs = nowMs;
-    }
+
+    // Anything at or below the chain's next nonce is settled; stop tracking it so the map
+    // cannot grow for the life of the process.
+    for (const n of [...this.signed.keys()]) if (n < onchain) this.signed.delete(n);
 
     const holding = mode === "mainnet" && this.reservedCeil !== null && onchain < this.reservedCeil;
-    if (holding && nowMs - this.lastOnchainChangeMs <= NonceManager.STALE_MS) {
+    let keep: boolean;
+    if (!holding) {
+      keep = false;
+    } else {
+      const verdict = await this.evidence(onchain);
+      // Evidence first; the clock only where evidence is silent.
+      keep = verdict === "alive" ? true
+        : verdict === "dead" ? false
+        : nowMs - this.reservedAtMs <= NonceManager.STALE_MS;
+    }
+
+    if (keep) {
       // Keep our reserved nonce — the chain just hasn't seen the bundle yet.
       this.next = Math.max(onchain, this.reservedCeil!);
     } else {
       // Chain is the truth: public/local always, or a mainnet reservation we've
-      // now released (chain caught up, or it went stale). Self-heals a bad gap.
+      // now released (chain caught up, or it is provably dead). Self-heals a bad gap.
       this.next = onchain;
       this.reservedCeil = null;
+      this.signed.clear();
     }
   }
 
@@ -56,7 +151,14 @@ export class NonceManager {
     if (this.next === null) throw new Error("NonceManager.reserve called before sync");
     const n = this.next;
     this.next = n + 1;
-    if (this.reservedCeil === null || this.next > this.reservedCeil) this.reservedCeil = this.next;
+    if (this.reservedCeil === null || this.next > this.reservedCeil) {
+      this.reservedCeil = this.next;
+      // Stamped on every ceiling RAISE, so back-to-back fires in one boundary each refresh
+      // the hold. Biased toward holding too long on purpose: an over-held nonce self-heals
+      // the moment the chain advances (or after STALE_MS), while an under-held one silently
+      // drops a transaction — which is the failure this exists to prevent.
+      this.reservedAtMs = Date.now();
+    }
     return n;
   }
 

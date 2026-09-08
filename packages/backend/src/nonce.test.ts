@@ -108,3 +108,78 @@ describe("multi-wallet: nonce state is per address", () => {
     expect(nonces.for(b)).not.toBe(ma);
   });
 });
+
+/**
+ * Regression: the epoch-176 boundary, where a payment and an audit were both signed with
+ * nonce 11946. The audit mined; the payment became permanently invalid, the citizen stayed
+ * 2 behind, a rival audited it in the same block, and catching up cost double the taxes.
+ *
+ * The mechanism is the staleness escape hatch in sync(). It exists to release a nonce whose
+ * bundle was dropped (bundles expire after ~2 blocks, and sticking behind a permanent gap
+ * would wedge the wallet). But it was measured against the last time the CHAIN's nonce
+ * changed, not the age of our own reservation — so a wallet that had simply been quiet for
+ * longer than STALE_MS failed the check on its very first reservation of the session.
+ *
+ * Away mode makes that the normal case, not an edge case: the engine sleeps between
+ * boundaries, so by the time it wakes and fires, the chain nonce has been unchanged for
+ * hours. The first fire reserves, the second fire syncs 2s later, and the reservation is
+ * judged "stale" the instant it is made.
+ */
+describe("reservation staleness is measured from the RESERVATION, not chain movement", () => {
+  const START = 1_787_615_000_000; // ms; arbitrary fixed epoch-176-era instant
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+  });
+
+  it("holds the reservation for a second fire seconds later, after a long-quiet wallet", async () => {
+    const nm = new NonceManager();
+    getCount.mockResolvedValue(11_946); // private bundles never reach the mempool
+
+    // Engine wakes; routine ticks sync for 15 minutes with the chain nonce unchanged.
+    await nm.sync(ADDR, "mainnet");
+    nm.reset();
+    vi.setSystemTime(START + 15 * 60_000);
+    await nm.sync(ADDR, "mainnet");
+    nm.reset();
+
+    // Payment fire: reserves 11946 and submits a private bundle.
+    await nm.sync(ADDR, "mainnet");
+    expect(nm.reserve()).toBe(11_946);
+    nm.reset();
+
+    // Audit fire, 2.4s later. The chain still shows 11946 because the payment bundle is
+    // private — but our reservation is 2.4s old, not stale.
+    vi.setSystemTime(START + 15 * 60_000 + 2_400);
+    await nm.sync(ADDR, "mainnet");
+    expect(nm.reserve()).toBe(11_947); // was 11946 -> collision -> payment silently dropped
+  });
+
+  it("still releases a genuinely stale reservation, so a dropped bundle cannot wedge the wallet", async () => {
+    // The other half: the escape hatch must survive the fix, or an expired bundle leaves a
+    // permanent nonce gap and nothing from this wallet ever lands again.
+    const nm = new NonceManager();
+    getCount.mockResolvedValue(11_946);
+    await nm.sync(ADDR, "mainnet");
+    expect(nm.reserve()).toBe(11_946);
+    nm.reset();
+
+    vi.setSystemTime(START + 91_000); // past STALE_MS with the chain never catching up
+    await nm.sync(ADDR, "mainnet");
+    expect(nm.reserve()).toBe(11_946); // released — the bundle is gone, reuse the nonce
+  });
+
+  it("releases as soon as the chain catches up, without waiting out the timer", async () => {
+    const nm = new NonceManager();
+    getCount.mockResolvedValue(11_946);
+    await nm.sync(ADDR, "mainnet");
+    expect(nm.reserve()).toBe(11_946);
+    nm.reset();
+
+    getCount.mockResolvedValue(11_947); // bundle mined
+    vi.setSystemTime(START + 3_000);
+    await nm.sync(ADDR, "mainnet");
+    expect(nm.peek()).toBe(11_947);
+  });
+});

@@ -25,37 +25,39 @@ vi.mock("./chain.js", () => ({
   publicClient: { getBlock: vi.fn(async () => ({ extraData: "0x" + Buffer.from("Titan (titanbuilder.xyz)").toString("hex") })) },
 }));
 
-const { recordRaceSubmission, recordRaceOutcome } = await import("./race-timing.js");
+const { recordRaceSubmission, recordRaceOutcome, awaitRaceTimingWrites } = await import("./race-timing.js");
 
 /** This test's own log file — repointed by beforeEach, so tests never share one. */
 const file = () => nodePath.join(cfg.dataDir, "race-timing.jsonl");
 const read = () => fs.readFileSync(file(), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 
 /**
- * Wait for the fire-and-forget write to land — by watching for it, not by guessing how
- * long it takes.
+ * Wait for a fire-and-forget write to land.
  *
- * These are genuine async disk writes (fs/promises), so draining microtasks does not wait
- * for them. This used to be a flat 60ms sleep, which is really the assertion "a disk write
- * finishes within 60ms on this machine right now". That holds when the box is idle and
- * fails when it is not: adding a CPU-heavy test elsewhere in the suite (solc compiling a
- * contract in a parallel worker) made this file fail roughly one run in three, with nothing
- * wrong in the code under test.
+ * Both halves of this are load-bearing, and the merge kept both.
  *
- * Polling asserts on the condition instead of on the clock, so it returns as soon as the
- * write lands — usually faster than the old sleep — and tolerates a busy machine. On
- * timeout it returns quietly and lets the real assertion report the real failure, rather
- * than throwing something less informative from in here.
+ * `awaitRaceTimingWrites()` (from master) awaits the actual write promises, so in the common
+ * case this is deterministic and returns as soon as they resolve — no clock involved.
+ *
+ * The poll after it (from the vault branch) covers the one case awaiting cannot: a write that
+ * has not been STARTED yet, because the code under test is still on its way to queueing it.
+ * Awaiting nothing returns instantly and the assertion would fail spuriously. This file learned
+ * that the hard way — it was once a flat 60ms sleep, i.e. the assertion "a disk write finishes
+ * within 60ms on this machine right now", which failed about one run in three once solc began
+ * compiling a contract in a parallel worker.
+ *
+ * Below vitest's 5s per-test timeout deliberately: if a condition never arrives, the test should
+ * fail on its own assertion, which says what was wrong, rather than on a timeout, which says
+ * only that something was slow.
  */
-// Below vitest's 5s per-test timeout on purpose: if a condition never arrives, the test
-// should fail on its own assertion (which says what was wrong) rather than on a timeout
-// (which says only that something was slow).
 const until = async (cond: () => boolean, timeoutMs = 3000): Promise<void> => {
+  await awaitRaceTimingWrites();
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try { if (cond()) return; } catch { /* file not written yet */ }
     if (Date.now() >= deadline) return;
     await new Promise((r) => setTimeout(r, 5));
+    await awaitRaceTimingWrites();
   }
 };
 
@@ -69,12 +71,12 @@ const flushUpdate = async (cond: (r: Record<string, unknown>) => boolean) =>
 /**
  * Settle for the cases that assert something did NOT happen.
  *
- * There is no condition to wait for when the expected result is "no write", so this is the
- * one place a fixed delay is unavoidable. It is generous rather than tight: too short only
- * risks passing a test that should fail, never the reverse, and a slow machine must not be
- * able to turn "nothing happened" into a false pass by simply not having got there yet.
+ * Awaiting the writes is the right primitive here too — if nothing was queued there is nothing
+ * to wait for — but a short delay stays on top of it, because "no write" has no condition to
+ * poll and a slow machine must not be able to turn "nothing happened" into a false pass by
+ * simply not having got there yet.
  */
-const settle = async () => { await new Promise((r) => setTimeout(r, 250)); };
+const settle = async () => { await awaitRaceTimingWrites(); await new Promise((r) => setTimeout(r, 250)); };
 
 const HASH = "0xabc0000000000000000000000000000000000000000000000000000000000001";
 const row = (over: Record<string, unknown> = {}) => ({

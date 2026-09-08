@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { PrivateKeyAccount } from "viem/accounts";
-import { VERSION, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
+import { VERSION, applyThorMode, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { vaultStatusForUi } from "./vault-preflight.js";
@@ -170,7 +170,36 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   excludedTokenIds: [],
   preBoundaryPay: true,
   preBoundaryLeadMs: 3000,
-  preBoundaryLeadMainnetMs: 5000,
+  /**
+   * 8s, raised from 5s — the margin between reaching the boundary block and missing it.
+   *
+   * Builders seal well before the slot starts, so what this really buys is time to be
+   * ACCEPTED, not time to be early. Measured on one operator across three boundaries, all
+   * at the same 244 gwei and the same 0.02 ETH bid:
+   *
+   *   epoch 182  submitted boundary-2.4s  bundle intact at idx 12-14  paid
+   *   epoch 184  submitted boundary-0.8s  bundle intact at idx  3-5   paid
+   *   epoch 186  submitted boundary-0.6s  bundle MISSED the block     both payments reverted
+   *
+   * At 186 the bundle was taken for boundary+1 instead, where it got idx 0-1 — perfect
+   * placement, one block too late — while the mempool mirror leaked a single payment into
+   * the boundary block at idx 49, below a rival's 36 gwei/gas bundle at idx 47. The 0.02 ETH
+   * bid bought position in a block where there was nothing left to win.
+   *
+   * The cutoff sits somewhere under a second, and 5s of lead was leaving under 1s of real
+   * margin once signing and submission are paid for. 8s roughly triples that margin.
+   *
+   * Firing earlier does NOT expose us earlier, which is the property that makes this safe:
+   * the public-mempool mirror waits on the pre-boundary BLOCK existing
+   * (preBoundarySlotSettled), not on the clock, so the leak time is unchanged. The bundle
+   * copy is private either way, raceTargetFrom derives its target from the head's timestamp
+   * so the extra 3s still resolves to the same block, and maxFee carries a 2x base-fee
+   * buffer against the staler block this reads.
+   *
+   * Kept well under the 11s zod ceiling: past ~12s the head is a whole slot older and the
+   * arithmetic starts depending on a slot NOT being missed.
+   */
+  preBoundaryLeadMainnetMs: 8000,
   // Away mode is a run-mode choice like `enabled`, so it is NOT a RECOMMENDED_FIELD —
   // a defaults bump must never silently put the engine back on 24/7 polling.
   awayMode: false,
@@ -181,15 +210,96 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   offenseEnabled: true,
   autoAudit: true,
   autoKill: false, // opt-in: killing an expired-audit token is free but aggressive
+  // On: the contract allows a behind citizen to audit, and holding its slot back wastes the
+  // slot whenever that citizen survives — which is the common case. Under-audit citizens are
+  // still excluded, so the genuinely dying asset is never committed.
+  auditWhileBehind: true,
+  /**
+   * Private, all-or-nothing OFFENSE — but the payment path keeps every fallback it has.
+   *
+   * This is deliberately three of Thor Mode's four overrides, with racePublicMempool left
+   * ON. The distinction is the whole point: a mirrored PAYMENT is not front-runnable (the
+   * delinquency it answers is already on-chain) and is the only copy that can land on the
+   * ~1 boundary in 10 built by a solo validator, so mirroring it protects a citizen. A
+   * mirrored AUDIT names its target seconds before the block is built, which is a gift.
+   *
+   * Measured over four consecutive boundaries: the contested target cured INSIDE the
+   * boundary block every time, once at tx index 0 on a 10 gwei tip. That is what a
+   * telegraphed audit buys the defender.
+   *
+   * all-or-nothing follows from the same evidence. A reverted audit costs gas AND raises
+   * the block's value to the builder that ordered you last — you pay to lose, and you pay
+   * the builder to prefer the ordering that beat you. Dropping the bundle instead makes a
+   * doomed audit free.
+   *
+   * What it costs, stated plainly: one target curing inside the block now takes the audits
+   * that would have succeeded alongside it, and a cure inside the block is invisible to
+   * simulation, so this is not something the bot can predict its way around. Operators who
+   * audit undefended targets are giving up reach for a risk they do not face — they should
+   * turn mirrorAudits back on.
+   *
+   * thorMode stays off: it also kills the payment mirror, which is the one that costs a
+   * citizen rather than an opportunity.
+   */
+  thorMode: false,
+  mirrorAudits: false,
+  auditBundleAllOrNothing: true,
+  /**
+   * The payment path is now private and all-or-nothing too, which makes the shipped default
+   * Thor Mode in everything but `racePublicMempool`.
+   *
+   * READ THIS BEFORE CHANGING IT BACK OR TAKING IT FURTHER. Every other default in this file
+   * trades an audit — an opportunity, recoverable next boundary. These two trade a CITIZEN.
+   * With the mirror off, a boundary whose slot is won by a builder we did not send to lands
+   * no payment at all, the citizen crosses to 2 behind, and it is auditable for a day. The
+   * bot then refuses to auto-pay it (automatic payment after an audit is deliberately off),
+   * so curing it is a manual act at the doubled price.
+   *
+   * The shipped estimate for that is ~9% of boundaries, i.e. roughly one exposure every
+   * eleven days per operator. Measured against it: at the epoch-186 boundary the mirror was
+   * the only reason a payment reached the boundary block at all — though it reverted there
+   * anyway, which is the honest counterweight, since a mirror that lands into a lost race
+   * buys a revert rather than a citizen.
+   *
+   * They ship together because neither is coherent alone. All-or-nothing while the payments
+   * are still broadcast is strictly worse than either setting by itself: the bundle is
+   * dropped AND the mirrored copies land and revert, so the atomic placement is lost and the
+   * gas is spent regardless. `tolerateReverts` enforces that pairing rather than trusting it.
+   */
+  mirrorPayments: false,
+  paymentBundleAllOrNothing: true,
   endgameOnlyWithin: null,
   offenseTargetTokenIds: loadRivalSkippers(),
+  // The mid-epoch sweep goes wide and cheap; the boundary stays narrow and expensive.
+  // Pins exist to say "these are worth race gas at the boundary", which is a different
+  // question from "is this rival auditable at all" — and unused audit capacity is worth
+  // nothing at the next boundary, since it resets per epoch. Auditability only SHRINKS
+  // during an epoch (currentEpoch is fixed while lastEpochPaid rises), so a slot held
+  // back mid-epoch is a slot spent on nobody.
+  sweepUnpinned: true,
+  sweepNormalGas: true,
   preBoundaryAudit: true,
   preBoundaryKill: true, // race kills into the first block after audit expiry (no-op unless autoKill is on)
-  // On by default, but self-guarding: it only fuses payment + audit into one bundle
-  // when a coinbase bid is set (coinbaseBidEth > 0). Without a bid it's a no-op — the
-  // bot sends separate bundles so audits keep their mempool fallback — so leaving it
-  // on is safe and means a later bid "just works" without a second toggle to find.
-  combinedBoundaryBundle: true,
+  /**
+   * OFF, so payments and audits race as two independent bundles.
+   *
+   * Fusing them is what makes auditBundleAllOrNothing unusable, and that is the reason:
+   * all-or-nothing is scoped to the STANDALONE audit bundle by construction, because in a
+   * fused bundle one cured target would drop every payment riding with it. Leaving the fuse
+   * on would therefore silently deny the offense setting above to anyone who sets a bid.
+   *
+   * Splitting also lets the two carry honest, separate prices. Payments are mandatory and
+   * want the expensive tip; audits are opportunistic and mostly do not. Fused, they share
+   * one density and one bid, so the cheap half is dragged up to the expensive half's price
+   * across the whole bundle.
+   *
+   * The cost is a second coinbase bid: a split boundary funds its audits from
+   * coinbaseBidAuditOnlyEth, not coinbaseBidEth. Anyone carrying a bid from before that
+   * field existed already had it seeded from the old single value on upgrade, but an
+   * operator who has explicitly zeroed it will now race audits on tip alone. That is
+   * visible in the dashboard's split badge rather than silent.
+   */
+  combinedBoundaryBundle: false,
   // Payment gas — tuned to win the boundary bundle race. The base-fee cap is generous
   // (boundary blocks run near-empty at <1 gwei; the cap only guards against a spike).
   maxBaseFeeGwei: 69.1,
@@ -285,6 +395,30 @@ export function adoptRefreshedLists(previousSkippers: string[]): boolean {
 // Leaving it at 4 means 120 reaches NEW installs only; existing users keep what they set
 // and can opt in themselves.
 export const DEFAULTS_VERSION = 4;
+
+/**
+ * One-off config migrations that must run EXACTLY ONCE, stamped separately from
+ * DEFAULTS_VERSION so they can move a single field without refreshing all of RECOMMENDED_FIELDS.
+ *
+ * A value check alone is not enough and the difference is not cosmetic. "Raise the lead if it
+ * is still 5000" re-fires on every load, so a user who deliberately sets 5000 has it silently
+ * reverted at each restart — the value becomes unsettable. The stamp is what makes a migration
+ * a migration rather than a permanent override.
+ *
+ * 1: mainnet pre-boundary lead 5s -> 8s.
+ * 2: private, all-or-nothing, split offense — mirrorAudits off, auditBundleAllOrNothing on,
+ *    combinedBoundaryBundle off.
+ * 3: the same for PAYMENTS — mirrorPayments off, paymentBundleAllOrNothing on. Unlike 2 this
+ *    one can cost a citizen rather than an audit; see DEFAULT_STRATEGY.mirrorPayments.
+ *
+ * A caveat that applies to 2 and not to 1, and is worth stating rather than discovering: these
+ * are BOOLEANS, so "still the shipped default" and "deliberately chose the shipped default"
+ * are the same state. Migration 1 could tell them apart because 5000 was one value out of a
+ * continuum; this one cannot. It therefore DOES override a deliberate choice — once, loudly,
+ * and reversibly in the UI. That is the accepted cost of changing an offense default that is
+ * losing audits in the field, not an oversight.
+ */
+export const MIGRATIONS_VERSION = 3;
 
 /**
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
@@ -467,6 +601,7 @@ class Runtime {
       const raw = JSON.parse(fs.readFileSync(p, "utf8"));
       // Meta key, not part of StrategyConfig. Absent => pre-versioning config (0).
       const savedDefaults = typeof raw.defaultsVersion === "number" ? raw.defaultsVersion : 0;
+      const savedMigrations = typeof raw.migrationsVersion === "number" ? raw.migrationsVersion : 0;
       // Keep only keys DEFAULT_STRATEGY still declares, so config.json doesn't carry
       // dead fields from retired settings across upgrades (and `defaultsVersion`
       // itself, which is file meta rather than strategy, is dropped here too).
@@ -487,10 +622,121 @@ class Runtime {
             `Set it separately to bid less on offense-only boundaries.`,
         );
       }
+      /**
+       * Raise the mainnet pre-boundary lead 5s -> 8s, for users still on the old shipped
+       * value. See DEFAULT_STRATEGY.preBoundaryLeadMainnetMs for why 5s was too tight.
+       *
+       * Done here rather than by bumping DEFAULTS_VERSION, and that distinction is the whole
+       * point. preBoundaryLeadMainnetMs is a RECOMMENDED_FIELD, so a version bump would also
+       * overwrite priorityFeeGwei, offensePriorityFeeGwei, both base-fee caps, both dynamic
+       * tip ceilings and the curated target list. Every operator hitting this problem runs a
+       * tip they chose deliberately — 200 to 369 gwei against a shipped 120 — so the bump
+       * would cut their tip to a third on the same boundary it was meant to help. That is
+       * the hazard the v1.3.4 note above records, and it applies here exactly.
+       *
+       * Only 5000 is touched: it was the shipped default, so it reads as "never changed".
+       * Anyone who set their own lead — including someone who deliberately chose 5000 — keeps
+       * it, and this cannot walk back a value already above 8000.
+       */
+      if (savedMigrations < 1 && merged.preBoundaryLeadMainnetMs === 5000) {
+        merged.preBoundaryLeadMainnetMs = 8000;
+        const msg =
+          `Config upgrade: pre-boundary lead raised 5s -> 8s. At 5s the bundle was reaching ` +
+          `builders with under a second of margin, and a boundary block missed by that much ` +
+          `costs the whole race. Change it in the JIT panel if you had a reason for 5s.`;
+        logger.info(msg);
+        activity.add({ kind: "info", status: "info", message: msg });
+      }
+      /**
+       * Move existing installs onto the private, all-or-nothing, split offense defaults.
+       *
+       * Only reachable through a migration: mirrorAudits and auditBundleAllOrNothing are not
+       * RECOMMENDED_FIELDS, so a saved config keeps whatever it has forever; and
+       * combinedBoundaryBundle IS one, so the only alternative route would be a
+       * DEFAULTS_VERSION bump that also resets every operator's tip to the shipped 120.
+       *
+       * Each flip is guarded on the OLD shipped value so this cannot fight a later change,
+       * and it runs once (see MIGRATIONS_VERSION, which also records why a boolean cannot
+       * distinguish a deliberate choice from an untouched default).
+       *
+       * A config written before 1.17.0 never reaches the first two branches at all — those
+       * keys are absent from `raw`, so the merge above already filled them from the new
+       * DEFAULT_STRATEGY.
+       */
+      if (savedMigrations < 2) {
+        const flips: string[] = [];
+        if (merged.mirrorAudits === true) {
+          merged.mirrorAudits = false;
+          flips.push("pre-boundary audits are no longer mirrored to the public mempool");
+        }
+        if (merged.auditBundleAllOrNothing === false) {
+          merged.auditBundleAllOrNothing = true;
+          flips.push("the audit bundle is dropped rather than paying for a reverting audit");
+        }
+        if (merged.combinedBoundaryBundle === true) {
+          merged.combinedBoundaryBundle = false;
+          flips.push("payments and audits race as two separate bundles");
+        }
+        if (flips.length > 0) {
+          const msg =
+            `Config upgrade — offense defaults changed: ${flips.join("; ")}. A mirrored audit ` +
+            `names its target before the block is built, and a reverting audit pays the ` +
+            `builder that ordered you last. Payments are untouched and still mirror. Split ` +
+            `boundaries fund audits from the Audit Coinbase Bid — check it is set. Reverse ` +
+            `any of this in Config if your targets are undefended.`;
+          logger.info(msg);
+          activity.add({ kind: "info", status: "info", message: msg });
+        }
+      }
+      /**
+       * Migration 3 — take the payment path private and all-or-nothing.
+       *
+       * Split from migration 2 rather than folded into it so the two are separately legible in
+       * the record: 2 changed which audits you win, 3 changes whether a payment lands at all.
+       * An operator reading their activity log after a bad boundary should be able to tell
+       * which of the two moved it.
+       *
+       * Same one-shot stamp and the same boolean caveat as 2 (see MIGRATIONS_VERSION): this
+       * DOES override someone who deliberately kept the mirror on. Louder about it, because
+       * what is at stake is a citizen rather than an audit.
+       */
+      if (savedMigrations < 3) {
+        const flips: string[] = [];
+        if (merged.mirrorPayments === true) {
+          merged.mirrorPayments = false;
+          flips.push("pre-boundary payments are no longer mirrored to the public mempool");
+        }
+        if (merged.paymentBundleAllOrNothing === false) {
+          merged.paymentBundleAllOrNothing = true;
+          flips.push("the payment bundle is dropped rather than paying for a reverting payment");
+        }
+        if (flips.length > 0) {
+          const msg =
+            `Config upgrade — PAYMENT defaults changed: ${flips.join("; ")}. This is the one ` +
+            `that can cost a citizen: with no mirror, a boundary whose slot is won by a ` +
+            `builder we did not send to lands no payment at all, and that citizen is ` +
+            `auditable for a day. Re-enable the payment mirror in Config if you would rather ` +
+            `keep the fallback than the privacy.`;
+          logger.info(msg);
+          activity.add({ kind: "info", status: "info", message: msg });
+        }
+      }
       this.strategy = merged as unknown as StrategyConfig;
       if (savedDefaults < DEFAULTS_VERSION) {
         this.strategy = this.applyRecommendedDefaults(this.strategy, savedDefaults);
+      }
+      // AFTER the defaults refresh, deliberately: combinedBoundaryBundle is a RECOMMENDED
+      // field, so a refresh would otherwise hand a Thor-Mode operator a fused bundle back.
+      // And BEFORE writeConfig, so the file on disk is the config the engine is running —
+      // writing first would persist the pre-override values and leave the two disagreeing
+      // until the next save.
+      this.strategy = applyThorMode(this.strategy);
+      if (savedDefaults < DEFAULTS_VERSION) {
         this.writeConfig(); // persist the migration + new stamp so it runs once
+      } else if (savedMigrations < MIGRATIONS_VERSION) {
+        // Stamp even when nothing changed, so each migration is attempted once and a value
+        // it moved stays settable afterwards.
+        this.writeConfig();
       }
     } catch (err) {
       logger.warn("Could not load strategy config:", (err as Error).message);
@@ -522,7 +768,7 @@ class Runtime {
       fs.mkdirSync(appConfig.dataDir, { recursive: true });
       fs.writeFileSync(
         this.configPath(),
-        JSON.stringify({ ...this.strategy, defaultsVersion: DEFAULTS_VERSION }, null, 2),
+        JSON.stringify({ ...this.strategy, defaultsVersion: DEFAULTS_VERSION, migrationsVersion: MIGRATIONS_VERSION }, null, 2),
       );
     } catch (err) {
       logger.warn("Could not save strategy config:", (err as Error).message);
@@ -530,7 +776,9 @@ class Runtime {
   }
 
   saveStrategy(next: Partial<StrategyConfig>): StrategyConfig {
-    this.strategy = { ...this.strategy, ...next };
+    // Folded in here rather than at each read site, so runtime.strategy is always the
+    // effective config and what config.json shows is what the engine does.
+    this.strategy = applyThorMode({ ...this.strategy, ...next });
     this.writeConfig();
     this.emitStatus();
     return this.strategy;

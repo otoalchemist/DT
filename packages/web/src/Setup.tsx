@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "./api.js";
 import { shortAddr } from "./util.js";
 
@@ -38,7 +38,7 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
     setError(null);
     setBusy(true);
     try {
-      await api.unlock(passphrase);
+      await api.unlock(passphrase, accessCode);
       onUnlocked();
     } catch (e) {
       setError((e as Error).message);
@@ -48,6 +48,26 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
   };
 
   const existing = hasKeystore || createdAddr;
+  // Only prompt for the team code on a build that gates it — a fork running with
+  // BOT_ACCESS_CODE_OFF=1 should not ask for something it will never check.
+  const [gated, setGated] = useState(false);
+  // The roster gate needs no input from the user, so it is surfaced only as an
+  // expectation to set BEFORE they try — the server does the actual checking, and its
+  // rejection lands in `error` below.
+  const [allyGated, setAllyGated] = useState(false);
+  const [accessCode, setAccessCode] = useState("");
+  useEffect(() => {
+    void api
+      .accessGate()
+      .then((g) => {
+        setGated(g.required);
+        setAllyGated(g.allyGate);
+      })
+      .catch(() => {
+        setGated(false);
+        setAllyGated(false);
+      });
+  }, []);
 
   return (
     <div className="center panel">
@@ -106,6 +126,50 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
         />
       </label>
 
+      {gated && existing && (
+        <label>
+          Team access code
+          <input
+            type="password"
+            value={accessCode}
+            onChange={(e) => setAccessCode(e.target.value)}
+            placeholder="the code you were given"
+          />
+          <span className="hint">
+            This build is gated to the team. The code is separate from your wallet passphrase —
+            it does not unlock your key, it just gates this build.
+          </span>
+        </label>
+      )}
+
+      {allyGated && existing && (
+        <p className="hint">
+          This build also checks the chain on unlock: the wallet must hold at least one
+          Citizen on the team roster. Nothing to enter — if your token is not on the list
+          yet, ask for it to be added, then restart the bot.
+        </p>
+      )}
+
+      {/**
+       * Deterrent copy for anyone running a leaked build. Shown alongside the gates rather than
+       * instead of them: the gates are what actually refuse an unlock, this is only there to
+       * make a non-member think twice before bothering.
+       *
+       * Deliberately NOT backed by telemetry. Nothing in this bot phones home, so "we see you"
+       * is a bluff, and making it literal would mean tracking everyone who runs it — teammates
+       * included — which is a far worse trade than a leaked copy. What IS real is on-chain: the
+       * ally gate reads the roster at unlock, and every audit and payment this bot sends is
+       * public, so a non-member's activity is as visible to the team as anyone else's.
+       */}
+      {(gated || allyGated) && existing && (
+        <p
+          className="err"
+          style={{ fontWeight: 600, border: "1px solid var(--red)", borderRadius: 6, padding: "8px 10px", margin: "8px 0" }}
+        >
+          If you are not a member. We see you 😈. Have fun moving your assets.
+        </p>
+      )}
+
       {error && <p className="err">{error}</p>}
 
       <div className="row" style={{ marginTop: 8 }}>
@@ -114,7 +178,7 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
             {busy ? "Creating…" : "Create keystore"}
           </button>
         ) : (
-          <button className="primary" disabled={busy || !passphrase} onClick={unlock}>
+          <button className="primary" disabled={busy || !passphrase || (gated && !accessCode)} onClick={unlock}>
             {busy ? "Unlocking…" : "Unlock"}
           </button>
         )}
