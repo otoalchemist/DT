@@ -486,21 +486,74 @@ export const THOR_FIELDS = Object.keys(THOR_OVERRIDES) as (keyof typeof THOR_OVE
 /** Fold the overrides into a config. Identity when Thor Mode is off, so it is safe to call
  *  on every load and save. */
 export function applyThorMode<T extends StrategyConfig>(s: T): T {
-  return s.thorMode ? { ...s, ...THOR_OVERRIDES } : s;
+  // thorOverridesFor, not THOR_OVERRIDES: with a vault configured it withholds the two flags
+  // that would degrade it, so turning Thor Mode on can never split a vault boundary in two.
+  return s.thorMode ? { ...s, ...thorOverridesFor(s) } : s;
 }
 
 /** True when the stored config already matches every override — i.e. Thor Mode is not just
  *  on but actually in effect. Used by the UI to prove the switch did what it says. */
 export function thorModeSettled(s: StrategyConfig): boolean {
-  return THOR_FIELDS.every((k) => s[k] === THOR_OVERRIDES[k]);
+  // Judged against the overrides that ACTUALLY apply to this config. Comparing against the
+  // full table would report a vault operator as never settled, because the two flags it
+  // withholds are precisely the ones left at the operator own values.
+  const applies = thorOverridesFor(s) as Record<string, unknown>;
+  return Object.keys(applies).every((k) => (s as unknown as Record<string, unknown>)[k] === applies[k]);
+}
+
+/** Is a CitizenVault configured and shaped like an address? */
+export function hasVault(s: Pick<StrategyConfig, "vaultAddress">): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test((s.vaultAddress ?? "").trim());
+}
+
+/**
+ * Thor Mode's overrides FOR A GIVEN CONFIG, because two of them stop making sense once a
+ * vault holds the citizens.
+ *
+ * `combinedBoundaryBundle: false` is the harmful one. Splitting exists to stop a cheap audit
+ * tip diluting an expensive payment tip, by giving each half its own bundle and its own bid.
+ * A vault removes the premise: payment and audits become ONE call with one tip, one bid, and
+ * ordering guaranteed by the contract instead of by nonce sequencing. Split, the same boundary
+ * costs two transactions, two coinbase bids, and puts the audit call on a nonce above an
+ * unmined payment — strictly worse on every axis the split was meant to improve.
+ *
+ * `auditBundleAllOrNothing: true` is inert once fused (the combined path deliberately ignores
+ * it, so a cured target can never drop a payment sharing the batch) but it is still dropped
+ * here, because leaving a flag set that has no effect is how an operator ends up reasoning
+ * about behaviour they do not have.
+ *
+ * The other four are kept: `mirrorAudits` and `racePublicMempool` never reach the vault path
+ * at all — flushVaultBatch calls submitTx directly with `race: hasPayment` — and the two
+ * payment flags still decide per-call tolerance inside the batch.
+ */
+export function thorOverridesFor(
+  s: Pick<StrategyConfig, "vaultAddress">,
+): Partial<typeof THOR_OVERRIDES> {
+  if (!hasVault(s)) return THOR_OVERRIDES;
+  const { combinedBoundaryBundle: _c, auditBundleAllOrNothing: _a, ...rest } = THOR_OVERRIDES;
+  return rest;
 }
 
 export function boundaryBundleMode(
   s: Pick<
     StrategyConfig,
-    "combinedBoundaryBundle" | "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress"
+    "combinedBoundaryBundle" | "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress" | "vaultAddress"
   >,
 ): BoundaryBundleMode {
+  /**
+   * A vault is ALWAYS fused, whatever the toggle says.
+   *
+   * Not a preference — a derivation. The vault makes the whole boundary one `run()` call, so
+   * there is no second bundle for a split to rank separately and nothing for a second bid to
+   * buy. Honouring the toggle here would hand a vault operator two transactions and two bids
+   * for strictly less than one, and would let Thor Mode silently degrade the vault it runs
+   * alongside.
+   *
+   * Note this drops the bid requirement too. Without a vault, fusing only buys something when
+   * there is a bid to share, hence `anyBid`. With one, fusing buys a single transaction whether
+   * or not a bid is configured.
+   */
+  if (hasVault(s)) return "fused";
   const anyBid = coinbaseBidFundedFor(s, "payment") || coinbaseBidFundedFor(s, "audit");
   return s.combinedBoundaryBundle && anyBid ? "fused" : "split";
 }

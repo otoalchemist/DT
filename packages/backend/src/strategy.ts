@@ -2332,12 +2332,15 @@ export async function firePreBoundaryBundle(): Promise<void> {
         paidInBundle,
       });
     }
-    // Coinbase bid tails the bundle to win the slot. This fire only runs when a bid is
-    // active (combinedBundleActive), so the audits always have the bid backing them —
-    // no-bid falls back to the separate schedulers, where audits keep their mempool mirror.
-    // Which bid this is depends on what actually got queued, not on what was configured:
-    // a payment in the bundle makes it a must-land defensive boundary, otherwise it is an
-    // ordinary offense night on the cheaper bid.
+    // Coinbase bid tails the bundle to win the slot. Which bid this is depends on what
+    // actually got queued, not on what was configured: a payment in the bundle makes it a
+    // must-land defensive boundary, otherwise it is an ordinary offense night on the cheaper
+    // bid. Exactly one bid either way — there is one bundle to buy position for.
+    //
+    // A bid is no longer guaranteed to be configured here. Without a vault this fire only runs
+    // when one is (combinedBundleActive requires it), but a VAULT is fused unconditionally,
+    // because fusing then buys a single transaction whether or not a bid is in play. With no
+    // bid, maybeQueueCoinbaseBid is a no-op and the batch goes out as run(calls, 0).
     const bidKind: BidKind = paidInBundle.size > 0 ? "payment" : "audit";
     if (paidInBundle.size > 0 || auditQueued) {
       /**

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { decodeFunctionData } from "viem";
-import { citizenVaultAbi } from "@dat-bot/shared";
+import { citizenVaultAbi, applyThorMode } from "@dat-bot/shared";
 import type { PrivateKeyAccount } from "viem/accounts";
 
 /**
@@ -129,7 +129,10 @@ vi.mock("./nonce.js", () => ({
 }));
 
 const { runtime, DEFAULT_STRATEGY } = await import("./runtime.js");
-const { firePreBoundaryBundle } = await import("./strategy.js");
+const {
+  firePreBoundaryBundle, combinedBundleActive,
+  schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle,
+} = await import("./strategy.js");
 
 /** Everything handed to the signer this fire — the real `to` / `data` / `value`. */
 let signed: { to: string; data: string; value: bigint }[] = [];
@@ -233,5 +236,116 @@ describe("vault batch: the whole boundary as one transaction", () => {
     const audits = calls.filter((c) => c.data.startsWith("0x22222222"));
     expect(audits.length).toBeGreaterThan(0);
     expect(audits.every((c) => c.tolerate)).toBe(true);
+  });
+});
+
+/**
+ * Fusion with a vault must be unconditional — the "foolproof" requirement.
+ *
+ * Split mode with a vault does not fail loudly; it quietly sends TWO run() calls, pays TWO
+ * coinbase bids, and puts the audit call on a nonce above an unmined payment. Every one of
+ * those is a regression against the reason the vault exists, and none of them announces itself.
+ *
+ * So these cases attack the fusion from each direction an operator could plausibly turn it off,
+ * and assert on the transactions actually handed to the signer rather than on the predicate.
+ */
+describe("a vault boundary cannot be split", () => {
+  it("stays one transaction with combinedBoundaryBundle explicitly OFF", async () => {
+    runtime.strategy = { ...runtime.strategy, combinedBoundaryBundle: false };
+    await firePreBoundaryBundle();
+    const { calls } = decodedBatch();
+    expect(calls.length).toBeGreaterThan(1); // non-vacuity: real work was batched
+    expect(signed.filter((t) => t.to.toLowerCase() === VAULT.toLowerCase())).toHaveLength(1);
+  });
+
+  it("stays one transaction under Thor Mode, which used to force the split", async () => {
+    // applyThorMode runs on every save, so this is the realistic path into the bad state:
+    // the operator turns Thor Mode on and the toggle is rewritten under them.
+    runtime.strategy = applyThorMode({ ...runtime.strategy, thorMode: true });
+    expect(runtime.strategy.combinedBoundaryBundle).toBe(true); // withheld, not forced off
+    await firePreBoundaryBundle();
+    const { calls } = decodedBatch();
+    expect(calls.length).toBeGreaterThan(1);
+    expect(signed.filter((t) => t.to.toLowerCase() === VAULT.toLowerCase())).toHaveLength(1);
+  });
+
+  it("stays one transaction with NO coinbase bid configured", async () => {
+    /**
+     * Without a vault, no bid means split however the toggle is set — fusing buys nothing when
+     * there is no bid to share. With one, fusing still buys a single transaction, so the bid
+     * requirement must not gate it. run(calls, 0) is a perfectly good call.
+     */
+    runtime.strategy = { ...runtime.strategy, coinbaseBidEth: 0, coinbaseBidAuditOnlyEth: 0 };
+    await firePreBoundaryBundle();
+    const { calls, bidWei, msgValue } = decodedBatch();
+    expect(calls.length).toBeGreaterThan(1);
+    expect(bidWei).toBe(0n);
+    expect(msgValue).toBe(calls.reduce((s, c) => s + c.value, 0n));
+    expect(signed.filter((t) => t.to.toLowerCase() === VAULT.toLowerCase())).toHaveLength(1);
+  });
+
+  it("does not ARM the standalone schedulers, so nothing can fire twice", () => {
+    /**
+     * The double-fire hazard, tested where the guard actually is.
+     *
+     * `combinedBundleActive` is checked by the SCHEDULERS (schedulePreBoundaryPay:1191,
+     * schedulePreBoundaryAudit:1825), not by the fire functions — so calling the fires directly
+     * proves nothing about production, where only an armed timer invokes them. An earlier
+     * version of this case did exactly that and "found" three transactions that no scheduler
+     * would ever have caused.
+     *
+     * So: put the boundary in the FUTURE (the harness otherwise sits past it, where every
+     * scheduler bails on deltaMs <= 0 and the test would pass for the wrong reason), then assert
+     * that only the bundle scheduler arms a timer.
+     */
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    runtime.startTime = nowSec + 3600n - runtime.currentEpoch! * 86400n; // boundary ~1h out
+    runtime.strategy = { ...runtime.strategy, combinedBoundaryBundle: false };
+    expect(combinedBundleActive(runtime.strategy)).toBe(true); // the vault fused it anyway
+
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    try {
+      schedulePreBoundaryPay();
+      schedulePreBoundaryAudit();
+      // Non-vacuity: the boundary really is reachable, so the bundle scheduler DOES arm. Without
+      // this the two assertions above would also pass with the boundary in the past.
+      expect(timer).not.toHaveBeenCalled();
+      schedulePreBoundaryBundle();
+      expect(timer).toHaveBeenCalledTimes(1);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+});
+
+/**
+ * Which bid a fused batch spends. There is one bundle, so there is exactly one bid, and the
+ * choice is made from what actually got QUEUED rather than from what was configured.
+ */
+describe("a fused vault batch spends exactly one bid", () => {
+  it("uses the PAYMENT bid when a payment is in the batch", async () => {
+    await firePreBoundaryBundle();
+    const { calls, bidWei, msgValue } = decodedBatch();
+    expect(calls.some((c) => c.data.startsWith("0x11111111"))).toBe(true); // a payment is present
+    expect(bidWei).toBe(30_000_000_000_000_000n); // 0.03 = coinbaseBidEth, not the 0.003 audit bid
+    expect(msgValue).toBe(calls.reduce((s, c) => s + c.value, 0n) + bidWei);
+  });
+
+  it("uses the AUDIT bid on an audit-only boundary", async () => {
+    // Nothing armed to pay, so no payment reaches the batch and the cheaper bid applies.
+    runtime.strategy = { ...runtime.strategy, jitEnabled: false, jitTargetEpoch: null };
+    await firePreBoundaryBundle();
+    const { calls, bidWei } = decodedBatch();
+    expect(calls.some((c) => c.data.startsWith("0x11111111"))).toBe(false); // no payment
+    expect(calls.length).toBeGreaterThan(0);
+    expect(bidWei).toBe(3_000_000_000_000_000n); // 0.003 = coinbaseBidAuditOnlyEth
+  });
+
+  it("pays that bid ONCE, not once per half", async () => {
+    // The concrete cost of splitting: two bids for one boundary. Fused there is one bid tx-side
+    // (inline) and one bid amount, and msgValue proves no second one was added.
+    await firePreBoundaryBundle();
+    const { calls, bidWei, msgValue } = decodedBatch();
+    expect(msgValue - calls.reduce((s, c) => s + c.value, 0n)).toBe(bidWei);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { boundaryBundleMode, coinbaseBidFundedFor, boundaryDensitiesGwei } from "@dat-bot/shared";
+import { boundaryBundleMode, coinbaseBidFundedFor, boundaryDensitiesGwei, applyThorMode, thorModeSettled, thorOverridesFor, hasVault } from "@dat-bot/shared";
 import type { StrategyConfig } from "@dat-bot/shared";
 
 // combinedBundleActive is a pure predicate, but importing strategy.ts pulls in config.ts,
@@ -49,11 +49,19 @@ const base: {
   coinbaseBidEth: number;
   coinbaseBidAuditOnlyEth: number;
   coinbasePayerAddress: string;
+  // Empty by default so every pre-existing case keeps its no-vault meaning; the vault block
+  // below sets it explicitly.
+  vaultAddress: string;
+  thorMode: boolean;
+  auditBundleAllOrNothing: boolean;
 } = {
   combinedBoundaryBundle: true,
   coinbaseBidEth: 0.01,
   coinbaseBidAuditOnlyEth: 0.005,
   coinbasePayerAddress: "0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815",
+  vaultAddress: "",
+  thorMode: false,
+  auditBundleAllOrNothing: false,
 };
 
 const cfg = (o: Partial<typeof base>) => ({ ...base, ...o }) as StrategyConfig;
@@ -188,5 +196,119 @@ describe("boundaryDensitiesGwei", () => {
     const d = boundaryDensitiesGwei(g({ coinbasePayerAddress: "" }));
     expect(d.payment).toBeCloseTo(151, 6);
     expect(d.audit).toBeCloseTo(101.1, 6);
+  });
+});
+
+/**
+ * A vault changes what "fused" means, so it gets its own block.
+ *
+ * The split/fused toggle exists to stop a cheap audit tip diluting an expensive payment tip, by
+ * giving each half its own bundle and its own bid. A vault removes that premise entirely: the
+ * boundary becomes ONE run() call with one tip, one bid, and ordering guaranteed by the contract
+ * rather than by nonce sequencing. Split, the same boundary costs two transactions, two bids,
+ * and puts the audit call on a nonce above an unmined payment.
+ *
+ * So with a vault, fused is a derivation rather than a preference — and Thor Mode must stop
+ * forcing the toggle off, or it silently degrades the vault it is running alongside.
+ */
+const VAULT = "0xD00B158B8644B1FE387508Ceb2De021E87926D6E";
+
+describe("a vault is always fused", () => {
+  it("fuses even with the toggle explicitly OFF", () => {
+    // The exact configuration this fix is for: Thor Mode had written combinedBoundaryBundle
+    // false, which would have sent two transactions and paid two bids.
+    expect(boundaryBundleMode(cfg({ combinedBoundaryBundle: false, vaultAddress: VAULT }))).toBe("fused");
+  });
+
+  it("fuses with NO bid funded, unlike the no-vault case", () => {
+    /**
+     * Without a vault, fusing only buys something when there is a bid to share, so no bid means
+     * split however the toggle is set. With one, fusing buys a single transaction regardless —
+     * hence the bid requirement is dropped rather than merely satisfied.
+     */
+    const noBid = { coinbaseBidEth: 0, coinbaseBidAuditOnlyEth: 0 };
+    expect(boundaryBundleMode(cfg({ ...noBid }))).toBe("split");
+    expect(boundaryBundleMode(cfg({ ...noBid, vaultAddress: VAULT }))).toBe("fused");
+  });
+
+  it("fuses with no coinbase payer, because the bid rides inside the call", () => {
+    expect(boundaryBundleMode(cfg({ coinbasePayerAddress: "", vaultAddress: VAULT }))).toBe("fused");
+  });
+
+  it("ignores a malformed vault address rather than fusing on it", () => {
+    // Non-vacuity for every case above: it is the ADDRESS being usable that fuses, not merely
+    // the field being non-empty.
+    expect(boundaryBundleMode(cfg({ combinedBoundaryBundle: false, vaultAddress: "0xnope" }))).toBe("split");
+    expect(boundaryBundleMode(cfg({ combinedBoundaryBundle: false, vaultAddress: "" }))).toBe("split");
+  });
+
+  it("agrees with the engine predicate, vault or not", () => {
+    // Same guarantee as the exhaustive case above: a badge that disagrees with the engine is
+    // worse than no badge, and this fix added a whole new reason for them to diverge.
+    for (const vaultAddress of ["", VAULT]) {
+      for (const combined of [true, false]) {
+        for (const payBid of [0, 0.01]) {
+          const c = cfg({ vaultAddress, combinedBoundaryBundle: combined, coinbaseBidEth: payBid });
+          expect(boundaryBundleMode(c) === "fused").toBe(combinedBundleActive(c));
+        }
+      }
+    }
+  });
+});
+
+describe("Thor Mode does not degrade a vault", () => {
+  const thor = (vaultAddress: string) =>
+    applyThorMode(cfg({
+      thorMode: true, vaultAddress,
+      combinedBoundaryBundle: true, auditBundleAllOrNothing: false,
+    }) as never) as unknown as Record<string, unknown>;
+
+  it("withholds combinedBoundaryBundle when a vault is configured", () => {
+    // The whole point: Thor Mode may not split a vault boundary in two.
+    expect(thor(VAULT).combinedBoundaryBundle).toBe(true);
+    // Without a vault it still forces it off, which is correct there.
+    expect(thor("").combinedBoundaryBundle).toBe(false);
+  });
+
+  it("withholds auditBundleAllOrNothing when a vault is configured", () => {
+    /**
+     * Inert once fused — the combined path deliberately ignores it, so a cured target can never
+     * drop a payment sharing the batch — but still withheld. A flag left set that has no effect
+     * is how an operator ends up reasoning about behaviour they do not have.
+     */
+    expect(thor(VAULT).auditBundleAllOrNothing).toBe(false);
+    expect(thor("").auditBundleAllOrNothing).toBe(true);
+  });
+
+  it("still applies the four that DO reach the vault path", () => {
+    // mirrorAudits and racePublicMempool never reach it (flushVaultBatch calls submitTx
+    // directly with race: hasPayment), but the two payment flags decide per-call tolerance
+    // inside the batch, so none of the four is dropped.
+    const t = thor(VAULT);
+    expect(t.mirrorAudits).toBe(false);
+    expect(t.racePublicMempool).toBe(false);
+    expect(t.mirrorPayments).toBe(false);
+    expect(t.paymentBundleAllOrNothing).toBe(true);
+  });
+
+  it("reports a vault operator as settled without the withheld flags", () => {
+    /**
+     * thorModeSettled judged against the FULL table would report a vault operator as never
+     * settled, because the two withheld flags are exactly the ones left at their own values —
+     * and the dashboard uses that to decide whether the switch took effect.
+     */
+    const settled = applyThorMode(cfg({
+      thorMode: true, vaultAddress: VAULT,
+      combinedBoundaryBundle: true, auditBundleAllOrNothing: false,
+    }) as never);
+    expect(thorModeSettled(settled as never)).toBe(true);
+  });
+
+  it("is idempotent with a vault, so repeated saves cannot drift", () => {
+    // applyThorMode runs on EVERY saveStrategy, so a non-idempotent version would walk the
+    // config somewhere else one save at a time.
+    const once = applyThorMode(cfg({ thorMode: true, vaultAddress: VAULT, combinedBoundaryBundle: true }) as never);
+    const twice = applyThorMode(once);
+    expect(twice).toEqual(once);
   });
 });
