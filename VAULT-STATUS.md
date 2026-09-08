@@ -2,9 +2,28 @@
 
 Working notes for the batched-boundary work. Delete this file before any merge to master.
 
-**Nothing is deployed. Nothing has touched mainnet.** `vaultAddress` defaults to `""`, so
-with it unset the bot behaves exactly as before — that is what the 323 pre-existing tests
-passing unchanged is there to prove.
+**A vault IS deployed and IS holding a citizen on mainnet, as of 2026-09-08.**
+
+| | |
+|---|---|
+| vault | `0xD00B158B8644B1FE387508Ceb2De021E87926D6E` |
+| owner (cold) | `0xCAd15eA89395a66Fc781EFDc93063C9d3372D3DE` — a MetaMask key, NOT in the keystore |
+| operator | `0xdE4b72239F6D6E2342CBC48Ca8FB04E05A25f1c7` — the bot's hot wallet |
+| holding | citizen #2036, migrated by `npm run vault-move` |
+| verify | `npm run vault-check` — wiring AND deployed-bytecode match |
+
+`owner` is **immutable** and there is no `transferOwnership`: that MetaMask seed is the only exit
+for every citizen inside. `withdrawCitizens` has no conditions on it and nothing in the contract
+can block it, which is the property that makes depositing safe — but it is gated on a key that
+cannot be replaced.
+
+Three earlier deploys (`0x910570E6…`, `0xFdb06786…`, `0x624F0d31…`) are dead and hold nothing.
+They carried the pre-audit bytecode: Remix served a cached compile three times running while the
+wiring checks passed every time, which is exactly why `vault-check` now compares bytecode against
+a local build and no longer prints PASS when it could not check the code.
+
+With `vaultAddress` unset the bot still behaves exactly as before — that is what the pre-existing
+tests passing unchanged are there to prove.
 
 ## What exists
 
@@ -158,18 +177,117 @@ Two consequences worth stating rather than discovering:
 ## Remaining before mainnet
 
 1. ~~Finish the insurance question~~ — CLOSED, see above. No production change needed.
-2. Correct the three gas constants to the measured values. Still outstanding: after the merge
-   `GAS_VAULT_OVERHEAD` is still 60_000 against a measured 10,100, and strategy.ts still carries
-   `VAULT_CALL_OVERHEAD_GAS = 60_000` / `VAULT_PER_CALL_GAS = 145_000` against 10,100 and
-   ~39,476. Over-providing is safe, but every beat/lead figure is quoted off the wrong number.
-3. External review of the contract — my own adversarial pass found one real bug (a non-contract
+2. Correct the three gas constants to the measured values. **Partly done**: `GAS_VAULT_OVERHEAD`
+   is now 31,100 (21,000 intrinsic + 10,100 measured wrapper). Still outstanding in strategy.ts:
+   `VAULT_CALL_OVERHEAD_GAS = 60_000` against 10,100 and `VAULT_PER_CALL_GAS = 145_000` against
+   ~39,476.
+
+   **Do not "fix" these by lowering them to the measured numbers.** They set the signed gas
+   LIMIT. At measured values a pay+audit batch would be provisioned 89,052 against a measured
+   87,135 — under 2,000 gas of headroom. Over-providing refunds; under-providing reverts a real
+   payment. If they are tightened it should be to a measured value plus a deliberate margin, and
+   the affordability check (limit × maxFee) is the only thing the current slack actually costs.
+3. External review of the contract. My own adversarial pass found one real bug (a non-contract
    `game` address made every call silently "succeed" while sending the ETH to a dead address;
-   fixed with constructor code checks, pinned as a test). Two other suspicions did not hold: a
-   hostile `block.coinbase` cannot revert the batch, and short calldata reverts rather than
-   zero-padding into a selector match.
-4. Dry run: one citizen, one full epoch, then withdraw it back with the cold key. PAYMENT AND
-   AUDIT ONLY — see the scope note above. A boundary that pays and audits from the vault, and
-   a withdraw that gets the citizen back, is the whole acceptance test.
+   fixed with constructor code checks, pinned as a test). A second pass against Hedo's deployed
+   TaxManager found three more — see the comparison section below.
+4. ~~Dry run: one citizen, one full epoch~~ — IN PROGRESS. #2036 is in the vault; the epoch-191
+   boundary is the first live batch. Withdraw back with the cold key afterwards to close it.
+
+## Compared against Hedo's deployed vault, 2026-09-08
+
+Their `TaxManagerAuditable` is verified on Sourcify (exact match, solc 0.8.32) at
+`0x08458A47aD56Ff42D2d3eCA8D67ee887A3F9dBAf`. Worth reading: it is a different architecture, not
+a bigger version of ours, and it is running live behind two more layers.
+
+- Three layers, not one: hot EOAs -> an UNVERIFIED keeper contract (`0xf8ef…EECd7`, which is the
+  vault's `keeper`) -> the vault -> the game. The strategy lives in the unverified layer.
+- **They pay 0.102 ETH to `block.coinbase` inline**, from the keeper, in the same transaction —
+  measured on tx `0x77c9b438…`, which landed at **tx index 2 on a 1.5 gwei tip**. Their other
+  three txs that week sat at index 33, 56 and 62. The bid buys the position, not the tip. Our
+  inline-bid design matches theirs; the amount does not.
+- **Their vault holds a standing balance (3.4157 ETH) and ours never does.** Every pay/audit
+  there spends `address(this).balance`, and `payAll`/`batchAudit` are `onlyAuthorized`, so a
+  compromised keeper can burn the lot. Ours requires `msg.value == sum(values) + bidWei`, so a
+  stolen operator key can only spend what it already controls. This is the single biggest
+  difference and the main thing NOT to copy.
+- **Their payments are unconditionally revert-tolerant** (`_tryPayTaxes` catches and emits
+  `TaxPaySkipped`), so the tx succeeds while the citizen goes unpaid. Ours lets the bot choose
+  per call, and a lone must-land payment stays intolerant.
+- Two bugs in theirs, recorded so they are not copied: `endgame`'s
+  `require(balance >= payoutPerCitizen * len)` counts dead tokens in `len`, so it bricks once any
+  tracked citizen is burned; and `withdrawNFT(id, safe=false)` transfers the NFT out but leaves
+  `isTracked` true, so `payAll` wastes gas on it every epoch.
+
+### What that review changed in ours
+
+- **Bounded the coinbase call.** `call(gas(), coinbase(), …)` forwarded 63/64 of the remaining
+  gas, so a fee-recipient CONTRACT that burns everything left 1/64 — and the refund after it
+  needs ~9,700. Running out there is an out-of-gas in our own frame, which reverts the WHOLE
+  transaction including payments that already succeeded. Now `call(50000, …)`.
+
+  Not the low-likelihood hardening item it first looked like: the bug only bites when gas
+  remaining at that point is under ~620,000, and strategy.ts signs `60,000 + n*145,000` —
+  350,000 for a two-call batch, squarely inside the range. The first version of the test used a
+  3,000,000 limit and PASSED against the bug; mutation testing is what caught that.
+- **`onERC721Received` restricted to the citizen collection** (as Hedo's is). `withdrawCitizens`
+  can only move `citizens`, so anything else was stuck forever. Not airtight — a plain
+  `transferFrom` skips the hook — but it stops the realistic accidental case.
+- **`sweep(address(0))` reverts** instead of burning the balance.
+
+Still true of ours and NOT fixed: no `rescueERC20`/`rescueERC721`, so an ERC20 or an unrelated
+NFT forced in with `transferFrom` is unrecoverable. A generic rescue would widen the one surface
+this contract keeps deliberately narrow.
+
+## A vault is always fused, and that is a derivation
+
+`boundaryBundleMode` returns `"fused"` whenever a valid `vaultAddress` is set, before it looks at
+the toggle or at whether a bid is funded.
+
+Splitting exists to stop a cheap audit tip diluting an expensive payment tip, by giving each half
+its own bundle and its own bid. A vault removes the premise: the boundary is ONE `run()` call with
+one tip, one bid, and ordering guaranteed by the contract rather than by nonce sequencing. Split,
+the same boundary costs two transactions, two bids, and puts the audit call on a nonce above an
+unmined payment — worse on every axis the split was meant to improve.
+
+So `thorOverridesFor(s)` replaces the static `THOR_OVERRIDES` table: with a vault it **withholds**
+`combinedBoundaryBundle` (harmful — it would split) and `auditBundleAllOrNothing` (inert once
+fused, because the combined path ignores it, but a flag left set that has nothing to do is how an
+operator ends up reasoning about behaviour they do not have). The other four still apply.
+
+Which bid a fused batch spends is decided by what got QUEUED, not by what was configured:
+`paidInBundle.size > 0 ? "payment" : "audit"`. One bundle, one bid.
+
+## "Do I hold this citizen" had three answers, and two were wrong
+
+A vault-held citizen is owned on-chain by the CONTRACT, so every place that answered ownership
+from `runtime.wallets` alone stopped recognising it. Found one failure at a time, which is the
+wrong way to find them:
+
+- `fetchOwnedAcrossWallets` (the engine) — already correct, vault listed LAST so a stale NFT index
+  mid-transfer lets the wallet copy win.
+- `readOwnedStatuses` (the dashboard) — **was wrong.** Showed zero citizens, which disables the
+  JIT Arm button (`nSelected === 0`). The engine would have paid #2036; the UI offered no way to
+  ask it to.
+- The **ally gate** on unlock — **was wrong, and locked the operator out of their own bot.** The
+  gate requires a rostered citizen in the unlocked wallet; migrating the last one emptied the
+  wallet and the next unlock was denied, minutes before a boundary. Escape hatch is
+  `BOT_ALLY_GATE_OFF=1`.
+- `readTargets`' `selfSet` — **was wrong.** A vaulted citizen read as not-ours and appeared under
+  RIVAL targets. Offense itself was safe either way, because it excludes by ally-roster token id
+  rather than by owner.
+
+Both dangerous cases were already sound: `walletForToken` returns the OPERATOR for a vaulted
+citizen, so `canSpend` checks the wallet that actually pays; and offense never targeted #2036.
+
+## Tooling
+
+| | |
+|---|---|
+| `npm run vault-check [addr]` | wiring + deployed-bytecode match. Reads only. Names the created contracts when handed a WALLET by mistake (derives them from the deployer's nonce). Does not print PASS when it could not verify the code. |
+| `npm run vault-move -- --token N --to-vault` | the deposit. Refuses on bad wiring, `eth_call`s first, confirms, then prompts for the keystore passphrase in raw mode (muted readline breaks paste). Refuses the outbound direction — withdrawal is owner-only and that key is deliberately not in the keystore. |
+| `npm run dry-run-boundary` | now finds vault-held citizens, simulates the REAL `vault.run(...)` from the operator rather than a direct call from a contract holding no ETH, and unmasks `CallFailed` by re-simulating with a balance override to recover the game's own revert reason. |
+
 
 Accepted limitations: `buyLifeInsurance`/`bailout` are unreachable from the vault (the bot
 never calls them); emigrating a vaulted citizen is withdraw-then-transfer; a pull-style
