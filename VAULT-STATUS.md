@@ -95,6 +95,43 @@ this note said was missing is present on master — true at 1.5.5, fixed since. 
 master is a regression pin only (`abi-errors.test.ts`), verified to fail if the inherited error
 is ever dropped in a regeneration.
 
+## Internal review, 2026-09-08
+
+NOT the external review item 3 asks for — I wrote much of what I am reviewing, so this
+narrows what an external reviewer has to find rather than replacing them.
+
+**Nothing exploitable found.** Three claims that cannot be settled by reading are now executed
+in `citizen-vault.test.ts` rather than argued:
+
+- short calldata cannot zero-pad into an allowlisted selector (`bytes4(bytes)` pads, giving
+  0x00000000, which matches nothing — but the failure mode would be silent, so it is run)
+- `tolerate: true` cannot smuggle a disallowed selector past the check: the allowlist is
+  evaluated BEFORE the call and is not tolerate-gated, so a hostile batch naming transferFrom
+  reverts on the vault's own guard rather than swallowing the failure
+- a compromised operator cannot reach a standing balance. `msg.value == sum(values) + bidWei`
+  means it can only ever spend what it supplies itself. This is the property the entire
+  owner/operator split rests on, and it was previously only asserted in prose.
+
+**Selector allowlist re-verified against the shipped game ABI.** `kill` takes ONE uint256
+(0xd29a0025) and the contract has it right. Worth recording because a wrong arity here is
+invisible: it produces a selector that matches nothing, and every kill would revert
+`SelectorNotAllowed` forever.
+
+### Noted, not fixed — none are blocking
+
+1. **Junk NFTs are permanently stuck.** `onERC721Received` accepts any collection, but
+   `withdrawCitizens` only moves `citizens`. Anything dusted in is unrecoverable. Harmless
+   unless someone cares about a stuck token; a generic rescue would widen the exit surface,
+   which is the one thing this contract should not do.
+2. **`sweep(address(0))` burns the balance.** Owner-only and the owner's own foot, but a
+   zero-address check is one line.
+3. **An operator that is a CONTRACT rejecting ETH would break tolerated batches.** The refund
+   uses `msg.sender.call`, so `RefundFailed` would revert any batch containing a tolerated
+   failure. The operator is meant to be the bot EOA; worth a line in the deploy notes.
+4. **A compromised operator can still waste ETH**, not just gas. It supplies the value, but it
+   can pay taxes nobody asked for or audit nothing. The header says "wasted gas and audit
+   slots"; "and any ETH it is willing to fund" is more accurate.
+
 ## Remaining before mainnet
 
 1. ~~Finish the insurance question~~ — CLOSED, see above. No production change needed.

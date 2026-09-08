@@ -395,3 +395,41 @@ describe("CitizenVault: measured gas", () => {
     expect(signed).toBeGreaterThan(realistic);
   });
 });
+
+/**
+ * Adversarial pass, 2026-09-08. Things that cannot be settled by reading the source.
+ */
+describe("CitizenVault: adversarial", () => {
+  it("short calldata cannot zero-pad its way into an allowlisted selector", async () => {
+    // bytes4(bytes) truncates or PADS. If a 1-byte payload padded to a selector that
+    // happened to match, the allowlist would be bypassable. It pads with zeros, so the
+    // result is 0x00000000 — which matches nothing — but that is worth executing rather
+    // than reasoning about, because the failure mode is silent.
+    for (const data of ["0x", "0x58", "0x586700"] as `0x${string}`[]) {
+      const r = await run(OPERATOR, [{ data, value: 0n, tolerate: true }]);
+      expect(r.reverted, `payload ${data} must be rejected`).toBe(true);
+    }
+  });
+
+  it("tolerate: true cannot smuggle a disallowed selector past the check", async () => {
+    // The selector check precedes the call and is NOT tolerate-gated. If tolerance were
+    // applied first, a hostile batch could name transferFrom and simply swallow the failure
+    // — except the failure would be the vault's own revert, not the call's.
+    const transferData = ("0x23b872dd" + "00".repeat(96)) as `0x${string}`;
+    const r = await run(OPERATOR, [{ data: transferData, value: 0n, tolerate: true }]);
+    expect(r.reverted).toBe(true);
+  });
+
+  it("the operator cannot spend a standing balance the vault happens to hold", async () => {
+    // The property the owner/operator split rests on. msg.value must equal sum(values) + bid,
+    // so a compromised bot key can never reach ETH already sitting here — it can only spend
+    // what it supplies itself. Fund the vault, then try to pay taxes from that balance.
+    const acct = await evm.stateManager.getAccount(vault);
+    await evm.stateManager.putAccount(vault, Object.assign(acct!, { balance: 10n ** 18n }));
+    const before = await balanceOf(vault);
+
+    const r = await run(OPERATOR, [{ data: payData(1n), value: 10n ** 17n, tolerate: false }], 0n, 0n);
+    expect(r.reverted, "value mismatch must reject it").toBe(true);
+    expect(await balanceOf(vault)).toBe(before);
+  });
+});
