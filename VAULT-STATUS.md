@@ -132,6 +132,29 @@ invisible: it produces a selector that matches nothing, and every kill would rev
    can pay taxes nobody asked for or audit nothing. The header says "wasted gas and audit
    slots"; "and any ETH it is willing to fund" is more accurate.
 
+## Scope, narrowed 2026-09-08 — payment and audit only
+
+The vault exists for the boundary, and the boundary is payments and audits. Everything below
+is verified and dry-run against those two; `kill` and `useBribe` are explicitly out of scope.
+
+**No code change was needed, because the routing already draws this line.** `isOwnerOnlyKind`
+covers pay-taxes / use-bribe / audit and deliberately excludes `kill`: the vault exists to be
+the OWNER of a citizen you hold, and `kill(target)` names a citizen you do not own, so there
+is nothing for an ownership check to test. Kills already go straight from the operator wallet
+and never enter a batch. `audit(auditorId, target)` is the contrast — gated on the auditor you
+hold, which is exactly why it must be wrapped.
+
+Two consequences worth stating rather than discovering:
+
+- **`SEL_KILL` in the contract allowlist is dead weight.** Nothing routes a kill through the
+  vault, so it is never exercised. Left in place: removing it is irreversible after deploy for
+  no gain, and a compromised operator making the vault call `kill` achieves nothing it could
+  not already do from its own wallet, since kill is permissionless.
+- **`useBribe` stays allowlisted and stays untested.** It is owner-only, so a vaulted citizen
+  can only bribe through the vault — dropping it would permanently remove that capability from
+  every migrated citizen. It is a manual dashboard action rather than a boundary one, so it is
+  out of scope for the dry run, not out of the contract.
+
 ## Remaining before mainnet
 
 1. ~~Finish the insurance question~~ — CLOSED, see above. No production change needed.
@@ -144,7 +167,9 @@ invisible: it produces a selector that matches nothing, and every kill would rev
    fixed with constructor code checks, pinned as a test). Two other suspicions did not hold: a
    hostile `block.coinbase` cannot revert the batch, and short calldata reverts rather than
    zero-padding into a selector match.
-4. Dry run: one citizen, one full epoch, then withdraw it back with the cold key.
+4. Dry run: one citizen, one full epoch, then withdraw it back with the cold key. PAYMENT AND
+   AUDIT ONLY — see the scope note above. A boundary that pays and audits from the vault, and
+   a withdraw that gets the citizen back, is the whole acceptance test.
 
 Accepted limitations: `buyLifeInsurance`/`bailout` are unreachable from the vault (the bot
 never calls them); emigrating a vaulted citizen is withdraw-then-transfer; a pull-style
