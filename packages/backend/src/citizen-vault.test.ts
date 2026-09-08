@@ -64,6 +64,16 @@ const STINGY_PAYER = `
 pragma solidity ^0.8.20;
 contract Payer { function payOut(address payable to) external payable { to.transfer(msg.value); } }`;
 
+/** A block.coinbase that burns all the gas it is handed, rather than reverting cheaply.
+ *  Reverting was already covered; exhaustion is the case that can take the payments with it. */
+const GAS_BURNER = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract GasBurner {
+    uint256 public burned;
+    receive() external payable { while (true) { burned++; } }
+}`;
+
 const OWNER = new Address(hexToBytes("0x" + "11".repeat(20))); // cold key
 const OPERATOR = new Address(hexToBytes("0x" + "22".repeat(20))); // bot hot key
 const STRANGER = new Address(hexToBytes("0x" + "33".repeat(20)));
@@ -75,6 +85,9 @@ let evm: EVM;
 let vault: Address;
 let nft: Address;
 let payer: Address;
+/** A second ERC721, unrelated to `citizens` — the junk a vault should refuse. */
+let junkNft: Address;
+let gasBurner: Address;
 
 const gameFn = (name: string, inputs: string[], mut: "payable" | "nonpayable" = "payable") =>
   [{ type: "function", name, inputs: inputs.map((t) => ({ type: t })), outputs: [], stateMutability: mut }] as Abi;
@@ -138,6 +151,7 @@ beforeAll(async () => {
           "MockGame.sol": { content: MOCK_GAME },
           "MiniNFT.sol": { content: MINI_NFT },
           "Payer.sol": { content: STINGY_PAYER },
+          "GasBurner.sol": { content: GAS_BURNER },
         },
         settings: {
           // Optimiser ON deliberately: it is the configuration that would be deployed, and
@@ -162,6 +176,9 @@ beforeAll(async () => {
   const game = await deploy(out.contracts["MockGame.sol"].MockGame.evm.bytecode.object);
   nft = await deploy(out.contracts["MiniNFT.sol"].MiniNFT.evm.bytecode.object);
   payer = await deploy(out.contracts["Payer.sol"].Payer.evm.bytecode.object);
+  // Same code as `nft`, different address — which is the only thing that makes it "junk".
+  junkNft = await deploy(out.contracts["MiniNFT.sol"].MiniNFT.evm.bytecode.object);
+  gasBurner = await deploy(out.contracts["GasBurner.sol"].GasBurner.evm.bytecode.object);
 
   const ctorArgs = encodeFunctionData({
     abi: gameFn("c", ["address", "address", "address"], "nonpayable"),
@@ -240,6 +257,114 @@ describe("CitizenVault: value and authorisation", () => {
     expect((await run(OPERATOR, call)).reverted).toBe(false);
     expect((await run(OWNER, call)).reverted).toBe(false);
     expect((await run(STRANGER, call)).reverted).toBe(true);
+  });
+});
+
+describe("CitizenVault: a hostile block.coinbase cannot cost us a payment", () => {
+  /** `run`, with block.coinbase pointed at whichever address the case wants. */
+  const runWithCoinbase = async (coinbase: Address, calls: Call[], bidWei: bigint) => {
+    const data = encodeFunctionData({ abi: vaultAbi, functionName: "run", args: [calls, bidWei] });
+    const value = calls.reduce((s, c) => s + c.value, bidWei);
+    const r = await evm.runCall({
+      // PRODUCTION-REALISTIC, and load-bearing. strategy.ts signs
+      // VAULT_CALL_OVERHEAD_GAS + n*VAULT_PER_CALL_GAS = 60,000 + 2*145,000 = 350,000 for this
+      // batch. An unbounded coinbase forward only starves the epilogue when 1/64 of the gas
+      // remaining at that point is under the refund cost (~9,700), i.e. under ~620,000 — so a
+      // roomy 3,000,000 here made the case pass against the very bug it exists to catch.
+      caller: OPERATOR, to: vault, data: hexToBytes(data), value, gasLimit: 350_000n,
+      block: { header: { coinbase, number: 1n, timestamp: 1n, difficulty: 0n, prevRandao: new Uint8Array(32), gasLimit: 30_000_000n, baseFeePerGas: 0n } } as never,
+    });
+    return {
+      reverted: !!r.execResult.exceptionError,
+      error: r.execResult.exceptionError?.error,
+      logs: (r.execResult.logs ?? []).map((l, i) => ({
+        address: bytesToHex(l[0]) as `0x${string}`,
+        topics: l[1].map((t) => bytesToHex(t)) as [`0x${string}`, ...`0x${string}`[]],
+        data: bytesToHex(l[2]) as `0x${string}`,
+        blockHash: `0x${"00".repeat(32)}` as `0x${string}`,
+        blockNumber: 0n, logIndex: i,
+        transactionHash: `0x${"00".repeat(32)}` as `0x${string}`,
+        transactionIndex: 0, removed: false as const,
+      })),
+    };
+  };
+
+  /** A payment that MUST land, plus a tolerated audit that reverts (target 999) so a refund
+   *  is genuinely owed after the bid — the refund is what runs out of gas. */
+  const batch = (): Call[] => [
+    { data: payData(77n), value: 1000n, tolerate: false },
+    { data: auditData(77n, 999n), value: 690_000_000_000_000n, tolerate: true },
+  ];
+
+  it("still pays the bid to an ordinary recipient", async () => {
+    // Control: the bound must not have broken the normal path.
+    const before = await balanceOf(COINBASE);
+    const r = await runWithCoinbase(COINBASE, batch(), 12_345n);
+    expect(r.reverted).toBe(false);
+    expect((await balanceOf(COINBASE)) - before).toBe(12_345n);
+    expect(okFlags(r.logs)).toEqual([true, false]);
+  });
+
+  it("survives a fee recipient that burns every gas unit it is given", async () => {
+    /**
+     * The finding this pins. `call(gas(), coinbase(), …)` forwards 63/64 of the remaining gas,
+     * so a recipient that never returns leaves 1/64 — and `msg.sender.call` for the refund
+     * still needs ~9,700. Running out THERE is an out-of-gas in our own frame, which reverts
+     * the entire transaction: the payment that already succeeded is undone.
+     *
+     * Ignoring the call's result does not help. A revert is cheap and was already covered;
+     * exhaustion is a different mechanism and needs a gas bound, which is why the call is
+     * `call(50000, …)`. Mutating that back to `gas()` fails this case.
+     */
+    const before = await balanceOf(gasBurner);
+    const r = await runWithCoinbase(gasBurner, batch(), 12_345n);
+    expect(r.reverted).toBe(false);
+    // The payment landed and the audit was tolerated — the batch was NOT rolled back.
+    expect(okFlags(r.logs)).toEqual([true, false]);
+    // The burner consumed its gas and never took the money, so the bid stayed with us.
+    expect(await balanceOf(gasBurner)).toBe(before);
+  });
+
+  it("refunds the tolerated audit's fee even when the recipient burns gas", async () => {
+    // The specific step that would have run out. Measured on the operator's balance rather
+    // than asserted from the log, so a silently swallowed refund cannot pass.
+    const AUDIT = 690_000_000_000_000n;
+    const before = await balanceOf(OPERATOR);
+    const r = await runWithCoinbase(gasBurner, batch(), 0n);
+    expect(r.reverted).toBe(false);
+    // Paid 1000 for the payment, sent AUDIT for the audit, got AUDIT back. Gas is free in
+    // this EVM harness, so the net movement is exactly the payment.
+    expect(before - (await balanceOf(OPERATOR))).toBe(1000n);
+  });
+});
+
+describe("CitizenVault: what it refuses to hold", () => {
+  it("rejects an ERC721 that is not the citizen collection", async () => {
+    /**
+     * withdrawCitizens can only move `citizens`, so anything else that got in would be stuck
+     * here permanently and a generic rescue would widen the exit surface this contract keeps
+     * deliberately narrow. Refusing on the way in is the cheap end of that trade.
+     */
+    const mint = encodeFunctionData({ abi: gameFn("mint", ["address", "uint256"], "nonpayable"), functionName: "mint", args: [bytesToHex(OWNER.bytes), 4242n] });
+    await rawCall(OWNER, junkNft, mint);
+    const xfer = encodeFunctionData({ abi: gameFn("safeTransferFrom", ["address", "address", "uint256"], "nonpayable"), functionName: "safeTransferFrom", args: [bytesToHex(OWNER.bytes), bytesToHex(vault.bytes), 4242n] });
+    expect((await rawCall(OWNER, junkNft, xfer)).reverted).toBe(true);
+
+    // Non-vacuity: the SAME transfer of the SAME id succeeds from the real collection, so the
+    // rejection is about which collection asked and not about the token or the transfer shape.
+    await rawCall(OWNER, nft, mint);
+    const realXfer = encodeFunctionData({ abi: gameFn("safeTransferFrom", ["address", "address", "uint256"], "nonpayable"), functionName: "safeTransferFrom", args: [bytesToHex(OWNER.bytes), bytesToHex(vault.bytes), 4242n] });
+    expect((await rawCall(OWNER, nft, realXfer)).reverted).toBe(false);
+
+    // And it is recoverable, which is the whole reason the restriction is worth having.
+    const wd = encodeFunctionData({ abi: vaultAbi, functionName: "withdrawCitizens", args: [[4242n], bytesToHex(OWNER.bytes)] });
+    expect((await rawCall(OWNER, vault, wd)).reverted).toBe(false);
+  });
+
+  it("refuses to sweep to address(0) rather than burning the balance", async () => {
+    const zero = new Address(hexToBytes("0x" + "00".repeat(20)));
+    const data = encodeFunctionData({ abi: vaultAbi, functionName: "sweep", args: [bytesToHex(zero.bytes)] });
+    expect((await rawCall(OWNER, vault, data)).reverted).toBe(true);
   });
 });
 

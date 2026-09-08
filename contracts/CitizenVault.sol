@@ -95,6 +95,8 @@ contract CitizenVault {
     error CallFailed(uint256 index);
     error RefundFailed();
     error NotAContract(address what);
+    error ZeroAddress();
+    error NotTheCitizenCollection(address collection);
 
     // Computed from the signatures rather than pasted as hex, so they are checkable by
     // reading. Verified against mainnet calldata: payTaxes 0x58670017, audit 0x5daba7c0.
@@ -166,11 +168,24 @@ contract CitizenVault {
 
         // The bid, paid inline rather than from a separate forwarder tx — one fewer
         // transaction in the bundle, so the same bid buys a higher value-per-gas.
+        //
         // Result deliberately ignored, exactly as CoinbasePayer._forward does: a builder
         // whose fee recipient rejects the transfer must never drag the batch down.
+        //
+        // GAS IS BOUNDED, and unlike CoinbasePayer that is load-bearing here. `call(gas(),…)`
+        // forwards 63/64 of what is left, so a fee-recipient CONTRACT that burns everything
+        // returns us 1/64 — and the refund below still needs ~9,700. Running out there
+        // reverts the WHOLE transaction, including payments that already succeeded, which is
+        // the one outcome this contract exists to prevent. CoinbasePayer is safe with an
+        // unbounded forward only because the coinbase call is the last thing it ever does.
+        //
+        // Ignoring the result is not enough on its own: a revert is cheap, exhaustion is not.
+        // 50,000 is far more than a payout splitter needs and cannot starve the epilogue. If
+        // a recipient ever wanted more, the bid simply fails and we lose the slot — losing a
+        // race is recoverable, losing a payment is not.
         if (bidWei > 0) {
             assembly {
-                pop(call(gas(), coinbase(), bidWei, 0, 0, 0, 0))
+                pop(call(50000, coinbase(), bidWei, 0, 0, 0, 0))
             }
         }
 
@@ -192,6 +207,9 @@ contract CitizenVault {
 
     /// Recover ETH that ended up here (a game refund, or a stray transfer). Owner only.
     function sweep(address to) external onlyOwner {
+        // address(0) would burn the balance rather than move it. Owner-only and the owner's
+        // own foot, but there is no reason to want it and one line to rule it out.
+        if (to == address(0)) revert ZeroAddress();
         (bool ok, ) = to.call{ value: address(this).balance }("");
         if (!ok) revert RefundFailed();
     }
@@ -204,7 +222,17 @@ contract CitizenVault {
     }
 
     /// Required for `safeTransferFrom` to accept a citizen into the vault.
-    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+    ///
+    /// Restricted to the citizen collection. `withdrawCitizens` can only move `citizens`, so
+    /// anything else that got in would be stuck here forever, and widening the exit to a
+    /// generic rescue would widen the one surface this contract must keep narrow.
+    ///
+    /// Not airtight, and deliberately not sold as such: a plain `transferFrom` skips this
+    /// hook entirely, so a determined sender can still force an unrelated token in. What this
+    /// stops is the realistic case — an accidental or drive-by `safeTransferFrom` — and it
+    /// costs nothing to stop it.
+    function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
+        if (msg.sender != citizens) revert NotTheCitizenCollection(msg.sender);
         return this.onERC721Received.selector;
     }
 
