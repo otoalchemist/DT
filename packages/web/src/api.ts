@@ -42,8 +42,14 @@ export const api = {
     }),
   createKeystore: (body: { mode: "import" | "generate"; privateKey?: string; passphrase: string }) =>
     req<{ address: string }>("/api/keystore", { method: "POST", body: JSON.stringify(body) }),
-  unlock: (passphrase: string, accessCode?: string) =>
-    req<BotStatus>("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase, accessCode }) }),
+  /** `vaultAddress` is optional and write-only: omit it to leave the stored one untouched.
+   *  Accepted on unlock rather than in the config panel because it is gated by the passphrase
+   *  there — see the note on the endpoint. */
+  unlock: (passphrase: string, accessCode?: string, vaultAddress?: string) =>
+    req<BotStatus>("/api/unlock", {
+      method: "POST",
+      body: JSON.stringify({ passphrase, accessCode, vaultAddress }),
+    }),
   /** Whether this build gates unlock behind a team access code. */
   accessGate: () => req<{ required: boolean; allyGate: boolean }>("/api/access-gate"),
   /** Audit one rival now, at normal network gas (not a race — no bid, no race tip). */

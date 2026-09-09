@@ -16,6 +16,9 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createdAddr, setCreatedAddr] = useState<string | null>(null);
+  // Blank unless the operator types one. Sent only when non-empty, and the server treats
+  // omitted as "leave the stored address alone" rather than "clear it".
+  const [vaultAddress, setVaultAddress] = useState("");
 
   const create = async () => {
     setError(null);
@@ -38,7 +41,7 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
     setError(null);
     setBusy(true);
     try {
-      await api.unlock(passphrase, accessCode);
+      await api.unlock(passphrase, accessCode, vaultAddress.trim() || undefined);
       onUnlocked();
     } catch (e) {
       setError((e as Error).message);
@@ -148,6 +151,32 @@ export function Setup({ hasKeystore, keystoreAddress, onUnlocked }: Props) {
           Citizen on the team roster. Nothing to enter — if your token is not on the list
           yet, ask for it to be added, then restart the bot.
         </p>
+      )}
+
+      {/* Only place in the UI that can SET this. It is kept out of the dashboard because the
+          bot sends tax ETH to this address, and the API listens on localhost where a hostile
+          page could otherwise repoint it; here it rides the passphrase, which an attacker does
+          not have. It is on the unlock screen specifically because the ally gate above reads
+          it — a vaulted citizen is owned by the contract, so without this an operator whose
+          last citizen was in the vault could not unlock to set it, and could not set it
+          without unlocking. */}
+      {existing && (
+        <label className="field">
+          Vault address <span className="muted">(optional)</span>
+          <input
+            type="text"
+            value={vaultAddress}
+            onChange={(e) => setVaultAddress(e.target.value)}
+            placeholder="0x… — leave blank unless your citizens are in a CitizenVault"
+            spellCheck={false}
+            style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }}
+          />
+          <span className="hint">
+            Only if you have moved citizens into a CitizenVault. It is saved before the roster
+            check above, so a citizen held by the vault still counts as yours. Leave blank to
+            keep whatever is already configured — this never clears it.
+          </span>
+        </label>
       )}
 
       {/**

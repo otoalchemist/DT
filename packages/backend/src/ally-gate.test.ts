@@ -36,7 +36,7 @@ vi.mock("./contract.js", () => ({
   filterLiveTokenIds: (citizens: string, ids: bigint[]) => filterLiveTokenIds(citizens, ids),
 }));
 
-const { checkAllyHolding, allyGateRequired } = await import("./ally-gate.js");
+const { checkAllyHolding, allyGateRequired, vaultAddressToStore } = await import("./ally-gate.js");
 
 const ORIGINAL = { ...process.env };
 
@@ -130,5 +130,103 @@ describe("ally-roster gate", () => {
 
   it("reports the gate as required by default", () => {
     expect(allyGateRequired()).toBe(true);
+  });
+});
+
+/**
+ * A vault-held citizen must still count as yours.
+ *
+ * This is the lockout that actually happened: an operator moved their LAST citizen into the
+ * CitizenVault, and the next unlock denied them. The gate asks "does one of these addresses
+ * own a rostered citizen", and a vaulted citizen is owned by the CONTRACT — so a wallet-only
+ * check reads a fully paid-up member as a stranger.
+ *
+ * The gate itself needs no change; it takes a list of addresses. What matters is that the
+ * caller includes the vault, and that the vault address is saved BEFORE the gate runs. The
+ * unlock endpoint owns both halves; these pin the gate's side of the contract.
+ */
+describe("ally gate with a vault", () => {
+  const VAULT = "0xD00B158B8644B1FE387508Ceb2De021E87926D6E";
+
+  beforeEach(() => {
+    delete process.env.BOT_ALLY_GATE_OFF;
+    // The realistic shape after migration: nothing left in the wallet, #2036 in the vault.
+    filterLiveTokenIds.mockResolvedValue([
+      { id: 100n, owner: THEIRS },
+      { id: 358n, owner: THEIRS },
+      { id: 2036n, owner: VAULT },
+    ]);
+  });
+  afterEach(() => { filterLiveTokenIds.mockReset(); });
+
+  it("denies a wallet-only check once the last citizen is vaulted", async () => {
+    // The bug, reproduced: this is what locked the operator out.
+    const v = await checkAllyHolding([MINE]);
+    expect(v.ok).toBe(false);
+  });
+
+  it("allows it when the vault is among the addresses", async () => {
+    const v = await checkAllyHolding([MINE, VAULT]);
+    expect(v.ok).toBe(true);
+    if (v.ok && v.reason === "held") {
+      expect(v.tokenId).toBe("2036");
+      expect(v.address.toLowerCase()).toBe(VAULT.toLowerCase());
+    }
+  });
+
+  it("matches the vault case-insensitively, since config and chain disagree on casing", async () => {
+    // The address is typed by a human into the unlock box and compared against whatever
+    // casing the chain returns. A case-sensitive match would deny on a checksummed paste.
+    const v = await checkAllyHolding([MINE, VAULT.toLowerCase()]);
+    expect(v.ok).toBe(true);
+  });
+});
+
+/**
+ * What an unlock should do with the vault address it was handed.
+ *
+ * Extracted from the endpoint so it can be tested at all: a mutation that stopped the endpoint
+ * saving the address entirely still passed the whole suite, because nothing covered the wiring.
+ *
+ * The rule that earns these tests is the negative one. Omitting the field must LEAVE THE
+ * STORED ADDRESS ALONE, never clear it — an operator unlocking from an older client, or just
+ * not touching the box, would otherwise silently lose a vault that is holding their citizens,
+ * and the bot would stop seeing them and stop paying them without a word.
+ */
+describe("vaultAddressToStore", () => {
+  const V = "0xD00B158B8644B1FE387508Ceb2De021E87926D6E";
+  const OTHER = "0x1111111111111111111111111111111111111111";
+
+  it("stores a newly supplied address", () => {
+    expect(vaultAddressToStore(V, "")).toBe(V);
+    expect(vaultAddressToStore(V, undefined)).toBe(V);
+  });
+
+  it("NEVER clears a stored vault when the field is omitted or blank", () => {
+    for (const supplied of [undefined, "", "   "]) {
+      expect(vaultAddressToStore(supplied, V), `supplied ${JSON.stringify(supplied)}`).toBeNull();
+    }
+  });
+
+  it("ignores a malformed value rather than storing or clearing it", () => {
+    // A half-pasted address must not overwrite a working one.
+    for (const bad of ["0x123", "not-an-address", V.slice(0, -1), V + "ff"]) {
+      expect(vaultAddressToStore(bad, V), `supplied ${bad}`).toBeNull();
+    }
+  });
+
+  it("is a no-op when the supplied address already matches, whatever the casing", () => {
+    expect(vaultAddressToStore(V, V)).toBeNull();
+    expect(vaultAddressToStore(V.toLowerCase(), V)).toBeNull();
+    expect(vaultAddressToStore(V, V.toLowerCase())).toBeNull();
+  });
+
+  it("does repoint when a DIFFERENT valid address is supplied", () => {
+    // Deliberate: this request carries the passphrase, so whoever sent it is the owner.
+    expect(vaultAddressToStore(OTHER, V)).toBe(OTHER);
+  });
+
+  it("trims, because the address arrives from a paste into a text box", () => {
+    expect(vaultAddressToStore(`  ${V}  `, "")).toBe(V);
   });
 });
