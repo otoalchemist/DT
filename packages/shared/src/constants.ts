@@ -173,6 +173,37 @@ export const GAS_COINBASE_BID_TX = 30_550;
 export const GAS_VAULT_OVERHEAD = 31_100;
 
 /**
+ * Per-action gas INSIDE a batch, which is a different number from the standalone one.
+ *
+ * GAS_PER_PAYMENT and GAS_PER_AUDIT are measured from standalone transactions, so each carries
+ * its own 21,000 of intrinsic gas. A batch pays intrinsic ONCE, and every action after the
+ * first hits storage the previous ones already warmed. Using the standalone figures for a
+ * batched bundle overstated it by 37-40% at realistic sizes, and since bidToBeat is
+ * (defense - tip) x gas, every bid quoted to a vault operator was inflated by the same margin.
+ *
+ * MEASURED by least-squares over eight real batched transactions on mainnet - Hedo, Graveyard
+ * and two others - covering 2 to 21 actions:
+ *
+ *   fit: 44,298 per payment, 79,489 per audit  (predicts the 21-action batch to 0.6%)
+ *
+ * The fit's own fixed term (168,749) is deliberately NOT used: it averages other operators'
+ * wrappers, and Hedo runs ~19KB of router plus vault against our 2,905 bytes. Ours is measured
+ * separately as GAS_VAULT_OVERHEAD. What transfers between contracts is the PER-ACTION cost,
+ * because that is dominated by the game's own execution rather than by the wrapper.
+ *
+ * Rounded UP from the fit, deliberately. Under-quoting a bid loses the boundary; over-quoting
+ * costs money you get back as a refund on the gas and as a slightly higher bid than needed.
+ * The asymmetry is not close, so the rounding goes one way.
+ *
+ * Validated against our own vault's only live batch to date (1 audit + inline bid, 107,532 gas
+ * on chain): this model says 113,100, i.e. 5% high. That is one observation, and it is a
+ * REVERTED audit - a successful one writes storage a reverted one skips. The epoch-192 boundary
+ * is the first with a real payment inside the vault; recalibrate from that receipt.
+ */
+export const GAS_PER_PAYMENT_BATCHED = 46_000;
+export const GAS_PER_AUDIT_BATCHED = 82_000;
+
+/**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.
  *
  * Builders order by value per gas, so the bar is the rival's DENSITY — (their bid + their
@@ -204,7 +235,9 @@ export function bidToBeat(
  * wrong lever is cheaper.
  */
 export function bundleGas(payments: number, audits: number, batched = false): number {
-  const work = payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
+  const work = batched
+    ? payments * GAS_PER_PAYMENT_BATCHED + audits * GAS_PER_AUDIT_BATCHED
+    : payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
   return work + (batched ? GAS_VAULT_OVERHEAD : GAS_COINBASE_BID_TX);
 }
 

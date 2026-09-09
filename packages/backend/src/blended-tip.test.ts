@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { blendedTipGwei, bidToBeat, tipCostEth, GAS_PER_PAYMENT, GAS_PER_AUDIT } from "@dat-bot/shared";
+import { blendedTipGwei, bidToBeat, tipCostEth, GAS_PER_PAYMENT, GAS_PER_AUDIT, bundleGas } from "@dat-bot/shared";
 
 /**
  * The blended tip the target-analysis panel prices against when payments and audits carry
@@ -62,5 +62,54 @@ describe("blendedTipGwei", () => {
     const blend = blendedTipGwei(1, 1, 400, 500);
     expect(blend).toBeGreaterThan(300);
     expect(bidToBeat(300, blend, 1, 1)).toBe(0);
+  });
+});
+
+/**
+ * Batched gas, and the bid quoted off it.
+ *
+ * bundleGas used the STANDALONE per-action figures for a batch too, so it charged the 21,000
+ * intrinsic once per action instead of once per transaction, and ignored that everything after
+ * the first action hits warm storage. Since bidToBeat is (defense - tip) x gas, a vault
+ * operator was quoted a bid inflated by the same 37-40%.
+ *
+ * The replacement is fitted on eight real batched transactions on mainnet. These pin its shape
+ * and, above all, the direction it errs in: over, never under, because under-quoting a bid
+ * loses the boundary while over-quoting only costs money.
+ */
+describe("batched bundle gas", () => {
+  it("is far cheaper than the same actions sent standalone", () => {
+    // The whole reason for a vault. If these ever converge, batching has stopped paying.
+    for (const [p, a] of [[1, 1], [9, 11], [11, 10]] as const) {
+      expect(bundleGas(p, a, true)).toBeLessThan(bundleGas(p, a, false) * 0.7);
+    }
+  });
+
+  it("matches our own live batch, and errs HIGH against it", () => {
+    // epoch-191, 1 audit + inline bid: 107,532 gas on chain.
+    const modelled = bundleGas(0, 1, true);
+    expect(modelled).toBeGreaterThan(107_532);        // never under-quote
+    expect(modelled).toBeLessThan(107_532 * 1.15);    // but not by a wide margin
+  });
+
+  it("charges intrinsic ONCE, not once per action", () => {
+    // The actual defect. Two payments in a batch must not cost two lots of 21,000 more than
+    // one — if the marginal ever approaches the standalone figure, the old model is back.
+    const marginal = bundleGas(2, 0, true) - bundleGas(1, 0, true);
+    expect(marginal).toBeLessThan(82_875 - 21_000 + 5_000);
+  });
+
+  it("leaves the unbatched path exactly as it was", () => {
+    // Every operator without a vault must see identical numbers; this is the guard that the
+    // batched work did not disturb them.
+    expect(bundleGas(1, 1, false)).toBe(82_875 + 130_409 + 30_550);
+    expect(bundleGas(9, 11, false)).toBe(9 * 82_875 + 11 * 130_409 + 30_550);
+  });
+
+  it("quotes a smaller bid for the same target once batched", () => {
+    const unbatched = bidToBeat(216.6, 10, 9, 11, false);
+    const batched = bidToBeat(216.6, 10, 9, 11, true);
+    expect(batched).toBeLessThan(unbatched);
+    expect(batched).toBeGreaterThan(0);
   });
 });
