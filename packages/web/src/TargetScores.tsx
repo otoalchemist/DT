@@ -603,11 +603,14 @@ export function TargetScores({
               {([["typical", "p50"], ["most blocks", "p90"], ["strongest seen", "max"]] as const).map(
                 ([label, k]) => {
                   const bar = state.leadBar![k];
-                  const bid = bidToBeat(bar, tip, payments, audits);
+                  // batched, like every other bid figure on this panel. Without it the lead
+                  // bar was the one row still priced for a bundle shape a vault operator is
+                  // not sending.
+                  const bid = bidToBeat(bar, tip, payments, audits, batched);
                   return (
                     <span
                       key={k}
-                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid — but that route also tips the CoinbasePayer tx, so its true total is ~${(bid + tipCostEth(tip, payments, audits) + (tip * 30550) / 1e9).toFixed(4)} ETH. The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator. A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid${batched ? "" : " — but that route also tips the CoinbasePayer tx"}, so its true total is ~${(bid + tipCostEth(tip, payments, audits) + (batched ? 0 : (tip * 30550) / 1e9)).toFixed(4)} ETH.${batched ? " With a vault the bid rides inside the batch call, so there is no payer transaction to tip, which is what makes the two routes cost the same here. The tip is still the only lever that works on the ~1 boundary in 10 built by a solo validator." : " The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator."} A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
                     >
                       {label}{" "}
                       <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>
