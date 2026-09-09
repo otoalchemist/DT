@@ -25,7 +25,7 @@ import { invalidateEmigrationRoster } from "./emigration.js";
 import { resolveJitTarget } from "./logic.js";
 import { normalizeAlchemyKey } from "@dat-bot/shared";
 import { accessCodeMatches, accessCodeRequired } from "./access-code.js";
-import { allyGateRequired, checkAllyHolding } from "./ally-gate.js";
+import { allyGateRequired, checkAllyHolding, vaultAddressToStore } from "./ally-gate.js";
 import { startEngine, stopEngine, scheduleJitBoundary, schedulePreBoundaryPay, schedulePreBoundaryAudit, schedulePreBoundaryBundle, scheduleDefenseBoundary, resetJitState, manualPayToCurrent, manualUseBribe, manualAudit, manualAuditAll, scheduleAwayWake, clearAwayTimers } from "./strategy.js";
 import { readOwnedStatuses, readTargets, readEmigrated, readAllies,
   readBigBoys, invalidateLiveCandidates, prewarmTargets } from "./service.js";
@@ -91,6 +91,7 @@ const strategyPatch = z
     coinbaseBidEth: z.number().min(0),
     coinbaseBidAuditOnlyEth: z.number().min(0),
     coinbasePayerAddress: z.string().regex(/^(0x[a-fA-F0-9]{40})?$/, "must be a 0x address or empty"),
+    vaultAddress: z.string().regex(/^(0x[a-fA-F0-9]{40})?$/, "must be a 0x address or empty"),
   })
   .partial();
 
@@ -347,7 +348,26 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post("/api/unlock", async (req, reply) => {
-    const schema = z.object({ passphrase: z.string(), accessCode: z.string().optional() });
+    /**
+     * vaultAddress is accepted HERE and nowhere else in the UI.
+     *
+     * It stays out of the dashboard for a reason that has not changed: the bot sends tax ETH
+     * TO this address, so a browser able to repoint it could redirect real money, and the API
+     * binds to localhost where a hostile page can still reach it. Setting it on unlock is not
+     * the same hole - this request already carries the passphrase and the access code, so the
+     * ability to set it is gated behind a secret an attacker does not have.
+     *
+     * It is here rather than in the panel because of an ordering problem that locked an
+     * operator out of their own bot: the ally gate below asks whether a rostered citizen is
+     * held, and a vaulted one is owned by the CONTRACT. With the address reachable only from
+     * data/config.json, an operator whose last citizen was in the vault could not unlock to
+     * set it, and could not set it without unlocking.
+     */
+    const schema = z.object({
+      passphrase: z.string(),
+      accessCode: z.string().optional(),
+      vaultAddress: z.string().regex(/^(0x[a-fA-F0-9]{40})?$/, "must be a 0x address or empty").optional(),
+    });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
     /**
@@ -382,21 +402,51 @@ export async function buildServer(): Promise<FastifyInstance> {
        * leaves the runtime exactly as locked as it was — no half-open state where the engine
        * could be started against a wallet the gate just rejected.
        *
+       * The VAULT counts as one of "your" addresses. A migrated citizen is owned on-chain by
+       * the CitizenVault, so a wallet-only check reads a fully paid-up team member as a
+       * stranger and locks them out of their own bot — which happened: moving the last citizen
+       * into the vault made the next unlock fail, minutes before a boundary. The vault is only
+       * reachable by its operator, so a rostered citizen inside it is exactly as much proof of
+       * membership as one held directly.
+       *
        * checkAllyHolding never throws and fails open on any indeterminate reading; see
        * ally-gate.ts for why a wrong deny is far more expensive than a wrong allow.
        */
-      const allyVerdict = await checkAllyHolding(wallets.map((w) => w.account.address));
+      /**
+       * Persist a supplied vault address BEFORE the gate reads it - the gate is the thing that
+       * needs it, so saving afterwards would deny this very unlock and change nothing until the
+       * next one.
+       *
+       * An omitted or empty field means LEAVE IT ALONE, never clear it. Unlocking from an older
+       * client, or simply not touching the box, must not silently forget a vault that holds
+       * citizens: the bot would stop seeing them and quietly stop paying them. Clearing stays a
+       * data/config.json operation, which is the same stance the dashboard takes.
+       */
+      const toStore = vaultAddressToStore(parsed.data.vaultAddress, runtime.strategy.vaultAddress);
+      if (toStore) {
+        runtime.saveStrategy({ vaultAddress: toStore });
+        logger.info(`Vault address set at unlock: ${toStore}`);
+      }
+      const vaultForGate = (runtime.strategy.vaultAddress ?? "").trim();
+      const gateAddresses = [
+        ...wallets.map((w) => w.account.address as string),
+        ...(/^0x[a-fA-F0-9]{40}$/.test(vaultForGate) ? [vaultForGate] : []),
+      ];
+      const allyVerdict = await checkAllyHolding(gateAddresses);
       if (!allyVerdict.ok) {
         logger.warn(
-          `Unlock denied by the ally gate: none of ${wallets.length} wallet(s) holds a rostered ` +
-            `citizen (${allyVerdict.checked} live roster entries checked)`,
+          `Unlock denied by the ally gate: none of ${gateAddresses.length} address(es) holds a ` +
+            `rostered citizen (${allyVerdict.checked} live roster entries checked)`,
         );
         return reply.code(403).send({
           error:
             "No allied Citizen found in this wallet. This build is gated to the team: the " +
             "wallet you unlock must hold at least one Citizen on the shared ally roster. If " +
             "you have just joined, ask for your token id to be added to the roster, then " +
-            "restart the bot so it syncs the new list.",
+            "restart the bot so it syncs the new list." +
+            (/^0x[a-fA-F0-9]{40}$/.test(vaultForGate)
+              ? ` Your configured vault (${vaultForGate}) was checked too and holds none either.`
+              : ""),
         });
       }
       if (allyVerdict.reason === "indeterminate") {

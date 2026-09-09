@@ -337,6 +337,17 @@ export interface LeadBar {
   max: number;
 }
 
+/** Whether the configured vault is wired to this bot, and what is wrong if not. */
+export interface VaultStatus {
+  address: string;
+  /** False = the bot will refuse to act on vault-held citizens until it is fixed. */
+  ok: boolean;
+  owner: string | null;
+  operator: string | null;
+  /** Reasons it is unusable, most important first. Empty when ok. */
+  problems: string[];
+}
+
 /** State of the on-demand rival scan behind the dashboard's "Analyze targets" button. */
 /** One epoch's contribution to the prize pool. */
 export interface TreasuryEpochRow {
@@ -696,6 +707,22 @@ export interface StrategyConfig {
   /** Address of the deployed CoinbasePayer forwarder used for coinbaseBidEth. Its
    *  receive() forwards ETH to block.coinbase. Empty = coinbase bidding disabled. */
   coinbasePayerAddress: string;
+  /**
+   * ADVANCED, opt-in. Address of a deployed CitizenVault (contracts/CitizenVault.sol)
+   * holding your citizens, so a whole boundary goes out as ONE transaction with each
+   * action allowed to fail on its own.
+   *
+   * Empty = off, and the bot behaves exactly as it did before this existed: one
+   * transaction per action, signed by whichever wallet holds the citizen.
+   *
+   * When set, the vault is treated as an additional holder — its citizens are owned by
+   * the contract on-chain, and the bot's wallet acts as the vault's `operator`. The
+   * coinbase bid is then paid inside the same call, so coinbasePayerAddress is unused.
+   *
+   * Setting this does NOT move anything. Citizens are yours until you
+   * `safeTransferFrom` them in, and only the vault's cold-key owner can take them out.
+   */
+  vaultAddress: string;
 
   /** Hard cap (ETH) on the value of any single transaction (payments in
    *  particular). A tx whose value exceeds this is skipped, not sent — a
@@ -783,6 +810,15 @@ export interface BotStatus {
   /** Away mode: unix seconds of the next scheduled wake-up, or null when away mode is
    *  off / nothing is armed to wake for. Lets the dashboard count down without polling. */
   awayNextWakeSec: number | null;
+  /**
+   * Result of the CitizenVault wiring check, or null when no vault is configured.
+   *
+   * Surfaced because the failure it catches is otherwise invisible: a vault whose operator
+   * was never pointed at this bot reverts every batch while looking healthy from outside —
+   * it builds, submits, the transaction lands, it reverted. Without this the operator's
+   * first signal is a citizen dying.
+   */
+  vault: VaultStatus | null;
   spentThisEpochWei: string;
   /** Game start time (unix seconds) — lets the UI compute epoch boundaries. */
   startTime: string | null;

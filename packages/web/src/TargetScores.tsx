@@ -22,8 +22,10 @@ const dimmed = (r: TargetScoreRow): boolean => r.uncatchable ?? false;
  * tipCostEth stay exactly as they were: for a bundle, `blend * totalGas` is identically
  * `payTip * payGas + auditTip * auditGas`, so every figure they produce is the true combined
  * one, not an approximation.
+ *
+ * `batched` is orthogonal to both — it changes the bundle's SHAPE, not its price per gas.
  */
-interface Plan { payments: number; audits: number; tipGwei: number; payTipGwei: number; auditTipGwei: number }
+interface Plan { payments: number; audits: number; tipGwei: number; payTipGwei: number; auditTipGwei: number; batched: boolean }
 
 /**
  * Price a beat-bid for THIS plan from the rival's raw defense density.
@@ -36,7 +38,7 @@ interface Plan { payments: number; audits: number; tipGwei: number; payTipGwei: 
  */
 function beatFor(densityGwei: number | null | undefined, plan: Plan): number | null {
   if (densityGwei === null || densityGwei === undefined) return null;
-  return bidToBeat(densityGwei, plan.tipGwei, plan.payments, plan.audits);
+  return bidToBeat(densityGwei, plan.tipGwei, plan.payments, plan.audits, plan.batched);
 }
 
 /**
@@ -363,6 +365,7 @@ export function TargetScores({
   currentEpoch,
   payTipGwei,
   auditTipGwei,
+  batched,
   ownedCitizens,
   auditCapacity,
 }: {
@@ -372,6 +375,11 @@ export function TargetScores({
   /** Configured tip for audits — offensePriorityFeeGwei when separateOffenseGas is on,
    *  otherwise the same payment tip, which is what resolveGas actually does. */
   auditTipGwei: number;
+  /** A vault sends the whole boundary as ONE tx with the bid inline, so there is no
+   *  CoinbasePayer transaction to price — which is the term the tip-vs-bid comparison
+   *  turns on. Without this every figure here is quoted for a bundle shape the operator
+   *  is not sending. */
+  batched: boolean;
   /** Citizens this wallet set holds — the natural payment count for a boundary. */
   ownedCitizens: number;
   /** Sum of auditLimit across them — how many audits a boundary can actually carry. */
@@ -433,8 +441,10 @@ export function TargetScores({
     catch (e) { setErr((e as Error).message); }
   };
 
-  const plan: Plan = { payments, audits, tipGwei: tip, payTipGwei: payTip, auditTipGwei: auditTip };
-  const planGas = bundleGas(payments, audits);
+  const plan: Plan = {
+    payments, audits, tipGwei: tip, payTipGwei: payTip, auditTipGwei: auditTip, batched,
+  };
+  const planGas = bundleGas(payments, audits, batched);
   const running = state?.running ?? false;
   const rows = state?.rows ?? null;
   const pool = rows
@@ -593,11 +603,14 @@ export function TargetScores({
               {([["typical", "p50"], ["most blocks", "p90"], ["strongest seen", "max"]] as const).map(
                 ([label, k]) => {
                   const bar = state.leadBar![k];
-                  const bid = bidToBeat(bar, tip, payments, audits);
+                  // batched, like every other bid figure on this panel. Without it the lead
+                  // bar was the one row still priced for a bundle shape a vault operator is
+                  // not sending.
+                  const bid = bidToBeat(bar, tip, payments, audits, batched);
                   return (
                     <span
                       key={k}
-                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid — but that route also tips the CoinbasePayer tx, so its true total is ~${(bid + tipCostEth(tip, payments, audits) + (tip * 30550) / 1e9).toFixed(4)} ETH. The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator. A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid${batched ? "" : " — but that route also tips the CoinbasePayer tx"}, so its true total is ~${(bid + tipCostEth(tip, payments, audits) + (batched ? 0 : (tip * 30550) / 1e9)).toFixed(4)} ETH.${batched ? " With a vault the bid rides inside the batch call, so there is no payer transaction to tip, which is what makes the two routes cost the same here. The tip is still the only lever that works on the ~1 boundary in 10 built by a solo validator." : " The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator."} A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
                     >
                       {label}{" "}
                       <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>

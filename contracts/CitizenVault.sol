@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * CitizenVault — holds your citizens so the whole boundary can go out as ONE
+ * transaction, with each action allowed to fail on its own.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * payTaxes / audit / useBribe are owner-only on-chain, so a batch of them can only be
+ * sent by whoever HOLDS the citizens. Sending one transaction per action — what the bot
+ * does without a vault — makes failure expensive: a reverted audit burns a full ~81,000
+ * gas transaction and a whole bundle slot. Inside a batch the same failure costs a few
+ * thousand gas of internal call and nothing else, which is what lets an operator fire
+ * speculative audits at all.
+ *
+ * It also removes a race the bot cannot otherwise win: with payments and audits in one
+ * call they execute atomically in submitted order, so a rival audit landing one index
+ * earlier can no longer invalidate a payment that was signed for the pre-audit price.
+ *
+ * WHAT IT DELIBERATELY IS NOT
+ * ---------------------------
+ * No upgrade path, no delegatecall, no generic external call, no owner-settable target.
+ * `run` can only reach the ONE game contract fixed at deployment, through FOUR
+ * allowlisted selectors. A vault that can call anything is a vault that can be talked
+ * into transferring your citizens.
+ *
+ * KEY SPLIT — owner vs operator
+ * -----------------------------
+ * `operator` is the bot's hot wallet. It signs every boundary and its key sits on disk.
+ * It can call `run` and NOTHING else — it can never move a citizen or take ETH out.
+ * `owner` is a cold key you keep offline. It alone can withdraw citizens, sweep ETH, or
+ * change the operator. So the worst case from a stolen bot key is wasted gas and audit
+ * slots, never loss of the citizens themselves. Set them to the same address only if you
+ * accept that trade.
+ *
+ * DEPLOY (Remix, compiler 0.8.20+), constructor args:
+ *   _game      0xa448c7f618087dDa1a3B128cAd8A424fBae4B71F   (DeathAndTaxes)
+ *   _citizens  read `citizens()` off the game contract
+ *   _operator  the bot wallet address shown in the dashboard header
+ * Deploy FROM the cold key — the deployer becomes `owner` permanently.
+ *
+ * Then put the deployed address in the bot's config (Vault address). Move citizens in
+ * with `safeTransferFrom(you, vault, tokenId)`. Move one and run a full epoch before
+ * moving the rest: everything after that is reversible only through `withdrawCitizens`.
+ *
+ * REENTRANCY: none possible. `run` is gated on owner/operator, and the game contract is
+ * neither, so a callback from the game cannot re-enter it. `receive` and
+ * `onERC721Received` change no state. No guard is used because there is nothing to guard
+ * and an unused guard is one more thing a reviewer has to reason about.
+ */
+
+interface IERC721 {
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+}
+
+contract CitizenVault {
+    /// Cold key. Sole authority to withdraw citizens, sweep ETH, or change the operator.
+    address public immutable owner;
+    /// The DeathAndTaxes game. Fixed at deployment — `run` can reach nothing else.
+    address public immutable game;
+    /// The Citizen NFT collection, for withdrawals.
+    address public immutable citizens;
+    /// The bot's hot wallet. May call `run` and nothing else.
+    address public operator;
+
+    /**
+     * One game action.
+     *
+     * `tolerate` is the whole point of the contract: true for speculative work (an audit
+     * whose target a rival may cure first), false for anything that must land or you want
+     * to know immediately (a tax payment). A tolerated failure is recorded and skipped; an
+     * untolerated one reverts the entire batch.
+     */
+    struct Call {
+        bytes data;
+        uint256 value;
+        bool tolerate;
+    }
+
+    /**
+     * Per-action outcome, emitted whether the call succeeded or not.
+     *
+     * A reverted audit emits no `Audited` event, so the game's own logs cannot tell you
+     * which of ten queued actions failed. This can: `index` is the position in the array
+     * the caller submitted, so the bot maps results straight back onto its activity log.
+     */
+    event CallResult(uint256 indexed index, bytes4 indexed selector, bool ok);
+    event OperatorChanged(address indexed previous, address indexed next);
+
+    error NotOwner();
+    error NotAuthorised();
+    error ValueMismatch(uint256 sent, uint256 required);
+    error SelectorNotAllowed(uint256 index, bytes4 selector);
+    error CallFailed(uint256 index);
+    error RefundFailed();
+    error NotAContract(address what);
+    error ZeroAddress();
+    error NotTheCitizenCollection(address collection);
+
+    // Computed from the signatures rather than pasted as hex, so they are checkable by
+    // reading. Verified against mainnet calldata: payTaxes 0x58670017, audit 0x5daba7c0.
+    // payTaxes takes a uint8 epoch count, NOT uint256 — the wrong type here silently
+    // produces a selector that matches nothing and every payment reverts.
+    bytes4 private constant SEL_PAY_TAXES = bytes4(keccak256("payTaxes(uint256,uint8)"));
+    bytes4 private constant SEL_AUDIT = bytes4(keccak256("audit(uint256,uint256)"));
+    bytes4 private constant SEL_USE_BRIBE = bytes4(keccak256("useBribe(uint256)"));
+    bytes4 private constant SEL_KILL = bytes4(keccak256("kill(uint256)"));
+
+    constructor(address _game, address _citizens, address _operator) {
+        // Both MUST be contracts, checked here because getting it wrong is silent and
+        // permanent otherwise. A low-level call to an address with no code SUCCEEDS and
+        // returns true, so a mistyped _game would make every payTaxes report ok while
+        // sending the tax straight to a dead address — the activity log would read
+        // "included", the citizen would go unpaid, and it would be killed on schedule with
+        // nothing anywhere saying why. Verified in the EVM: 0.5 ETH sent, run() returned
+        // success. Failing at deploy is the only place this is cheap to catch.
+        if (_game.code.length == 0) revert NotAContract(_game);
+        if (_citizens.code.length == 0) revert NotAContract(_citizens);
+        owner = msg.sender;
+        game = _game;
+        citizens = _citizens;
+        operator = _operator;
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    /**
+     * Execute a batch of game actions, then optionally pay the block builder.
+     *
+     * `msg.value` must be exactly the sum of the call values plus `bidWei`, so the vault
+     * never needs a standing balance and a miscounted batch fails loudly instead of
+     * quietly spending whatever happened to be sitting here.
+     *
+     * The value of any tolerated call that reverts is refunded to the caller at the end —
+     * a failed audit's fee is never consumed, and leaving it here would slowly accumulate
+     * ETH in a contract whose whole design is to hold none.
+     */
+    function run(Call[] calldata calls, uint256 bidWei) external payable {
+        if (msg.sender != owner && msg.sender != operator) revert NotAuthorised();
+
+        uint256 n = calls.length;
+        uint256 required = bidWei;
+        for (uint256 i; i < n; ) {
+            required += calls[i].value;
+            unchecked { ++i; }
+        }
+        if (msg.value != required) revert ValueMismatch(msg.value, required);
+
+        uint256 refund;
+        for (uint256 i; i < n; ) {
+            Call calldata c = calls[i];
+            bytes4 sel = bytes4(c.data);
+            if (sel != SEL_PAY_TAXES && sel != SEL_AUDIT && sel != SEL_USE_BRIBE && sel != SEL_KILL) {
+                revert SelectorNotAllowed(i, sel);
+            }
+            (bool ok, ) = game.call{ value: c.value }(c.data);
+            if (!ok) {
+                if (!c.tolerate) revert CallFailed(i);
+                refund += c.value;
+            }
+            emit CallResult(i, sel, ok);
+            unchecked { ++i; }
+        }
+
+        // The bid, paid inline rather than from a separate forwarder tx — one fewer
+        // transaction in the bundle, so the same bid buys a higher value-per-gas.
+        //
+        // Result deliberately ignored, exactly as CoinbasePayer._forward does: a builder
+        // whose fee recipient rejects the transfer must never drag the batch down.
+        //
+        // GAS IS BOUNDED, and unlike CoinbasePayer that is load-bearing here. `call(gas(),…)`
+        // forwards 63/64 of what is left, so a fee-recipient CONTRACT that burns everything
+        // returns us 1/64 — and the refund below still needs ~9,700. Running out there
+        // reverts the WHOLE transaction, including payments that already succeeded, which is
+        // the one outcome this contract exists to prevent. CoinbasePayer is safe with an
+        // unbounded forward only because the coinbase call is the last thing it ever does.
+        //
+        // Ignoring the result is not enough on its own: a revert is cheap, exhaustion is not.
+        // 50,000 is far more than a payout splitter needs and cannot starve the epilogue. If
+        // a recipient ever wanted more, the bid simply fails and we lose the slot — losing a
+        // race is recoverable, losing a payment is not.
+        if (bidWei > 0) {
+            assembly {
+                pop(call(50000, coinbase(), bidWei, 0, 0, 0, 0))
+            }
+        }
+
+        if (refund > 0) {
+            (bool sent, ) = msg.sender.call{ value: refund }("");
+            if (!sent) revert RefundFailed();
+        }
+    }
+
+    /// Move citizens back out. Owner only, always available, no conditions — this is the
+    /// exit, and nothing in this contract may ever be able to block it.
+    function withdrawCitizens(uint256[] calldata tokenIds, address to) external onlyOwner {
+        uint256 n = tokenIds.length;
+        for (uint256 i; i < n; ) {
+            IERC721(citizens).safeTransferFrom(address(this), to, tokenIds[i]);
+            unchecked { ++i; }
+        }
+    }
+
+    /// Recover ETH that ended up here (a game refund, or a stray transfer). Owner only.
+    function sweep(address to) external onlyOwner {
+        // address(0) would burn the balance rather than move it. Owner-only and the owner's
+        // own foot, but there is no reason to want it and one line to rule it out.
+        if (to == address(0)) revert ZeroAddress();
+        (bool ok, ) = to.call{ value: address(this).balance }("");
+        if (!ok) revert RefundFailed();
+    }
+
+    /// Rotate the bot wallet — after a key rotation, or to disable batching entirely by
+    /// setting it to the zero address. Owner only.
+    function setOperator(address next) external onlyOwner {
+        emit OperatorChanged(operator, next);
+        operator = next;
+    }
+
+    /// Required for `safeTransferFrom` to accept a citizen into the vault.
+    ///
+    /// Restricted to the citizen collection. `withdrawCitizens` can only move `citizens`, so
+    /// anything else that got in would be stuck here forever, and widening the exit to a
+    /// generic rescue would widen the one surface this contract must keep narrow.
+    ///
+    /// Not airtight, and deliberately not sold as such: a plain `transferFrom` skips this
+    /// hook entirely, so a determined sender can still force an unrelated token in. What this
+    /// stops is the realistic case — an accidental or drive-by `safeTransferFrom` — and it
+    /// costs nothing to stop it.
+    function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
+        if (msg.sender != citizens) revert NotTheCitizenCollection(msg.sender);
+        return this.onERC721Received.selector;
+    }
+
+    /// Accept refunds from the game without reverting. `sweep` recovers anything left.
+    receive() external payable {}
+}

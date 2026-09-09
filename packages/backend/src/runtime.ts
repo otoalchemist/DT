@@ -4,6 +4,7 @@ import type { PrivateKeyAccount } from "viem/accounts";
 import { VERSION, applyThorMode, type BotStatus, type StrategyConfig } from "@dat-bot/shared";
 import { appConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { vaultStatusForUi } from "./vault-preflight.js";
 import { activity } from "./activity.js";
 import { ownershipIndexingAvailable } from "./index-tokens.js";
 import { versionState } from "./version-check.js";
@@ -333,6 +334,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   // block.coinbase). Only used when coinbaseBidEth > 0; deploy your own if you'd
   // rather not share (see contracts/CoinbasePayer.sol).
   coinbasePayerAddress: "0xb69D1Bb4613722bdAb1aA77BA8F4409071f0a815",
+  // Off. Unlike the payer above there is deliberately NO shared default: a vault holds
+  // citizens, so pointing at someone else's would be pointing at their portfolio. Each
+  // operator deploys their own (contracts/CitizenVault.sol) or leaves this empty.
+  vaultAddress: "",
   maxPaymentEth: 0, // 0 = no cap (opt-in guardrail)
 };
 
@@ -419,8 +424,12 @@ export const MIGRATIONS_VERSION = 3;
  * Refreshed to DEFAULT_STRATEGY when the defaults version changes. Everything NOT
  * listed is PRESERVED from the user's saved config — their mode/run-state
  * (enabled, offenseEnabled, endgameOnlyWithin), wallet-side settings
- * (coinbaseBidEth, coinbasePayerAddress), spend guardrails (minBalanceEth,
+ * (coinbaseBidEth, coinbasePayerAddress, vaultAddress), spend guardrails (minBalanceEth,
  * maxPaymentEth), and JIT session (jitEnabled, jitTargetEpoch, jitTokenIds).
+ *
+ * vaultAddress in particular must NEVER be listed below: a defaults bump that cleared it
+ * would silently move a user off their vault, and one that set it would point them at a
+ * contract holding someone else's citizens.
  */
 const RECOMMENDED_FIELDS: (keyof StrategyConfig)[] = [
   "proactivePay", "prepayEpochs", "maxAutoPayEpochs",
@@ -813,6 +822,7 @@ class Runtime {
       citizensAddress: this.citizensAddress,
       lastBlock: this.lastBlock?.toString() ?? null,
       awayNextWakeSec: this.awayNextWakeSec,
+      vault: vaultStatusForUi(),
       spentThisEpochWei: this.spentThisEpochWei().toString(),
       startTime: this.startTime?.toString() ?? null,
       jitEnabled: this.strategy.jitEnabled,

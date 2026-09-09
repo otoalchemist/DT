@@ -12,7 +12,7 @@ const PAYMENT_FIELDS: (keyof StrategyConfig)[] = [
   "offenseDynamicTipEnabled", "offenseDynamicTipMaxGwei",
   "preBoundaryPay", "preBoundaryLeadMs", "preBoundaryLeadMainnetMs",
   "maxAutoPayEpochs", "coinbaseBidEth", "coinbaseBidAuditOnlyEth",
-  "coinbasePayerAddress", "combinedBoundaryBundle",
+  "coinbasePayerAddress", "combinedBoundaryBundle", "vaultAddress",
   // Mirrored from the Strategy panel (see the Offense Gas column). Listed here so this
   // Save lights up for it; the Strategy panel lists it too, so either Save persists it.
   "offenseEnabled",
@@ -145,6 +145,7 @@ export function JitPanel({
         coinbaseBidAuditOnlyEth: config.coinbaseBidAuditOnlyEth,
         coinbasePayerAddress: config.coinbasePayerAddress,
         combinedBoundaryBundle: config.combinedBoundaryBundle,
+        vaultAddress: config.vaultAddress,
         offenseEnabled: config.offenseEnabled,
       });
       onConfigSaved(next);
@@ -610,9 +611,80 @@ export function JitPanel({
                 />
               </label>
             </div>
-            {(config.coinbaseBidEth > 0 || config.coinbaseBidAuditOnlyEth > 0) && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
+            {/* Only meaningful without a vault: with one, the bid is paid inside the batch
+                call and the forwarder is never used, so this warning would be wrong. */}
+            {!config.vaultAddress
+              && (config.coinbaseBidEth > 0 || config.coinbaseBidAuditOnlyEth > 0)
+              && !/^0x[a-fA-F0-9]{40}$/.test(config.coinbasePayerAddress) && (
               <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
                 No CoinbasePayer address configured, so the bid won't fire. Set it in data/config.json.
+              </p>
+            )}
+
+            {/**
+              * Vault address — editable, and always rendered.
+              *
+              * It used to be read-only and hidden unless already set, which made the field
+              * useless for the one job it has: there was no way to enter an address without
+              * editing data/config.json first, and the read-only box only appeared after you
+              * had already done that.
+              *
+              * The reason it was read-only is real, though, so it is not simply dropped. The
+              * bot signs `run()` calls to this address WITH ETH attached, so a repointed vault
+              * is a way to send tax money to a contract someone else wrote. Note the preflight
+              * is not a defence here — a hostile contract can answer owner/operator/game/
+              * citizens with whatever the check wants to see. What actually contains it:
+              *
+              *   - blank is the safe default and stays the default (no shared fallback);
+              *   - it never takes effect from a keystroke, only from an explicit Save;
+              *   - the preflight verdict is shown right here, so a wrong address reads as
+              *     "NOT USABLE" next to the box rather than as silent inaction at a boundary;
+              *   - moving citizens in is a separate, deliberate on-chain transfer, and only
+              *     the vault's cold-key owner can move them out.
+              *
+              * So the exposure is "whoever can reach this dashboard can redirect ETH the bot
+              * spends", which is already true of the bid fields immediately above.
+              */}
+            <div className="row wrap" style={{ gap: 12, alignItems: "flex-end", marginTop: 8 }}>
+              <label className="field" style={{ flex: "2 1 320px" }}>
+                Vault address (batched boundary)
+                <input
+                  type="text"
+                  value={config.vaultAddress}
+                  onChange={(e) => gasField("vaultAddress", e.target.value.trim())}
+                  placeholder="0x… — leave blank to send the boundary as separate transactions"
+                  spellCheck={false}
+                  title="CitizenVault holding your citizens. With one set, the whole boundary goes out as ONE transaction with each action allowed to fail on its own, and the coinbase bid is paid inside that same call. Blank = unchanged behaviour."
+                  style={{ fontFamily: "ui-monospace, monospace", fontSize: 11 }}
+                />
+              </label>
+              {/* The wiring verdict, from the backend preflight. Only meaningful once the
+                  address has been SAVED, so it is suppressed while there are unsaved edits —
+                  otherwise a half-typed address shows a stale green "ready". */}
+              {config.vaultAddress === savedConfig?.vaultAddress && status?.vault ? (
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: 11, alignSelf: "center",
+                    color: status.vault.ok ? "var(--green)" : "var(--red)",
+                  }}
+                  title={status.vault.problems.join(" ")}
+                >
+                  {status.vault.ok ? "vault ready" : "vault NOT usable"}
+                </span>
+              ) : null}
+            </div>
+            {config.vaultAddress !== "" && !/^0x[a-fA-F0-9]{40}$/.test(config.vaultAddress) && (
+              <p className="err" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
+                Not a 20-byte 0x address. Batching stays off until this is valid — Save will reject it.
+              </p>
+            )}
+            {config.vaultAddress !== "" && /^0x[a-fA-F0-9]{40}$/.test(config.vaultAddress)
+              && config.vaultAddress !== savedConfig?.vaultAddress && (
+              <p className="muted" style={{ fontSize: 11, margin: "4px 0 0 0" }}>
+                Not in effect until you Save. The bot will then check the vault's
+                owner/operator/game/citizens and refuse to act on vaulted citizens if any of
+                them is wrong — <b>transfer a citizen in only after this reads "vault ready"</b>.
               </p>
             )}
 

@@ -25,7 +25,9 @@
     "target-scores": "node scripts/target-scores.mjs",
     "race-timing": "node scripts/race-timing.mjs",
     "token-moves": "node scripts/token-moves.mjs",
-    "dry-run-boundary": "node scripts/dry-run-boundary.mjs"
+    "dry-run-boundary": "node scripts/dry-run-boundary.mjs",
+    "vault-move": "node scripts/vault-move.mjs",
+    "vault-check": "node scripts/vault-check.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

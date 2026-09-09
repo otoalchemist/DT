@@ -27,6 +27,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// The rest of this script speaks raw JSON-RPC with no dependencies, deliberately. viem is
+// imported for ONE job: ABI-encoding CitizenVault.run(Call[], uint256). Hand-rolling a dynamic
+// struct array is exactly where a subtle offset bug produces a plausible-looking FALSE PASS,
+// which is the one outcome a dry-run tool must never produce.
+import { encodeFunctionData } from "viem";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dataDir = path.join(root, "data");
@@ -48,6 +53,8 @@ const SEL_AUDIT_LIMIT = "0x9f8a13d7";
 const SEL_AUDITS_USED = "0x2f3b3d9e";
 const SEL_PAY_TAXES = "0x58670017"; // payTaxes(uint256,uint256)
 const SEL_AUDIT = "0x5daba7c0";     // audit(uint256,uint256)
+// CitizenVault.operator() — who will sign run() for a vault-held citizen.
+const SEL_OPERATOR = "0x570ca735";
 const SEL_OWNER_OF = "0x6352211e";
 
 const args = process.argv.slice(2);
@@ -127,15 +134,18 @@ async function ownedTokens(citizens, owner) {
 
 /**
  * Run one action at `atTime` via block overrides. Returns null on success, or the revert.
- * Mirrors simulateAtTimestamp: state overrides are empty, so the wallet's REAL balance
+ * Mirrors simulateAtTimestamp: state overrides are empty, so the signer's REAL balance
  * applies and an underfunded wallet shows up as a failure rather than a false pass.
+ *
+ * `to` is a parameter rather than always GAME because a vault-held citizen is not reached by
+ * calling the game directly — see routeAction.
  */
-async function simulateAt(from, data, valueWei, gas, atTime) {
+async function simulateAt(from, to, data, valueWei, gas, atTime, stateOverride = {}) {
   try {
     await rpc("eth_call", [
-      { from, to: GAME, data, value: hex(valueWei), gas: hex(gas) },
+      { from, to, data, value: hex(valueWei), gas: hex(gas) },
       "latest",
-      {},
+      stateOverride,
       { time: hex(atTime) },
     ]);
     return null;
@@ -147,8 +157,56 @@ async function simulateAt(from, data, valueWei, gas, atTime) {
     if (e.data === undefined && !/revert/i.test(err.message)) {
       return { unsupported: true, message: err.message };
     }
-    return { selector: sel, message: err.message };
+    return { selector: sel, data: typeof e.data === "string" ? e.data : null, message: err.message };
   }
+}
+
+/** Mirrors VAULT_CALL_OVERHEAD_GAS / VAULT_PER_CALL_GAS in strategy.ts. */
+const VAULT_OVERHEAD_GAS = 60_000n;
+const VAULT_PER_CALL_GAS = 145_000n;
+
+/**
+ * Where a single action should actually be sent from and to.
+ *
+ * A vault-held citizen is the whole reason this exists. Simulating `payTaxes` FROM the vault
+ * reproduces nothing the bot will ever send, and it fails for the wrong reason: the vault holds
+ * no ETH by design — every boundary is funded from the operator's `msg.value` — so a direct
+ * call from it reverts OutOfFunds and reads as a broken payment path on a perfectly healthy
+ * setup. That false alarm is what prompted this.
+ *
+ * What the bot really sends is ONE `vault.run([call], bidWei)` signed by the operator, with the
+ * value attached to that outer call. Simulating exactly that also covers the vault's own guards
+ * (authorisation, the selector allowlist, `msg.value == sum + bid`), none of which a direct
+ * game call would touch.
+ *
+ * `tolerate: false` here on purpose: a tolerated call that reverts INSIDE the batch still lets
+ * `run` succeed, so the simulation would report success for an action that did nothing. Marking
+ * it intolerant makes an internal revert surface as an outer revert, which is what we want to
+ * see.
+ */
+function routeAction(holder, gameData, valueWei, gas, vault, operator) {
+  const viaVault = vault && holder && holder.toLowerCase() === vault.toLowerCase();
+  if (!viaVault) return { from: holder, to: GAME, data: gameData, value: valueWei, gas };
+  return {
+    from: operator,
+    to: vault,
+    data: encodeFunctionData({
+      abi: [{
+        type: "function", name: "run", stateMutability: "payable", outputs: [],
+        inputs: [
+          { name: "calls", type: "tuple[]", components: [
+            { name: "data", type: "bytes" }, { name: "value", type: "uint256" }, { name: "tolerate", type: "bool" },
+          ] },
+          { name: "bidWei", type: "uint256" },
+        ],
+      }],
+      functionName: "run",
+      args: [[{ data: gameData, value: valueWei, tolerate: false }], 0n],
+    }),
+    value: valueWei,
+    gas: VAULT_OVERHEAD_GAS + VAULT_PER_CALL_GAS,
+    viaVault: true,
+  };
 }
 
 const REVERTS = {
@@ -156,10 +214,38 @@ const REVERTS = {
   "0x7e273289": "ERC721NonexistentToken — that token is burned",
   "0x042ee60a": "already under audit",
   "0xe72c6951": "not auditable yet at this timestamp",
+  // CitizenVault's own errors. Worth naming because they mean something quite different from a
+  // game revert: the batch never reached the game at all.
+  "0xc589ca3c": "SelectorNotAllowed — the vault refused this call (not one of its four selectors)",
+  "0x626ade30": "ValueMismatch — msg.value did not equal the calls plus the bid",
+  "0x1648fd01": "NotAuthorised — the signer is neither the vault's owner nor its operator",
+  "0xf0c49d44": "RefundFailed — the vault could not return a tolerated call's value",
 };
+/** The vault's "an inner call reverted" error, which HIDES the game's own reason. */
+const SEL_CALL_FAILED = "0x3f9a3b48";
+
 const explain = (r) =>
   r.unsupported ? `RPC does not support block overrides (${r.message.slice(0, 60)})`
+  : r.inner ? `${explain(r.inner)}  (inside vault.run)`
+  : r.selector === SEL_CALL_FAILED ? "CallFailed inside vault.run — inner reason unavailable"
   : `${r.selector ?? "revert"}${REVERTS[r.selector] ? ` — ${REVERTS[r.selector]}` : ""}`;
+
+/**
+ * Recover the real reason behind the vault's CallFailed.
+ *
+ * `tolerate: false` makes an inner revert bubble up as CitizenVault's own `CallFailed(index)`,
+ * which is useless diagnostically — "the audit failed" without saying whether the target cured,
+ * is burned, or was already under audit. Routing through the vault therefore made this tool
+ * WORSE at explaining failures than it was before, which is not a trade worth making.
+ *
+ * So on CallFailed, re-simulate the bare game call directly from the vault, with a balance
+ * override so it does not just fail OutOfFunds. The override is diagnosis-only and never used
+ * for the verdict itself — the verdict already came from the accurate vault-routed run above.
+ */
+async function innerReason(vault, gameData, valueWei, gas, atTime) {
+  const funded = { [vault]: { balance: hex(10n ** 18n) } };
+  return simulateAt(vault, GAME, gameData, valueWei, gas, atTime, funded);
+}
 
 async function main() {
   const startTime = BigInt(await call(SEL_START_TIME));
@@ -175,7 +261,34 @@ async function main() {
     `${((Number(boundaryTs - nowSec)) / 3600).toFixed(2)}h away`);
 
   const wallets = walletsFromKeystore();
-  if (wallets.length === 0) {
+
+  /**
+   * The vault is a HOLDER, not a wallet, so keystore enumeration alone misses everything inside
+   * it. Once a citizen is migrated the tool reported "No citizens found to simulate" — which
+   * reads as "nothing to do" on the very night you most want a dry run.
+   *
+   * `operator` is read off the vault rather than assumed to be the first keystore entry: it is
+   * the address that will actually sign `run`, and if it is not one of ours the simulation would
+   * be signed by an account that cannot authorise the call.
+   */
+  let vault = null, operator = null;
+  try {
+    const v = (JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf8")).vaultAddress ?? "").trim();
+    if (/^0x[a-fA-F0-9]{40}$/.test(v)) {
+      const code = await rpc("eth_getCode", [v, "latest"]);
+      if (code && code !== "0x") {
+        vault = v.toLowerCase();
+        operator = "0x" + (await rpc("eth_call", [{ to: v, data: SEL_OPERATOR }, "latest"])).slice(26);
+        const known = wallets.includes(operator.toLowerCase());
+        console.log(`vault      ${vault}  operator ${operator}${known ? "" : "  (NOT in this keystore — the bot could not sign)"}`);
+      } else {
+        console.log(`vault      ${v} has no code — ignoring it`);
+      }
+    }
+  } catch { /* no config, or unreadable — carry on walletless */ }
+
+  const holders = vault ? [...wallets, vault] : wallets;
+  if (holders.length === 0) {
     console.error("\nNo wallet address found in data/. Pass --tokens and it will use the on-chain owner.");
   }
 
@@ -184,7 +297,7 @@ async function main() {
   if (tokensArg) {
     owned = tokensArg.split(",").map((s) => BigInt(s.trim())).filter((x) => x > 0n);
   } else {
-    for (const a of wallets) {
+    for (const a of holders) {
       const ids = await ownedTokens(citizens, a);
       if (ids === null) {
         console.error("\nAlchemy NFT API unavailable — rerun with --tokens 2036,5852");
@@ -218,10 +331,19 @@ async function main() {
       continue;
     }
     const value = 1n * targetEpoch * BASE_TAX_RATE_WEI;
-    const r = await simulateAt(from, SEL_PAY_TAXES + w(id) + w(1), value, GAS_PER_PAYMENT, boundaryTs);
+    const route = routeAction(from, SEL_PAY_TAXES + w(id) + w(1), value, GAS_PER_PAYMENT, vault, operator);
+    if (route.viaVault && !operator) {
+      console.log(`  #${String(id).padEnd(5)} | ${String(targetEpoch - lep).padEnd(13)} | ${eth(value)} ETH    | skipped: vault operator unreadable`);
+      continue;
+    }
+    const r = await simulateAt(route.from, route.to, route.data, route.value, route.gas, boundaryTs);
+    // Unmask the vault: CallFailed alone would not say WHY the payment failed.
+    if (r && r.selector === SEL_CALL_FAILED && route.viaVault) {
+      r.inner = await innerReason(vault, SEL_PAY_TAXES + w(id) + w(1), value, GAS_PER_PAYMENT, boundaryTs);
+    }
     const verdict = r === null ? "WOULD SUCCEED" : `WOULD REVERT: ${explain(r)}`;
     if (r !== null) payFail++;
-    console.log(`  #${String(id).padEnd(5)} | ${String(targetEpoch - lep).padEnd(13)} | ${eth(value)} ETH    | ${verdict}`);
+    console.log(`  #${String(id).padEnd(5)} | ${String(targetEpoch - lep).padEnd(13)} | ${eth(value)} ETH    | ${verdict}${route.viaVault ? "  [via vault.run]" : ""}`);
   }
 
   // --- audits: eligible auditors x pinned/auditable targets ---
@@ -238,7 +360,9 @@ async function main() {
       console.log("  no usable auditor citizen");
     } else {
       const aDue = await tryCall(SEL_AUDIT_DUE + w(auditor));
-      console.log(`  auditing from #${auditor}${aDue && aDue !== 0n ? "  (NOTE: itself under audit — the bot would skip it)" : ""}`);
+      const aRoute = routeAction(from, "0x", 0n, 0n, vault, operator);
+      console.log(`  auditing from #${auditor}${aRoute.viaVault ? " (held in the vault, so via vault.run)" : ""}` +
+        `${aDue && aDue !== 0n ? "  (NOTE: itself under audit — the bot would skip it)" : ""}`);
       console.log("  target | result");
       for (const t of pinned) {
         const lep = await tryCall(SEL_LAST_EPOCH_PAID + w(t));
@@ -248,7 +372,12 @@ async function main() {
           console.log(`   #${String(t).padEnd(6)} | skipped: lastEpochPaid ${lep}, needs <= ${targetEpoch - 2n} at epoch ${targetEpoch}`);
           continue;
         }
-        const r = await simulateAt(from, SEL_AUDIT + w(auditor) + w(t), AUDIT_COST_WEI, PRE_BOUNDARY_OFFENSE_GAS, boundaryTs);
+        const route = routeAction(from, SEL_AUDIT + w(auditor) + w(t), AUDIT_COST_WEI, PRE_BOUNDARY_OFFENSE_GAS, vault, operator);
+        if (route.viaVault && !operator) { console.log(`   #${String(t).padEnd(6)} | skipped: vault operator unreadable`); continue; }
+        const r = await simulateAt(route.from, route.to, route.data, route.value, route.gas, boundaryTs);
+        if (r && r.selector === SEL_CALL_FAILED && route.viaVault) {
+          r.inner = await innerReason(vault, SEL_AUDIT + w(auditor) + w(t), AUDIT_COST_WEI, PRE_BOUNDARY_OFFENSE_GAS, boundaryTs);
+        }
         console.log(`   #${String(t).padEnd(6)} | ${r === null ? "WOULD SUCCEED" : `WOULD REVERT: ${explain(r)}`}`);
       }
     }

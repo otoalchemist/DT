@@ -40,6 +40,25 @@ import { resolveCitizensAddress, filterLiveTokenIds } from "./contract.js";
  * the escape hatch if the roster is ever wrong about a real member.
  */
 
+/**
+ * Which vault address an unlock should STORE, or null to leave the stored one alone.
+ *
+ * Lives here beside the gate because the two are one decision: the gate has to see the vault
+ * to count a migrated citizen, and the unlock is the only place the address can arrive in time
+ * for it.
+ *
+ * "Omitted means leave it alone" is the rule worth being careful about. Unlocking from an older
+ * client, or simply not touching the box, must never clear a vault that is holding citizens —
+ * the bot would stop seeing them, stop paying them, and say nothing. Clearing stays a
+ * data/config.json edit, which is the same stance the dashboard takes on this field.
+ */
+export function vaultAddressToStore(supplied: string | undefined, stored: string | undefined): string | null {
+  const next = (supplied ?? "").trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(next)) return null;          // absent, blank or malformed
+  if (next.toLowerCase() === (stored ?? "").trim().toLowerCase()) return null; // unchanged
+  return next;
+}
+
 /** True unless a fork or a dev machine has switched the gate off. */
 export function allyGateRequired(): boolean {
   return process.env.BOT_ALLY_GATE_OFF !== "1";

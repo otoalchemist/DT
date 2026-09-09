@@ -674,6 +674,42 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
           </div>
         </div>
 
+        {/*
+          Vault wiring. Rendered ABOVE the stats and only when a vault is configured, because
+          the failure it reports is otherwise invisible: a vault whose operator was never
+          pointed at this bot reverts every batch while looking completely healthy from the
+          outside — it builds, it submits, the transaction lands, it reverted. The bot refuses
+          to act in that state rather than burn gas, so without a banner the only symptom is
+          the engine quietly doing nothing until a citizen dies.
+        */}
+        {status?.vault ? (
+          <div
+            className="panel"
+            style={{
+              borderColor: status.vault.ok ? "var(--green)" : "var(--red)",
+              borderWidth: status.vault.ok ? 1 : 2,
+            }}
+          >
+            <div className="row wrap" style={{ gap: 12, alignItems: "baseline" }}>
+              <span style={{ fontWeight: 600, color: status.vault.ok ? "var(--green)" : "var(--red)" }}>
+                {status.vault.ok ? "Vault ready — boundary sends as one transaction" : "VAULT NOT USABLE — the bot will not act on vault-held citizens"}
+              </span>
+              <span className="mono muted" style={{ fontSize: 11 }}>{status.vault.address}</span>
+            </div>
+            {status.vault.ok ? (
+              <p className="muted" style={{ fontSize: 11, margin: "6px 0 0 0", lineHeight: 1.5 }}>
+                Operator <span className="mono">{status.vault.operator ?? "—"}</span> (this bot) may batch;
+                owner <span className="mono">{status.vault.owner ?? "—"}</span> alone can withdraw citizens or
+                sweep ETH. The bid is paid inside the batch, so no CoinbasePayer transaction is sent.
+              </p>
+            ) : (
+              <ul style={{ fontSize: 12, margin: "8px 0 0 0", paddingLeft: 18, lineHeight: 1.6 }}>
+                {status.vault.problems.map((p) => (<li key={p} className="err">{p}</li>))}
+              </ul>
+            )}
+          </div>
+        ) : null}
+
         <div className="panel">
           <div className="row wrap" style={{ gap: 28 }}>
             <div className="stat"><span className="label">Balance</span><span className="value">{weiToEth(status?.balanceWei ?? null)} ETH</span></div>
@@ -716,12 +752,20 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
                       className="muted"
                       style={{ fontSize: 11 }}
                       title={
-                        t.walletAddress
-                          ? `Held by ${t.walletLabel} (${t.walletAddress}). Paying or auditing this citizen is owner-only on-chain, so it is signed by — and spends gas from — this wallet.`
-                          : undefined
+                        /* The vault is a CONTRACT, so the usual wording would be wrong twice
+                           over: it does not sign and it does not hold the gas. The whole point
+                           of the owner/operator split is that the signer and the holder are
+                           different, so say which is which. */
+                        !t.walletAddress
+                          ? undefined
+                          : t.walletLabel === "vault"
+                            ? `Held by the CitizenVault (${t.walletAddress}). The contract is the on-chain owner, so payments and audits are made BY it — signed by the bot wallet as its operator, and funded from that wallet. Only the vault's cold owner key can move this citizen out.`
+                            : `Held by ${t.walletLabel} (${t.walletAddress}). Paying or auditing this citizen is owner-only on-chain, so it is signed by — and spends gas from — this wallet.`
                       }
                     >
-                      {t.walletLabel ?? "—"}
+                      {t.walletLabel === "vault"
+                        ? <span className="badge" title="Batched: the whole boundary goes out as one transaction.">vault</span>
+                        : (t.walletLabel ?? "—")}
                     </td>
                     <td>{current
                       ? <span className="badge on">current</span>
@@ -827,6 +871,7 @@ Mid-epoch work is still missed: kill deadlines fall 24h after an audit, not on a
           // one slot, so a wallet's real capacity is usually above its citizen count.
           // Falls back to 1 per citizen for rows read before auditLimit was fetched.
           auditCapacity={auditCapacity}
+          batched={!!config?.vaultAddress}
         />
 
         <div className="spacer" />

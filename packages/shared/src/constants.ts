@@ -155,6 +155,55 @@ export const GAS_PER_AUDIT = 130_409;
 export const GAS_COINBASE_BID_TX = 30_550;
 
 /**
+ * Fixed cost of the one transaction a vault boundary sends: the 21,000 intrinsic every
+ * transaction pays, plus the run() wrapper itself — dispatch, the value check, the loop, the
+ * per-call CallResult logs, the refund and the inline coinbase transfer.
+ *
+ * MEASURED, twice, by different methods that agree:
+ *   - mainnet fork (VAULT-STATUS, block 25780106): 10,100 execution for bid-only, 0 calls
+ *   - the EVM harness in citizen-vault.test.ts: 35,100, of which 25,000 is cold-account
+ *     creation for a block.coinbase this EVM has never seen and mainnet always has
+ * So ~10,100 of wrapper, + 21,000 intrinsic = 31,100.
+ *
+ * Was 60,000, sized off the gas LIMIT the bot signs with — which is a different quantity and
+ * deliberately generous (see VAULT_CALL_OVERHEAD_GAS in strategy.ts). Using it here inflated
+ * every batched density figure by ~29,000 gas of transaction that does not exist, which makes
+ * a batched bundle look denser to price and therefore under-bids it.
+ */
+export const GAS_VAULT_OVERHEAD = 31_100;
+
+/**
+ * Per-action gas INSIDE a batch, which is a different number from the standalone one.
+ *
+ * GAS_PER_PAYMENT and GAS_PER_AUDIT are measured from standalone transactions, so each carries
+ * its own 21,000 of intrinsic gas. A batch pays intrinsic ONCE, and every action after the
+ * first hits storage the previous ones already warmed. Using the standalone figures for a
+ * batched bundle overstated it by 37-40% at realistic sizes, and since bidToBeat is
+ * (defense - tip) x gas, every bid quoted to a vault operator was inflated by the same margin.
+ *
+ * MEASURED by least-squares over eight real batched transactions on mainnet - Hedo, Graveyard
+ * and two others - covering 2 to 21 actions:
+ *
+ *   fit: 44,298 per payment, 79,489 per audit  (predicts the 21-action batch to 0.6%)
+ *
+ * The fit's own fixed term (168,749) is deliberately NOT used: it averages other operators'
+ * wrappers, and Hedo runs ~19KB of router plus vault against our 2,905 bytes. Ours is measured
+ * separately as GAS_VAULT_OVERHEAD. What transfers between contracts is the PER-ACTION cost,
+ * because that is dominated by the game's own execution rather than by the wrapper.
+ *
+ * Rounded UP from the fit, deliberately. Under-quoting a bid loses the boundary; over-quoting
+ * costs money you get back as a refund on the gas and as a slightly higher bid than needed.
+ * The asymmetry is not close, so the rounding goes one way.
+ *
+ * Validated against our own vault's only live batch to date (1 audit + inline bid, 107,532 gas
+ * on chain): this model says 113,100, i.e. 5% high. That is one observation, and it is a
+ * REVERTED audit - a successful one writes storage a reverted one skips. The epoch-192 boundary
+ * is the first with a real payment inside the vault; recalibrate from that receipt.
+ */
+export const GAS_PER_PAYMENT_BATCHED = 46_000;
+export const GAS_PER_AUDIT_BATCHED = 82_000;
+
+/**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.
  *
  * Builders order by value per gas, so the bar is the rival's DENSITY — (their bid + their
@@ -166,15 +215,30 @@ export function bidToBeat(
   ourTipGwei: number,
   payments: number,
   audits: number,
+  batched = false,
 ): number {
-  const gas = payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
   if (defenseGwei <= ourTipGwei) return 0;
-  return ((defenseGwei - ourTipGwei) * gas) / 1e9;
+  return ((defenseGwei - ourTipGwei) * bundleGas(payments, audits, batched)) / 1e9;
 }
 
-/** Total gas of a bundle carrying `payments` payments, `audits` audits and the bid tx. */
-export function bundleGas(payments: number, audits: number): number {
-  return payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT + GAS_COINBASE_BID_TX;
+/**
+ * Total gas of the bundle a bid is spread across.
+ *
+ * `batched` selects the SHAPE, which differs in a way that matters to every figure priced
+ * off it. Without a vault the bundle is N transactions plus a separate CoinbasePayer tx
+ * carrying the bid. With one it is a SINGLE transaction: the payer tx does not exist, so
+ * its ~30,550 gas is not paid, and the vault's own wrapper overhead is paid instead.
+ *
+ * Getting this wrong is not cosmetic. It is the term the whole tip-versus-bid comparison
+ * turns on: the documented ~0.0133 ETH advantage of the tip route IS the payer tx priced at
+ * defense density, so a batched operator reading the unbatched number is being told the
+ * wrong lever is cheaper.
+ */
+export function bundleGas(payments: number, audits: number, batched = false): number {
+  const work = batched
+    ? payments * GAS_PER_PAYMENT_BATCHED + audits * GAS_PER_AUDIT_BATCHED
+    : payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
+  return work + (batched ? GAS_VAULT_OVERHEAD : GAS_COINBASE_BID_TX);
 }
 
 /**
@@ -455,21 +519,74 @@ export const THOR_FIELDS = Object.keys(THOR_OVERRIDES) as (keyof typeof THOR_OVE
 /** Fold the overrides into a config. Identity when Thor Mode is off, so it is safe to call
  *  on every load and save. */
 export function applyThorMode<T extends StrategyConfig>(s: T): T {
-  return s.thorMode ? { ...s, ...THOR_OVERRIDES } : s;
+  // thorOverridesFor, not THOR_OVERRIDES: with a vault configured it withholds the two flags
+  // that would degrade it, so turning Thor Mode on can never split a vault boundary in two.
+  return s.thorMode ? { ...s, ...thorOverridesFor(s) } : s;
 }
 
 /** True when the stored config already matches every override — i.e. Thor Mode is not just
  *  on but actually in effect. Used by the UI to prove the switch did what it says. */
 export function thorModeSettled(s: StrategyConfig): boolean {
-  return THOR_FIELDS.every((k) => s[k] === THOR_OVERRIDES[k]);
+  // Judged against the overrides that ACTUALLY apply to this config. Comparing against the
+  // full table would report a vault operator as never settled, because the two flags it
+  // withholds are precisely the ones left at the operator own values.
+  const applies = thorOverridesFor(s) as Record<string, unknown>;
+  return Object.keys(applies).every((k) => (s as unknown as Record<string, unknown>)[k] === applies[k]);
+}
+
+/** Is a CitizenVault configured and shaped like an address? */
+export function hasVault(s: Pick<StrategyConfig, "vaultAddress">): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test((s.vaultAddress ?? "").trim());
+}
+
+/**
+ * Thor Mode's overrides FOR A GIVEN CONFIG, because two of them stop making sense once a
+ * vault holds the citizens.
+ *
+ * `combinedBoundaryBundle: false` is the harmful one. Splitting exists to stop a cheap audit
+ * tip diluting an expensive payment tip, by giving each half its own bundle and its own bid.
+ * A vault removes the premise: payment and audits become ONE call with one tip, one bid, and
+ * ordering guaranteed by the contract instead of by nonce sequencing. Split, the same boundary
+ * costs two transactions, two coinbase bids, and puts the audit call on a nonce above an
+ * unmined payment — strictly worse on every axis the split was meant to improve.
+ *
+ * `auditBundleAllOrNothing: true` is inert once fused (the combined path deliberately ignores
+ * it, so a cured target can never drop a payment sharing the batch) but it is still dropped
+ * here, because leaving a flag set that has no effect is how an operator ends up reasoning
+ * about behaviour they do not have.
+ *
+ * The other four are kept: `mirrorAudits` and `racePublicMempool` never reach the vault path
+ * at all — flushVaultBatch calls submitTx directly with `race: hasPayment` — and the two
+ * payment flags still decide per-call tolerance inside the batch.
+ */
+export function thorOverridesFor(
+  s: Pick<StrategyConfig, "vaultAddress">,
+): Partial<typeof THOR_OVERRIDES> {
+  if (!hasVault(s)) return THOR_OVERRIDES;
+  const { combinedBoundaryBundle: _c, auditBundleAllOrNothing: _a, ...rest } = THOR_OVERRIDES;
+  return rest;
 }
 
 export function boundaryBundleMode(
   s: Pick<
     StrategyConfig,
-    "combinedBoundaryBundle" | "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress"
+    "combinedBoundaryBundle" | "coinbaseBidEth" | "coinbaseBidAuditOnlyEth" | "coinbasePayerAddress" | "vaultAddress"
   >,
 ): BoundaryBundleMode {
+  /**
+   * A vault is ALWAYS fused, whatever the toggle says.
+   *
+   * Not a preference — a derivation. The vault makes the whole boundary one `run()` call, so
+   * there is no second bundle for a split to rank separately and nothing for a second bid to
+   * buy. Honouring the toggle here would hand a vault operator two transactions and two bids
+   * for strictly less than one, and would let Thor Mode silently degrade the vault it runs
+   * alongside.
+   *
+   * Note this drops the bid requirement too. Without a vault, fusing only buys something when
+   * there is a bid to share, hence `anyBid`. With one, fusing buys a single transaction whether
+   * or not a bid is configured.
+   */
+  if (hasVault(s)) return "fused";
   const anyBid = coinbaseBidFundedFor(s, "payment") || coinbaseBidFundedFor(s, "audit");
   return s.combinedBoundaryBundle && anyBid ? "fused" : "split";
 }

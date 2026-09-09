@@ -24,3 +24,6 @@ data/.update-manifest.json
 data/flashbots-signer.key
 data/*.keystore.json
 keystore/
+
+# Local contract build output (bytecode/ABI for a manual deploy)
+build/
