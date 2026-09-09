@@ -261,6 +261,9 @@ export function Config({
 
   const num = (k: keyof StrategyConfig) => (e: React.ChangeEvent<HTMLInputElement>) =>
     set(k, Number(e.target.value) as never);
+  /** A CitizenVault changes what several of these switches mean, and silences one entirely. */
+  const vaulted = /^0x[a-fA-F0-9]{40}$/.test((cfg.vaultAddress ?? "").trim());
+
   const chk = (k: keyof StrategyConfig) => (e: React.ChangeEvent<HTMLInputElement>) =>
     set(k, e.target.checked as never);
 
@@ -477,12 +480,17 @@ export function Config({
             cured inside the block, once at tx index 0 on a 10 gwei tip.
           </span>
         </label>
-        <label className="check">
+        <label className="check" style={{ opacity: vaulted ? 0.55 : 1 }}>
           <input
             type="checkbox"
             checked={cfg.auditBundleAllOrNothing}
             onChange={chk("auditBundleAllOrNothing")}
-            disabled={!cfg.offenseEnabled || !cfg.autoAudit || cfg.thorMode}
+            /* Disabled with a vault because it has NO effect there, not merely a smaller one.
+               A vault is always fused, and the fused path sets audit tolerance from
+               "is a payment or an audit bid present" and deliberately ignores this flag. A
+               switch that can be toggled while changing nothing is worse than a missing one:
+               it invites reasoning about behaviour you do not have. */
+            disabled={!cfg.offenseEnabled || !cfg.autoAudit || cfg.thorMode || vaulted}
           />
           Drop the audit bundle rather than pay for a reverting audit
           <span className="hint" style={{ display: "block" }}>
@@ -492,6 +500,15 @@ export function Config({
             succeeded with it, and a cure inside the block cannot be simulated in advance.
             Only ever applies to a <b>split</b> boundary, where audits have their own bundle —
             fused with a payment they stay revert-tolerant so they can never drop it.
+            {vaulted && (
+              <>
+                {" "}
+                <b>No effect while a vault is configured:</b> a vault is always fused, and a
+                reverting audit there costs a few thousand gas of internal call instead of a
+                whole transaction — which is the reason the vault exists, so it is never traded
+                away.
+              </>
+            )}
           </span>
         </label>
         {/* The payment pair. Deliberately last and deliberately labelled as the dangerous
@@ -528,6 +545,27 @@ export function Config({
             {cfg.mirrorPayments
               ? " Unavailable while payments mirror: the dropped bundle's transactions still reach the chain and still revert, so the gas is spent anyway."
               : " Active, because payments are no longer mirrored."}
+            {/* Deliberately NOT disabled for a vault, unlike the audit version above: this one
+                still reaches the batch. It sets each payment's per-call tolerance inside
+                run(), and the gate is 2+ owing citizens either way — so it is inert at one
+                citizen for a reason that has nothing to do with the vault. Saying "no effect"
+                here would be false. */}
+            {vaulted && (
+              <>
+                {" "}
+                <b>With a vault this reads differently.</b> There is one bundle carrying
+                everything, and the builder already drops it whole if the batch reverts — that
+                part is not optional. What this actually sets is whether one citizen may fail
+                <i> inside</i> the batch without taking its siblings. It does nothing until you
+                have <b>2 or more citizens owing</b>; a lone payment is always must-land.
+                {" "}
+                <b>Recommended OFF with a vault at 2+ citizens:</b> a reverting payment there
+                costs a few thousand gas rather than a whole transaction, so the coarse trade
+                that justifies this without a vault stops paying for itself — leaving it on
+                means one already-current or freshly-audited citizen costs every sibling its
+                boundary block.
+              </>
+            )}
           </span>
         </label>
         <label className="check">

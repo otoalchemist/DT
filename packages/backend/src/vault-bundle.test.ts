@@ -349,3 +349,81 @@ describe("a fused vault batch spends exactly one bid", () => {
     expect(msgValue - calls.reduce((s, c) => s + c.value, 0n)).toBe(bidWei);
   });
 });
+
+/**
+ * What the two all-or-nothing switches actually do to a vault batch.
+ *
+ * The Config panel now tells the operator that one of them has NO effect with a vault and that
+ * the other means something different. Both of those are claims about behaviour, so they are
+ * pinned here rather than left as prose that can quietly stop being true.
+ *
+ * NOT covered here: that the OUTER transaction stays all-or-nothing whatever either switch says.
+ * flushVaultBatch hard-codes `revertible: false` with no input wired to it, and this harness
+ * captures at signTransaction rather than at the bundle post — it makes no fetch calls at all,
+ * so revertingTxHashes is not observable. A version of that case written to pass here would
+ * assert nothing, so it is deliberately absent rather than weakened.
+ */
+describe("the all-or-nothing switches, against a vault", () => {
+  const PAY_SEL = "0x11111111";
+  const AUDIT_SEL = "0x22222222";
+  /** Fire once and hand back the decoded batch, clearing the wire first. */
+  const fireOnce = async () => {
+    signed.length = 0;
+    await firePreBoundaryBundle();
+    return decodedBatch();
+  };
+  const kindsOf = (calls: { data: string; tolerate: boolean }[]) =>
+    calls.map((c) => ({ sel: c.data.slice(0, 10), tolerate: c.tolerate }));
+
+  it("auditBundleAllOrNothing changes NOTHING — the batches are identical", async () => {
+    /**
+     * The claim the panel makes when it greys this out. A vault is always fused, and the fused
+     * path sets audit tolerance from "is a payment or an audit bid present", deliberately
+     * ignoring this flag — so both settings must produce byte-identical calls.
+     */
+    runtime.strategy = { ...runtime.strategy, auditBundleAllOrNothing: false };
+    const off = await fireOnce();
+    runtime.strategy = { ...runtime.strategy, auditBundleAllOrNothing: true };
+    const on = await fireOnce();
+
+    // Non-vacuity first: there must BE audits in the batch, or "identical" is trivial.
+    expect(off.calls.filter((c) => c.data.startsWith(AUDIT_SEL)).length).toBeGreaterThan(0);
+    expect(kindsOf(on.calls)).toEqual(kindsOf(off.calls));
+    expect(on.bidWei).toBe(off.bidWei);
+    expect(on.msgValue).toBe(off.msgValue);
+  });
+
+  it("keeps audits tolerant either way, so a cured target cannot drop the payments", async () => {
+    // The property that makes the flag safe to ignore: this is the whole reason the vault
+    // exists, so it is never traded away.
+    for (const flag of [false, true]) {
+      runtime.strategy = { ...runtime.strategy, auditBundleAllOrNothing: flag };
+      const { calls } = await fireOnce();
+      const audits = calls.filter((c) => c.data.startsWith(AUDIT_SEL));
+      expect(audits.length).toBeGreaterThan(0);
+      expect(audits.every((c) => c.tolerate)).toBe(true);
+    }
+  });
+
+  it("paymentBundleAllOrNothing DOES reach the batch at 2+ owing citizens", async () => {
+    /**
+     * The contrast, and the reason this one is NOT greyed out. It sets each payment's per-call
+     * tolerance inside run(). Five citizens owe here, so the 2+ gate is open.
+     *
+     * ON  -> intolerant: one reverting citizen reverts run(), the builder drops the whole batch.
+     * OFF -> tolerant: that citizen goes unpaid and its siblings still land.
+     */
+    runtime.strategy = { ...runtime.strategy, mirrorPayments: false, paymentBundleAllOrNothing: true };
+    const strict = await fireOnce();
+    const strictPays = strict.calls.filter((c) => c.data.startsWith(PAY_SEL));
+    expect(strictPays.length).toBeGreaterThan(1); // the 2+ gate is genuinely open
+    expect(strictPays.every((c) => !c.tolerate)).toBe(true);
+
+    runtime.strategy = { ...runtime.strategy, paymentBundleAllOrNothing: false };
+    const lenient = await fireOnce();
+    const lenientPays = lenient.calls.filter((c) => c.data.startsWith(PAY_SEL));
+    expect(lenientPays).toHaveLength(strictPays.length);
+    expect(lenientPays.every((c) => c.tolerate)).toBe(true);
+  });
+
+});
