@@ -173,45 +173,59 @@ export const GAS_COINBASE_BID_TX = 30_550;
 export const GAS_VAULT_OVERHEAD = 31_100;
 
 /**
- * Per-action gas INSIDE a batch, which is a different number from the standalone one.
+ * Cold-start premium a batch pays ON TOP of GAS_VAULT_OVERHEAD, before any per-action cost.
  *
- * GAS_PER_PAYMENT and GAS_PER_AUDIT are measured from standalone transactions, so each carries
- * its own 21,000 of intrinsic gas. A batch pays intrinsic ONCE, and actions after the first hit
- * storage the previous ones already warmed. Using the standalone figures for a batched bundle
- * overstates it, and since bidToBeat is (defense - tip) x gas, every bid quoted to a vault
- * operator is inflated by the same margin.
+ * GAS_VAULT_OVERHEAD is measured with ZERO game calls in the batch, so it sees none of the
+ * game contract's storage. The first payTaxes and the first audit each touch slots nothing has
+ * warmed - the epoch, the fee config, the citizen record - and every later call in the same
+ * transaction reuses them. That premium is real, is paid once, and does not scale, so it
+ * belongs in the fixed term rather than smeared across the per-action figures.
  *
- * CALIBRATED ON OUR OWN VAULT, from the epoch-192 boundary receipt - the first batch we have
- * ever sent that carried a real payment and had every call succeed:
- *
- *   0x51586c79...43eb1e, block 25943258: 1 payment + 1 audit, both ok, 196,543 gas
- *     intrinsic 21,000 + 3,000 calldata = 24,000
- *     execution                          = 172,543
- *
- * Holding GAS_VAULT_OVERHEAD at its separately measured 31,100 leaves 165,443 for the two
- * actions, split on the standalone ratio (each minus its own intrinsic: 61,875 payment to
- * 109,409 audit) and rounded UP: 60,000 and 106,000. That predicts the receipt at 197,100,
- * i.e. 0.3% high.
- *
- * THIS REPLACES A FIT ON OTHER OPERATORS' BATCHES (44,298 / 79,489, from eight mainnet
- * transactions of 2 to 21 actions). That fit was not wrong - it predicted Graveyard's
- * 21-action batch to 0.6% - but it under-quoted OURS by 19%: it says 159,100 where the chain
- * says 196,543. The gap is batch SIZE. Their per-action average is dominated by warm storage
- * across many calls; a two-call batch warms almost nothing, so each action costs close to its
- * standalone price minus the intrinsic it no longer pays.
- *
- * The model has one constant per action and therefore cannot be right at both ends. It is
- * calibrated to the small end because that is what this bot sends - a vault holding a handful
- * of citizens fires 1-4 calls - and because erring high is the safe direction: under-quoting a
- * bid loses the boundary, over-quoting costs a refundable margin. An operator batching 10+
- * actions will be over-quoted here, by roughly the same 20% these figures used to be under by.
- *
- * The epoch-191 batch (107,532 gas, 1 audit) is NOT a calibration point: its audit REVERTED,
- * and a reverted call skips the storage writes a successful one pays for. It bounds the
- * successful figure from below, nothing more.
+ * Deriving it is the point: 196,543 measured, minus 42,000 + 90,000 of per-action cost below,
+ * minus the 31,100 wrapper, leaves 33,500.
  */
-export const GAS_PER_PAYMENT_BATCHED = 60_000;
-export const GAS_PER_AUDIT_BATCHED = 106_000;
+export const GAS_VAULT_COLD_START = 33_500;
+
+/**
+ * MARGINAL gas per action inside a batch - the cost of one MORE payment or audit in a
+ * transaction that already has some. Not the cost of the first one; that premium lives in
+ * GAS_VAULT_COLD_START above.
+ *
+ * MEASURED as a slope on two independent operators' real mainnet batches at boundaries
+ * 182-192, which is the only way to see a marginal at all - it needs batches that differ in
+ * exactly one action count:
+ *
+ *   Graveyard (0x91baec4d), payments pinned at 11 across every batch:
+ *     1 audit    696,247      2 audits   733,813
+ *     9 audits 1,353,712      9 audits 1,353,724   (12 gas apart, two epochs)
+ *    10 audits 1,442,245
+ *     -> 2->9 audits: 88,557 each.  9->10: 88,527.
+ *
+ *   0x28ead8f1, which varies BOTH counts:
+ *     0p 2a  262,420 / 350,583 / 382,299      6p 3a  669,549
+ *     6p 4a  756,496 / 759,806               6p 5a  843,055 / 852,534
+ *     -> 3->4 audits: 88,602.  4->5: 89,644.  payments: 41,364 each.
+ *
+ * Two operators, different contracts, agreeing on ~89,000 per audit and ~41,400 per payment.
+ * Rounded UP to 42,000 and 90,000: under-quoting a bid loses the boundary, over-quoting costs
+ * a refundable margin, and the asymmetry is not close.
+ *
+ * WHY THIS SHAPE, after two attempts at a flat one. A single per-action constant cannot fit
+ * both ends and both previous values proved it:
+ *
+ *   46,000 / 82,000 - fitted on other operators' LARGE batches. Predicted our 1-payment +
+ *     1-audit receipt at 159,100 against 196,543 on chain: 19% under.
+ *   60,000 / 106,000 - refitted on that receipt alone. Exact at two actions, but it charged
+ *     the first call's cold premium again for every later call, so a 9-payment + 11-audit
+ *     plan came out at 1,737,100 gas and quoted 0.7659 ETH to out-rank Graveyard - who had
+ *     just bought that same position for 0.307 over 696,247 gas of their own.
+ *
+ * Splitting fixed from marginal fits both: 196,600 for our receipt (0.03% high), and 1,432,600
+ * for 9+11, which sits just under Graveyard's measured 1,442,245 for 11+10 - as it should,
+ * since our wrapper is 2,905 bytes against their ~19KB router stack.
+ */
+export const GAS_PER_PAYMENT_BATCHED = 42_000;
+export const GAS_PER_AUDIT_BATCHED = 90_000;
 
 /**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.
@@ -248,7 +262,7 @@ export function bundleGas(payments: number, audits: number, batched = false): nu
   const work = batched
     ? payments * GAS_PER_PAYMENT_BATCHED + audits * GAS_PER_AUDIT_BATCHED
     : payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
-  return work + (batched ? GAS_VAULT_OVERHEAD : GAS_COINBASE_BID_TX);
+  return work + (batched ? GAS_VAULT_OVERHEAD + GAS_VAULT_COLD_START : GAS_COINBASE_BID_TX);
 }
 
 /**

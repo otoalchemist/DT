@@ -163,11 +163,15 @@ const GAS_PER_AUDIT = 130_409;
 const GAS_BID_TX = 30_550;
 // Inside a vault batch the shape changes: one transaction, so intrinsic is paid ONCE rather
 // than per action, and the separate bid tx does not exist because the bid rides inline.
-// Calibrated on our own epoch-192 receipt (0x51586c79…43eb1e, 1 payment + 1 audit, 196,543
-// gas). Keep in sync with GAS_*_BATCHED / GAS_VAULT_OVERHEAD in shared/constants.ts.
-const GAS_PER_PAYMENT_BATCHED = 60_000;
-const GAS_PER_AUDIT_BATCHED = 106_000;
+// Fixed term anchored on our own epoch-192 receipt (0x51586c79…43eb1e, 1 payment + 1 audit,
+// 196,543 gas). Keep in sync with GAS_*_BATCHED / GAS_VAULT_* in shared/constants.ts.
+// MARGINAL per action (the cost of one MORE), measured as a slope on Graveyard's and
+// 0x28ead8f1's real batches; the first call of each kind costs more and that premium is the
+// separate GAS_VAULT_COLD_START. See the long note in shared/constants.ts.
+const GAS_PER_PAYMENT_BATCHED = 42_000;
+const GAS_PER_AUDIT_BATCHED = 90_000;
 const GAS_VAULT_OVERHEAD = 31_100;
+const GAS_VAULT_COLD_START = 33_500;
 const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI, 0.00069 ETH
 const TAXES_PAID = "0xa13146c03f92fd93f0bccebeff87928581da5e13079c83238adc89e466ebfaca";
 const AUDITED = "0xee1e30708b892ceb30b2a542bccb9a10c605f220dd821cc582226d1fbeea4f6f";
@@ -218,7 +222,7 @@ const PLAN_AUDITS = numArg("--audits", 1);
 const PLAN_WORK_GAS = batched
   ? PLAN_PAYMENTS * GAS_PER_PAYMENT_BATCHED + PLAN_AUDITS * GAS_PER_AUDIT_BATCHED
   : PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT;
-const OUR_BUNDLE_GAS = PLAN_WORK_GAS + (batched ? GAS_VAULT_OVERHEAD : GAS_BID_TX);
+const OUR_BUNDLE_GAS = PLAN_WORK_GAS + (batched ? GAS_VAULT_OVERHEAD + GAS_VAULT_COLD_START : GAS_BID_TX);
 // Same bundle WITHOUT the bid tx: the tip route never sends one, so charging a tip for its
 // ~30,550 gas would overstate the tip lever by exactly that. Keep in sync with
 // tipOnlyBundleGas / tipCostEth in shared/constants.ts.
