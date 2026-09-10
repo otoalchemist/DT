@@ -101,6 +101,7 @@
 //   node scripts/target-scores.mjs --epochs 20        # widen the cadence look-back
 //   node scripts/target-scores.mjs --payments 6 --audits 7   # price the bundle you'll send
 //   node scripts/target-scores.mjs --audits 2 --tip 120      # ...and at a different tip
+//   node scripts/target-scores.mjs --batched                 # price it as ONE vault tx
 //   node scripts/target-scores.mjs --curated          # only data/rival-targets.json (old scope)
 //   node scripts/target-scores.mjs --promote          # add newly-observed skippers to the list
 //   node scripts/target-scores.mjs --json             # machine-readable dump (full set)
@@ -160,6 +161,13 @@ const EPOCH_DURATION = 86400n;
 const GAS_PER_PAYMENT = 82_875;
 const GAS_PER_AUDIT = 130_409;
 const GAS_BID_TX = 30_550;
+// Inside a vault batch the shape changes: one transaction, so intrinsic is paid ONCE rather
+// than per action, and the separate bid tx does not exist because the bid rides inline.
+// Calibrated on our own epoch-192 receipt (0x51586c79…43eb1e, 1 payment + 1 audit, 196,543
+// gas). Keep in sync with GAS_*_BATCHED / GAS_VAULT_OVERHEAD in shared/constants.ts.
+const GAS_PER_PAYMENT_BATCHED = 60_000;
+const GAS_PER_AUDIT_BATCHED = 106_000;
+const GAS_VAULT_OVERHEAD = 31_100;
 const BASE = 690_000_000_000_000n; // BASE_TAX_RATE_WEI, 0.00069 ETH
 const TAXES_PAID = "0xa13146c03f92fd93f0bccebeff87928581da5e13079c83238adc89e466ebfaca";
 const AUDITED = "0xee1e30708b892ceb30b2a542bccb9a10c605f220dd821cc582226d1fbeea4f6f";
@@ -183,6 +191,11 @@ const curatedOnly = args.includes("--curated");
 // otherwise strictly read-only, and that file feeds the bot's default target list, so
 // writing it stays an explicit opt-in rather than a side effect of looking at the data.
 const promote = args.includes("--promote");
+// --batched: price the bundle as ONE vault transaction rather than N standalone ones plus a
+// CoinbasePayer tx. This is not cosmetic — it is the gas term every bid figure is multiplied
+// by, so a vault operator reading the unbatched number is quoted a bid for a bundle they will
+// never send. Defaults off: without a vault the standalone shape is the real one.
+const batched = args.includes("--batched");
 
 /** Numeric flag: `--name 5`. Returns `dflt` when absent or unparseable. */
 function numArg(name, dflt, { min = 0 } = {}) {
@@ -202,11 +215,16 @@ function numArg(name, dflt, { min = 0 } = {}) {
 // Defaults stay 1+1 so existing invocations print what they always did.
 const PLAN_PAYMENTS = numArg("--payments", 1);
 const PLAN_AUDITS = numArg("--audits", 1);
-const OUR_BUNDLE_GAS = PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT + GAS_BID_TX;
+const PLAN_WORK_GAS = batched
+  ? PLAN_PAYMENTS * GAS_PER_PAYMENT_BATCHED + PLAN_AUDITS * GAS_PER_AUDIT_BATCHED
+  : PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT;
+const OUR_BUNDLE_GAS = PLAN_WORK_GAS + (batched ? GAS_VAULT_OVERHEAD : GAS_BID_TX);
 // Same bundle WITHOUT the bid tx: the tip route never sends one, so charging a tip for its
 // ~30,550 gas would overstate the tip lever by exactly that. Keep in sync with
 // tipOnlyBundleGas / tipCostEth in shared/constants.ts.
-const OUR_TIP_GAS = PLAN_PAYMENTS * GAS_PER_PAYMENT + PLAN_AUDITS * GAS_PER_AUDIT;
+// Batched, the tip route and the bid route are the SAME transaction — there is no payer tx to
+// drop — so the tip is charged on the whole thing including the vault overhead.
+const OUR_TIP_GAS = batched ? OUR_BUNDLE_GAS : PLAN_WORK_GAS;
 /** What a `gwei` priority fee costs in ETH for the planned bundle. Marginal cost of the tip
  *  only — base fee is paid either way, so this is what compares against a bid figure. */
 const tipEth = (gwei) => (gwei === null ? null : (gwei * OUR_TIP_GAS) / 1e9);

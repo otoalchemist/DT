@@ -176,32 +176,42 @@ export const GAS_VAULT_OVERHEAD = 31_100;
  * Per-action gas INSIDE a batch, which is a different number from the standalone one.
  *
  * GAS_PER_PAYMENT and GAS_PER_AUDIT are measured from standalone transactions, so each carries
- * its own 21,000 of intrinsic gas. A batch pays intrinsic ONCE, and every action after the
- * first hits storage the previous ones already warmed. Using the standalone figures for a
- * batched bundle overstated it by 37-40% at realistic sizes, and since bidToBeat is
- * (defense - tip) x gas, every bid quoted to a vault operator was inflated by the same margin.
+ * its own 21,000 of intrinsic gas. A batch pays intrinsic ONCE, and actions after the first hit
+ * storage the previous ones already warmed. Using the standalone figures for a batched bundle
+ * overstates it, and since bidToBeat is (defense - tip) x gas, every bid quoted to a vault
+ * operator is inflated by the same margin.
  *
- * MEASURED by least-squares over eight real batched transactions on mainnet - Hedo, Graveyard
- * and two others - covering 2 to 21 actions:
+ * CALIBRATED ON OUR OWN VAULT, from the epoch-192 boundary receipt - the first batch we have
+ * ever sent that carried a real payment and had every call succeed:
  *
- *   fit: 44,298 per payment, 79,489 per audit  (predicts the 21-action batch to 0.6%)
+ *   0x51586c79...43eb1e, block 25943258: 1 payment + 1 audit, both ok, 196,543 gas
+ *     intrinsic 21,000 + 3,000 calldata = 24,000
+ *     execution                          = 172,543
  *
- * The fit's own fixed term (168,749) is deliberately NOT used: it averages other operators'
- * wrappers, and Hedo runs ~19KB of router plus vault against our 2,905 bytes. Ours is measured
- * separately as GAS_VAULT_OVERHEAD. What transfers between contracts is the PER-ACTION cost,
- * because that is dominated by the game's own execution rather than by the wrapper.
+ * Holding GAS_VAULT_OVERHEAD at its separately measured 31,100 leaves 165,443 for the two
+ * actions, split on the standalone ratio (each minus its own intrinsic: 61,875 payment to
+ * 109,409 audit) and rounded UP: 60,000 and 106,000. That predicts the receipt at 197,100,
+ * i.e. 0.3% high.
  *
- * Rounded UP from the fit, deliberately. Under-quoting a bid loses the boundary; over-quoting
- * costs money you get back as a refund on the gas and as a slightly higher bid than needed.
- * The asymmetry is not close, so the rounding goes one way.
+ * THIS REPLACES A FIT ON OTHER OPERATORS' BATCHES (44,298 / 79,489, from eight mainnet
+ * transactions of 2 to 21 actions). That fit was not wrong - it predicted Graveyard's
+ * 21-action batch to 0.6% - but it under-quoted OURS by 19%: it says 159,100 where the chain
+ * says 196,543. The gap is batch SIZE. Their per-action average is dominated by warm storage
+ * across many calls; a two-call batch warms almost nothing, so each action costs close to its
+ * standalone price minus the intrinsic it no longer pays.
  *
- * Validated against our own vault's only live batch to date (1 audit + inline bid, 107,532 gas
- * on chain): this model says 113,100, i.e. 5% high. That is one observation, and it is a
- * REVERTED audit - a successful one writes storage a reverted one skips. The epoch-192 boundary
- * is the first with a real payment inside the vault; recalibrate from that receipt.
+ * The model has one constant per action and therefore cannot be right at both ends. It is
+ * calibrated to the small end because that is what this bot sends - a vault holding a handful
+ * of citizens fires 1-4 calls - and because erring high is the safe direction: under-quoting a
+ * bid loses the boundary, over-quoting costs a refundable margin. An operator batching 10+
+ * actions will be over-quoted here, by roughly the same 20% these figures used to be under by.
+ *
+ * The epoch-191 batch (107,532 gas, 1 audit) is NOT a calibration point: its audit REVERTED,
+ * and a reverted call skips the storage writes a successful one pays for. It bounds the
+ * successful figure from below, nothing more.
  */
-export const GAS_PER_PAYMENT_BATCHED = 46_000;
-export const GAS_PER_AUDIT_BATCHED = 82_000;
+export const GAS_PER_PAYMENT_BATCHED = 60_000;
+export const GAS_PER_AUDIT_BATCHED = 106_000;
 
 /**
  * Coinbase bid (ETH) needed to out-rank a rival defending at `defenseGwei` gwei/gas.

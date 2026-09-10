@@ -78,18 +78,40 @@ describe("blendedTipGwei", () => {
  * loses the boundary while over-quoting only costs money.
  */
 describe("batched bundle gas", () => {
-  it("is far cheaper than the same actions sent standalone", () => {
+  it("is cheaper than the same actions sent standalone", () => {
     // The whole reason for a vault. If these ever converge, batching has stopped paying.
+    //
+    // The threshold was 0.7 while the per-action figures were fitted on other operators'
+    // large batches. Our own epoch-192 receipt measures the real saving at a two-call size:
+    // 196,543 batched against 243,834 standalone, i.e. 0.806. The saving is smaller than the
+    // borrowed fit implied because it is almost entirely the intrinsic gas we stop paying per
+    // action - warm storage needs many calls to add much, and we do not send many.
     for (const [p, a] of [[1, 1], [9, 11], [11, 10]] as const) {
-      expect(bundleGas(p, a, true)).toBeLessThan(bundleGas(p, a, false) * 0.7);
+      expect(bundleGas(p, a, true)).toBeLessThan(bundleGas(p, a, false) * 0.85);
     }
   });
 
   it("matches our own live batch, and errs HIGH against it", () => {
-    // epoch-191, 1 audit + inline bid: 107,532 gas on chain.
-    const modelled = bundleGas(0, 1, true);
-    expect(modelled).toBeGreaterThan(107_532);        // never under-quote
-    expect(modelled).toBeLessThan(107_532 * 1.15);    // but not by a wide margin
+    // The calibration point: epoch-192 boundary, tx 0x51586c79...43eb1e in block 25943258.
+    // 1 payment + 1 audit, both calls succeeded, 196,543 gas on chain. This is the only batch
+    // we have sent that carried a real payment and reverted nothing, so it is the only one
+    // that measures what the model claims to predict.
+    const modelled = bundleGas(1, 1, true);
+    expect(modelled).toBeGreaterThan(196_543);        // never under-quote
+    expect(modelled).toBeLessThan(196_543 * 1.05);    // but not by a wide margin
+
+    // Guards the direction of the miss. The previous constants (46,000 / 82,000, fitted on
+    // other operators' 2-to-21-action batches) said 159,100 for this receipt - 19% UNDER,
+    // which is the direction that loses a boundary. Anything that drifts back below the
+    // measured figure fails above; this pins that 159,100 specifically is not it.
+    expect(modelled).toBeGreaterThan(159_100);
+  });
+
+  it("does not treat the reverted epoch-191 batch as a calibration point", () => {
+    // 107,532 gas for 1 audit, but that audit REVERTED inside run(): it skipped the storage
+    // writes a successful audit pays for. It bounds a successful audit from below and says
+    // nothing about its actual cost, so the model must sit above it - not near it.
+    expect(bundleGas(0, 1, true)).toBeGreaterThan(107_532);
   });
 
   it("charges intrinsic ONCE, not once per action", () => {
