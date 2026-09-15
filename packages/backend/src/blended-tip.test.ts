@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { blendedTipGwei, bidToBeat, tipCostEth, GAS_PER_PAYMENT, GAS_PER_AUDIT, bundleGas } from "@dat-bot/shared";
+import { blendedTipGwei, bidToBeat, tipCostEth, tipOnlyBundleGas, GAS_PER_PAYMENT, GAS_PER_AUDIT, bundleGas } from "@dat-bot/shared";
 
 /**
  * The blended tip the target-analysis panel prices against when payments and audits carry
@@ -133,5 +133,51 @@ describe("batched bundle gas", () => {
     const batched = bidToBeat(216.6, 10, 9, 11, true);
     expect(batched).toBeLessThan(unbatched);
     expect(batched).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The tip lever, batched.
+ *
+ * bundleGas learned `batched`; tipOnlyBundleGas did not, and TargetScores calls it for every
+ * tip figure on the panel. So the bid column was priced on the transaction a vault operator
+ * sends and the tip column right beside it on N transactions they do not — the two levers the
+ * panel exists to compare, quoted against different bundles.
+ */
+describe("the tip lever, against a vault", () => {
+  it("prices the tip on the SAME transaction the bid rides in", () => {
+    // A vault pays the bid inline, so unlike the standalone route there is no CoinbasePayer
+    // transaction to subtract. Tip route and bid route are one transaction.
+    for (const [p, a] of [[1, 1], [1, 0], [9, 11]] as const) {
+      expect(tipOnlyBundleGas(p, a, true)).toBe(bundleGas(p, a, true));
+    }
+  });
+
+  it("errs in BOTH directions when the flag is dropped, so neither sign can stand in for it", () => {
+    // The reason this could not be waved through as "close enough". Ignoring `batched`
+    // over-states a pay+audit bundle and under-states a payment-only one, because a lone
+    // batched payment still carries the whole vault fixed cost while saving one intrinsic.
+    expect(tipOnlyBundleGas(1, 1, false)).toBeGreaterThan(tipOnlyBundleGas(1, 1, true));
+    expect(tipOnlyBundleGas(1, 0, false)).toBeLessThan(tipOnlyBundleGas(1, 0, true));
+  });
+
+  it("carries that through to the ETH figure the panel prints", () => {
+    // 302 gwei is what it took to out-rank Graveyard's epoch-196 batch (300.63 gwei/gas).
+    expect(tipCostEth(302, 1, 1, true)).toBeCloseTo(0.0594, 4);
+    expect(tipCostEth(302, 1, 0, true)).toBeCloseTo(0.0322, 4);
+    // and the unbatched numbers are untouched — every operator without a vault sees what they saw
+    expect(tipCostEth(302, 1, 1, false)).toBeCloseTo(0.0644, 4);
+    expect(tipCostEth(302, 1, 0, false)).toBeCloseTo(0.025, 4);
+  });
+
+  it("does not blend two tips a vault can never carry at once", () => {
+    // flushVaultBatch signs the whole batch with ONE profile, chosen by `offense: !hasPayment`.
+    // A weighted mean of 10 and 500 is a price no transaction is ever signed at.
+    expect(blendedTipGwei(9, 11, 10, 500, true)).toBe(10);   // a payment is present -> payment tip
+    expect(blendedTipGwei(0, 11, 10, 500, true)).toBe(500);  // audit-only -> offense tip
+    // unbatched still blends, gas-weighted
+    const blend = blendedTipGwei(9, 11, 10, 500, false);
+    expect(blend).toBeGreaterThan(10);
+    expect(blend).toBeLessThan(500);
   });
 });

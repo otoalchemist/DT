@@ -271,8 +271,17 @@ export function bundleGas(payments: number, audits: number, batched = false): nu
  * The tip route doesn't send one — that's the whole point of it — so pricing a tip against
  * `bundleGas` would charge ~30,550 gas of a transaction that never exists on this path, and
  * make the tip look worse than it is by exactly that much.
+ *
+ * BATCHED HAS NO SUCH TRANSACTION TO SUBTRACT. A vault pays the bid inline, so the tip route
+ * and the bid route are the SAME single transaction and this is simply `bundleGas`. Omitting
+ * the flag here did not just lose the batched per-action figures - it silently priced a vault
+ * operator's tip on a bundle of N standalone transactions they never send, and the error does
+ * not even point one way: at 1 payment + 1 audit it over-states (213,284 against 196,600), at
+ * 1 payment alone it UNDER-states (82,875 against 106,600), because a lone batched payment
+ * still carries the whole vault fixed cost while saving only one intrinsic.
  */
-export function tipOnlyBundleGas(payments: number, audits: number): number {
+export function tipOnlyBundleGas(payments: number, audits: number, batched = false): number {
+  if (batched) return bundleGas(payments, audits, true);
   return payments * GAS_PER_PAYMENT + audits * GAS_PER_AUDIT;
 }
 
@@ -297,8 +306,13 @@ export function tipOnlyBundleGas(payments: number, audits: number): number {
  * mid-epoch payments. And the tip buys the thing a bid cannot: it still works on the ~1
  * boundary in 10 built by a solo validator, which ignores coinbase transfers outright.
  */
-export function tipCostEth(tipGwei: number, payments: number, audits: number): number {
-  return (tipGwei * tipOnlyBundleGas(payments, audits)) / 1e9;
+export function tipCostEth(
+  tipGwei: number,
+  payments: number,
+  audits: number,
+  batched = false,
+): number {
+  return (tipGwei * tipOnlyBundleGas(payments, audits, batched)) / 1e9;
 }
 
 /**
@@ -329,7 +343,14 @@ export function blendedTipGwei(
   audits: number,
   payTipGwei: number,
   auditTipGwei: number,
+  batched = false,
 ): number {
+  // A VAULT DOES NOT BLEND. Its boundary is one transaction carrying one tip, and
+  // flushVaultBatch picks which by `offense: !hasPayment` - a batch with any payment in it is
+  // defensive and takes the payment profile, an audit-only batch takes the offense one. So the
+  // honest figure here is that single tip, not a weighted mean of two that never coexist.
+  // Blending them would quote a price no transaction will ever be signed at.
+  if (batched) return payments > 0 ? payTipGwei : auditTipGwei;
   const payGas = payments * GAS_PER_PAYMENT;
   const auditGas = audits * GAS_PER_AUDIT;
   const total = payGas + auditGas;

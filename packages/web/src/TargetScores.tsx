@@ -64,7 +64,7 @@ function TipLine({ density, plan }: { density: number | null | undefined; plan: 
   // The bid above is in ETH and the tip is in gwei/gas, so they cannot be compared as
   // printed. Quote the tip in ETH too. Converting shows the tip is the CHEAPER lever at
   // equal density — the bid route also sends and tips the CoinbasePayer tx.
-  const costEth = tipCostEth(tip, plan.payments, plan.audits);
+  const costEth = tipCostEth(tip, plan.payments, plan.audits, plan.batched);
   return (
     <>
       <br />
@@ -72,8 +72,8 @@ function TipLine({ density, plan }: { density: number | null | undefined; plan: 
         style={{ fontSize: 10, color: enough ? "var(--green)" : "var(--muted, #888)" }}
         title={
           enough
-            ? `Your ${plan.tipGwei} gwei tip already exceeds the ${tip} gwei this bar needs, so no bid is required on any builder — including the ~1 boundary in 10 built by a solo validator that ignores coinbase bids entirely. At ${tip} gwei over ${tipOnlyBundleGas(plan.payments, plan.audits).toLocaleString()} gas that is ~${costEth.toFixed(4)} ETH of priority fee (the bid tx is not sent on this route, so its gas is excluded).`
-            : `Or skip the bid: a ${tip} gwei priority fee clears this bar on its own, costing ~${costEth.toFixed(4)} ETH over ${tipOnlyBundleGas(plan.payments, plan.audits).toLocaleString()} gas. Compare that against the bid above PLUS the tip you would still be paying on the bid route — including its CoinbasePayer transaction — which makes the tip the cheaper lever at equal density, not the dearer one. It is also the ONLY lever on the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which ignores coinbase transfers.`
+            ? `Your ${plan.tipGwei} gwei tip already exceeds the ${tip} gwei this bar needs, so no bid is required on any builder — including the ~1 boundary in 10 built by a solo validator that ignores coinbase bids entirely. At ${tip} gwei over ${tipOnlyBundleGas(plan.payments, plan.audits, plan.batched).toLocaleString()} gas that is ~${costEth.toFixed(4)} ETH of priority fee (the bid tx is not sent on this route, so its gas is excluded).`
+            : `Or skip the bid: a ${tip} gwei priority fee clears this bar on its own, costing ~${costEth.toFixed(4)} ETH over ${tipOnlyBundleGas(plan.payments, plan.audits, plan.batched).toLocaleString()} gas. Compare that against the bid above PLUS the tip you would still be paying on the bid route — including its CoinbasePayer transaction — which makes the tip the cheaper lever at equal density, not the dearer one. It is also the ONLY lever on the ~1 boundary in 10 built by a solo validator on vanilla geth/reth, which ignores coinbase transfers.`
         }
       >
         Prio: {tip}gw ≈ {costEth.toFixed(4)}Ξ
@@ -414,7 +414,7 @@ export function TargetScores({
   const auditTip = auditTipEdit ?? auditTipGwei;
   // What the bundle behaves as: gas-weighted, so an audit's ~130k gas pulls harder than a
   // payment's ~83k. Every Beat figure prices against this.
-  const tip = blendedTipGwei(payments, audits, payTip, auditTip);
+  const tip = blendedTipGwei(payments, audits, payTip, auditTip, batched);
   const pollRef = useRef<number | null>(null);
 
   const load = async () => {
@@ -553,16 +553,20 @@ export function TargetScores({
             <span
               className="muted"
               style={{ fontSize: 11, lineHeight: 1.5 }}
-              title="Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus 30,550 for the CoinbasePayer transaction that carries the bid. That last figure is gas USED, not the 60,000 limit the payer tx is signed with — builders simulate and order on what a bundle actually burns, so pricing against the limit overstated every bundle by ~30,000 gas."
+              title={batched
+                ? "Batched: 42,000 gas per payment and 90,000 per audit — the MARGINAL cost of one more inside a transaction that already has some, measured as a slope on Graveyard's and 0x28ead8f1's real mainnet batches. Plus a fixed 64,600: 31,100 of run() wrapper and intrinsic, and 33,500 of cold start the first payment and audit pay to touch game storage nothing has warmed. No CoinbasePayer transaction exists on this route — the bid rides inside the call."
+                : "Measured on-chain: 82,875 gas per payment, 130,409 per audit, plus 30,550 for the CoinbasePayer transaction that carries the bid. That last figure is gas USED, not the 60,000 limit the payer tx is signed with — builders simulate and order on what a bundle actually burns, so pricing against the limit overstated every bundle by ~30,000 gas."}
             >
               bundle {planGas.toLocaleString()} gas @ {tip.toFixed(tip < 10 ? 1 : 0)} gwei blended tip ≈{" "}
-              {tipCostEth(tip, payments, audits).toFixed(4)} ETH in tips
+              {tipCostEth(tip, payments, audits, batched).toFixed(4)} ETH in tips
               {payTip !== auditTip ? (
                 <span
                   className="muted"
-                  title={`Gas-weighted, not averaged: ${payments} payment(s) at ${payTip} gwei over ${(payments * 82_875).toLocaleString()} gas, plus ${audits} audit(s) at ${auditTip} gwei over ${(audits * 130_409).toLocaleString()} gas. A builder sorts on total priority value over total gas, so this blend is what your bundle actually behaves as — and with no coinbase bid the two go out as SEPARATE bundles, where each carries its own tip rather than the blend.`}
+                  title={batched
+                    ? `No blend with a vault: the boundary is ONE transaction carrying ONE tip. flushVaultBatch signs it offense = !hasPayment, so a batch with any payment in it takes the ${payTip} gwei payment tip and an audit-only batch takes the ${auditTip} gwei offense tip. This plan has ${payments} payment(s), so the ${payments > 0 ? payTip : auditTip} gwei figure is the one that applies — the other never reaches this transaction.`
+                    : `Gas-weighted, not averaged: ${payments} payment(s) at ${payTip} gwei over ${(payments * 82_875).toLocaleString()} gas, plus ${audits} audit(s) at ${auditTip} gwei over ${(audits * 130_409).toLocaleString()} gas. A builder sorts on total priority value over total gas, so this blend is what your bundle actually behaves as — and with no coinbase bid the two go out as SEPARATE bundles, where each carries its own tip rather than the blend.`}
                 >
-                  {" "}({payTip} pay / {auditTip} audit)
+                  {" "}({payTip} pay / {auditTip} audit{batched ? (payments > 0 ? ", pay tip applies" : ", offense tip applies") : ""})
                 </span>
               ) : null}
               {paymentsEdit === null && auditsEdit === null && payTipEdit === null && auditTipEdit === null ? (
@@ -610,7 +614,7 @@ export function TargetScores({
                   return (
                     <span
                       key={k}
-                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid${batched ? "" : " — but that route also tips the CoinbasePayer tx"}, so its true total is ~${(bid + tipCostEth(tip, payments, audits) + (batched ? 0 : (tip * 30550) / 1e9)).toFixed(4)} ETH.${batched ? " With a vault the bid rides inside the batch call, so there is no payer transaction to tip, which is what makes the two routes cost the same here. The tip is still the only lever that works on the ~1 boundary in 10 built by a solo validator." : " The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator."} A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
+                      title={`The strongest bundle present was ${bar} gwei/gas at this percentile of ${state.leadBar!.blocks} observed boundary race(s). Two ways to clear it, priced like for like: a ${tipFor(bar)} gwei priority fee on its own costs ~${tipCostEth(tipFor(bar)!, payments, audits, batched).toFixed(4)} ETH, or keep your ${tip} gwei tip and add ${bid.toFixed(4)} ETH of bid${batched ? "" : " — but that route also tips the CoinbasePayer tx"}, so its true total is ~${(bid + tipCostEth(tip, payments, audits, batched) + (batched ? 0 : (tip * 30550) / 1e9)).toFixed(4)} ETH.${batched ? " With a vault the bid rides inside the batch call, so there is no payer transaction to tip, which is what makes the two routes cost the same here. The tip is still the only lever that works on the ~1 boundary in 10 built by a solo validator." : " The tip is therefore the CHEAPER lever here, as well as the only one that works on the ~1 boundary in 10 built by a solo validator."} A bid's advantage is scope, not price: it applies to this boundary only, while the tip re-prices every transaction the bot sends.`}
                     >
                       {label}{" "}
                       <strong style={{ color: bid > 0 ? "var(--amber)" : "var(--green)" }}>
@@ -621,10 +625,10 @@ export function TargetScores({
                           {" "}
                           {/* Totals, not the bare bid: the bid route keeps paying its tip
                               (payer tx included), so the raw bid understates it. */}
-                          (+{tipCostEth(tip, payments, audits).toFixed(4)} tip ={" "}
+                          (+{tipCostEth(tip, payments, audits, batched).toFixed(4)} tip ={" "}
                           {(bid + (tip * bundleGas(payments, audits)) / 1e9).toFixed(4)}Ξ) or{" "}
                           {tipFor(bar)}gw tip alone ={" "}
-                          {tipCostEth(tipFor(bar)!, payments, audits).toFixed(4)}Ξ
+                          {tipCostEth(tipFor(bar)!, payments, audits, batched).toFixed(4)}Ξ
                         </span>
                       ) : null}
                     </span>
